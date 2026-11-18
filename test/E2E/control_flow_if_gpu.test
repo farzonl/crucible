@@ -1,0 +1,10 @@
+# End-to-end GPU test for divergent if/else.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/control_flow_if.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 8,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:f32:8:iota | FileCheck %s
+
+# x < 2 -> x*3 : [0, 3]; else min(x, 10) : [2..7]
+# CHECK: buffer0: 0 3 2 3 4 5 6 7

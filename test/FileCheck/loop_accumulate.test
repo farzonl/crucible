@@ -1,0 +1,13 @@
+# Loops: dxc's rotated loop must come out as a guarded do-while with
+# loop-carried values demoted to mutable locals.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/loop_accumulate.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK: if (dtid.x == 0u) {
+# CHECK: } else {
+# CHECK: do {
+# CHECK: } while (
+# CHECK-NOT: goto

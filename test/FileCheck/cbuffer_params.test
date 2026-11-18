@@ -1,0 +1,19 @@
+# Constant buffers: legacy cbuffer rows bind as constant float4* with uint
+# fields reinterpreted per load site.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/cbuffer_params.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --reflect %t.json
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+
+# CHECK: kernel void main0(
+# CHECK: device float* [[DATA:[A-Za-z0-9_]+]] {{\[\[}}buffer(0){{\]\]}},
+# CHECK: constant float4* [[CB:[A-Za-z0-9_]+]] {{\[\[}}buffer(1){{\]\]}},
+# CHECK: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: if (dtid.x < as_type<uint>([[CB]][0u].z)) {
+# CHECK: [[DATA]][dtid.x] = [[CB]][0u].x * [[DATA]][dtid.x] + [[CB]][0u].y;
+
+# REFLECT: "class": "uav"
+# REFLECT: "metalIndex": 0
+# REFLECT: "class": "cbv"
+# REFLECT: "metalIndex": 1

@@ -1,0 +1,11 @@
+# End-to-end GPU test for loops with nested control flow.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/loop_accumulate.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 8,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:f32:8:iota | FileCheck %s
+
+# acc(id) = sum of Data[i] for i < id where Data[i] <= 4 (Data = iota):
+#   0, 0, 1, 3, 6, 10, 10 (skip 5), 10 (skip 5, 6)
+# CHECK: buffer0: 0 0 1 3 6 10 10 10

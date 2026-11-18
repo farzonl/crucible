@@ -66,6 +66,9 @@ enum class DXILOp : uint32_t {
   GroupId = 94,
   ThreadIdInGroup = 95,
   FlattenedThreadIdInGroup = 96,
+  // SM 6.2+ raw/structured buffer access
+  RawBufferLoad = 139,
+  RawBufferStore = 140,
   // SM 6.6 resource handles
   AnnotateHandle = 216,
   CreateHandleFromBinding = 217,

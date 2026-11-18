@@ -78,6 +78,15 @@ void fillBuffer(const BufferSpec &Spec, void *Data) {
   if (!Iota && !Zero)
     Values = split(Spec.Init, ',');
   for (size_t I = 0; I < Spec.Count; ++I) {
+    // "0x"-prefixed values are raw 32-bit patterns regardless of buffer type
+    // (useful for packing uint fields into float-typed cbuffers).
+    if (!Iota && !Zero && I < Values.size() &&
+        Values[I].rfind("0x", 0) == 0) {
+      uint32_t Bits =
+          static_cast<uint32_t>(strtoul(Values[I].c_str(), nullptr, 16));
+      memcpy(static_cast<uint32_t *>(Data) + I, &Bits, 4);
+      continue;
+    }
     double V = 0;
     if (Iota)
       V = static_cast<double>(I);

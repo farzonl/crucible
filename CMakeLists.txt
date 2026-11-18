@@ -28,13 +28,45 @@ endif()
 find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
 
+if(NOT MLIR_DIR)
+  get_filename_component(CRUCIBLE_LLVM_PREFIX "${LLVM_DIR}/../../.." ABSOLUTE)
+  if(EXISTS "${CRUCIBLE_LLVM_PREFIX}/lib/cmake/mlir/MLIRConfig.cmake")
+    set(MLIR_DIR "${CRUCIBLE_LLVM_PREFIX}/lib/cmake/mlir")
+  endif()
+endif()
+find_package(MLIR REQUIRED CONFIG)
+message(STATUS "Found MLIR at ${MLIR_DIR}")
+
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
-include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
+include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS_LIST})
 
-llvm_map_components_to_libnames(CRUCIBLE_LLVM_LIBS
-  Core Object BitReader IRReader BinaryFormat Support TargetParser
-  Analysis Passes TransformUtils ScalarOpts)
+# Prefer the monolithic LLVM dylib when present (Homebrew ships one and its
+# MLIR static archives depend on it); mixing it with static component
+# archives duplicates LLVM globals and crashes at runtime.
+if(TARGET LLVM)
+  set(CRUCIBLE_LLVM_LIBS LLVM)
+else()
+  llvm_map_components_to_libnames(CRUCIBLE_LLVM_LIBS
+    Core Object BitReader IRReader BinaryFormat Support TargetParser
+    Analysis Passes TransformUtils ScalarOpts)
+endif()
+
+# MLIR is used to lift the unstructured DXIL CFG into structured scf.if /
+# scf.while regions (via LiftControlFlowToSCF) that the MSL emitter walks.
+set(CRUCIBLE_MLIR_LIBS
+  MLIRTargetLLVMIRImport
+  MLIRLLVMIRToLLVMTranslation
+  MLIRControlFlowToSCF
+  MLIRSCFDialect
+  MLIRControlFlowDialect
+  MLIRFuncDialect
+  MLIRLLVMDialect
+  MLIRArithDialect
+  MLIRDLTIDialect
+  MLIRTransforms
+  MLIRPass
+  MLIRIR)
 
 # Match LLVM conventions: no RTTI / no exceptions unless LLVM has them.
 if(NOT LLVM_ENABLE_RTTI)

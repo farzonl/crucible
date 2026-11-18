@@ -12,6 +12,7 @@
 #include "Transforms/Transforms.h"
 
 #include "llvm/IR/LLVMContext.h"
+#include "mlir/IR/MLIRContext.h"
 
 using namespace llvm;
 
@@ -27,7 +28,12 @@ Expected<CompileResult> compileDXILToMSL(MemoryBufferRef DXIL,
   if (Error E = assignMetalBindings(Shader->Reflect, Opts))
     return std::move(E);
 
-  auto MSL = emitMSL(*Shader, Opts);
+  mlir::MLIRContext MCtx;
+  auto Structured = structurizeCFG(*Shader, MCtx);
+  if (!Structured)
+    return Structured.takeError();
+
+  auto MSL = emitMSL(Structured->Entry, Shader->Reflect, Opts);
   if (!MSL)
     return MSL.takeError();
 

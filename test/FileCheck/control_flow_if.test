@@ -1,0 +1,17 @@
+# Structured control flow: a real CFG diamond must come out as if/else with
+# the PHI demoted to a local -- never a goto.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/control_flow_if.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK: float [[X:v[0-9]+]] = [[BUF:[A-Za-z0-9_]+]][dtid.x];
+# CHECK-NEXT: float [[RES:v[0-9]+]];
+# CHECK-NEXT: if ([[X]] < 2.0f) {
+# CHECK-NEXT: [[RES]] = [[X]] * 3.0f;
+# CHECK-NEXT: } else {
+# CHECK-NEXT: [[RES]] = min([[X]], 10.0f);
+# CHECK-NEXT: }
+# CHECK-NEXT: [[BUF]][dtid.x] = [[RES]];
+# CHECK-NOT: goto

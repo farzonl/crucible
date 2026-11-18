@@ -49,9 +49,10 @@ kernel void main0(
 | 1 | `lib/Frontend/ContainerLoader` | `llvm::object::DXContainer` part extraction (DXIL, PSV0, signatures); bare bitcode passthrough |
 | 2 | `lib/Frontend/DXILUpgrader` | `llvm::parseBitcodeFile` auto-upgrades frozen LLVM 3.7 bitcode (incl. data-layout fix via `ParserCallbacks`); `DXILUpgradePass` + mem2reg/SROA/SimplifyCFG cleanup; `!dx.*` metadata reflection |
 | 3 | `lib/Transforms/ResourceLowering` | Deterministic `(class, space, register) → [[buffer(n)]]` direct binding assignment |
-| 4 | `lib/Backend/MSLEmitter` | Structured IR → MSL printer with use-count-based expression inlining and signedness recovery |
-| 5 | `lib/Backend/IntrinsicMap` | `@dx.op.*` → `metal_stdlib` mapping table |
-| 6 | `tools/cruciblec` | CLI driver + `xcrun metal`/`metallib` toolchain wrapper (`--metallib`) |
+| 4 | `lib/Transforms/CFGStructurizer` | Imports the module into MLIR and lifts the unstructured CFG to `scf.if`/`scf.while` regions via `LiftControlFlowToSCF` (goto-free by construction; value yields double as PHI demotion) |
+| 5 | `lib/Backend/MSLEmitter` | Structured SCF regions → MSL printer: if/else, do-while/while loops, use-count-based expression inlining, signedness recovery |
+| 6 | `lib/Backend/IntrinsicMap` | `@dx.op.*` → `metal_stdlib` mapping table |
+| 7 | `tools/cruciblec` | CLI driver + `xcrun metal`/`metallib` toolchain wrapper (`--metallib`) |
 | — | `tools/crucible-run` | Metal compute dispatch harness for GPU-verified lit tests |
 
 Design guardrails:
@@ -108,9 +109,11 @@ output, which becomes the compliance target in Milestone 4.
 Crucible deliberately builds on best-in-class open source instead of
 reinventing it:
 
-- **[LLVM](https://llvm.org)** — DXContainer object parsing, bitcode
+- **[LLVM + MLIR](https://llvm.org)** — DXContainer object parsing, bitcode
   auto-upgrade (LLVM 3.7 → modern opaque-pointer IR), pass infrastructure,
-  `llvm::json`, `Error`/`Expected` diagnostics, CommandLine.
+  `llvm::json`, `Error`/`Expected` diagnostics, CommandLine; MLIR's
+  `LiftControlFlowToSCF` (the "perfect reconstructability" algorithm)
+  structurizes arbitrary shader CFGs instead of a hand-rolled structurizer.
 - **[DirectXShaderCompiler (dxc)](https://github.com/microsoft/DirectXShaderCompiler)**
   — reference HLSL → DXIL compiler used by the test suite.
 - **[LLVM lit + FileCheck](https://llvm.org/docs/CommandGuide/lit.html)** —
@@ -124,8 +127,9 @@ reinventing it:
 - [x] **Milestone 1** — DXContainer loader, compute kernels, structured
   buffers, direct bindings, reflection JSON, `xcrun` integration, GPU-verified
   lit suite.
-- [ ] **Milestone 2** — CFG structurization (`if`/`else`/loops, PHI demotion),
-  cbuffers, `ByteAddressBuffer`, full signedness analysis.
+- [x] **Milestone 2** — CFG structurization via MLIR `ControlFlowToSCF`
+  (`if`/`else`, do-while/while loops, PHI demotion), cbuffers (incl. mixed
+  float/uint rows), raw buffer ops, signedness recovery.
 - [ ] **Milestone 3** — groupshared + barriers, atomics, wave ops
   (`simd_*`), SM 6.8 packed/vector dot products, benchmarks vs.
   `metal-shaderconverter`.
