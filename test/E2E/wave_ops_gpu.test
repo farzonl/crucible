@@ -1,0 +1,10 @@
+# End-to-end GPU test: wave intrinsics on one 32-lane Apple simdgroup.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/wave_ops.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 32,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:u32:8:zero | FileCheck %s
+
+# Out[i] = WaveActiveSum(0..31)=496 + first(0) + prefix(i)
+# CHECK: buffer0: 496 497 498 499 500 501 502 503

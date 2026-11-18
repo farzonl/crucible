@@ -126,6 +126,13 @@ Error executeCompute(Pipeline &P) {
 
     NS::Error *NErr = nullptr;
     MTL::CompileOptions *CO = MTL::CompileOptions::alloc()->init();
+    // Compliance runs match the D3D contract: NaN/INF must propagate
+    // (sin(inf) == NaN), which requires safe math -- Metal's relaxed mode
+    // still loses NaN through transcendental builtins. The remaining gap is
+    // denormal flushing (D3D FTZ vs. Metal preserve in safe mode).
+    // Benchmarks opt into fast math separately. (setFastMathEnabled rather
+    // than setMathMode: the latter silently no-ops on current runtimes.)
+    CO->setFastMathEnabled(false);
     MTL::Library *Lib = Device->newLibrary(
         NS::String::string(Compiled->MSL.c_str(), NS::UTF8StringEncoding), CO,
         &NErr);

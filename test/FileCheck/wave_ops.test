@@ -1,0 +1,13 @@
+# Wave intrinsics -> Metal simdgroup functions.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/wave_ops.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK-DAG: simd_sum(
+# CHECK-DAG: simd_broadcast_first(
+# CHECK-DAG: simd_prefix_exclusive_sum(
+
+# REQUIRES: metal-tools
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air

@@ -1,0 +1,10 @@
+# End-to-end GPU test: threadgroup reduction via shared atomics.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/groupshared_reduce.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 64,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:u32:1:zero | FileCheck %s
+
+# sum(0..63) = 2016
+# CHECK: buffer0: 2016

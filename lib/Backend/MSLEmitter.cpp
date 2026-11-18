@@ -18,6 +18,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -60,6 +61,102 @@ struct Expr {
   std::string Text;
   int Prec = PrecPrimary;
 };
+
+// Source for on-demand MSL helper functions implementing exact DXIL
+// semantics where metal_stdlib differs (bit scans return -1 on zero input,
+// bitfield ops mask their operands, packed dot products, ballot shape,
+// compare-exchange result semantics).
+StringRef helperSource(StringRef Name) {
+  if (Name == "crucible_firstbitlo")
+    return "static inline uint crucible_firstbitlo(uint v) {\n"
+           "  return v == 0u ? 0xffffffffu : ctz(v);\n"
+           "}\n";
+  if (Name == "crucible_firstbithi")
+    return "static inline uint crucible_firstbithi(uint v) {\n"
+           "  return v == 0u ? 0xffffffffu : 31u - clz(v);\n"
+           "}\n";
+  if (Name == "crucible_firstbitshi")
+    return "static inline uint crucible_firstbitshi(uint v) {\n"
+           "  if (as_type<int>(v) < 0) v = ~v;\n"
+           "  return v == 0u ? 0xffffffffu : 31u - clz(v);\n"
+           "}\n";
+  if (Name == "crucible_ubfe")
+    return "static inline uint crucible_ubfe(uint width, uint offset, uint v) "
+           "{\n"
+           "  width &= 31u; offset &= 31u;\n"
+           "  if (width == 0u) return 0u;\n"
+           "  if (width + offset < 32u) return (v << (32u - width - offset)) "
+           ">> (32u - width);\n"
+           "  return v >> offset;\n"
+           "}\n";
+  if (Name == "crucible_ibfe")
+    return "static inline uint crucible_ibfe(uint width, uint offset, uint v) "
+           "{\n"
+           "  width &= 31u; offset &= 31u;\n"
+           "  if (width == 0u) return 0u;\n"
+           "  int sv = as_type<int>(v);\n"
+           "  if (width + offset < 32u)\n"
+           "    return as_type<uint>((sv << (32u - width - offset)) >> (32u - "
+           "width));\n"
+           "  return as_type<uint>(sv >> offset);\n"
+           "}\n";
+  if (Name == "crucible_bfi")
+    return "static inline uint crucible_bfi(uint width, uint offset, uint "
+           "src, uint dst) {\n"
+           "  width &= 31u; offset &= 31u;\n"
+           "  uint mask = (width == 0u ? 0u : (0xffffffffu >> (32u - width))) "
+           "<< offset;\n"
+           "  return (src << offset & mask) | (dst & ~mask);\n"
+           "}\n";
+  if (Name == "crucible_dot4add_u8packed")
+    return "static inline uint crucible_dot4add_u8packed(uint acc, uint a, "
+           "uint b) {\n"
+           "  uchar4 ua = as_type<uchar4>(a), ub = as_type<uchar4>(b);\n"
+           "  return acc + uint(ua.x) * uint(ub.x) + uint(ua.y) * uint(ub.y) "
+           "+\n"
+           "         uint(ua.z) * uint(ub.z) + uint(ua.w) * uint(ub.w);\n"
+           "}\n";
+  if (Name == "crucible_dot4add_i8packed")
+    return "static inline uint crucible_dot4add_i8packed(uint acc, uint a, "
+           "uint b) {\n"
+           "  char4 sa = as_type<char4>(a), sb = as_type<char4>(b);\n"
+           "  int r = as_type<int>(acc) + int(sa.x) * int(sb.x) + int(sa.y) * "
+           "int(sb.y) +\n"
+           "          int(sa.z) * int(sb.z) + int(sa.w) * int(sb.w);\n"
+           "  return as_type<uint>(r);\n"
+           "}\n";
+  if (Name == "crucible_wave_ballot")
+    return "static inline uint4 crucible_wave_ballot(bool b) {\n"
+           "  simd_vote v = simd_ballot(b);\n"
+           "  uint64_t bits = (simd_vote::vote_t)v;\n"
+           "  return uint4(uint(bits), uint(bits >> 32), 0u, 0u);\n"
+           "}\n";
+  if (Name == "crucible_atomic_cmpxchg_device")
+    return "static inline uint crucible_atomic_cmpxchg(device atomic_uint "
+           "*p, uint cmp, uint val) {\n"
+           "  uint expected = cmp;\n"
+           "  while (!atomic_compare_exchange_weak_explicit(\n"
+           "      p, &expected, val, memory_order_relaxed, "
+           "memory_order_relaxed)) {\n"
+           "    if (expected != cmp) break;\n"
+           "    expected = cmp;\n"
+           "  }\n"
+           "  return expected;\n"
+           "}\n";
+  if (Name == "crucible_atomic_cmpxchg_threadgroup")
+    return "static inline uint crucible_atomic_cmpxchg(threadgroup "
+           "atomic_uint *p, uint cmp, uint val) {\n"
+           "  uint expected = cmp;\n"
+           "  while (!atomic_compare_exchange_weak_explicit(\n"
+           "      p, &expected, val, memory_order_relaxed, "
+           "memory_order_relaxed)) {\n"
+           "    if (expected != cmp) break;\n"
+           "    expected = cmp;\n"
+           "  }\n"
+           "  return expected;\n"
+           "}\n";
+  return {};
+}
 
 std::string sanitizeIdentifier(StringRef Name, StringRef Fallback) {
   std::string Out;
@@ -165,6 +262,16 @@ private:
   DenseMap<mlir::Value, std::string> ValueNames;     // declared locals
   unsigned NextTemp = 0;
   bool UsesDTid = false, UsesGTid = false, UsesGid = false, UsesGidx = false;
+  bool UsesLane = false, UsesLaneCount = false;
+  // MSL helper functions required by the emitted code, in emission order.
+  std::vector<std::string> HelperOrder;
+  llvm::StringSet<> HelperSet;
+  std::string GroupsharedDecls; // threadgroup declarations (kernel prologue)
+
+  void requireHelper(StringRef Name) {
+    if (HelperSet.insert(Name).second)
+      HelperOrder.push_back(Name.str());
+  }
 
   std::string Body;
 
@@ -194,7 +301,24 @@ private:
   Expected<Expr> bufferElementExpr(mlir::LLVM::ExtractValueOp EV);
   Expected<std::string> bufferIndexExpr(ResState &RS, mlir::Value Coord0,
                                         mlir::Value Coord1, unsigned Comp);
+  /// Byte size of one scalar element of an MSL type name.
+  static unsigned elemByteSize(StringRef MSLTy) {
+    if (MSLTy == "half" || MSLTy == "ushort")
+      return 2;
+    if (MSLTy == "ulong")
+      return 8;
+    return 4;
+  }
   bool shouldInline(mlir::Operation *Op);
+
+  // --- pointers (groupshared / local arrays) ---
+  Error collectGroupshared();
+  /// Render a pointer-typed SSA value as an MSL lvalue (e.g. "gs[idx]").
+  Expected<Expr> lvalueFor(mlir::Value Ptr);
+  /// MSL address space of a pointer value ("threadgroup", "device", "thread").
+  Expected<std::string> addrSpaceOf(mlir::Value Ptr);
+  DenseMap<mlir::Operation *, std::string> GlobalNames; // llvm.mlir.global
+  DenseMap<mlir::Operation *, std::string> GlobalTypes; // element MSL type
 
   // --- statements ---
   Error emitBlock(mlir::Block &B, unsigned Ind);
@@ -203,6 +327,7 @@ private:
   Error emitWhile(mlir::scf::WhileOp While, unsigned Ind);
   Error emitBufferStore(mlir::LLVM::CallOp Call, unsigned Ind);
   Error emitBarrier(mlir::LLVM::CallOp Call, unsigned Ind);
+  Error emitDXAtomic(mlir::LLVM::CallOp Call, DXILOp Op, unsigned Ind);
   Error emitTemp(mlir::Operation *Op, unsigned Ind);
 
   /// Guarantee V is referable by a stable name (or literal) and return it.
@@ -413,10 +538,12 @@ Error Emitter::inferElementTypes() {
     }
     if (RS->ElemType.empty())
       RS->ElemType = *TyOrErr;
-    else if (RS->ElemType != *TyOrErr)
+    else if (elemByteSize(RS->ElemType) != elemByteSize(*TyOrErr))
       FirstError = "resource '" + RS->ParamName +
-                   "' is accessed with mixed element types (" + RS->ElemType +
+                   "' is accessed with mixed element sizes (" + RS->ElemType +
                    " vs " + *TyOrErr + "); not supported yet";
+    // Same-size mixed types (float vs uint) keep the first-seen canonical
+    // type; load/store sites reinterpret with as_type.
   };
 
   Entry.walk([&](mlir::LLVM::CallOp Call) {
@@ -437,6 +564,11 @@ Error Emitter::inferElementTypes() {
     case DXILOp::BufferStore:
     case DXILOp::RawBufferStore:
       Record(Args[1], Args[4].getType());
+      break;
+    case DXILOp::AtomicBinOp:
+    case DXILOp::AtomicCompareExchange:
+      // Atomics operate on 32-bit integer views.
+      Record(Args[1], Args[6].getType());
       break;
     case DXILOp::CBufferLoadLegacy: {
       auto Ret = mlir::cast<mlir::LLVM::LLVMStructType>(
@@ -480,6 +612,109 @@ Error Emitter::inferElementTypes() {
 }
 
 //===----------------------------------------------------------------------===//
+// Groupshared memory, local arrays, and pointer lvalues
+//===----------------------------------------------------------------------===//
+
+Error Emitter::collectGroupshared() {
+  auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+  unsigned Idx = 0;
+  for (auto G : Mod.getOps<mlir::LLVM::GlobalOp>()) {
+    if (G.getAddrSpace() != 3)
+      continue;
+    mlir::Type T = G.getGlobalType();
+    uint64_t N = 1;
+    mlir::Type Elem = T;
+    if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(T)) {
+      N = Arr.getNumElements();
+      Elem = Arr.getElementType();
+    }
+    auto ETy = mslType(Elem);
+    if (!ETy)
+      return ETy.takeError();
+    std::string Fallback = "gs" + std::to_string(Idx++);
+    std::string Name = sanitizeIdentifier(G.getSymName(), Fallback);
+    for (auto &[Op, Existing] : GlobalNames)
+      if (Existing == Name)
+        Name += "_" + std::to_string(Idx);
+    GlobalNames[G] = Name;
+    GlobalTypes[G] = *ETy;
+    GroupsharedDecls += "  threadgroup " + *ETy + " " + Name +
+                        (N > 1 ? "[" + std::to_string(N) + "]" : "") + ";\n";
+  }
+  return Error::success();
+}
+
+Expected<std::string> Emitter::addrSpaceOf(mlir::Value Ptr) {
+  auto PT = mlir::dyn_cast<mlir::LLVM::LLVMPointerType>(Ptr.getType());
+  if (!PT)
+    return makeError("expected a pointer type");
+  switch (PT.getAddressSpace()) {
+  case 0:
+    return std::string("thread");
+  case 3:
+    return std::string("threadgroup");
+  default:
+    return makeError("unsupported pointer address space {0}",
+                     PT.getAddressSpace());
+  }
+}
+
+Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr) {
+  mlir::Operation *Def = Ptr.getDefiningOp();
+  if (!Def)
+    return makeError("pointer block arguments are not supported");
+
+  if (auto AO = mlir::dyn_cast<mlir::LLVM::AddressOfOp>(Def)) {
+    auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+    auto G = Mod.lookupSymbol<mlir::LLVM::GlobalOp>(AO.getGlobalNameAttr());
+    auto It = G ? GlobalNames.find(G) : GlobalNames.end();
+    if (It == GlobalNames.end())
+      return makeError("reference to unsupported global '{0}'",
+                       AO.getGlobalName());
+    return Expr{It->second, PrecPrimary};
+  }
+
+  if (auto AL = mlir::dyn_cast<mlir::LLVM::AllocaOp>(Def)) {
+    auto It = ValueNames.find(AL.getResult());
+    if (It == ValueNames.end())
+      return makeError("use of alloca before declaration");
+    return Expr{It->second, PrecPrimary};
+  }
+
+  if (auto GEP = mlir::dyn_cast<mlir::LLVM::GEPOp>(Def)) {
+    auto Base = lvalueFor(GEP.getBase());
+    if (!Base)
+      return Base.takeError();
+    std::string Text = Base->Text;
+    auto Indices = GEP.getIndices();
+    for (unsigned I = 0; I < Indices.size(); ++I) {
+      std::string IdxText;
+      if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(Indices[I])) {
+        if (I == 0) {
+          if (IA.getValue().getZExtValue() != 0)
+            return makeError("pointer-arithmetic GEPs are not supported");
+          continue; // leading zero: address of the aggregate itself
+        }
+        IdxText = std::to_string(IA.getValue().getZExtValue()) + "u";
+      } else {
+        auto V = mlir::cast<mlir::Value>(Indices[I]);
+        auto E = exprFor(V, PrecUnknown);
+        if (!E)
+          return E.takeError();
+        if (I == 0)
+          return makeError("pointer-arithmetic GEPs are not supported");
+        IdxText = E->Text;
+      }
+      Text += "[" + IdxText + "]";
+    }
+    return Expr{Text, PrecPrimary};
+  }
+
+  return makeError("unsupported pointer producer '{0}'",
+                   Def->getName().getStringRef());
+}
+
+//===----------------------------------------------------------------------===//
 // Expressions
 //===----------------------------------------------------------------------===//
 
@@ -498,6 +733,9 @@ static bool mayWriteMemory(mlir::Operation *Op) {
       return false;
     }
   }
+  if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
+                mlir::LLVM::AtomicCmpXchgOp>(Op))
+    return true;
   if (mlir::isa<mlir::LLVM::CallOp>(Op))
     return true; // unknown call
   return false;  // the pure ops we support
@@ -506,6 +744,15 @@ static bool mayWriteMemory(mlir::Operation *Op) {
 bool Emitter::shouldInline(mlir::Operation *Op) {
   if (isConstantLike(Op))
     return true;
+
+  // Pointer producers are always folded into the lvalue they feed.
+  if (mlir::isa<mlir::LLVM::GEPOp, mlir::LLVM::AddressOfOp>(Op))
+    return true;
+
+  // Side-effecting or aggregate-producing ops are materialized as statements.
+  if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
+                mlir::LLVM::AtomicCmpXchgOp, mlir::LLVM::AllocaOp>(Op))
+    return false;
 
   if (auto DXOp = dxOpcode(Op)) {
     switch (*DXOp) {
@@ -523,6 +770,10 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
     case DXILOp::CBufferLoadLegacy:
       // Never materialized directly; consumed via handles/extractvalue.
       return true;
+    case DXILOp::AtomicBinOp:
+    case DXILOp::AtomicCompareExchange:
+    case DXILOp::WaveActiveBallot:
+      return false; // materialized as statements
     default:
       break;
     }
@@ -533,8 +784,21 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
 
   mlir::Operation *User = *Op->getResult(0).getUsers().begin();
 
-  // A UAV read must not be folded forward across a write or barrier, since
-  // the inlined load would observe the mutation.
+  // A memory read must not be folded forward across a write or barrier,
+  // since the inlined load would observe the mutation.
+  auto PinAgainstWrites = [&]() {
+    if (User->getBlock() != Op->getBlock())
+      return false; // conservative across region boundaries
+    for (mlir::Operation *P = Op->getNextNode(); P && P != User;
+         P = P->getNextNode())
+      if (mayWriteMemory(P))
+        return false;
+    return true;
+  };
+
+  if (mlir::isa<mlir::LLVM::LoadOp>(Op))
+    return PinAgainstWrites();
+
   if (auto EV = mlir::dyn_cast<mlir::LLVM::ExtractValueOp>(Op)) {
     mlir::Operation *Load = EV.getContainer().getDefiningOp();
     auto LoadOp = dxOpcode(Load);
@@ -542,19 +806,12 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
         (*LoadOp == DXILOp::BufferLoad || *LoadOp == DXILOp::RawBufferLoad)) {
       auto Call = mlir::cast<mlir::LLVM::CallOp>(Load);
       ResState *RS = stateFor(Call.getArgOperands()[1]);
-      if (RS && RS->RB->Class == ResourceClass::UAV) {
-        if (User->getBlock() != Op->getBlock())
-          return false; // conservative across region boundaries
-        for (mlir::Operation *P = Op->getNextNode(); P && P != User;
-             P = P->getNextNode())
-          if (mayWriteMemory(P))
-            return false;
-      }
+      if (RS && RS->RB->Class == ResourceClass::UAV)
+        return PinAgainstWrites();
     }
     return true;
   }
 
-  (void)User;
   return !mayWriteMemory(Op);
 }
 
@@ -913,6 +1170,9 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   if (auto Freeze = mlir::dyn_cast<FreezeOp>(Op))
     return exprFor(Freeze.getOperand(), PrecUnknown);
 
+  if (auto Load = mlir::dyn_cast<LoadOp>(Op))
+    return lvalueFor(Load.getAddr());
+
   if (auto EV = mlir::dyn_cast<ExtractValueOp>(Op))
     return bufferElementExpr(EV);
 
@@ -960,6 +1220,18 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
   bool IsFloat = Call.getNumResults() == 1 &&
                  mlir::isa<mlir::FloatType>(Call.getResult().getType());
 
+  // DXIL Frc must propagate NaN for infinite inputs (metal::fract clamps),
+  // so spell it as x - floor(x).
+  if (Op == DXILOp::Frc) {
+    auto A = exprFor(Args[1], PrecAdd);
+    if (!A)
+      return A.takeError();
+    auto AF = exprFor(Args[1], PrecUnknown);
+    if (!AF)
+      return AF.takeError();
+    return Expr{A->Text + " - floor(" + AF->Text + ")", PrecAdd};
+  }
+
   if (StringRef Fn = mslUnaryFunction(Op, IsFloat); !Fn.empty()) {
     auto A = exprFor(Args[1], PrecUnknown);
     if (!A)
@@ -999,6 +1271,203 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     return Expr{A->Text + " * " + B->Text + " + " + C->Text, PrecAdd};
   }
 
+  // Bit scans with DXIL's -1-on-zero semantics.
+  if (Op == DXILOp::FirstbitLo || Op == DXILOp::FirstbitHi ||
+      Op == DXILOp::FirstbitSHi) {
+    const char *Helper = Op == DXILOp::FirstbitLo    ? "crucible_firstbitlo"
+                         : Op == DXILOp::FirstbitHi ? "crucible_firstbithi"
+                                                     : "crucible_firstbitshi";
+    requireHelper(Helper);
+    auto A = exprFor(Args[1], PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{std::string(Helper) + "(" + A->Text + ")", PrecPrimary};
+  }
+
+  // Bitfield ops with DXIL's operand masking semantics.
+  if (Op == DXILOp::Ubfe || Op == DXILOp::Ibfe || Op == DXILOp::Bfi) {
+    const char *Helper = Op == DXILOp::Ubfe   ? "crucible_ubfe"
+                         : Op == DXILOp::Ibfe ? "crucible_ibfe"
+                                              : "crucible_bfi";
+    requireHelper(Helper);
+    std::string Text = std::string(Helper) + "(";
+    for (unsigned I = 1; I < Args.size(); ++I) {
+      auto A = exprFor(Args[I], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      Text += (I > 1 ? ", " : "") + A->Text;
+    }
+    return Expr{Text + ")", PrecPrimary};
+  }
+
+  // Float vector dot products: scalarized operands -> vector constructor.
+  if (Op == DXILOp::Dot2 || Op == DXILOp::Dot3 || Op == DXILOp::Dot4) {
+    unsigned N = Op == DXILOp::Dot2 ? 2 : Op == DXILOp::Dot3 ? 3 : 4;
+    std::string VecTy =
+        (Call.getResult().getType().isF16() ? "half" : "float") +
+        std::to_string(N);
+    auto Operand = [&](unsigned Base) -> Expected<std::string> {
+      std::string V = VecTy + "(";
+      for (unsigned I = 0; I < N; ++I) {
+        auto A = exprFor(Args[Base + I], PrecUnknown);
+        if (!A)
+          return A.takeError();
+        V += (I ? ", " : "") + A->Text;
+      }
+      return V + ")";
+    };
+    auto LHS = Operand(1);
+    if (!LHS)
+      return LHS.takeError();
+    auto RHS = Operand(1 + N);
+    if (!RHS)
+      return RHS.takeError();
+    return Expr{"dot(" + *LHS + ", " + *RHS + ")", PrecPrimary};
+  }
+
+  // SM 6.4 packed dot products.
+  if (Op == DXILOp::Dot4AddI8Packed || Op == DXILOp::Dot4AddU8Packed) {
+    const char *Helper = Op == DXILOp::Dot4AddI8Packed
+                             ? "crucible_dot4add_i8packed"
+                             : "crucible_dot4add_u8packed";
+    requireHelper(Helper);
+    auto Acc = exprFor(Args[1], PrecUnknown);
+    if (!Acc)
+      return Acc.takeError();
+    auto A = exprFor(Args[2], PrecUnknown);
+    if (!A)
+      return A.takeError();
+    auto B = exprFor(Args[3], PrecUnknown);
+    if (!B)
+      return B.takeError();
+    return Expr{std::string(Helper) + "(" + Acc->Text + ", " + A->Text + ", " +
+                    B->Text + ")",
+                PrecPrimary};
+  }
+  if (Op == DXILOp::Dot2AddHalf) {
+    // (acc:f32, ax, ay, bx, by : f16) -> f32
+    auto Acc = exprFor(Args[1], PrecUnknown);
+    if (!Acc)
+      return Acc.takeError();
+    std::string Dots;
+    for (unsigned I = 0; I < 2; ++I) {
+      auto A = exprFor(Args[2 + I], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      auto B = exprFor(Args[4 + I], PrecUnknown);
+      if (!B)
+        return B.takeError();
+      Dots += " + float(" + A->Text + ") * float(" + B->Text + ")";
+    }
+    return Expr{Acc->Text + Dots, PrecAdd};
+  }
+
+  // Wave operations -> Metal simdgroup functions.
+  switch (Op) {
+  case DXILOp::WaveIsFirstLane:
+    return Expr{"simd_is_first()", PrecPrimary};
+  case DXILOp::WaveGetLaneIndex:
+    UsesLane = true;
+    return Expr{"lane", PrecPrimary};
+  case DXILOp::WaveGetLaneCount:
+    UsesLaneCount = true;
+    return Expr{"lanecount", PrecPrimary};
+  case DXILOp::WaveAnyTrue:
+  case DXILOp::WaveAllTrue: {
+    auto A = exprFor(Args[1], PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{std::string(Op == DXILOp::WaveAnyTrue ? "simd_any"
+                                                      : "simd_all") +
+                    "(" + A->Text + ")",
+                PrecPrimary};
+  }
+  case DXILOp::WaveActiveAllEqual: {
+    auto A = exprFor(Args[1], PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{"simd_all(" + A->Text + " == simd_broadcast_first(" + A->Text +
+                    "))",
+                PrecPrimary};
+  }
+  case DXILOp::WaveReadLaneAt: {
+    auto V = exprFor(Args[1], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    auto L = exprFor(Args[2], PrecUnknown);
+    if (!L)
+      return L.takeError();
+    return Expr{"simd_shuffle(" + V->Text + ", ushort(" + L->Text + "))",
+                PrecPrimary};
+  }
+  case DXILOp::WaveReadLaneFirst: {
+    auto V = exprFor(Args[1], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    return Expr{"simd_broadcast_first(" + V->Text + ")", PrecPrimary};
+  }
+  case DXILOp::WaveActiveOp:
+  case DXILOp::WavePrefixOp: {
+    auto Kind = constInt(Args[2]);
+    auto SignedOp = constInt(Args[3]);
+    if (!Kind || !SignedOp)
+      return makeError("dynamic wave op kind is not supported");
+    bool Prefix = Op == DXILOp::WavePrefixOp;
+    StringRef Fn;
+    switch (static_cast<DXILWaveOpKind>(*Kind)) {
+    case DXILWaveOpKind::Sum:
+      Fn = Prefix ? "simd_prefix_exclusive_sum" : "simd_sum";
+      break;
+    case DXILWaveOpKind::Product:
+      Fn = Prefix ? "simd_prefix_exclusive_product" : "simd_product";
+      break;
+    case DXILWaveOpKind::Min:
+      Fn = "simd_min";
+      break;
+    case DXILWaveOpKind::Max:
+      Fn = "simd_max";
+      break;
+    }
+    if (Prefix && (Fn == "simd_min" || Fn == "simd_max"))
+      return makeError("wave prefix min/max is not supported");
+    auto V = exprFor(Args[1], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    bool IsInt = Call.getResult().getType().isInteger(32);
+    bool IsSigned = *SignedOp == 0 && IsInt;
+    // Signed min/max (and ordering-sensitive prefix ops) need signed views;
+    // sums/products are bit-identical for signed and unsigned.
+    if (IsSigned && (Fn == "simd_min" || Fn == "simd_max"))
+      return Expr{"as_type<uint>(" + Fn.str() + "(as_type<int>(" + V->Text +
+                      ")))",
+                  PrecPrimary};
+    return Expr{Fn.str() + "(" + V->Text + ")", PrecPrimary};
+  }
+  case DXILOp::WaveActiveBit: {
+    auto Kind = constInt(Args[2]);
+    if (!Kind)
+      return makeError("dynamic wave bit op kind is not supported");
+    StringRef Fn;
+    switch (static_cast<DXILWaveBitOpKind>(*Kind)) {
+    case DXILWaveBitOpKind::And:
+      Fn = "simd_and";
+      break;
+    case DXILWaveBitOpKind::Or:
+      Fn = "simd_or";
+      break;
+    case DXILWaveBitOpKind::Xor:
+      Fn = "simd_xor";
+      break;
+    }
+    auto V = exprFor(Args[1], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    return Expr{Fn.str() + "(" + V->Text + ")", PrecPrimary};
+  }
+  default:
+    break;
+  }
+
   return makeError("unsupported DXIL op {0}", static_cast<uint32_t>(Op));
 }
 
@@ -1007,14 +1476,16 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
                                                unsigned Comp) {
   std::string Index;
   uint64_t ConstOffset = 0; // in scalar elements
+  const unsigned EB = elemByteSize(RS.ElemType);
+  const unsigned Shift = EB == 2 ? 1 : EB == 8 ? 3 : 2;
 
   switch (RS.RB->Kind) {
   case ResourceKind::StructuredBuffer: {
     uint32_t Stride = RS.RB->ElementStride;
-    if (Stride == 0 || Stride % 4 != 0)
+    if (Stride == 0 || Stride % EB != 0)
       return makeError("structured buffer '{0}' has unsupported stride {1}",
                        RS.ParamName, Stride);
-    uint32_t K = Stride / 4;
+    uint32_t K = Stride / EB;
     auto E = exprFor(Coord0, K > 1 ? PrecMul : PrecAdd);
     if (!E)
       return E.takeError();
@@ -1023,12 +1494,12 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
       Index += " * " + std::to_string(K) + "u";
     if (!isUndefLike(Coord1)) {
       if (auto COff = constInt(Coord1))
-        ConstOffset += *COff / 4;
+        ConstOffset += *COff / EB;
       else {
         auto Off = exprFor(Coord1, PrecShift);
         if (!Off)
           return Off.takeError();
-        Index += " + (" + Off->Text + " >> 2u)";
+        Index += " + (" + Off->Text + " >> " + std::to_string(Shift) + "u)";
       }
     }
     break;
@@ -1036,12 +1507,12 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
   case ResourceKind::RawBuffer: {
     // ByteAddressBuffer: coord0 is a byte offset.
     if (auto CByte = constInt(Coord0)) {
-      Index = std::to_string(*CByte / 4) + "u";
+      Index = std::to_string(*CByte / EB) + "u";
     } else {
       auto E = exprFor(Coord0, PrecShift);
       if (!E)
         return E.takeError();
-      Index = "(" + E->Text + " >> 2u)";
+      Index = "(" + E->Text + " >> " + std::to_string(Shift) + "u)";
     }
     break;
   }
@@ -1063,16 +1534,39 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
 }
 
 Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
-  auto Call = mlir::dyn_cast_or_null<mlir::LLVM::CallOp>(
-      EV.getContainer().getDefiningOp());
+  mlir::Operation *Producer = EV.getContainer().getDefiningOp();
+  auto Pos = EV.getPosition();
+  unsigned Comp = Pos.empty() ? 0 : static_cast<unsigned>(Pos[0]);
+
+  // Compare-exchange aggregates: {original, success}.
+  if (auto CX = mlir::dyn_cast_or_null<mlir::LLVM::AtomicCmpXchgOp>(Producer)) {
+    auto It = ValueNames.find(CX.getResult());
+    if (It == ValueNames.end())
+      return makeError("use of cmpxchg result before materialization");
+    if (Comp == 0)
+      return Expr{It->second, PrecPrimary};
+    auto Cmp = exprFor(CX.getCmp(), PrecEq);
+    if (!Cmp)
+      return Cmp.takeError();
+    return Expr{It->second + " == " + Cmp->Text, PrecEq};
+  }
+
+  auto Call = mlir::dyn_cast_or_null<mlir::LLVM::CallOp>(Producer);
   if (!Call)
     return makeError("extractvalue from a non-resource aggregate");
   auto Op = dxOpcode(Call);
   if (!Op)
     return makeError("extractvalue from unsupported call");
-  auto Pos = EV.getPosition();
-  unsigned Comp = Pos.empty() ? 0 : static_cast<unsigned>(Pos[0]);
   auto Args = Call.getArgOperands();
+
+  // Ballot aggregates were materialized as uint4 temporaries.
+  if (*Op == DXILOp::WaveActiveBallot) {
+    auto It = ValueNames.find(Call.getResult());
+    if (It == ValueNames.end())
+      return makeError("use of ballot result before materialization");
+    return Expr{It->second + "." + std::string(1, "xyzw"[Comp & 3]),
+                PrecPrimary};
+  }
 
   if (*Op == DXILOp::BufferLoad || *Op == DXILOp::RawBufferLoad) {
     if (Comp > 3)
@@ -1083,7 +1577,17 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     auto Index = bufferIndexExpr(*RS, Args[2], Args[3], Comp);
     if (!Index)
       return Index.takeError();
-    return Expr{RS->ParamName + "[" + *Index + "]", PrecPrimary};
+    std::string Element = RS->ParamName + "[" + *Index + "]";
+    // Reinterpret when this load's type differs from the canonical element
+    // type (same-size mixed-type access).
+    auto Ret =
+        mlir::cast<mlir::LLVM::LLVMStructType>(Call.getResult().getType());
+    auto LoadTy = mslType(Ret.getBody()[0]);
+    if (!LoadTy)
+      return LoadTy.takeError();
+    if (*LoadTy != RS->ElemType)
+      return Expr{"as_type<" + *LoadTy + ">(" + Element + ")", PrecPrimary};
+    return Expr{Element, PrecPrimary};
   }
 
   if (*Op == DXILOp::CBufferLoadLegacy) {
@@ -1177,7 +1681,13 @@ Error Emitter::emitBufferStore(mlir::LLVM::CallOp Call, unsigned Ind) {
     auto V = exprFor(Args[4 + Comp], PrecUnknown);
     if (!V)
       return V.takeError();
-    line(Ind, RS->ParamName + "[" + *Index + "] = " + V->Text + ";");
+    std::string Value = V->Text;
+    auto StoreTy = mslType(Args[4 + Comp].getType());
+    if (!StoreTy)
+      return StoreTy.takeError();
+    if (*StoreTy != RS->ElemType)
+      Value = "as_type<" + RS->ElemType + ">(" + Value + ")";
+    line(Ind, RS->ParamName + "[" + *Index + "] = " + Value + ";");
   }
   return Error::success();
 }
@@ -1197,6 +1707,93 @@ Error Emitter::emitBarrier(mlir::LLVM::CallOp Call, unsigned Ind) {
   if (Flags.empty())
     Flags = "mem_flags::mem_none";
   line(Ind, "threadgroup_barrier(" + Flags + ");");
+  return Error::success();
+}
+
+// Lower dx.op.atomicBinOp / atomicCompareExchange on buffer UAVs to Metal
+// atomic_* functions over reinterpreted atomic views.
+Error Emitter::emitDXAtomic(mlir::LLVM::CallOp Call, DXILOp Op, unsigned Ind) {
+  auto Args = Call.getArgOperands();
+  ResState *RS = stateFor(Args[1]);
+  if (!RS)
+    return makeError("atomic through unresolved handle");
+
+  const unsigned Coord0 = Op == DXILOp::AtomicBinOp ? 3 : 2;
+  if (!isUndefLike(Args[Coord0 + 2]))
+    return makeError("texture atomics are not supported yet");
+  auto Index = bufferIndexExpr(*RS, Args[Coord0], Args[Coord0 + 1], 0);
+  if (!Index)
+    return Index.takeError();
+  const std::string LV = RS->ParamName + "[" + *Index + "]";
+
+  std::string Text;
+  if (Op == DXILOp::AtomicBinOp) {
+    auto AOp = constInt(Args[2]);
+    if (!AOp)
+      return makeError("dynamic atomic op kind is not supported");
+    auto V = exprFor(Args[6], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    const char *Fn = nullptr;
+    bool Signed = false;
+    switch (static_cast<DXILAtomicBinOp>(*AOp)) {
+    case DXILAtomicBinOp::Add:
+      Fn = "atomic_fetch_add_explicit";
+      break;
+    case DXILAtomicBinOp::And:
+      Fn = "atomic_fetch_and_explicit";
+      break;
+    case DXILAtomicBinOp::Or:
+      Fn = "atomic_fetch_or_explicit";
+      break;
+    case DXILAtomicBinOp::Xor:
+      Fn = "atomic_fetch_xor_explicit";
+      break;
+    case DXILAtomicBinOp::IMin:
+      Fn = "atomic_fetch_min_explicit";
+      Signed = true;
+      break;
+    case DXILAtomicBinOp::IMax:
+      Fn = "atomic_fetch_max_explicit";
+      Signed = true;
+      break;
+    case DXILAtomicBinOp::UMin:
+      Fn = "atomic_fetch_min_explicit";
+      break;
+    case DXILAtomicBinOp::UMax:
+      Fn = "atomic_fetch_max_explicit";
+      break;
+    case DXILAtomicBinOp::Exchange:
+      Fn = "atomic_exchange_explicit";
+      break;
+    default:
+      return makeError("unsupported atomic op kind {0}", *AOp);
+    }
+    if (Signed)
+      Text = std::string("as_type<uint>(") + Fn + "((device atomic_int *)&" +
+             LV + ", as_type<int>(" + V->Text + "), memory_order_relaxed))";
+    else
+      Text = std::string(Fn) + "((device atomic_uint *)&" + LV + ", " +
+             V->Text + ", memory_order_relaxed)";
+  } else {
+    requireHelper("crucible_atomic_cmpxchg_device");
+    auto Cmp = exprFor(Args[5], PrecUnknown);
+    if (!Cmp)
+      return Cmp.takeError();
+    auto V = exprFor(Args[6], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    Text = "crucible_atomic_cmpxchg((device atomic_uint *)&" + LV + ", " +
+           Cmp->Text + ", " + V->Text + ")";
+  }
+
+  if (Call.getNumResults() == 1 && !Call.getResult().use_empty()) {
+    std::string Name = freshName();
+    line(Ind, "uint " + Name + " = " + Text + ";");
+    ValueNames[Call.getResult()] = Name;
+  } else {
+    line(Ind, Text + ";");
+  }
   return Error::success();
 }
 
@@ -1392,6 +1989,21 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
       return emitBufferStore(Call, Ind);
     case DXILOp::Barrier:
       return emitBarrier(Call, Ind);
+    case DXILOp::AtomicBinOp:
+    case DXILOp::AtomicCompareExchange:
+      return emitDXAtomic(Call, *DXOp, Ind);
+    case DXILOp::WaveActiveBallot: {
+      // Aggregate result; materialize as a uint4 so extractvalue can swizzle.
+      requireHelper("crucible_wave_ballot");
+      auto Cond = exprFor(Call.getArgOperands()[1], PrecUnknown);
+      if (!Cond)
+        return Cond.takeError();
+      std::string Name = freshName();
+      line(Ind, "uint4 " + Name + " = crucible_wave_ballot(" + Cond->Text +
+                    ");");
+      ValueNames[Call.getResult()] = Name;
+      return Error::success();
+    }
     case DXILOp::BufferLoad:
     case DXILOp::RawBufferLoad:
     case DXILOp::CBufferLoadLegacy:
@@ -1404,6 +2016,126 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
   // The ResBind aggregate feeding createHandleFromBinding.
   if (mlir::isa<mlir::LLVM::InsertValueOp>(Op))
     return Error::success();
+
+  // Local (thread address space) arrays.
+  if (auto AL = mlir::dyn_cast<mlir::LLVM::AllocaOp>(Op)) {
+    mlir::Type T = AL.getElemType();
+    uint64_t N = 1;
+    if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(T)) {
+      N = Arr.getNumElements();
+      T = Arr.getElementType();
+    }
+    if (auto Count = constInt(AL.getArraySize()); Count && *Count != 1)
+      N *= *Count;
+    auto ETy = mslType(T);
+    if (!ETy)
+      return ETy.takeError();
+    std::string Name = freshName();
+    line(Ind, *ETy + " " + Name +
+                  (N > 1 ? "[" + std::to_string(N) + "]" : "") + ";");
+    ValueNames[AL.getResult()] = Name;
+    return Error::success();
+  }
+
+  if (auto Store = mlir::dyn_cast<mlir::LLVM::StoreOp>(Op)) {
+    auto LV = lvalueFor(Store.getAddr());
+    if (!LV)
+      return LV.takeError();
+    auto V = exprFor(Store.getValue(), PrecUnknown);
+    if (!V)
+      return V.takeError();
+    line(Ind, LV->Text + " = " + V->Text + ";");
+    return Error::success();
+  }
+
+  if (auto RMW = mlir::dyn_cast<mlir::LLVM::AtomicRMWOp>(Op)) {
+    auto LV = lvalueFor(RMW.getPtr());
+    if (!LV)
+      return LV.takeError();
+    auto AS = addrSpaceOf(RMW.getPtr());
+    if (!AS)
+      return AS.takeError();
+    auto V = exprFor(RMW.getVal(), PrecUnknown);
+    if (!V)
+      return V.takeError();
+    const char *Fn = nullptr;
+    bool Signed = false;
+    switch (RMW.getBinOp()) {
+    case mlir::LLVM::AtomicBinOp::add:
+      Fn = "atomic_fetch_add_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::sub:
+      Fn = "atomic_fetch_sub_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::_and:
+      Fn = "atomic_fetch_and_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::_or:
+      Fn = "atomic_fetch_or_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::_xor:
+      Fn = "atomic_fetch_xor_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::min:
+      Fn = "atomic_fetch_min_explicit";
+      Signed = true;
+      break;
+    case mlir::LLVM::AtomicBinOp::max:
+      Fn = "atomic_fetch_max_explicit";
+      Signed = true;
+      break;
+    case mlir::LLVM::AtomicBinOp::umin:
+      Fn = "atomic_fetch_min_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::umax:
+      Fn = "atomic_fetch_max_explicit";
+      break;
+    case mlir::LLVM::AtomicBinOp::xchg:
+      Fn = "atomic_exchange_explicit";
+      break;
+    default:
+      return makeError("unsupported atomicrmw kind");
+    }
+    std::string Text;
+    if (Signed)
+      Text = std::string("as_type<uint>(") + Fn + "((" + *AS +
+             " atomic_int *)&" + LV->Text + ", as_type<int>(" + V->Text +
+             "), memory_order_relaxed))";
+    else
+      Text = std::string(Fn) + "((" + *AS + " atomic_uint *)&" + LV->Text +
+             ", " + V->Text + ", memory_order_relaxed)";
+    if (!RMW.getResult().use_empty()) {
+      std::string Name = freshName();
+      line(Ind, "uint " + Name + " = " + Text + ";");
+      ValueNames[RMW.getResult()] = Name;
+    } else {
+      line(Ind, Text + ";");
+    }
+    return Error::success();
+  }
+
+  if (auto CX = mlir::dyn_cast<mlir::LLVM::AtomicCmpXchgOp>(Op)) {
+    auto LV = lvalueFor(CX.getPtr());
+    if (!LV)
+      return LV.takeError();
+    auto AS = addrSpaceOf(CX.getPtr());
+    if (!AS)
+      return AS.takeError();
+    requireHelper(*AS == "threadgroup" ? "crucible_atomic_cmpxchg_threadgroup"
+                                       : "crucible_atomic_cmpxchg_device");
+    auto Cmp = exprFor(CX.getCmp(), PrecUnknown);
+    if (!Cmp)
+      return Cmp.takeError();
+    auto V = exprFor(CX.getVal(), PrecUnknown);
+    if (!V)
+      return V.takeError();
+    std::string Name = freshName();
+    line(Ind, "uint " + Name + " = crucible_atomic_cmpxchg((" + *AS +
+                  " atomic_uint *)&" + LV->Text + ", " + Cmp->Text + ", " +
+                  V->Text + ");");
+    ValueNames[CX.getResult()] = Name;
+    return Error::success();
+  }
 
   // Pure value: inline single-use values; declare temporaries otherwise.
   if (shouldInline(Op))
@@ -1484,6 +2216,14 @@ Expected<std::string> Emitter::kernelSignature() {
     Sep();
     OS << "    uint gidx [[thread_index_in_threadgroup]]";
   }
+  if (UsesLane) {
+    Sep();
+    OS << "    uint lane [[thread_index_in_simdgroup]]";
+  }
+  if (UsesLaneCount) {
+    Sep();
+    OS << "    uint lanecount [[threads_per_simdgroup]]";
+  }
   OS << ")";
   return Sig;
 }
@@ -1499,6 +2239,8 @@ Expected<std::string> Emitter::run() {
     return std::move(E);
   if (Error E = inferElementTypes())
     return std::move(E);
+  if (Error E = collectGroupshared())
+    return std::move(E);
   if (Error E = emitBlock(Entry.getBody().front(), 1))
     return std::move(E);
 
@@ -1511,9 +2253,10 @@ Expected<std::string> Emitter::run() {
   OS << "// Generated by crucible from DXIL (" << R.EntryName << ", cs_"
      << R.ShaderModelMajor << "_" << R.ShaderModelMinor << ")\n"
      << "#include <metal_stdlib>\n"
-     << "using namespace metal;\n\n"
-     << *Sig << " {\n"
-     << Body << "}\n";
+     << "using namespace metal;\n\n";
+  for (const std::string &H : HelperOrder)
+    OS << helperSource(H) << "\n";
+  OS << *Sig << " {\n" << GroupsharedDecls << Body << "}\n";
   return Out;
 }
 

@@ -15,12 +15,30 @@ llvm::StringRef mslUnaryFunction(DXILOp Op, bool IsFloat) {
     return "fabs";
   case DXILOp::Saturate:
     return "saturate";
+  case DXILOp::IsNaN:
+    return "isnan";
+  case DXILOp::IsInf:
+    return "isinf";
+  case DXILOp::IsFinite:
+    return "isfinite";
   case DXILOp::Cos:
     return "cos";
   case DXILOp::Sin:
     return "sin";
   case DXILOp::Tan:
     return "tan";
+  case DXILOp::Acos:
+    return "acos";
+  case DXILOp::Asin:
+    return "asin";
+  case DXILOp::Atan:
+    return "atan";
+  case DXILOp::Hcos:
+    return "cosh";
+  case DXILOp::Hsin:
+    return "sinh";
+  case DXILOp::Htan:
+    return "tanh";
   case DXILOp::Exp:
     return "exp2"; // DXIL Exp is 2^x
   case DXILOp::Frc:
