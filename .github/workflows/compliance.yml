@@ -1,0 +1,125 @@
+# Runs the compliance suite on a Metal GPU and publishes the pass-rate
+# dashboard (pages/index.html) to GitHub Pages, mirroring Nacelle's
+# offload-compliance pipeline.
+#
+# Today this records crucible's own lit suite. Once the offload-test-suite
+# Metal integration lands (Milestone 4), point the lit invocation at
+# build-offload/test/metal instead -- the recorder is format-compatible.
+
+name: Compliance
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  compliance:
+    runs-on: macos-15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore DXC SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+
+      - name: Install DXC (from Vulkan SDK)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/lib
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/dxc* .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+      - name: Save DXC SDK cache
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+
+      - name: Install build dependencies
+        run: |
+          brew install llvm ninja
+          pip3 install --break-system-packages lit
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DLLVM_EXTERNAL_LIT="$(which lit)"
+          cmake --build build --parallel
+
+      - name: Run compliance suite
+        env:
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/.sdk/lib
+        run: |
+          lit -v --timeout=60 --output=offload-results.json build/test || true
+
+      - name: Restore historical compliance data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .compliance-cache
+          key: offload-history-${{ github.sha }}
+          restore-keys: |
+            offload-history-
+
+      - name: Record compliance history and build GitHub Pages site
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_TS=$(git log -1 --pretty=%cI)
+          python3 scripts/record_offload_compliance.py \
+            --lit-json offload-results.json \
+            --site-src pages \
+            --out-dir _site \
+            --sha "${{ github.sha }}" \
+            --message "$COMMIT_MSG" \
+            --author "$COMMIT_AUTHOR" \
+            --timestamp "$COMMIT_TS" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --pages-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" \
+            --history-cache .compliance-cache/history.json
+
+      - name: Save historical compliance data cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .compliance-cache
+          key: offload-history-${{ github.sha }}
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

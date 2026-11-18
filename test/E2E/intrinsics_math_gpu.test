@@ -1,0 +1,18 @@
+# End-to-end GPU validation of math intrinsics / select / cast lowering.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/intrinsics_math.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 8,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:f32:8:iota | FileCheck %s
+
+# Reference (computed on CPU):
+#   x=0: s=0,     m=0.5,       scaled=0.5;  x<2 -> 0.5
+#   x=1: s=1,     m=1,         scaled=2;    x<2 -> 2
+#   x=2: s=1.414, m=1.414,     scaled=4.24; else -> min(4.24264, 10) = 4.24264
+#   x=3: s=1.732, m=1.732,     scaled=6.93; else -> 6.9282
+#   x=4: s=2,     m=2,         scaled=10;   else -> 10
+#   x=5: s=2.236, m=2.236,     scaled=13.4; else -> 10
+#   x=6: s=2.449, m=2.449,     scaled=17.1; else -> 10
+#   x=7: s=2.646, m=2.646,     scaled=21.2; else -> 10
+# CHECK: buffer0: 0.5 2 4.24264 6.9282 10 10 10 10

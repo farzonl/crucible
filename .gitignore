@@ -1,0 +1,10 @@
+build/
+.sdk/
+.toolchains/
+.compliance-cache/
+*.dxil
+*.air
+*.metallib
+.DS_Store
+__pycache__/
+compile_commands.json

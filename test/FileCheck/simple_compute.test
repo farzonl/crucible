@@ -1,0 +1,28 @@
+# DXIL -> MSL golden test for the Milestone 1 compute kernel.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --reflect %t.json
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+
+# CHECK: #include <metal_stdlib>
+# CHECK: using namespace metal;
+# CHECK: kernel void main0(
+# CHECK-NEXT: device float* [[BUF:(Out|uav0)]] {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK-NEXT: [[BUF]][dtid.x] = [[BUF]][dtid.x] * 2.0f + 1.0f;
+# CHECK-NEXT: }
+
+# llvm::json serializes object keys in sorted order.
+# REFLECT: "bindings"
+# REFLECT: "class": "uav"
+# REFLECT: "elementStride": 4
+# REFLECT: "metalIndex": 0
+# REFLECT: "register": 0
+# REFLECT: "space": 0
+# REFLECT: "entry": "main"
+# REFLECT: "mslEntry": "main0"
+# REFLECT: "numThreads": [
+# REFLECT-NEXT: 64,
+# REFLECT-NEXT: 1,
+# REFLECT-NEXT: 1

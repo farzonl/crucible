@@ -1,0 +1,7 @@
+# Every emitted kernel must compile cleanly under Apple's toolchain with
+# -Werror so invalid MSL can never land.
+# REQUIRES: metal-tools
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air

@@ -1,0 +1,10 @@
+@LIT_SITE_CFG_IN_HEADER@
+
+config.cruciblec = "@CRUCIBLE_CRUCIBLEC_PATH@"
+config.crucible_run = "@CRUCIBLE_RUN_PATH@"
+config.dxc = "@DXC_EXECUTABLE@"
+config.filecheck = "@FILECHECK_EXECUTABLE@"
+config.test_exec_root = "@CMAKE_CURRENT_BINARY_DIR@"
+
+lit_config.load_config(
+    config, os.path.join("@CMAKE_CURRENT_SOURCE_DIR@", "lit.cfg.py"))
