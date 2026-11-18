@@ -18,6 +18,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -122,6 +123,15 @@ int main(int argc, char **argv) {
   unsigned Threads[3] = {1, 1, 1};
   unsigned Groups[3] = {1, 1, 1};
   std::vector<BufferSpec> Buffers;
+  // Benchmark mode: --iters N --warmup W --bench-json prints GPU timings as
+  // JSON instead of buffer contents.
+  unsigned Iters = 0, Warmup = 0;
+  bool BenchJSON = false;
+  // metal-shaderconverter ABI mode: the listed buffer indices are root
+  // descriptors, packed as raw GPU addresses into the top-level argument
+  // buffer bound at MSC's fixed bind point (2).
+  std::vector<unsigned> IRRootOrder;
+  bool UseIRAB = false;
 
   for (int I = 1; I < argc; ++I) {
     std::string Arg = argv[I];
@@ -142,12 +152,24 @@ int main(int argc, char **argv) {
         fail("bad --groups (want x,y,z)");
     } else if (Arg == "--buffer")
       Buffers.push_back(parseBufferSpec(Next()));
-    else
+    else if (Arg == "--iters")
+      Iters = static_cast<unsigned>(strtoul(Next(), nullptr, 10));
+    else if (Arg == "--warmup")
+      Warmup = static_cast<unsigned>(strtoul(Next(), nullptr, 10));
+    else if (Arg == "--bench-json")
+      BenchJSON = true;
+    else if (Arg == "--ir-ab") {
+      UseIRAB = true;
+      for (const std::string &Tok : split(Next(), ','))
+        IRRootOrder.push_back(
+            static_cast<unsigned>(strtoul(Tok.c_str(), nullptr, 10)));
+    } else
       fail("unknown argument '" + Arg + "'");
   }
   if (!LibPath || !Entry)
     fail("usage: crucible-run --lib <metallib> --entry <kernel> "
-         "[--threads x,y,z] [--groups x,y,z] --buffer i:type:count:init ...");
+         "[--threads x,y,z] [--groups x,y,z] --buffer i:type:count:init ... "
+         "[--iters N --warmup W --bench-json] [--ir-ab i0,i1,...]");
 
   @autoreleasepool {
     id<MTLDevice> Device = MTLCreateSystemDefaultDevice();
@@ -165,11 +187,16 @@ int main(int argc, char **argv) {
     if (!Fn)
       fail(std::string("kernel '") + Entry + "' not found in library");
 
+    auto PipelineStart = std::chrono::steady_clock::now();
     id<MTLComputePipelineState> PSO =
         [Device newComputePipelineStateWithFunction:Fn error:&Err];
+    auto PipelineEnd = std::chrono::steady_clock::now();
     if (!PSO)
       fail(std::string("pipeline creation failed: ") +
            Err.localizedDescription.UTF8String);
+    double PipelineMs =
+        std::chrono::duration<double, std::milli>(PipelineEnd - PipelineStart)
+            .count();
 
     std::vector<id<MTLBuffer>> MTLBuffers;
     for (const BufferSpec &Spec : Buffers) {
@@ -181,23 +208,85 @@ int main(int argc, char **argv) {
       MTLBuffers.push_back(B);
     }
 
-    id<MTLCommandQueue> Queue = [Device newCommandQueue];
-    id<MTLCommandBuffer> Cmd = [Queue commandBuffer];
-    id<MTLComputeCommandEncoder> Enc = [Cmd computeCommandEncoder];
-    [Enc setComputePipelineState:PSO];
-    for (size_t I = 0; I < Buffers.size(); ++I)
-      [Enc setBuffer:MTLBuffers[I] offset:0 atIndex:Buffers[I].Index];
-    [Enc dispatchThreadgroups:MTLSizeMake(Groups[0], Groups[1], Groups[2])
-        threadsPerThreadgroup:MTLSizeMake(Threads[0], Threads[1], Threads[2])];
-    [Enc endEncoding];
-    [Cmd commit];
-    [Cmd waitUntilCompleted];
-    if (Cmd.status == MTLCommandBufferStatusError)
-      fail(std::string("GPU execution failed: ") +
-           (Cmd.error ? Cmd.error.localizedDescription.UTF8String : "unknown"));
+    // Top-level argument buffer for the metal-shaderconverter ABI: root
+    // descriptors are raw 64-bit GPU virtual addresses in root-parameter
+    // order.
+    id<MTLBuffer> ABBuf = nil;
+    constexpr unsigned kIRArgumentBufferBindPoint = 2;
+    if (UseIRAB) {
+      ABBuf = [Device newBufferWithLength:IRRootOrder.size() * 8
+                                  options:MTLResourceStorageModeShared];
+      auto *Slots = static_cast<uint64_t *>(ABBuf.contents);
+      for (size_t I = 0; I < IRRootOrder.size(); ++I) {
+        unsigned BufIdx = IRRootOrder[I];
+        bool Found = false;
+        for (size_t J = 0; J < Buffers.size(); ++J)
+          if (Buffers[J].Index == BufIdx) {
+            Slots[I] = MTLBuffers[J].gpuAddress;
+            Found = true;
+          }
+        if (!Found)
+          fail("--ir-ab references undeclared buffer index");
+      }
+    }
 
-    for (size_t I = 0; I < Buffers.size(); ++I)
-      printBuffer(Buffers[I], MTLBuffers[I].contents);
+    id<MTLCommandQueue> Queue = [Device newCommandQueue];
+
+    auto Dispatch = [&]() -> id<MTLCommandBuffer> {
+      id<MTLCommandBuffer> Cmd = [Queue commandBuffer];
+      id<MTLComputeCommandEncoder> Enc = [Cmd computeCommandEncoder];
+      [Enc setComputePipelineState:PSO];
+      if (UseIRAB) {
+        [Enc setBuffer:ABBuf offset:0 atIndex:kIRArgumentBufferBindPoint];
+        for (id<MTLBuffer> B : MTLBuffers)
+          [Enc useResource:B
+                     usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+      } else {
+        for (size_t I = 0; I < Buffers.size(); ++I)
+          [Enc setBuffer:MTLBuffers[I] offset:0 atIndex:Buffers[I].Index];
+      }
+      [Enc dispatchThreadgroups:MTLSizeMake(Groups[0], Groups[1], Groups[2])
+          threadsPerThreadgroup:MTLSizeMake(Threads[0], Threads[1],
+                                            Threads[2])];
+      [Enc endEncoding];
+      [Cmd commit];
+      [Cmd waitUntilCompleted];
+      if (Cmd.status == MTLCommandBufferStatusError)
+        fail(std::string("GPU execution failed: ") +
+             (Cmd.error ? Cmd.error.localizedDescription.UTF8String
+                        : "unknown"));
+      return Cmd;
+    };
+
+    auto FirstStart = std::chrono::steady_clock::now();
+    Dispatch();
+    auto FirstEnd = std::chrono::steady_clock::now();
+    double FirstDispatchMs =
+        std::chrono::duration<double, std::milli>(FirstEnd - FirstStart)
+            .count();
+
+    if (Iters > 0) {
+      for (unsigned I = 0; I < Warmup; ++I)
+        Dispatch();
+      std::vector<double> Samples;
+      Samples.reserve(Iters);
+      for (unsigned I = 0; I < Iters; ++I) {
+        id<MTLCommandBuffer> Cmd = Dispatch();
+        Samples.push_back((Cmd.GPUEndTime - Cmd.GPUStartTime) * 1000.0);
+      }
+      if (BenchJSON) {
+        printf("{\"pipelineMs\": %.6f, \"firstDispatchMs\": %.6f, "
+               "\"samplesMs\": [",
+               PipelineMs, FirstDispatchMs);
+        for (size_t I = 0; I < Samples.size(); ++I)
+          printf("%s%.6f", I ? ", " : "", Samples[I]);
+        printf("]}\n");
+      }
+    }
+
+    if (!BenchJSON)
+      for (size_t I = 0; I < Buffers.size(); ++I)
+        printBuffer(Buffers[I], MTLBuffers[I].contents);
   }
   return 0;
 }

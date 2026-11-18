@@ -5,9 +5,9 @@
 # RUN: FileCheck %s --input-file=%t.metal
 
 # CHECK: kernel void main0(
-# CHECK: threadgroup uint [[GS:[A-Za-z0-9_]+]];
+# CHECK: threadgroup uint [[GS:[A-Za-z0-9_]+]][1];
 # CHECK-DAG: threadgroup_barrier(mem_flags::mem_threadgroup);
-# CHECK-DAG: atomic_fetch_add_explicit((threadgroup atomic_uint *)&[[GS]]
+# CHECK-DAG: atomic_fetch_add_explicit((threadgroup atomic_uint *)&[[GS]][0]
 # CHECK-NOT: goto
 
 # REQUIRES: metal-tools

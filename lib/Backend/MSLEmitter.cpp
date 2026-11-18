@@ -26,6 +26,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
 
 #include <optional>
 #include <string>
@@ -232,7 +233,7 @@ bool isUndefLike(mlir::Value V) {
 bool isConstantLike(mlir::Operation *Op) {
   return mlir::isa<mlir::LLVM::ConstantOp, mlir::arith::ConstantOp,
                    mlir::LLVM::UndefOp, mlir::LLVM::PoisonOp,
-                   mlir::LLVM::ZeroOp>(Op);
+                   mlir::LLVM::ZeroOp, mlir::ub::PoisonOp>(Op);
 }
 
 //===----------------------------------------------------------------------===//
@@ -314,7 +315,9 @@ private:
   // --- pointers (groupshared / local arrays) ---
   Error collectGroupshared();
   /// Render a pointer-typed SSA value as an MSL lvalue (e.g. "gs[idx]").
-  Expected<Expr> lvalueFor(mlir::Value Ptr);
+  /// When the pointer is a bare array base and DecayArray is set, the first
+  /// element is addressed (C array-to-pointer decay in reverse).
+  Expected<Expr> lvalueFor(mlir::Value Ptr, bool DecayArray = true);
   /// MSL address space of a pointer value ("threadgroup", "device", "thread").
   Expected<std::string> addrSpaceOf(mlir::Value Ptr);
   DenseMap<mlir::Operation *, std::string> GlobalNames; // llvm.mlir.global
@@ -375,7 +378,7 @@ Expected<Expr> Emitter::constant(mlir::Operation *Def) {
   else if (auto C = mlir::dyn_cast<mlir::arith::ConstantOp>(Def))
     ValAttr = C.getValue();
   else if (mlir::isa<mlir::LLVM::UndefOp, mlir::LLVM::PoisonOp,
-                     mlir::LLVM::ZeroOp>(Def))
+                     mlir::LLVM::ZeroOp, mlir::ub::PoisonOp>(Def))
     return Expr{"0", PrecPrimary};
   else
     return makeError("unsupported constant-like op '{0}'",
@@ -624,9 +627,11 @@ Error Emitter::collectGroupshared() {
     mlir::Type T = G.getGlobalType();
     uint64_t N = 1;
     mlir::Type Elem = T;
+    bool IsArray = false;
     if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(T)) {
       N = Arr.getNumElements();
       Elem = Arr.getElementType();
+      IsArray = true;
     }
     auto ETy = mslType(Elem);
     if (!ETy)
@@ -639,7 +644,7 @@ Error Emitter::collectGroupshared() {
     GlobalNames[G] = Name;
     GlobalTypes[G] = *ETy;
     GroupsharedDecls += "  threadgroup " + *ETy + " " + Name +
-                        (N > 1 ? "[" + std::to_string(N) + "]" : "") + ";\n";
+                        (IsArray ? "[" + std::to_string(N) + "]" : "") + ";\n";
   }
   return Error::success();
 }
@@ -659,7 +664,7 @@ Expected<std::string> Emitter::addrSpaceOf(mlir::Value Ptr) {
   }
 }
 
-Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr) {
+Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
   mlir::Operation *Def = Ptr.getDefiningOp();
   if (!Def)
     return makeError("pointer block arguments are not supported");
@@ -671,18 +676,22 @@ Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr) {
     if (It == GlobalNames.end())
       return makeError("reference to unsupported global '{0}'",
                        AO.getGlobalName());
-    return Expr{It->second, PrecPrimary};
+    bool IsArray = mlir::isa<mlir::LLVM::LLVMArrayType>(G.getGlobalType());
+    return Expr{It->second + (IsArray && DecayArray ? "[0]" : ""),
+                PrecPrimary};
   }
 
   if (auto AL = mlir::dyn_cast<mlir::LLVM::AllocaOp>(Def)) {
     auto It = ValueNames.find(AL.getResult());
     if (It == ValueNames.end())
       return makeError("use of alloca before declaration");
-    return Expr{It->second, PrecPrimary};
+    bool IsArray = mlir::isa<mlir::LLVM::LLVMArrayType>(AL.getElemType());
+    return Expr{It->second + (IsArray && DecayArray ? "[0]" : ""),
+                PrecPrimary};
   }
 
   if (auto GEP = mlir::dyn_cast<mlir::LLVM::GEPOp>(Def)) {
-    auto Base = lvalueFor(GEP.getBase());
+    auto Base = lvalueFor(GEP.getBase(), /*DecayArray=*/false);
     if (!Base)
       return Base.takeError();
     std::string Text = Base->Text;
@@ -1134,7 +1143,8 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   }
 
   // Casts.
-  if (mlir::isa<TruncOp, ZExtOp, FPTruncOp, FPExtOp, FPToUIOp, UIToFPOp>(Op)) {
+  if (mlir::isa<TruncOp, ZExtOp, FPTruncOp, FPExtOp, FPToUIOp, UIToFPOp,
+                mlir::arith::ExtUIOp, mlir::arith::TruncIOp>(Op)) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
@@ -1143,7 +1153,7 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
       return DstTy.takeError();
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
   }
-  if (mlir::isa<SExtOp, SIToFPOp>(Op)) {
+  if (mlir::isa<SExtOp, SIToFPOp, mlir::arith::ExtSIOp>(Op)) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
@@ -2021,18 +2031,22 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
   if (auto AL = mlir::dyn_cast<mlir::LLVM::AllocaOp>(Op)) {
     mlir::Type T = AL.getElemType();
     uint64_t N = 1;
+    bool IsArray = false;
     if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(T)) {
       N = Arr.getNumElements();
       T = Arr.getElementType();
+      IsArray = true;
     }
-    if (auto Count = constInt(AL.getArraySize()); Count && *Count != 1)
+    if (auto Count = constInt(AL.getArraySize()); Count && *Count != 1) {
       N *= *Count;
+      IsArray = true;
+    }
     auto ETy = mslType(T);
     if (!ETy)
       return ETy.takeError();
     std::string Name = freshName();
     line(Ind, *ETy + " " + Name +
-                  (N > 1 ? "[" + std::to_string(N) + "]" : "") + ";");
+                  (IsArray ? "[" + std::to_string(N) + "]" : "") + ";");
     ValueNames[AL.getResult()] = Name;
     return Error::success();
   }

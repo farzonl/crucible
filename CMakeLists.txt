@@ -63,6 +63,7 @@ set(CRUCIBLE_MLIR_LIBS
   MLIRFuncDialect
   MLIRLLVMDialect
   MLIRArithDialect
+  MLIRUBDialect
   MLIRDLTIDialect
   MLIRTransforms
   MLIRPass

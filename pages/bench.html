@@ -1,0 +1,1849 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Crucible — DXIL to Metal Shader Benchmarks</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("crucible-theme");
+        const theme = (saved === "light" || saved === "dark")
+          ? saved
+          : (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.dataset.theme = theme;
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
+    })();
+  </script>
+  <style>
+    :root {
+      color-scheme: light;
+
+      --bg-light: #f8fafc;
+      --bg-dark: #0b0f17;
+      --surface-light: #ffffff;
+      --surface-dark: #111827;
+      --surface-alt-light: #f1f5f9;
+      --surface-alt-dark: #182235;
+      --border-light: #cbd5e1;
+      --border-dark: #293548;
+      --text-light: #0f172a;
+      --text-dark: #f1f5f9;
+      --muted-light: #475569;
+      --muted-dark: #94a3b8;
+      --accent-light: #0369a1;
+      --accent-dark: #38bdf8;
+      --crucible-light: #0284c7;
+      --crucible-dark: #38bdf8;
+      --warp-light: #7c3aed;
+      --warp-dark: #a78bfa;
+      --llvmpipe-light: #15803d;
+      --llvmpipe-dark: #4ade80;
+      --swift-light: #c2410c;
+      --swift-dark: #fb923c;
+
+      --bg: var(--bg-light);
+      --surface: var(--surface-light);
+      --surface-alt: var(--surface-alt-light);
+      --border: var(--border-light);
+      --text: var(--text-light);
+      --muted: var(--muted-light);
+      --accent: var(--accent-light);
+      --c-crucible: var(--crucible-light);
+      --c-warp: var(--warp-light);
+      --c-llvmpipe: var(--llvmpipe-light);
+      --c-swift: var(--swift-light);
+
+      --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --radius: 12px;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border) transparent;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --bg: var(--bg-dark);
+        --surface: var(--surface-dark);
+        --surface-alt: var(--surface-alt-dark);
+        --border: var(--border-dark);
+        --text: var(--text-dark);
+        --muted: var(--muted-dark);
+        --accent: var(--accent-dark);
+        --c-crucible: var(--crucible-dark);
+        --c-warp: var(--warp-dark);
+        --c-llvmpipe: var(--llvmpipe-dark);
+        --c-swift: var(--swift-dark);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: var(--bg-dark);
+      --surface: var(--surface-dark);
+      --surface-alt: var(--surface-alt-dark);
+      --border: var(--border-dark);
+      --text: var(--text-dark);
+      --muted: var(--muted-dark);
+      --accent: var(--accent-dark);
+      --c-crucible: var(--crucible-dark);
+      --c-warp: var(--warp-dark);
+      --c-llvmpipe: var(--llvmpipe-dark);
+      --c-swift: var(--swift-dark);
+    }
+
+    @media (forced-colors: active) {
+      :root {
+        --bg: Canvas;
+        --surface: Canvas;
+        --surface-alt: Canvas;
+        --border: ButtonText;
+        --text: CanvasText;
+        --muted: GrayText;
+        --accent: LinkText;
+        --c-crucible: CanvasText;
+        --c-warp: CanvasText;
+        --c-llvmpipe: CanvasText;
+        --c-swift: CanvasText;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 2.25rem 1.5rem 4.5rem;
+      display: grid;
+      gap: 1.75rem;
+    }
+
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 1rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1rem;
+    }
+
+    .title-group h1 {
+      margin: 0;
+      font-size: clamp(1.35rem, 2.2vw, 1.85rem);
+      font-weight: 650;
+      letter-spacing: -0.02em;
+    }
+
+    .title-group p {
+      margin: 0.25rem 0 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    .meta-pill {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      padding: 0.35rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      text-decoration: none;
+      line-height: 1.3;
+    }
+
+    button.meta-pill {
+      cursor: pointer;
+    }
+
+    .meta-pill:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .meta-pill:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.35rem 1.5rem;
+      display: grid;
+      gap: 1rem;
+    }
+
+    .kpi-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .kpi-value {
+      margin-top: 0.35rem;
+      font-size: 1.75rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.02em;
+    }
+
+    .kpi-sub {
+      margin-top: 0.2rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .chart-card {
+      display: grid;
+      gap: 1rem;
+    }
+
+    .card-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 0.85rem 1.25rem;
+    }
+
+    .card-header h2 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.9rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      background: none;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 0.15rem 0.4rem;
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+      transition: opacity 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+
+    button.legend-item:hover {
+      border-color: var(--border);
+      color: var(--text);
+    }
+
+    button.legend-item:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    button.legend-item.is-hidden {
+      opacity: 0.4;
+      text-decoration: line-through;
+    }
+
+    .swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      border: 1px solid var(--border);
+    }
+
+    .canvas-wrap {
+      position: relative;
+      width: 100%;
+      height: 300px;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+    }
+
+    .tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.8rem;
+      min-width: 210px;
+      opacity: 0;
+      transform: translate(-50%, -105%);
+      transition: opacity 0.12s ease;
+      z-index: 5;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .tooltip.visible { opacity: 1; }
+    .tooltip .tt-sha { font-family: var(--font-mono); font-weight: 700; color: var(--accent); }
+    .tooltip .tt-msg {
+      color: var(--muted);
+      margin: 0.15rem 0 0.3rem;
+      max-width: 240px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .svg-chart-wrap { width: 100%; overflow-x: auto; }
+    .svg-chart-wrap svg { display: block; width: 100%; height: auto; }
+
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(440px, 65vh);
+      container-type: inline-size;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .table-wrapper:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 0.88rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    caption {
+      text-align: left;
+      padding: 0.65rem 0.85rem;
+      font-weight: 600;
+      font-size: 0.9rem;
+      color: var(--muted);
+      background: var(--surface-alt);
+      border-bottom: 1px solid var(--border);
+    }
+
+    thead th {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--surface-alt);
+      color: var(--muted);
+      font-weight: 600;
+      text-align: left;
+      padding: 0.6rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    tbody th, tbody td {
+      padding: 0.55rem 0.85rem;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+      color: var(--text);
+    }
+
+    tbody th {
+      position: sticky;
+      inset-inline-start: 0;
+      z-index: 1;
+      background: var(--surface);
+      color: var(--text);
+      text-align: left;
+      font-family: var(--font-mono);
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    tbody tr:hover th, tbody tr:hover td { background: var(--surface-alt); }
+
+    .bench-table {
+      --label-2: "Category";
+      --label-3: "Backend";
+      --label-4: "Cold (ms)";
+      --label-5: "Hot (ms)";
+      --label-6: "Short (ms)";
+      --label-7: "Long (ms)";
+      --label-8: "Peak (MB)";
+      --label-9: "Score";
+      --label-10: "Status";
+    }
+
+    .winners-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 0.95rem;
+    }
+
+    .winner-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+      text-align: left;
+      font: inherit;
+      color: inherit;
+    }
+
+    button.winner-card {
+      cursor: pointer;
+      transition: border-color 0.15s ease, background-color 0.15s ease, transform 0.12s ease;
+    }
+
+    button.winner-card:hover {
+      border-color: var(--accent);
+      background: var(--surface-alt);
+    }
+
+    button.winner-card:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    button.winner-card.active-scope {
+      border-color: var(--accent);
+      background: var(--surface-alt);
+    }
+
+    .winner-card .w-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin-bottom: 0.25rem;
+    }
+
+    .winner-card .w-val {
+      font-family: var(--font-mono);
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--accent);
+      word-break: break-word;
+    }
+
+    .winner-card .w-sub {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 0.2rem;
+    }
+
+    .controls-row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    select.meta-pill, button.meta-pill {
+      cursor: pointer;
+      background: var(--surface-alt);
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      padding: 0.42rem 0.85rem;
+    }
+
+    select.meta-pill {
+      white-space: nowrap;
+      max-width: 100%;
+    }
+
+    select.meta-pill optgroup {
+      font-family: var(--font-sans);
+      font-size: 0.78rem;
+      font-weight: 700;
+      line-height: 1.5;
+      color: var(--muted);
+      background: var(--surface);
+      padding: 0.35rem 0.5rem 0.15rem;
+      white-space: nowrap;
+    }
+
+    select.meta-pill option {
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      font-weight: 400;
+      line-height: 1.5;
+      color: var(--text);
+      background: var(--surface);
+      padding: 0.35rem 0.6rem;
+      white-space: nowrap;
+    }
+
+    @supports (appearance: base-select) {
+      select.meta-pill,
+      select.meta-pill::picker(select) {
+        appearance: base-select;
+      }
+
+      select.meta-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+      }
+
+      select.meta-pill::picker-icon {
+        color: var(--muted);
+        transition: transform 0.15s ease;
+      }
+
+      select.meta-pill:open::picker-icon {
+        transform: rotate(180deg);
+      }
+
+      select.meta-pill::picker(select) {
+        background: var(--surface);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 0.4rem;
+        margin-block-start: 0.35rem;
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+        min-inline-size: anchor-size(inline-size);
+        inline-size: max-content;
+        max-inline-size: min(92vw, 34rem);
+        max-block-size: min(60vh, 26rem);
+        overflow-y: auto;
+      }
+
+      select.meta-pill optgroup {
+        padding: 0.45rem 0.55rem 0.2rem;
+        letter-spacing: 0.03em;
+      }
+
+      select.meta-pill optgroup:not(:first-child) {
+        margin-top: 0.25rem;
+        border-top: 1px solid var(--border);
+        padding-top: 0.55rem;
+      }
+
+      select.meta-pill option {
+        border-radius: 6px;
+        cursor: pointer;
+        padding: 0.38rem 0.6rem;
+      }
+
+      select.meta-pill option:hover,
+      select.meta-pill option:focus-visible {
+        background: var(--surface-alt);
+        color: var(--accent);
+      }
+
+      select.meta-pill option:checked {
+        font-weight: 600;
+        color: var(--accent);
+      }
+
+      select.meta-pill option::checkmark {
+        color: var(--accent);
+      }
+    }
+
+    button.meta-pill:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    th.sortable {
+      cursor: pointer;
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    th.sortable:hover,
+    th.sortable.active-sort {
+      color: var(--accent);
+    }
+
+    .pagination-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.85rem;
+      margin-top: 0.25rem;
+      padding-top: 0.9rem;
+      border-top: 1px solid var(--border);
+      font-family: var(--font-mono);
+      font-size: 0.82rem;
+      color: var(--muted);
+    }
+
+    @container (width < 600px) {
+      table, thead, tbody, tr, th, td { display: block; }
+      thead { display: none; }
+      tr {
+        margin-block-end: 0.85rem;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      tbody th {
+        position: sticky;
+        inset-block-start: 0;
+        z-index: 2;
+        background: var(--surface-alt);
+        border-bottom: 1px solid var(--border);
+      }
+      tbody td {
+        display: flex;
+        justify-content: space-between;
+        gap: 1rem;
+      }
+      td:nth-child(2)::before { content: var(--label-2) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(3)::before { content: var(--label-3) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(4)::before { content: var(--label-4) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(5)::before { content: var(--label-5) ": "; color: var(--muted); font-weight: 600; }
+      td:nth-child(6)::before { content: var(--label-6) ": "; color: var(--muted); font-weight: 600; }
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <div class="title-group">
+        <h1>Crucible Shader Benchmarks</h1>
+        <p>crucible vs. metal-shaderconverter on Apple Silicon — compute workloads (memory, ALU/loops, barriers, simdgroup) + compile time</p>
+      </div>
+      <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center;">
+        <button id="theme-toggle" class="meta-pill" type="button" aria-label="Toggle color theme">☀ Light</button>
+        <a class="meta-pill" href="index.html">← Offload Compliance</a>
+        <a id="latest-run-link" class="meta-pill" href="https://github.com/farzonl/crucible" target="_blank" rel="noopener">
+          Latest commit: —
+        </a>
+      </div>
+    </header>
+
+    <section aria-label="Global benchmark scope and summary" style="display: grid; gap: 1rem;">
+      <div class="card-header">
+        <div class="controls-row">
+          <label for="platform-select" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Platform:</label>
+          <select id="platform-select" class="meta-pill" aria-label="Select benchmark platform">
+            <option value="macos">macOS</option>
+            <option value="windows">Windows</option>
+          </select>
+          <label for="global-scope" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Scope &amp; Metric:</label>
+          <select id="global-scope" class="meta-pill" aria-label="Select global benchmark scope and metric"></select>
+          <select id="commit-window" class="meta-pill" aria-label="Limit commits shown in trend charts">
+            <option value="all" selected>All Commits</option>
+            <option value="15">Last 15 Commits</option>
+            <option value="30">Last 30 Commits</option>
+            <option value="60">Last 60 Commits</option>
+            <option value="90">Last 90 Commits</option>
+            <option value="120">Last 120 Commits</option>
+          </select>
+        </div>
+        <span id="kpi-context" style="font-size: 0.82rem; color: var(--muted); font-family: var(--font-mono);">Commit —</span>
+      </div>
+      <div class="kpi-grid" id="kpi-grid" aria-label="Selected commit benchmark metrics"></div>
+    </section>
+
+    <section class="card" aria-labelledby="winners-title">
+      <div class="card-header">
+        <h2 id="winners-title">Category &amp; Regime Winners</h2>
+        <button type="button" class="meta-pill" id="overall-winner-pill" data-scope="overall:all:medianMs">Overall Winner: —</button>
+      </div>
+      <div class="winners-grid" id="winners-grid"></div>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="trend-title">
+      <div class="card-header">
+        <h2 id="trend-title">Historical Trend Over Commits</h2>
+        <div class="legend" id="trend-legend"></div>
+      </div>
+      <div class="canvas-wrap" id="trend-wrap">
+        <canvas id="trend-canvas" aria-label="Line chart of benchmark metric across commits"></canvas>
+        <div class="tooltip" id="trend-tooltip" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="mem-trend-title">
+      <div class="card-header">
+        <h2 id="mem-trend-title">Historical Memory Usage Over Commits (Peak RSS MB, lower is better)</h2>
+        <div class="legend" id="mem-trend-legend"></div>
+      </div>
+      <div class="canvas-wrap" id="mem-trend-wrap">
+        <canvas id="mem-trend-canvas" aria-label="Line chart of peak memory usage across commits"></canvas>
+        <div class="tooltip" id="mem-trend-tooltip" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section class="card chart-card" aria-labelledby="bar-title">
+      <div class="card-header">
+        <h2 id="bar-title">Selected Commit Comparison</h2>
+        <div class="controls-row">
+          <select id="sort-metric" class="meta-pill" aria-label="Sort by metric">
+            <option value="medianMs:asc">Sort: Hot (ms) ↑</option>
+            <option value="coldMs:asc">Sort: Cold (ms) ↑</option>
+            <option value="shortJobMs:asc">Sort: Short (ms) ↑</option>
+            <option value="longJobMs:asc">Sort: Long (ms) ↑</option>
+            <option value="peakRssMb:asc">Sort: Peak (MB) ↑</option>
+            <option value="default:asc">Sort: Suite Order</option>
+          </select>
+          <select id="page-size" class="meta-pill" aria-label="Rows per page">
+            <option value="12">12 / page</option>
+            <option value="24">24 / page</option>
+            <option value="50">50 / page</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
+      <div class="svg-chart-wrap" id="bar-svg-wrap"></div>
+      <div class="pagination-bar" id="bar-pagination"></div>
+    </section>
+
+    <section class="card" aria-labelledby="bench-table-caption">
+      <div class="card-header">
+        <h2 id="bench-table-title">Shader, Regime &amp; Memory Profile Timings</h2>
+        <div class="controls-row">
+          <select id="table-page-size" class="meta-pill" aria-label="Table rows per page">
+            <option value="12">12 / page</option>
+            <option value="24">24 / page</option>
+            <option value="50">50 / page</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+      </div>
+      <div tabindex="0" role="region" aria-labelledby="bench-table-caption" class="table-wrapper">
+        <table class="bench-table">
+          <caption id="bench-table-caption">Selected commit shader, regime &amp; memory profile timings (click column headers to sort)</caption>
+          <thead>
+            <tr>
+              <th scope="col" class="sortable" data-sort="benchName">Benchmark</th>
+              <th scope="col" class="sortable" data-sort="category">Category</th>
+              <th scope="col" class="sortable" data-sort="backend">Backend</th>
+              <th scope="col" class="sortable" data-sort="coldMs">Cold (ms)</th>
+              <th scope="col" class="sortable" data-sort="medianMs">Hot (ms)</th>
+              <th scope="col" class="sortable" data-sort="shortJobMs">Short (ms)</th>
+              <th scope="col" class="sortable" data-sort="longJobMs">Long (ms)</th>
+              <th scope="col" class="sortable" data-sort="peakRssMb">Peak (MB)</th>
+              <th scope="col" class="sortable" data-sort="status">Status</th>
+            </tr>
+          </thead>
+          <tbody id="bench-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pagination-bar" id="table-pagination"></div>
+    </section>
+  </main>
+
+  <script>
+    const FALLBACK_BENCH = [
+      {
+        sha: "6bcd6be000000000000000000000000000000000",
+        shortSha: "6bcd6be",
+        message: "Sample preview (awaiting first Windows benchmark CI run)",
+        timestamp: new Date().toISOString(),
+        results: [
+          { backend: "Metal (crucible)", shaderFormat: "DXIL", ran: true, compileMs: 12.0, medianMs: 8.5, minMs: 8.1, peakRssMb: 68.2, status: "OK" },
+          { backend: "Metal (crucible)", shaderFormat: "DXIL", ran: true, compileMs: 14.0, medianMs: 6.2, minMs: 5.9, peakRssMb: 68.1, status: "OK" },
+          { backend: "Microsoft WARP", shaderFormat: "DXIL", ran: true, compileMs: 10.5, medianMs: 9.8, minMs: 9.4, peakRssMb: 84.5, status: "OK" },
+          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.2, medianMs: 11.4, minMs: 10.9, peakRssMb: 79.0, status: "OK" },
+          { backend: "Vulkan (SwiftShader)", shaderFormat: "SPIR-V", ran: true, compileMs: 22.0, medianMs: 16.5, minMs: 15.8, peakRssMb: 92.3, status: "OK" }
+        ]
+      }
+    ];
+
+    const FALLBACK_BENCH_MACOS = [
+      {
+        sha: "6bcd6be000000000000000000000000000000000",
+        shortSha: "6bcd6be",
+        message: "Sample preview (awaiting first macOS benchmark CI run)",
+        timestamp: new Date().toISOString(),
+        os: "macOS",
+        results: [
+          { backend: "Metal (crucible)", shaderFormat: "DXIL", ran: true, compileMs: 11.2, medianMs: 6.4, minMs: 6.1, peakRssMb: 64.0, status: "OK" },
+          { backend: "Metal (IRConverter)", shaderFormat: "DXIL", ran: true, compileMs: 19.5, medianMs: 1.8, minMs: 1.6, peakRssMb: 88.0, status: "OK" },
+          { backend: "Vulkan (MoltenVK)", shaderFormat: "SPIR-V", ran: true, compileMs: 16.0, medianMs: 2.3, minMs: 2.1, peakRssMb: 82.0, status: "OK" },
+          { backend: "Vulkan (KosmicKrisp)", shaderFormat: "SPIR-V", ran: true, compileMs: 17.5, medianMs: 2.9, minMs: 2.7, peakRssMb: 85.0, status: "OK" },
+          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.0, medianMs: 10.5, minMs: 10.1, peakRssMb: 78.0, status: "OK" }
+        ]
+      }
+    ];
+
+    let activePlatform = "windows";
+    let benchHistory = [];
+    let selectedIndex = 0;
+    let hoveredIndex = -1;
+    const PENALTY_MULTIPLIER = 5.0;
+    const hiddenSeriesByLegend = {
+      "trend-legend": new Set(),
+      "mem-trend-legend": new Set(),
+    };
+    const LEGEND_FOR_CANVAS = {
+      "trend-canvas": "trend-legend",
+      "mem-trend-canvas": "mem-trend-legend",
+    };
+
+    function getActiveTheme() {
+      return document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+    }
+
+    function applyTheme(theme, persist = false) {
+      document.documentElement.dataset.theme = theme;
+      if (persist) {
+        try { localStorage.setItem("crucible-theme", theme); } catch {}
+      }
+      const btn = document.getElementById("theme-toggle");
+      if (btn) {
+        const isDark = theme === "dark";
+        btn.textContent = isDark ? "☀ Light mode" : "☾ Dark mode";
+        btn.setAttribute("aria-pressed", String(isDark));
+        btn.title = isDark ? "Switch to light mode" : "Switch to dark mode";
+      }
+    }
+
+    function setupThemeToggle() {
+      applyTheme(getActiveTheme(), false);
+      const btn = document.getElementById("theme-toggle");
+      if (btn) {
+        btn.addEventListener("click", () => {
+          const next = getActiveTheme() === "dark" ? "light" : "dark";
+          applyTheme(next, true);
+          drawTrendChart();
+        });
+      }
+      window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+        try {
+          const saved = localStorage.getItem("crucible-theme");
+          if (saved === "light" || saved === "dark") return;
+        } catch {}
+        applyTheme(e.matches ? "dark" : "light", false);
+        drawTrendChart();
+      });
+    }
+
+    function cssVar(name) {
+      return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function getEntrySuites(entry) {
+      return (entry.suites && entry.suites.length) ? entry.suites : (entry.results || []);
+    }
+
+    function geomean(arr) {
+      const pos = arr.filter(x => x > 0);
+      if (!pos.length) return 0;
+      return Math.exp(pos.reduce((s, x) => s + Math.log(x), 0) / pos.length);
+    }
+
+    const BACKEND_FAMILIES = [
+      { key: "crucible", label: "Metal (crucible)", color: "#0284c7", cssVarName: "--c-crucible", match: b => b.includes("crucible") },
+      { key: "warp", label: "Microsoft WARP", color: "#7c3aed", cssVarName: "--c-warp", match: b => b.includes("warp") },
+      { key: "llvmpipe", label: "Mesa llvmpipe", color: "#15803d", cssVarName: "--c-llvmpipe", match: b => b.includes("llvmpipe") },
+      { key: "swift", label: "SwiftShader", color: "#c2410c", cssVarName: "--c-swift", match: b => b.includes("swiftshader") },
+      { key: "moltenvk", label: "Vulkan (MoltenVK)", color: "#0d9488", match: b => b.includes("moltenvk") },
+      { key: "kosmickrisp", label: "Vulkan (KosmicKrisp)", color: "#db2777", match: b => b.includes("kosmickrisp") },
+      { key: "metal", label: "Metal (IRConverter)", color: "#ca8a04", match: b => b.includes("irconverter") },
+    ];
+
+    function familyColor(fam) {
+      return fam.cssVarName ? cssVar(fam.cssVarName) : fam.color;
+    }
+
+    function colorForBackend(name) {
+      const n = (name || "").toLowerCase();
+      const fam = BACKEND_FAMILIES.find(f => f.match(n));
+      return fam ? (fam.cssVarName ? `var(${fam.cssVarName})` : fam.color) : "var(--accent)";
+    }
+
+    function metricVal(r, field) {
+      if (field === "coldMs") return Number(r.coldMs || r.compileMs || 0);
+      return Number(r[field] || 0);
+    }
+
+    function computeMaxByBench(suites, field) {
+      const maxByBench = new Map();
+      for (const r of suites) {
+        if (!r.ran) continue;
+        const v = metricVal(r, field);
+        if (v <= 0) continue;
+        const bid = r.benchId || "bench_raymarch";
+        if (!maxByBench.has(bid) || v > maxByBench.get(bid)) {
+          maxByBench.set(bid, v);
+        }
+      }
+      return maxByBench;
+    }
+
+    function computePenalizedBackendGeomeans(suites, field, { requireRanInScope = false, activeBackends = null } = {}) {
+      const maxByBench = computeMaxByBench(suites, field);
+      const out = new Map();
+      if (maxByBench.size === 0) return out;
+
+      const byBackend = new Map();
+      for (const r of suites) {
+        const b = r.backend || "";
+        if (!b) continue;
+        if (!byBackend.has(b)) byBackend.set(b, new Map());
+        if (r.ran) {
+          const v = metricVal(r, field);
+          if (v > 0) byBackend.get(b).set(r.benchId || "bench_raymarch", v);
+        }
+      }
+
+      const backends = activeBackends || [...byBackend.keys()];
+      for (const b of backends) {
+        const ranMap = byBackend.get(b) || new Map();
+        if (requireRanInScope && ranMap.size === 0) continue;
+        const vals = [];
+        for (const [bid, maxV] of maxByBench.entries()) {
+          vals.push(ranMap.has(bid) ? ranMap.get(bid) : PENALTY_MULTIPLIER * maxV);
+        }
+        const gm = geomean(vals);
+        if (gm > 0) {
+          out.set(b, { val: gm, backend: b, ranCount: ranMap.size, totalBenches: maxByBench.size });
+        }
+      }
+      return out;
+    }
+
+    const BENCH_CATEGORIES = ["Compute", "Vertex", "Pixel", "Geometry", "Tessellation", "Ray Tracing", "Mesh"];
+
+    function computePenalizedSummary(entry) {
+      if (entry._penalizedSummary) return entry._penalizedSummary;
+      const suites = getEntrySuites(entry);
+      const activeBackends = new Set(suites.filter(r => r.ran && r.backend).map(r => r.backend));
+      const backendCatMs = new Map();
+      const categoryWinners = [];
+
+      for (const cat of BENCH_CATEGORIES) {
+        const catSuites = suites.filter(r => (r.category || "Compute") === cat);
+        const gms = computePenalizedBackendGeomeans(catSuites, "medianMs", {
+          requireRanInScope: false,
+          activeBackends,
+        });
+        let bestBackend = "N/A";
+        let bestMs = Infinity;
+        for (const [b, info] of gms.entries()) {
+          if (!backendCatMs.has(b)) backendCatMs.set(b, []);
+          backendCatMs.get(b).push(info.val);
+          if (info.ranCount > 0 && info.val < bestMs) {
+            bestMs = info.val;
+            bestBackend = b;
+          }
+        }
+        if (gms.size > 0 || catSuites.length > 0) {
+          categoryWinners.push({
+            category: cat,
+            winner: bestBackend,
+            geomean_ms: bestBackend === "N/A" ? 0 : bestMs,
+          });
+        }
+      }
+
+      const overallGeomeanMs = {};
+      let overallWinner = "N/A";
+      let bestOverall = Infinity;
+      for (const [b, catVals] of backendCatMs.entries()) {
+        const ov = geomean(catVals);
+        if (ov > 0) {
+          overallGeomeanMs[b] = ov;
+          if (ov < bestOverall) {
+            bestOverall = ov;
+            overallWinner = b;
+          }
+        }
+      }
+
+      const regimeSpecs = [
+        { regime: "Cold JIT", field: "coldMs", unit: "ms" },
+        { regime: "Hot JIT", field: "medianMs", unit: "ms" },
+        { regime: "Short-Running Job", field: "shortJobMs", unit: "ms" },
+        { regime: "Long-Running Job", field: "longJobMs", unit: "ms" },
+        { regime: "Lowest Peak Memory", field: "peakRssMb", unit: "MB" },
+      ];
+      const regimeWinners = regimeSpecs.map(({ regime, field, unit }) => {
+        const gms = computePenalizedBackendGeomeans(suites, field, {
+          requireRanInScope: true,
+          activeBackends,
+        });
+        let winner = "N/A";
+        let value = 0;
+        let best = Infinity;
+        for (const [b, info] of gms.entries()) {
+          if (info.val < best) {
+            best = info.val;
+            winner = b;
+            value = info.val;
+          }
+        }
+        return { regime, winner, value, unit };
+      });
+
+      entry._penalizedSummary = { overallWinner, overallGeomeanMs, categoryWinners, regimeWinners };
+      return entry._penalizedSummary;
+    }
+
+    function extractMetrics(entry, trendKey = "overall:all:medianMs") {
+      const allSuites = getEntrySuites(entry);
+      const [mode, param, field] = trendKey.split(":");
+      const fName = field || "medianMs";
+      const unit = fName.toLowerCase().includes("mb") ? "MB" : "ms";
+      const out = { unit };
+
+      if (mode === "shader") {
+        const ran = allSuites.filter(r => r.ran && (r.benchId || "bench_raymarch") === param);
+        for (const f of BACKEND_FAMILIES) {
+          const items = ran.filter(r => f.match((r.backend || "").toLowerCase()));
+          if (!items.length) { out[f.key] = null; continue; }
+          const best = items.reduce((a, b) => (metricVal(a, fName) <= metricVal(b, fName) ? a : b));
+          out[f.key] = {
+            val: metricVal(best, fName),
+            backend: best.backend,
+            minMs: Number(best.minMs || best.medianMs || 0),
+          };
+        }
+        return out;
+      }
+
+      const pickBestFromMap = (backendMap) => {
+        for (const f of BACKEND_FAMILIES) {
+          let bestInfo = null;
+          for (const [b, info] of backendMap.entries()) {
+            if (f.match(b.toLowerCase()) && info.val > 0 && (!bestInfo || info.val < bestInfo.val)) {
+              bestInfo = info;
+            }
+          }
+          out[f.key] = bestInfo ? { val: bestInfo.val, backend: bestInfo.backend, minMs: bestInfo.val } : null;
+        }
+      };
+
+      if (mode === "overall") {
+        const uniqueBenches = new Set(allSuites.map(r => r.benchId || "bench_raymarch"));
+        if (uniqueBenches.size > 1) {
+          const summary = computePenalizedSummary(entry);
+          const map = new Map(
+            Object.entries(summary.overallGeomeanMs).map(([b, val]) => [b, { val, backend: b }])
+          );
+          pickBestFromMap(map);
+          return out;
+        }
+        const gms = entry.overallGeomeanMs || {};
+        if (Object.keys(gms).length > 0) {
+          const map = new Map(
+            Object.entries(gms).map(([b, val]) => [b, { val: Number(val), backend: b }])
+          );
+          pickBestFromMap(map);
+          return out;
+        }
+        pickBestFromMap(computePenalizedBackendGeomeans(allSuites, "medianMs", { requireRanInScope: true }));
+        return out;
+      }
+
+      const scopeSuites = mode === "cat"
+        ? allSuites.filter(r => (r.category || "Compute") === param)
+        : allSuites;
+      pickBestFromMap(computePenalizedBackendGeomeans(scopeSuites, fName, { requireRanInScope: true }));
+      return out;
+    }
+
+    function getActiveFamilies() {
+      const active = new Set(["crucible", "metal"]);
+      for (const h of benchHistory) {
+        for (const r of getEntrySuites(h)) {
+          if (!r.ran) continue;
+          const b = (r.backend || "").toLowerCase();
+          const fam = BACKEND_FAMILIES.find(f => f.match(b));
+          if (fam) active.add(fam.key);
+        }
+      }
+      return BACKEND_FAMILIES.filter(f => active.has(f.key));
+    }
+
+    function getGlobalScope() {
+      return document.getElementById("global-scope")?.value || "overall:all:medianMs";
+    }
+
+    function getMemoryScopeKey(scope) {
+      const [mode, param] = scope.split(":");
+      if (mode === "cat") return `cat:${param}:peakRssMb`;
+      if (mode === "shader") return `shader:${param}:peakRssMb`;
+      return "regime:all:peakRssMb";
+    }
+
+    function renderKPIs(idx) {
+      const entry = benchHistory[idx];
+      if (!entry) return;
+      const scope = getGlobalScope();
+      const memScope = getMemoryScopeKey(scope);
+      const m = extractMetrics(entry, scope);
+      const memM = extractMetrics(entry, memScope);
+      const ctxEl = document.getElementById("kpi-context");
+      if (ctxEl) {
+        ctxEl.textContent = `Commit ${entry.shortSha} · ${m.unit === "MB" ? "MB (lower is better)" : "ms (lower is faster)"}`;
+      }
+      const families = getActiveFamilies();
+
+      const grid = document.getElementById("kpi-grid");
+      if (grid) {
+        grid.innerHTML = families.map(f => {
+          const item = m[f.key];
+          const memItem = memM[f.key];
+          const memSuffix = memItem ? ` · ${memItem.val.toFixed(1)} MB peak` : "";
+          const col = f.cssVarName ? `var(${f.cssVarName})` : f.color;
+          return `
+            <article class="card" style="gap: 0.25rem;">
+              <div class="kpi-label">${escapeHtml(f.label)}</div>
+              <div class="kpi-value" style="color: ${col}">${item ? `${item.val.toFixed(2)} ${m.unit}` : "—"}</div>
+              <div class="kpi-sub">${item ? `${escapeHtml(item.backend)}${memSuffix}` : "Not run"}</div>
+            </article>`;
+        }).join("");
+      }
+
+      for (const legendId of ["trend-legend", "mem-trend-legend"]) {
+        const legend = document.getElementById(legendId);
+        if (legend) {
+          const hidden = hiddenSeriesByLegend[legendId] || new Set();
+          legend.innerHTML = families.map(f => {
+            const col = f.cssVarName ? `var(${f.cssVarName})` : f.color;
+            const isHidden = hidden.has(f.key);
+            return `<button type="button" class="legend-item${isHidden ? " is-hidden" : ""}" data-family="${escapeHtml(f.key)}" aria-pressed="${String(!isHidden)}" title="Click to toggle ${escapeHtml(f.label)}"><span class="swatch" style="background: ${col}"></span>${escapeHtml(f.label)}</button>`;
+          }).join("");
+        }
+      }
+
+      const pill = document.getElementById("latest-run-link");
+      pill.textContent = `Commit ${entry.shortSha}`;
+      if (entry.runUrl) pill.href = entry.runUrl;
+    }
+
+    function scopeForCategoryWinner(category) {
+      const scope = `cat:${category}:medianMs`;
+      const sel = document.getElementById("global-scope");
+      return sel && [...sel.options].some(o => o.value === scope) ? scope : null;
+    }
+
+    function scopeForRegimeWinner(regime) {
+      const map = {
+        "Cold JIT": "regime:all:coldMs",
+        "Hot JIT": "regime:all:medianMs",
+        "Short-Running Job": "regime:all:shortJobMs",
+        "Long-Running Job": "regime:all:longJobMs",
+        "Lowest Peak Memory": "regime:all:peakRssMb",
+      };
+      const scope = map[regime] || null;
+      if (!scope) return null;
+      const sel = document.getElementById("global-scope");
+      return sel && [...sel.options].some(o => o.value === scope) ? scope : null;
+    }
+
+    function syncActiveWinnerCard() {
+      const activeScope = getGlobalScope();
+      document.querySelectorAll("#winners-grid button.winner-card[data-scope]").forEach((btn) => {
+        const isActive = btn.dataset.scope === activeScope;
+        btn.classList.toggle("active-scope", isActive);
+        btn.setAttribute("aria-pressed", String(isActive));
+      });
+      const overallPill = document.getElementById("overall-winner-pill");
+      if (overallPill) {
+        const isOverall = activeScope === "overall:all:medianMs";
+        overallPill.setAttribute("aria-pressed", String(isOverall));
+      }
+    }
+
+    function selectGlobalScope(scope) {
+      const sel = document.getElementById("global-scope");
+      if (!sel || !scope) return;
+      if (![...sel.options].some(o => o.value === scope)) return;
+      sel.value = scope;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
+    function renderWinners(entry) {
+      const grid = document.getElementById("winners-grid");
+      const overallPill = document.getElementById("overall-winner-pill");
+      const suites = getEntrySuites(entry);
+      const isMultiShader = new Set(suites.map(r => r.benchId || "bench_raymarch")).size > 1;
+      const summary = isMultiShader ? computePenalizedSummary(entry) : entry;
+      if (overallPill) {
+        const ow = summary.overallWinner || "—";
+        const gm = summary.overallGeomeanMs && summary.overallGeomeanMs[ow] ? ` (${Number(summary.overallGeomeanMs[ow]).toFixed(2)} ms geomean)` : "";
+        overallPill.textContent = `Overall Winner: ${ow}${gm}`;
+      }
+      const cats = summary.categoryWinners || [];
+      const regs = summary.regimeWinners || [];
+      const cards = [];
+      for (const c of cats) {
+        const val = c.geomean_ms || 0;
+        const scope = val > 0 ? scopeForCategoryWinner(c.category) : null;
+        const inner = `
+            <div class="w-label">${escapeHtml(c.category)} Winner</div>
+            <div class="w-val">${escapeHtml(c.winner || "N/A")}</div>
+            <div class="w-sub">${val > 0 ? Number(val).toFixed(2) + " ms" : "—"}</div>`;
+        cards.push(scope
+          ? `<button type="button" class="winner-card" data-scope="${escapeHtml(scope)}">${inner}</button>`
+          : `<div class="winner-card">${inner}</div>`);
+      }
+      for (const r of regs) {
+        const scope = r.value > 0 ? scopeForRegimeWinner(r.regime) : null;
+        const inner = `
+            <div class="w-label">${escapeHtml(r.regime)}</div>
+            <div class="w-val">${escapeHtml(r.winner || "N/A")}</div>
+            <div class="w-sub">${r.value > 0 ? Number(r.value).toFixed(2) + " " + escapeHtml(r.unit || "") : "—"}</div>`;
+        cards.push(scope
+          ? `<button type="button" class="winner-card" data-scope="${escapeHtml(scope)}">${inner}</button>`
+          : `<div class="winner-card">${inner}</div>`);
+      }
+      grid.innerHTML = cards.length ? cards.join("") : `<p style="color:var(--muted)">Single-shader legacy entry (upgrade CI to v2 for full category winners).</p>`;
+      syncActiveWinnerCard();
+    }
+
+    let suiteFilter = "avg:all";
+    let sortField = "medianMs";
+    let sortDir = "asc";
+    let currentPage = 1;
+    let pageSize = 12;
+
+    function aggregateByStage(suites, categoryFilter) {
+      const target = categoryFilter === "all" ? suites : suites.filter(r => (r.category || "Compute") === categoryFilter);
+      const byCat = new Map();
+      for (const r of target) {
+        const cat = r.category || "Compute";
+        if (!byCat.has(cat)) byCat.set(cat, []);
+        byCat.get(cat).push(r);
+      }
+      const fields = ["coldMs", "medianMs", "shortJobMs", "longJobMs", "peakRssMb"];
+      const out = [];
+      for (const [cat, catRows] of byCat.entries()) {
+        const maxByField = {};
+        for (const f of fields) maxByField[f] = computeMaxByBench(catRows, f);
+        const catBenchCount = maxByField.medianMs.size;
+
+        const byBackend = new Map();
+        for (const r of catRows) {
+          if (!byBackend.has(r.backend)) byBackend.set(r.backend, []);
+          byBackend.get(r.backend).push(r);
+        }
+
+        for (const [backend, group] of byBackend.entries()) {
+          const ranRows = group.filter(r => r.ran);
+          const totalTests = catBenchCount || group.length;
+          const testLabel = `${cat} Avg (${totalTests} test${totalTests === 1 ? "" : "s"})`;
+          if (ranRows.length > 0) {
+            const penalizedMean = (f) => {
+              const maxMap = maxByField[f];
+              if (!maxMap || maxMap.size === 0) return 0;
+              const ranByBench = new Map();
+              for (const r of ranRows) {
+                const v = metricVal(r, f);
+                if (v > 0) ranByBench.set(r.benchId || "bench_raymarch", v);
+              }
+              const vals = [];
+              for (const [bid, maxV] of maxMap.entries()) {
+                vals.push(ranByBench.has(bid) ? ranByBench.get(bid) : PENALTY_MULTIPLIER * maxV);
+              }
+              return geomean(vals);
+            };
+            const missingCount = Math.max(0, totalTests - ranRows.length);
+            out.push({
+              benchId: `stage:${cat}`,
+              benchName: testLabel,
+              category: cat,
+              backend,
+              coldMs: penalizedMean("coldMs"),
+              medianMs: penalizedMean("medianMs"),
+              shortJobMs: penalizedMean("shortJobMs"),
+              longJobMs: penalizedMean("longJobMs"),
+              peakRssMb: penalizedMean("peakRssMb"),
+              ran: true,
+              status: missingCount > 0 ? `AVG (${ranRows.length}/${totalTests} · penalized)` : `AVG (${ranRows.length}/${totalTests})`,
+            });
+          } else {
+            out.push({
+              benchId: `stage:${cat}`,
+              benchName: testLabel,
+              category: cat,
+              backend,
+              coldMs: 0,
+              medianMs: 0,
+              shortJobMs: 0,
+              longJobMs: 0,
+              peakRssMb: 0,
+              ran: false,
+              status: group[0].status,
+            });
+          }
+        }
+      }
+      return out;
+    }
+
+    function getFilteredSortedSuites(entry) {
+      const suites = getEntrySuites(entry);
+      const [mode, param] = getGlobalScope().split(":");
+      let filtered;
+      if (mode === "shader") {
+        filtered = suites.filter(r => (r.benchId || "bench_raymarch") === param);
+      } else if (mode === "cat") {
+        filtered = aggregateByStage(suites, param);
+      } else {
+        filtered = aggregateByStage(suites, "all");
+      }
+      if (sortField === "default") return filtered;
+
+      const numericFields = new Set(["coldMs", "medianMs", "shortJobMs", "longJobMs", "peakRssMb"]);
+      const isNum = numericFields.has(sortField);
+      const valOf = (r) => {
+        if (!r.ran) return isNum ? (sortDir === "asc" ? Infinity : -Infinity) : "~~~";
+        if (sortField === "coldMs") return Number(r.coldMs || r.compileMs || 0);
+        if (isNum) return Number(r[sortField] || 0);
+        return String(r[sortField] || r.benchId || "").toLowerCase();
+      };
+      filtered.sort((a, b) => {
+        const va = valOf(a);
+        const vb = valOf(b);
+        if (va < vb) return sortDir === "asc" ? -1 : 1;
+        if (va > vb) return sortDir === "asc" ? 1 : -1;
+        return 0;
+      });
+      return filtered;
+    }
+
+    function getPagedRows(rows) {
+      if (pageSize <= 0) return { items: rows, totalPages: 1, total: rows.length, start: 0 };
+      const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+      if (currentPage > totalPages) currentPage = totalPages;
+      if (currentPage < 1) currentPage = 1;
+      const start = (currentPage - 1) * pageSize;
+      return { items: rows.slice(start, start + pageSize), totalPages, total: rows.length, start };
+    }
+
+    function renderPaginationControls(containerId, pageInfo) {
+      const el = document.getElementById(containerId);
+      if (!el) return;
+      if (pageInfo.total === 0) {
+        el.innerHTML = "";
+        return;
+      }
+      const from = pageInfo.start + 1;
+      const to = pageInfo.start + pageInfo.items.length;
+      el.innerHTML = `
+        <span>Showing ${from}–${to} of ${pageInfo.total}</span>
+        <div class="controls-row">
+          <button type="button" class="meta-pill" data-page-act="prev" ${currentPage <= 1 ? "disabled" : ""}>← Prev</button>
+          <span>Page ${currentPage} / ${pageInfo.totalPages}</span>
+          <button type="button" class="meta-pill" data-page-act="next" ${currentPage >= pageInfo.totalPages ? "disabled" : ""}>Next →</button>
+        </div>`;
+      el.querySelector('[data-page-act="prev"]')?.addEventListener("click", () => {
+        if (currentPage > 1) { currentPage--; renderCommitData(benchHistory[selectedIndex]); }
+      });
+      el.querySelector('[data-page-act="next"]')?.addEventListener("click", () => {
+        if (currentPage < pageInfo.totalPages) { currentPage++; renderCommitData(benchHistory[selectedIndex]); }
+      });
+    }
+
+    function updateSortHeaders() {
+      document.querySelectorAll("th.sortable").forEach(th => {
+        const f = th.dataset.sort;
+        const base = th.dataset.baseLabel || th.textContent.replace(/ [▲▼⇅]$/, "");
+        th.dataset.baseLabel = base;
+        const isActive = (f === sortField);
+        th.classList.toggle("active-sort", isActive);
+        th.textContent = isActive ? `${base} ${sortDir === "asc" ? "▲" : "▼"}` : `${base} ⇅`;
+      });
+      const sortSelect = document.getElementById("sort-metric");
+      if (sortSelect) {
+        const candidate = `${sortField}:${sortDir}`;
+        if ([...sortSelect.options].some(o => o.value === candidate)) {
+          sortSelect.value = candidate;
+        }
+      }
+      const pageVal = pageSize <= 0 ? "all" : String(pageSize);
+      const pageSel = document.getElementById("page-size");
+      if (pageSel) pageSel.value = pageVal;
+      const tablePageSel = document.getElementById("table-page-size");
+      if (tablePageSel) tablePageSel.value = pageVal;
+    }
+
+    function formatBenchName(r) {
+      return String(r.benchName || r.benchId || "Raymarcher").replace(/\s*\(Shadertoy PS\)\s*$/i, "");
+    }
+
+    function renderBarSVG(entry) {
+      const wrap = document.getElementById("bar-svg-wrap");
+      const allRan = getFilteredSortedSuites(entry).filter(r => r.ran);
+      const pageInfo = getPagedRows(allRan);
+      const ran = pageInfo.items;
+      renderPaginationControls("bar-pagination", pageInfo);
+      if (!ran.length) {
+        wrap.innerHTML = `<p style="color: var(--muted)">No benchmark results for this filter.</p>`;
+        return;
+      }
+
+      const barMetric = (sortField === "coldMs" || sortField === "shortJobMs" || sortField === "longJobMs" || sortField === "peakRssMb")
+        ? sortField : "medianMs";
+      const unit = barMetric === "peakRssMb" ? "MB" : "ms";
+      const valOf = (r) => barMetric === "coldMs" ? Number(r.coldMs || r.compileMs || 0) : Number(r[barMetric] || 0);
+      const maxVal = Math.max(...ran.map(valOf), 0.1);
+      const labels = ran.map(r => `${formatBenchName(r)} · ${r.backend}`);
+      const maxLabelLen = Math.max(...labels.map(l => l.length), 20);
+      const rowH = 34;
+      const padLeft = Math.max(240, Math.min(480, Math.ceil(maxLabelLen * 6.8) + 28));
+      const padRight = 115;
+      const barW = 500;
+      const width = padLeft + barW + padRight;
+      const height = 20 + ran.length * rowH;
+
+      const rows = ran.map((r, i) => {
+        const y = 10 + i * rowH;
+        const v = valOf(r);
+        const w = Math.max(4, (v / maxVal) * barW);
+        const label = labels[i];
+        const valText = `${barMetric === "peakRssMb" ? v.toFixed(1) : v.toFixed(2)} ${unit}`;
+        return `
+          <g transform="translate(0, ${y})">
+            <text x="${padLeft - 14}" y="19" text-anchor="end" font-size="11" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(label)}</text>
+            <rect x="${padLeft}" y="6" width="${w.toFixed(1)}" height="16" rx="4" fill="${colorForBackend(r.backend)}">
+              <title>${escapeHtml(label)}: ${valText}</title>
+            </rect>
+            <text x="${(padLeft + w + 12).toFixed(1)}" y="19" font-size="11" font-family="var(--font-mono)" fill="var(--muted)">${valText}</text>
+          </g>`;
+      }).join("");
+
+      wrap.innerHTML = `
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Backend benchmark comparison">
+          <title>Benchmark comparison for ${escapeHtml(entry.shortSha)}</title>
+          ${rows}
+        </svg>`;
+    }
+
+    function renderTable(entry) {
+      const tbody = document.getElementById("bench-tbody");
+      const allRows = getFilteredSortedSuites(entry);
+      const pageInfo = getPagedRows(allRows);
+      renderPaginationControls("table-pagination", pageInfo);
+      updateSortHeaders();
+      tbody.innerHTML = pageInfo.items.map(r => `
+        <tr>
+          <th scope="row">${escapeHtml(formatBenchName(r))}</th>
+          <td>${escapeHtml(r.category || "Compute")}</td>
+          <td>${escapeHtml(r.backend)}</td>
+          <td>${r.ran && r.coldMs ? r.coldMs.toFixed(2) : (r.ran ? r.compileMs.toFixed(2) : "—")}</td>
+          <td>${r.ran ? r.medianMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.shortJobMs ? r.shortJobMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.longJobMs ? r.longJobMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.peakRssMb ? r.peakRssMb.toFixed(1) : "—"}</td>
+          <td>${escapeHtml(r.status)}</td>
+        </tr>`).join("");
+    }
+
+    function renderCommitData(entry) {
+      if (!entry) return;
+      renderBarSVG(entry);
+      renderTable(entry);
+    }
+
+    function drawSingleTrendCanvas(canvasId, wrapId, trendKey) {
+      const canvas = document.getElementById(canvasId);
+      const wrap = document.getElementById(wrapId);
+      if (!canvas || !wrap) return;
+      const rect = wrap.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * dpr);
+      canvas.height = Math.round(rect.height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+
+      const W = rect.width;
+      const H = rect.height;
+      const pad = { top: 24, right: 32, bottom: 38, left: 68 };
+      const plotW = W - pad.left - pad.right;
+      const plotH = H - pad.top - pad.bottom;
+
+      const hiddenSet = hiddenSeriesByLegend[LEGEND_FOR_CANVAS[canvasId]] || new Set();
+      const seriesDefs = getActiveFamilies()
+        .filter(f => !hiddenSet.has(f.key))
+        .map(f => ({
+          key: f.key,
+          color: familyColor(f),
+          label: f.label,
+        }));
+
+      const borderCol = cssVar("--border");
+      const mutedCol = cssVar("--muted");
+      const surfaceCol = cssVar("--surface");
+      ctx.clearRect(0, 0, W, H);
+
+      if (!seriesDefs.length) {
+        ctx.font = "12px " + cssVar("--font-mono");
+        ctx.fillStyle = mutedCol;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("All series hidden — click a legend item to show.", W / 2, H / 2);
+        canvas._xs = [];
+        return;
+      }
+
+      const winVal = document.getElementById("commit-window")?.value || "all";
+      const winCount = winVal === "all" ? benchHistory.length : Math.max(1, Number(winVal));
+      const startWinIdx = Math.max(0, benchHistory.length - winCount);
+
+      const rawParsed = [];
+      for (let idx = startWinIdx; idx < benchHistory.length; idx++) {
+        const h = benchHistory[idx];
+        rawParsed.push({ h, m: extractMetrics(h, trendKey), i: idx });
+      }
+
+      const firstDataIdx = rawParsed.findIndex(p => seriesDefs.some(s => p.m[s.key]));
+
+      if (firstDataIdx === -1) {
+        ctx.font = "12px " + cssVar("--font-mono");
+        ctx.fillStyle = mutedCol;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText("No data recorded for this scope in the selected commit window.", W / 2, H / 2);
+        canvas._xs = [];
+        return;
+      }
+
+      const parsed = rawParsed.slice(firstDataIdx);
+      let maxVal = 1;
+      for (const p of parsed) {
+        for (const s of seriesDefs) {
+          if (p.m[s.key]) maxVal = Math.max(maxVal, p.m[s.key].val);
+        }
+      }
+      maxVal *= 1.12;
+
+      ctx.font = "11px " + cssVar("--font-mono");
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      for (let g = 0; g <= 4; g++) {
+        const val = (maxVal * g) / 4;
+        const y = pad.top + plotH * (1 - g / 4);
+        ctx.strokeStyle = borderCol;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(W - pad.right, y);
+        ctx.stroke();
+        ctx.fillStyle = mutedCol;
+        ctx.fillText(val >= 100 ? Math.round(val).toString() : val.toFixed(1), pad.left - 8, y);
+      }
+
+      const xFor = (localIdx) => parsed.length === 1
+        ? pad.left + plotW / 2
+        : pad.left + (localIdx / (parsed.length - 1)) * plotW;
+
+      for (const s of seriesDefs) {
+        const pts = [];
+        parsed.forEach((p, localIdx) => {
+          if (p.m[s.key]) {
+            pts.push({ x: xFor(localIdx), y: pad.top + plotH * (1 - p.m[s.key].val / maxVal), i: p.i });
+          }
+        });
+        if (pts.length > 1) {
+          ctx.beginPath();
+          ctx.moveTo(pts[0].x, pts[0].y);
+          for (let k = 1; k < pts.length; k++) ctx.lineTo(pts[k].x, pts[k].y);
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = 2.2;
+          ctx.stroke();
+        } else if (pts.length === 1) {
+          ctx.save();
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(pad.left, pts[0].y);
+          ctx.lineTo(W - pad.right, pts[0].y);
+          ctx.strokeStyle = s.color;
+          ctx.globalAlpha = 0.35;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+          ctx.restore();
+        }
+        for (const p of pts) {
+          ctx.beginPath();
+          const radius = pts.length === 1 ? 5.5 : (p.i === selectedIndex || p.i === hoveredIndex ? 5 : 3.2);
+          ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
+          ctx.fillStyle = s.color;
+          ctx.fill();
+          ctx.lineWidth = 1.5;
+          ctx.strokeStyle = surfaceCol;
+          ctx.stroke();
+        }
+      }
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      const step = Math.max(1, Math.ceil(parsed.length / 8));
+      parsed.forEach((p, localIdx) => {
+        if (localIdx % step === 0 || localIdx === parsed.length - 1) {
+          ctx.fillStyle = mutedCol;
+          ctx.fillText(p.h.shortSha, xFor(localIdx), pad.top + plotH + 8);
+        }
+      });
+
+      canvas._xs = parsed.map((p, localIdx) => ({ x: xFor(localIdx), p }));
+    }
+
+    function drawTrendChart() {
+      const scope = getGlobalScope();
+      const memKey = getMemoryScopeKey(scope);
+      drawSingleTrendCanvas("trend-canvas", "trend-wrap", scope);
+      drawSingleTrendCanvas("mem-trend-canvas", "mem-trend-wrap", memKey);
+    }
+
+    function populateTrendSelector() {
+      const sel = document.getElementById("global-scope");
+      if (!sel) return;
+      const seenShaders = new Map([["bench_raymarch", { name: "Raymarcher (ALU+CF)", cat: "Compute" }]]);
+      for (const h of benchHistory) {
+        for (const r of getEntrySuites(h)) {
+          const id = r.benchId || "bench_raymarch";
+          if (!seenShaders.has(id)) {
+            seenShaders.set(id, { name: formatBenchName(r), cat: r.category || "Compute" });
+          }
+        }
+      }
+
+      const overallOpts = [
+        { val: "overall:all:medianMs", label: "Overall Geomean (All Stages, ms)" },
+        { val: "regime:all:coldMs", label: "Regime: Cold JIT Time (geomean ms)" },
+        { val: "regime:all:medianMs", label: "Regime: Hot JIT Time (geomean ms)" },
+        { val: "regime:all:shortJobMs", label: "Regime: Short-Running Job (geomean ms)" },
+        { val: "regime:all:longJobMs", label: "Regime: Long-Running Job (geomean ms)" },
+        { val: "regime:all:peakRssMb", label: "Regime: Lowest Peak Memory (geomean MB)" },
+      ];
+      const stageOpts = [
+        { val: "cat:Compute:medianMs", label: "Stage Avg: Compute (ms)" },
+        { val: "cat:Vertex:medianMs", label: "Stage Avg: Vertex (ms)" },
+        { val: "cat:Pixel:medianMs", label: "Stage Avg: Pixel (ms)" },
+        { val: "cat:Geometry:medianMs", label: "Stage Avg: Geometry (ms)" },
+        { val: "cat:Tessellation:medianMs", label: "Stage Avg: Tessellation (ms)" },
+        { val: "cat:Ray Tracing:medianMs", label: "Stage Avg: Ray Tracing (ms)" },
+        { val: "cat:Mesh:medianMs", label: "Stage Avg: Mesh (ms)" },
+      ];
+      const shaderOpts = [...seenShaders.entries()].map(([id, info]) => ({
+        val: `shader:${id}:medianMs`,
+        label: `Test: ${info.name} (${info.cat})`
+      }));
+
+      const renderGroup = (label, items) =>
+        `<optgroup label="${escapeHtml(label)}">${items.map(o => `<option value="${escapeHtml(o.val)}">${escapeHtml(o.label)}</option>`).join("")}</optgroup>`;
+
+      sel.innerHTML =
+        renderGroup("Overall & Regimes", overallOpts) +
+        renderGroup("Per-Stage Averages", stageOpts) +
+        renderGroup("Individual Shaders", shaderOpts);
+      sel.value = "overall:all:medianMs";
+    }
+
+    function selectCommit(idx) {
+      if (idx < 0 || idx >= benchHistory.length) return;
+      selectedIndex = idx;
+      currentPage = 1;
+      renderKPIs(idx);
+      renderWinners(benchHistory[idx]);
+      renderCommitData(benchHistory[idx]);
+      drawTrendChart();
+    }
+
+    function attachTrendInteraction(canvasId, tooltipId) {
+      const canvas = document.getElementById(canvasId);
+      const tooltip = document.getElementById(tooltipId);
+      if (!canvas || !tooltip) return;
+
+      canvas.addEventListener("pointermove", (e) => {
+        const xs = canvas._xs || [];
+        if (!xs.length) return;
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        let nearest = xs[0];
+        let best = Math.abs(mx - nearest.x);
+        for (const item of xs) {
+          const d = Math.abs(mx - item.x);
+          if (d < best) { best = d; nearest = item; }
+        }
+        hoveredIndex = nearest.p.i;
+        drawTrendChart();
+
+        const m = nearest.p.m;
+        const fmt = (it) => it ? `${it.val.toFixed(2)} ${m.unit}` : "—";
+        const dot = (col) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${col};margin-right:4px;"></span>`;
+        const hiddenSet = hiddenSeriesByLegend[LEGEND_FOR_CANVAS[canvasId]] || new Set();
+        const visibleFamilies = getActiveFamilies().filter(f => !hiddenSet.has(f.key));
+        const lines = visibleFamilies.length
+          ? visibleFamilies.map(f =>
+              `<div>${dot(familyColor(f))}${escapeHtml(f.label)}: ${fmt(m[f.key])}</div>`
+            ).join("")
+          : `<div>All series hidden</div>`;
+        tooltip.innerHTML = `
+          <div class="tt-sha">${escapeHtml(nearest.p.h.shortSha)}</div>
+          <div class="tt-msg">${escapeHtml(nearest.p.h.message || "—")}</div>
+          ${lines}`;
+        tooltip.style.left = `${Math.max(105, Math.min(rect.width - 105, nearest.x))}px`;
+        tooltip.style.top = `48px`;
+        tooltip.classList.add("visible");
+      });
+      canvas.addEventListener("pointerleave", () => {
+        hoveredIndex = -1;
+        tooltip.classList.remove("visible");
+        drawTrendChart();
+      });
+      canvas.addEventListener("click", () => {
+        if (hoveredIndex >= 0) selectCommit(hoveredIndex);
+      });
+    }
+
+    function setupInteraction() {
+      document.getElementById("platform-select")?.addEventListener("change", (e) => {
+        const nextPlatform = e.target.value === "macos" ? "macos" : "windows";
+        const url = new URL(window.location.href);
+        url.searchParams.set("os", nextPlatform);
+        window.history.replaceState({}, "", url);
+        loadPlatformData(nextPlatform);
+      });
+      document.getElementById("global-scope")?.addEventListener("change", (e) => {
+        const [mode, , field] = e.target.value.split(":");
+        if (mode === "regime" && field) {
+          sortField = field;
+          sortDir = "asc";
+        }
+        currentPage = 1;
+        renderKPIs(selectedIndex);
+        renderCommitData(benchHistory[selectedIndex]);
+        drawTrendChart();
+        syncActiveWinnerCard();
+      });
+      document.getElementById("winners-grid")?.addEventListener("click", (e) => {
+        const btn = e.target.closest("button.winner-card[data-scope]");
+        if (btn) selectGlobalScope(btn.dataset.scope);
+      });
+      document.getElementById("overall-winner-pill")?.addEventListener("click", () => {
+        selectGlobalScope("overall:all:medianMs");
+      });
+      document.getElementById("commit-window")?.addEventListener("change", () => {
+        drawTrendChart();
+      });
+      document.getElementById("sort-metric")?.addEventListener("change", (e) => {
+        const [field, dir] = e.target.value.split(":");
+        sortField = field;
+        sortDir = dir || "asc";
+        currentPage = 1;
+        renderCommitData(benchHistory[selectedIndex]);
+      });
+      const onPageSizeChange = (e) => {
+        const val = e.target.value;
+        pageSize = val === "all" ? 0 : Number(val);
+        currentPage = 1;
+        renderCommitData(benchHistory[selectedIndex]);
+      };
+      document.getElementById("page-size")?.addEventListener("change", onPageSizeChange);
+      document.getElementById("table-page-size")?.addEventListener("change", onPageSizeChange);
+      document.querySelectorAll("th.sortable").forEach((th) => {
+        th.addEventListener("click", () => {
+          const field = th.dataset.sort;
+          if (!field) return;
+          if (sortField === field) {
+            sortDir = sortDir === "asc" ? "desc" : "asc";
+          } else {
+            sortField = field;
+            sortDir = "asc";
+          }
+          currentPage = 1;
+          renderCommitData(benchHistory[selectedIndex]);
+        });
+      });
+
+      attachTrendInteraction("trend-canvas", "trend-tooltip");
+      attachTrendInteraction("mem-trend-canvas", "mem-trend-tooltip");
+
+      for (const legendId of ["trend-legend", "mem-trend-legend"]) {
+        document.getElementById(legendId)?.addEventListener("click", (e) => {
+          const btn = e.target.closest("button.legend-item[data-family]");
+          if (!btn) return;
+          const famKey = btn.dataset.family;
+          const hidden = hiddenSeriesByLegend[legendId];
+          if (hidden.has(famKey)) hidden.delete(famKey);
+          else hidden.add(famKey);
+          const isHidden = hidden.has(famKey);
+          btn.classList.toggle("is-hidden", isHidden);
+          btn.setAttribute("aria-pressed", String(!isHidden));
+          drawTrendChart();
+        });
+      }
+    }
+
+    async function loadPlatformData(platform) {
+      activePlatform = platform === "macos" ? "macos" : "windows";
+      const dataPath = activePlatform === "macos" ? "data/bench-history-macos.json" : "data/bench-history.json";
+      const fallback = activePlatform === "macos" ? FALLBACK_BENCH_MACOS : FALLBACK_BENCH;
+      const sel = document.getElementById("platform-select");
+      if (sel) sel.value = activePlatform;
+      document.title = activePlatform === "macos"
+        ? "Crucible — macOS DXIL-to-Metal Benchmarks"
+        : "Crucible — Shader Benchmarks";
+      try {
+        const resp = await fetch(dataPath, { cache: "no-store" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const json = await resp.json();
+        benchHistory = Array.isArray(json) && json.length ? json : fallback;
+      } catch {
+        benchHistory = fallback;
+      }
+      populateTrendSelector();
+      selectedIndex = benchHistory.length - 1;
+      hoveredIndex = -1;
+      currentPage = 1;
+      selectCommit(selectedIndex);
+    }
+
+    async function init() {
+      const params = new URLSearchParams(window.location.search);
+      const osParam = (params.get("os") || "").toLowerCase();
+      const initialPlatform = osParam === "windows" ? "windows" : "macos";
+      setupThemeToggle();
+      await loadPlatformData(initialPlatform);
+      setupInteraction();
+      new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("trend-wrap"));
+      new ResizeObserver(() => drawTrendChart()).observe(document.getElementById("mem-trend-wrap"));
+    }
+
+    init();
+  </script>
+</body>
+</html>

@@ -143,6 +143,27 @@ reinventing it:
   lit conventions, benchmark harness, and the compliance dashboard were
   lifted from our DXIL software rasterizer.
 
+## Benchmarks
+
+`scripts/bench.py` benchmarks crucible against Apple's metal-shaderconverter
+on the same DXIL: both convert identical dxc output, dispatch through the same
+minimal native runner (`crucible-run --bench-json`, GPU timestamps), and the
+results publish to the `pages/bench.html` trend dashboard (ported from
+Nacelle). MSC's argument-buffer ABI is honored via root-descriptor GPU
+addresses at its fixed bind point — no IRConverter SDK required at runtime.
+
+First results on Apple Silicon (median GPU ms, lower is better):
+
+| Workload | crucible | metal-shaderconverter |
+|---|---|---|
+| Streaming FMA (memory-bound) | 1.59 | 1.59 |
+| Mandelbrot loop (ALU-bound) | 1.54 | **1.16** |
+| Groupshared reduction (barrier-bound) | **1.26** | 1.64 |
+| Wave prefix ops (simd-bound) | 1.55 | 1.54 |
+
+Direct bindings already win on binding-heavy workloads; loop codegen quality
+is the current optimization target.
+
 ## Roadmap
 
 - [x] **Milestone 1** — DXContainer loader, compute kernels, structured
@@ -151,8 +172,8 @@ reinventing it:
 - [x] **Milestone 2** — CFG structurization via MLIR `ControlFlowToSCF`
   (`if`/`else`, do-while/while loops, PHI demotion), cbuffers (incl. mixed
   float/uint rows), raw buffer ops, signedness recovery.
-- [ ] **Milestone 3** — groupshared + barriers, atomics, wave ops
-  (`simd_*`), SM 6.8 packed/vector dot products, benchmarks vs.
+- [x] **Milestone 3** — groupshared + barriers, atomics, wave ops
+  (`simd_*`), SM 6.4/6.8 packed dot products, benchmarks vs.
   `metal-shaderconverter`.
 - [x] **Milestone 4 (partial)** — offload-test-suite integration
   (`crucible-offload` + `check-crucible-offload`) and public compliance
