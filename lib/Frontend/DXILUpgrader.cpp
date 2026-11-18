@@ -163,6 +163,67 @@ static void parseResources(const Module &M, const ResourceWidths &Widths,
                     ResourceClass::CBV, Widths, R.Resources);
   parseResourceList(dyn_cast_or_null<MDNode>(Root->getOperand(3).get()),
                     ResourceClass::Sampler, Widths, R.Resources);
+
+  // Infer finite bounds for unbounded arrays (rangeSize == -1) when every
+  // createHandle referencing them uses a constant register index.
+  for (ResourceBinding &RB : R.Resources) {
+    if (RB.RangeSize != 0xFFFFFFFFu)
+      continue;
+    bool AllConst = true;
+    uint32_t MaxReg = RB.LowerBound;
+    bool SawAny = false;
+    for (const Function &F : M) {
+      for (const BasicBlock &BB : F) {
+        for (const Instruction &I : BB) {
+          const auto *CI = dyn_cast<CallInst>(&I);
+          if (!CI || !CI->getCalledFunction())
+            continue;
+          if (!CI->getCalledFunction()->getName().starts_with(
+                  "dx.op.createHandle"))
+            continue;
+          if (CI->arg_size() < 4)
+            continue;
+          auto *OpC = dyn_cast<ConstantInt>(CI->getArgOperand(0));
+          if (!OpC || OpC->getZExtValue() != 57) // CreateHandle
+            continue;
+          auto *ClsC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+          auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+          if (!ClsC || !IdC ||
+              static_cast<ResourceClass>(ClsC->getZExtValue()) != RB.Class ||
+              IdC->getZExtValue() != RB.RecordID)
+            continue;
+          SawAny = true;
+          if (auto *RegC = dyn_cast<ConstantInt>(CI->getArgOperand(3))) {
+            uint32_t Reg = static_cast<uint32_t>(RegC->getZExtValue());
+            if (Reg > MaxReg)
+              MaxReg = Reg;
+          } else {
+            AllConst = false;
+            break;
+          }
+        }
+        if (!AllConst)
+          break;
+      }
+      if (!AllConst)
+        break;
+    }
+    if (AllConst && SawAny && MaxReg >= RB.LowerBound)
+      RB.RangeSize = MaxReg - RB.LowerBound + 1;
+  }
+  for (const Function &F : M) {
+    if (F.getName().starts_with("dx.op.getDimensions")) {
+      for (const ResourceBinding &RB : R.Resources) {
+        if (RB.Kind == ResourceKind::StructuredBuffer ||
+            RB.Kind == ResourceKind::RawBuffer ||
+            RB.Kind == ResourceKind::TypedBuffer) {
+          R.HasBufferDimensions = true;
+          break;
+        }
+      }
+      break;
+    }
+  }
 }
 
 static ShaderStage parseStage(StringRef Name) {
@@ -182,6 +243,7 @@ static ShaderStage parseStage(StringRef Name) {
 // DXIL entry-point property tags (hlsl::DXIL::EntryPropsTag).
 enum : uint32_t {
   kDxilShaderFlagsTag = 0,
+  kDxilDSStateTag = 2,
   kDxilNumThreadsTag = 4,
 };
 
@@ -218,9 +280,37 @@ static Error parseStageParameters(const MDNode *List,
                    static_cast<uint32_t>(mdUInt(N->getOperand(3))),
                    static_cast<uint32_t>(mdUInt(N->getOperand(5))),
                    static_cast<uint32_t>(mdUInt(N->getOperand(6))),
-                   static_cast<uint32_t>(mdUInt(N->getOperand(7)))});
+                   static_cast<uint32_t>(mdUInt(N->getOperand(7))), {}});
+    for (const MDOperand &Index : Indices->operands())
+      Out.back().RowSemanticIndices.push_back(mdUInt(Index));
   }
   return Error::success();
+}
+
+static Error parseDomainInterface(const MDNode *Props, const MDNode *Sig,
+                                  Reflection &R) {
+  if (!Props || !Sig || Sig->getNumOperands() < 3)
+    return makeError("missing DXIL domain shader metadata");
+  for (unsigned I = 0; I + 1 < Props->getNumOperands(); I += 2) {
+    if (mdUInt(Props->getOperand(I)) != kDxilDSStateTag)
+      continue;
+    auto *State = dyn_cast_or_null<MDNode>(Props->getOperand(I + 1).get());
+    if (!State || State->getNumOperands() != 2)
+      return makeError("invalid DXIL domain shader state");
+    auto Kind = mdUInt(State->getOperand(0));
+    auto Count = mdUInt(State->getOperand(1));
+    if (Kind != static_cast<unsigned>(TessellationDomain::Triangle) &&
+        Kind != static_cast<unsigned>(TessellationDomain::Quad))
+      return makeError("only triangle and quad tessellation domains are supported");
+    if (Count < 1 || Count > 32)
+      return makeError("invalid DXIL domain control-point count");
+    R.Domain = DomainInterface{static_cast<TessellationDomain>(Kind),
+                               static_cast<uint32_t>(Count), {}};
+    return parseStageParameters(
+        dyn_cast_or_null<MDNode>(Sig->getOperand(2).get()),
+        R.Domain->PatchConstants);
+  }
+  return makeError("missing DXIL domain shader state");
 }
 
 static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
@@ -241,8 +331,11 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
     if (!F)
       continue;
     R.EntryName = Name.str();
-    if (R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel) {
-      if (auto *Sig = dyn_cast_or_null<MDNode>(EP->getOperand(2).get())) {
+    auto *Sig = dyn_cast_or_null<MDNode>(EP->getOperand(2).get());
+    auto *Props = dyn_cast_or_null<MDNode>(EP->getOperand(4).get());
+    if (R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel ||
+        R.Stage == ShaderStage::Domain) {
+      if (Sig) {
         if (Sig->getNumOperands() < 2)
           return makeError("invalid DXIL entry signature");
         if (Error E = parseStageParameters(
@@ -253,7 +346,10 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
           return E;
       }
     }
-    parseEntryProps(dyn_cast_or_null<MDNode>(EP->getOperand(4).get()), R);
+    if (R.Stage == ShaderStage::Domain)
+      if (Error E = parseDomainInterface(Props, Sig, R))
+        return E;
+    parseEntryProps(Props, R);
     return F;
   }
   return makeError("entry point '{0}' not found in dx.entryPoints",
@@ -358,7 +454,10 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
                          GetContainedTypeIDTy GetContained) {
     if (!isa<PointerType>(GetType(ID)))
       return;
-    auto *Ty = dyn_cast_or_null<StructType>(GetType(GetContained(ID, 0)));
+    Type *Pointee = GetType(GetContained(ID, 0));
+    while (auto *Arr = dyn_cast_or_null<ArrayType>(Pointee))
+      Pointee = Arr->getElementType();
+    auto *Ty = dyn_cast_or_null<StructType>(Pointee);
     if (!Ty || !Ty->hasName() || Ty->isOpaque() || Ty->getNumElements() != 1 ||
         !(Ty->getName().starts_with("class.Buffer<") ||
           Ty->getName().starts_with("class.RWBuffer<")))
@@ -368,6 +467,11 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
     unsigned Components = Vec ? Vec->getNumElements() : 1;
     Type *Scalar = Elem->getScalarType();
     if (Components > 4 || !(Scalar->isIntegerTy() || Scalar->isFloatingPointTy()))
+      return;
+    // DXIL typed buffer operations access 64-bit integers as pairs of i32s.
+    if (Scalar->isIntegerTy(64))
+      Components *= 2;
+    if (Components > 4)
       return;
     // Typed undef symbols with different pointees become the same opaque
     // pointer value. Keep the metadata records distinct until reflection.

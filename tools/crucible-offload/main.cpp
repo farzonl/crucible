@@ -15,11 +15,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "API/FormatConversion.h"
 #include "Support/Check.h"
 #include "Support/Pipeline.h"
 
 #include "crucible/Compiler.h"
 
+#include "llvm/Object/DXContainer.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -34,7 +36,10 @@
 #define MTL_PRIVATE_IMPLEMENTATION
 #include "SingleHeader/Metal.hpp"
 
+#include <cerrno>
+#include <cstdlib>
 #include <map>
+#include <tuple>
 #include <string>
 
 using namespace llvm;
@@ -52,6 +57,8 @@ static cl::opt<std::string> OutputFilename("o", cl::desc("Output filename"),
                                            cl::init("-"));
 static cl::opt<bool>
     Quiet("quiet", cl::desc("Suppress printing the pipeline as output"));
+static cl::opt<bool>
+    Validation("validation-layer", cl::desc("Enable Metal API Validation"));
 
 // Crucible implements the D3D12 shader/binding contract (the MoltenVK model);
 // Metal is the backend. Accept the offloader's -api flag for drop-in
@@ -284,6 +291,10 @@ Error executeRaster(Pipeline &P) {
   auto CO = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
   CO->setFastMathEnabled(false);
   bool HasVertex = false, HasPixel = false, UsesVertexBuffer = false;
+  bool WritesDepth = false;
+  constexpr unsigned VertexDataSlot = 30;
+  std::map<CPUBuffer *, NS::SharedPtr<MTL::Buffer>> RasterBuffers;
+  SmallVector<std::tuple<bool, unsigned, MTL::Buffer *>, 8> BufferBindings;
   size_t Stride = B.VertexBufferPtr ? B.VertexBufferPtr->Stride : 0;
   if (!Stride)
     Stride = B.getVertexStride();
@@ -301,8 +312,36 @@ Error executeRaster(Pipeline &P) {
     if (R.Stage != (Vertex ? crucible::ShaderStage::Vertex
                            : crucible::ShaderStage::Pixel))
       return Fail("DXIL shader stage does not match the raster pipeline");
-    if (!R.Resources.empty())
-      return Fail("raster shader resource bindings are not supported yet");
+    for (const auto &RB : R.Resources) {
+      if (RB.RangeSize != 1 || RB.HasCounter ||
+          (RB.Kind != crucible::ResourceKind::StructuredBuffer &&
+           RB.Kind != crucible::ResourceKind::RawBuffer &&
+           RB.Kind != crucible::ResourceKind::TypedBuffer &&
+           RB.Kind != crucible::ResourceKind::CBuffer))
+        return Fail("unsupported raster shader resource kind");
+      if (RB.MetalIndex >= VertexDataSlot)
+        return Fail("raster buffer binding exceeds the available slots");
+      CPUBuffer *CPU = nullptr;
+      for (auto &Set : P.Sets)
+        for (auto &Res : Set.Resources)
+          if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+              !isTextureResource(Res.Kind) && !Res.HasCounter &&
+              !Res.IsReserved &&
+              Res.DXBinding->Space == RB.Space &&
+              Res.DXBinding->Register == RB.LowerBound &&
+              Res.getArraySize() == 1)
+            CPU = Res.BufferPtr;
+      if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
+          !CPU->Data[0])
+        return Fail("missing backing buffer for raster shader resource");
+      auto &GPU = RasterBuffers[CPU];
+      if (!GPU)
+        GPU = NS::TransferPtr(Device->newBuffer(CPU->Data[0].get(), CPU->Size,
+                                               MTL::ResourceStorageModeShared));
+      if (!GPU)
+        return Fail("cannot allocate raster shader buffer");
+      BufferBindings.emplace_back(Vertex, RB.MetalIndex, GPU.get());
+    }
     if (!Vertex && llvm::any_of(R.Outputs, [](const auto &P) {
           return P.SemanticIndex != 0;
         }))
@@ -317,6 +356,9 @@ Error executeRaster(Pipeline &P) {
     if (!Fn)
       return Fail("compiled raster entry point was not found");
     if (!Vertex) {
+      WritesDepth = llvm::any_of(R.Outputs, [](const auto &P) {
+        return P.Kind >= 17 && P.Kind <= 19;
+      });
       Desc->setFragmentFunction(Fn.get());
       HasPixel = true;
       continue;
@@ -354,12 +396,12 @@ Error executeRaster(Pipeline &P) {
       auto *A = VertexDesc->attributes()->object(Input.ID);
       A->setFormat(Formats[Attr->Channels - 1]);
       A->setOffset(Attr->Offset);
-      A->setBufferIndex(0);
+      A->setBufferIndex(VertexDataSlot);
       UsesVertexBuffer = true;
     }
   }
   if (UsesVertexBuffer) {
-    VertexDesc->layouts()->object(0)->setStride(Stride);
+    VertexDesc->layouts()->object(VertexDataSlot)->setStride(Stride);
     Desc->setVertexDescriptor(VertexDesc);
   }
   size_t VertexCount = P.DispatchParameters.VertexCount.value_or(0);
@@ -376,6 +418,8 @@ Error executeRaster(Pipeline &P) {
   case PrimitiveTopology::PointList: Primitive = MTL::PrimitiveTypePoint; break;
   default: return Fail("unsupported raster primitive topology");
   }
+  if (WritesDepth)
+    Desc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
   auto PSO = NS::TransferPtr(Device->newRenderPipelineState(Desc.get(), &NErr));
   if (!PSO)
     return mtlError("render pipeline state creation failed", NErr);
@@ -399,6 +443,26 @@ Error executeRaster(Pipeline &P) {
       static_cast<size_t>(Sc.Y) + Sc.Height > Height)
     return Fail("scissor exceeds the render target");
   auto *Pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+  NS::SharedPtr<MTL::Texture> DepthTarget;
+  NS::SharedPtr<MTL::DepthStencilState> DepthState;
+  if (WritesDepth) {
+    auto *DepthDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        MTL::PixelFormatDepth32Float, Width, Height, false);
+    DepthDesc->setStorageMode(MTL::StorageModePrivate);
+    DepthDesc->setUsage(MTL::TextureUsageRenderTarget);
+    DepthTarget = NS::TransferPtr(Device->newTexture(DepthDesc));
+    auto DS = NS::TransferPtr(MTL::DepthStencilDescriptor::alloc()->init());
+    DS->setDepthCompareFunction(MTL::CompareFunctionLess);
+    DS->setDepthWriteEnabled(true);
+    DepthState = NS::TransferPtr(Device->newDepthStencilState(DS.get()));
+    if (!DepthTarget || !DepthState)
+      return Fail("cannot allocate Metal depth target or state");
+    auto *Attachment = Pass->depthAttachment();
+    Attachment->setTexture(DepthTarget.get());
+    Attachment->setLoadAction(MTL::LoadActionClear);
+    Attachment->setClearDepth(1.0);
+    Attachment->setStoreAction(MTL::StoreActionDontCare);
+  }
   auto *Color = Pass->colorAttachments()->object(0);
   Color->setTexture(Target.get());
   Color->setLoadAction(MTL::LoadActionClear);
@@ -411,12 +475,19 @@ Error executeRaster(Pipeline &P) {
   if (!Enc)
     return Fail("cannot allocate Metal render command encoder");
   Enc->setRenderPipelineState(PSO.get());
+  if (DepthState)
+    Enc->setDepthStencilState(DepthState.get());
   Enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
   Enc->setViewport({VP.X, VP.Y, VP.Width, VP.Height, VP.MinDepth, VP.MaxDepth});
   Enc->setScissorRect({static_cast<size_t>(Sc.X), static_cast<size_t>(Sc.Y),
                        Sc.Width, Sc.Height});
   if (Vertices)
-    Enc->setVertexBuffer(Vertices.get(), 0, 0);
+    Enc->setVertexBuffer(Vertices.get(), 0, VertexDataSlot);
+  for (auto [Vertex, Slot, GPU] : BufferBindings)
+    if (Vertex)
+      Enc->setVertexBuffer(GPU, 0, Slot);
+    else
+      Enc->setFragmentBuffer(GPU, 0, Slot);
   Enc->drawPrimitives(Primitive, NS::UInteger{0}, VertexCount);
   Enc->endEncoding();
   Cmd->commit();
@@ -425,6 +496,8 @@ Error executeRaster(Pipeline &P) {
     return mtlError("GPU rendering failed", Cmd->error());
   Target->getBytes(Output->Data[0].get(), Pitch,
                    MTL::Region::Make2D(0, 0, Width, Height), 0);
+  for (auto &[CPU, GPU] : RasterBuffers)
+    memcpy(CPU->Data[0].get(), GPU->contents(), CPU->Size);
   return Error::success();
 }
 
@@ -440,9 +513,11 @@ Error executeCompute(Pipeline &P) {
                              "no Metal device available");
   MTL::CommandQueue *Queue = Device->newCommandQueue();
 
-  // One MTLBuffer / MTLTexture per CPUBuffer, shared across shaders.
-  std::map<CPUBuffer *, MTL::Buffer *> GPUBuffers;
-  std::map<CPUBuffer *, MTL::Texture *> GPUTextures;
+  // One MTLBuffer / MTLTexture per (CPUBuffer, ArraySlice), shared across shaders.
+  using BufKey = std::pair<CPUBuffer *, uint32_t>;
+  std::map<BufKey, MTL::Buffer *> GPUBuffers;
+  std::map<BufKey, MTL::Buffer *> GPUCounters;
+  std::map<BufKey, MTL::Texture *> GPUTextures;
   std::map<CPUBuffer *, MTL::TextureUsage> TextureUsages;
   std::map<CPUBuffer *, ResourceKind> TextureKinds;
   std::map<YAMLSampler *, MTL::SamplerState *> GPUSamplers;
@@ -481,18 +556,34 @@ Error executeCompute(Pipeline &P) {
         return &RB;
     return nullptr;
   };
-  auto GetGPUBuffer = [&](CPUBuffer *CPU) -> MTL::Buffer * {
-    auto It = GPUBuffers.find(CPU);
+  auto GetGPUBuffer = [&](CPUBuffer *CPU, uint32_t Slice = 0) -> MTL::Buffer * {
+    BufKey Key{CPU, Slice};
+    auto It = GPUBuffers.find(Key);
     if (It != GPUBuffers.end())
       return It->second;
-    MTL::Buffer *B = Device->newBuffer(CPU->Data[0].get(),
+    MTL::Buffer *B = Device->newBuffer(CPU->Data[Slice].get(),
                                        std::max<size_t>(CPU->Size, 16),
                                        MTL::ResourceStorageModeShared);
-    GPUBuffers[CPU] = B;
+    GPUBuffers[Key] = B;
     return B;
   };
-  auto GetGPUTexture = [&](CPUBuffer *CPU) -> Expected<MTL::Texture *> {
-    auto It = GPUTextures.find(CPU);
+  auto GetGPUCounter = [&](CPUBuffer *CPU, uint32_t Slice) -> MTL::Buffer * {
+    BufKey Key{CPU, Slice};
+    auto It = GPUCounters.find(Key);
+    if (It != GPUCounters.end())
+      return It->second;
+    if (CPU->Counters.size() <= Slice)
+      CPU->Counters.resize(Slice + 1, 0);
+    uint32_t InitVal = CPU->Counters[Slice];
+    MTL::Buffer *B = Device->newBuffer(&InitVal, 16,
+                                       MTL::ResourceStorageModeShared);
+    GPUCounters[Key] = B;
+    return B;
+  };
+  auto GetGPUTexture = [&](CPUBuffer *CPU,
+                           uint32_t ArrIdx = 0) -> Expected<MTL::Texture *> {
+    BufKey Key{CPU, ArrIdx};
+    auto It = GPUTextures.find(Key);
     if (It != GPUTextures.end())
       return It->second;
     auto PF = pixelFormatFor(CPU->Format, CPU->Channels);
@@ -501,7 +592,7 @@ Error executeCompute(Pipeline &P) {
     int W = std::max(1, CPU->OutputProps.Width);
     int H = std::max(1, CPU->OutputProps.Height);
     int D = std::max(1, CPU->OutputProps.Depth);
-    int Mips = std::max(1, CPU->OutputProps.MipLevels);
+    int Mips = CPU->OutputProps.MipLevels;
     int Slices = std::max(1, CPU->OutputProps.ArraySlices);
     MTL::TextureType TT = metalTextureType(TextureKinds.at(CPU));
     if (TT == MTL::TextureType1D || TT == MTL::TextureType1DArray) {
@@ -518,6 +609,33 @@ Error executeCompute(Pipeline &P) {
     } else {
       Slices = 1;
     }
+    if (Mips <= 0)
+      return createStringError(
+          std::errc::invalid_argument,
+          "Texture resource '%s' requires at least one mip level (got %d).",
+          CPU->Name.c_str(), Mips);
+    auto Fmt = toFormat(CPU->Format, CPU->Channels);
+    if (!Fmt)
+      return Fmt.takeError();
+    TextureCreateDesc CreateDesc;
+    CreateDesc.Fmt = *Fmt;
+    CreateDesc.Dim =
+        TT == MTL::TextureType1D || TT == MTL::TextureType1DArray
+            ? ResourceDimension::Dim1D
+        : TT == MTL::TextureType3D ? ResourceDimension::Dim3D
+        : TT == MTL::TextureTypeCube || TT == MTL::TextureTypeCubeArray
+            ? ResourceDimension::Cube
+            : ResourceDimension::Dim2D;
+    CreateDesc.IsArray = TT == MTL::TextureType1DArray ||
+                         TT == MTL::TextureType2DArray ||
+                         TT == MTL::TextureTypeCubeArray;
+    CreateDesc.Width = W;
+    CreateDesc.Height = H;
+    CreateDesc.Depth = D;
+    CreateDesc.ArraySlices = Slices;
+    CreateDesc.MipLevels = Mips;
+    if (auto Err = validateTextureCreateDesc(CreateDesc))
+      return Err;
     MTL::TextureDescriptor *Desc = MTL::TextureDescriptor::alloc()->init();
     Desc->setTextureType(TT);
     Desc->setPixelFormat(*PF);
@@ -529,11 +647,16 @@ Error executeCompute(Pipeline &P) {
                          : TT == MTL::TextureTypeCubeArray ? Slices / 6
                                                            : Slices);
     MTL::TextureUsage Usage = TextureUsages.at(CPU);
-    if ((Usage & MTL::TextureUsageShaderAtomic) &&
-        *PF != MTL::PixelFormatR32Uint && *PF != MTL::PixelFormatR32Sint)
-      return createStringError(inconvertibleErrorCode(),
-                               "texture '%s': atomics require R32Uint or R32Sint",
-                               CPU->Name.c_str());
+    if (Usage & MTL::TextureUsageShaderAtomic) {
+      if (*PF == MTL::PixelFormatR32Float)
+        *PF = MTL::PixelFormatR32Uint;
+      if (*PF != MTL::PixelFormatR32Uint && *PF != MTL::PixelFormatR32Sint)
+        return createStringError(
+            inconvertibleErrorCode(),
+            "texture '%s': atomics require R32Uint, R32Sint, or R32Float",
+            CPU->Name.c_str());
+    }
+    Desc->setPixelFormat(*PF);
     Desc->setUsage(Usage);
     Desc->setStorageMode(MTL::StorageModeShared);
     MTL::Texture *Tex = Device->newTexture(Desc);
@@ -544,7 +667,7 @@ Error executeCompute(Pipeline &P) {
                                CPU->Name.c_str());
     size_t BytesPerPixel = CPU->getSingleElementSize() * CPU->Channels;
     size_t Offset = 0;
-    const char *Base = CPU->Data[0].get();
+    const char *Base = CPU->Data[ArrIdx].get();
     for (int Slice = 0; Slice < Slices; ++Slice) {
       for (int Mip = 0; Mip < Mips; ++Mip) {
         int MW = std::max(1, W >> Mip);
@@ -560,7 +683,7 @@ Error executeCompute(Pipeline &P) {
         Offset += MipBytes;
       }
     }
-    GPUTextures[CPU] = Tex;
+    GPUTextures[Key] = Tex;
     return Tex;
   };
 
@@ -575,6 +698,15 @@ Error executeCompute(Pipeline &P) {
     crucible::Options Opts;
     Opts.EntryPoint = S.Entry;
     Opts.FlushDenormsF32 = true;
+    for (const DescriptorSet &Set : P.Sets) {
+      for (const Resource &Res : Set.Resources) {
+        auto Class = classify(Res.Kind);
+        if (Class && Res.DXBinding && Res.getArraySize() > 1)
+          Opts.ArraySizeOverrides.push_back(
+              {*Class, Res.DXBinding->Space, Res.DXBinding->Register,
+               Res.getArraySize()});
+      }
+    }
     auto Compiled =
         crucible::compileDXILToMSL(S.Shader->getMemBufferRef(), Opts);
     if (!Compiled)
@@ -633,6 +765,9 @@ Error executeCompute(Pipeline &P) {
     SmallVector<std::pair<uint32_t, MTL::Buffer *>, 8> BufferBinds;
     SmallVector<std::pair<uint32_t, MTL::Texture *>, 8> TextureBinds;
     SmallVector<std::pair<uint32_t, MTL::SamplerState *>, 8> SamplerBinds;
+    std::vector<uint32_t> BufferDims;
+    if (R.BufferSizesMetalIndex != UINT32_MAX)
+      BufferDims.resize(R.BufferSizesMetalIndex + 1, 0);
     for (DescriptorSet &Set : P.Sets) {
       for (Resource &Res : Set.Resources) {
         auto Class = classify(Res.Kind);
@@ -645,37 +780,67 @@ Error executeCompute(Pipeline &P) {
           return createStringError(inconvertibleErrorCode(),
                                    "resource '%s' has no DirectXBinding",
                                    Res.Name.c_str());
-        if (Res.getArraySize() != 1)
-          return createStringError(
-              inconvertibleErrorCode(),
-              "resource '%s': resource arrays are not supported yet",
-              Res.Name.c_str());
 
         const auto *Match = FindBinding(Res, R);
         if (!Match)
           continue; // not referenced by this shader
+        uint32_t RegOffset = Res.DXBinding->Register - Match->LowerBound;
+        uint32_t BaseSlot = Match->MetalIndex + RegOffset;
         if (Res.Kind == ResourceKind::Sampler) {
           if (!Res.SamplerPtr)
             return createStringError(inconvertibleErrorCode(),
                                      "sampler '%s' has no descriptor",
                                      Res.Name.c_str());
-          SamplerBinds.push_back(
-              {Match->MetalIndex, GetGPUSampler(Res.SamplerPtr)});
+          for (uint32_t I = 0; I < Res.getArraySize(); ++I)
+            SamplerBinds.push_back(
+                {BaseSlot + I, GetGPUSampler(Res.SamplerPtr)});
           continue;
         }
         if (!Res.BufferPtr)
           return createStringError(inconvertibleErrorCode(),
                                    "resource '%s' has no backing buffer",
                                    Res.Name.c_str());
-        if (isTextureResource(Res.Kind)) {
-          auto Tex = GetGPUTexture(Res.BufferPtr);
-          if (!Tex)
-            return Tex.takeError();
-          TextureBinds.push_back({Match->MetalIndex, *Tex});
-        } else {
-          BufferBinds.push_back({Match->MetalIndex, GetGPUBuffer(Res.BufferPtr)});
+        for (uint32_t I = 0; I < Res.getArraySize(); ++I) {
+          if (isTextureResource(Res.Kind)) {
+            auto Tex = GetGPUTexture(Res.BufferPtr, I);
+            if (!Tex)
+              return Tex.takeError();
+            TextureBinds.push_back({BaseSlot + I, *Tex});
+          } else {
+            BufferBinds.push_back(
+                {BaseSlot + I, GetGPUBuffer(Res.BufferPtr, I)});
+            if (Match->HasCounter)
+              BufferBinds.push_back(
+                  {Match->CounterMetalIndex + RegOffset + I,
+                   GetGPUCounter(Res.BufferPtr, I)});
+            if (R.BufferSizesMetalIndex != UINT32_MAX &&
+                BaseSlot + I < BufferDims.size()) {
+              uint32_t ElemCount = 0;
+              if (Match->Kind == crucible::ResourceKind::StructuredBuffer &&
+                  Match->ElementStride > 0)
+                ElemCount = static_cast<uint32_t>(Res.BufferPtr->Size /
+                                                  Match->ElementStride);
+              else if (Match->Kind == crucible::ResourceKind::RawBuffer)
+                ElemCount = static_cast<uint32_t>(Res.BufferPtr->Size);
+              else if (Match->Kind == crucible::ResourceKind::TypedBuffer) {
+                uint32_t ElemBytes = Res.BufferPtr->getSingleElementSize() *
+                                     Res.BufferPtr->Channels;
+                if (ElemBytes > 0)
+                  ElemCount =
+                      static_cast<uint32_t>(Res.BufferPtr->Size / ElemBytes);
+              }
+              BufferDims[BaseSlot + I] = ElemCount;
+            }
+          }
         }
       }
+    }
+    if (R.BufferSizesMetalIndex != UINT32_MAX) {
+      MTL::Buffer *DimsBuf = Device->newBuffer(
+          BufferDims.data(),
+          std::max<size_t>(BufferDims.size() * sizeof(uint32_t), 16),
+          MTL::ResourceStorageModeShared);
+      BufferBinds.push_back({R.BufferSizesMetalIndex, DimsBuf});
     }
 
     MTL::CommandBuffer *Cmd = Queue->commandBuffer();
@@ -687,6 +852,85 @@ Error executeCompute(Pipeline &P) {
       Enc->setTexture(Tex, Index);
     for (auto &[Index, Samp] : SamplerBinds)
       Enc->setSamplerState(Samp, Index);
+    if (!P.Settings.DX.RootParams.empty()) {
+      auto Container = object::DXContainer::create(
+          P.Shaders[&Compiled - CompiledShaders.data()].Shader->getMemBufferRef());
+      if (!Container)
+        return Container.takeError();
+      const auto &RSOpt = Container->getRootSignature();
+      if (!RSOpt)
+        return createStringError(inconvertibleErrorCode(),
+                                 "pipeline specifies RootParameters but DXIL "
+                                 "container has no RTS0 root signature");
+      const auto &RS = *RSOpt;
+      auto Headers = RS.param_headers();
+      if (P.Settings.DX.RootParams.size() != RS.getNumRootParameters())
+        return createStringError(
+            inconvertibleErrorCode(),
+            "RootParameters count (%zu) does not match RTS0 (%u)",
+            P.Settings.DX.RootParams.size(), RS.getNumRootParameters());
+      auto FindReg = [&](crucible::ResourceClass Class, uint32_t Space,
+                         uint32_t Reg) -> const crucible::ResourceBinding * {
+        for (const crucible::ResourceBinding &RB : R.Resources)
+          if (RB.Class == Class && RB.Space == Space &&
+              Reg >= RB.LowerBound && Reg - RB.LowerBound < RB.RangeSize)
+            return &RB;
+        return nullptr;
+      };
+      size_t Idx = 0;
+      for (const auto &Header : Headers) {
+        const auto &RP = P.Settings.DX.RootParams[Idx++];
+        if (RP.Kind == dx::RootParamKind::DescriptorTable)
+          continue;
+        auto ParamOrErr = RS.getParameter(Header);
+        if (!ParamOrErr)
+          return ParamOrErr.takeError();
+        if (RP.Kind == dx::RootParamKind::Constant) {
+          const auto &RC = std::get<dx::RootConstant>(RP.Data);
+          auto *CV = dyn_cast<object::DirectX::RootConstantView>(&*ParamOrErr);
+          if (!CV)
+            return createStringError(inconvertibleErrorCode(),
+                                     "RootParameter '%s' is not Constants32Bit",
+                                     RC.Name.c_str());
+          auto Info = CV->read();
+          if (!Info)
+            return Info.takeError();
+          if (const auto *Match = FindReg(crucible::ResourceClass::CBV,
+                                          Info->RegisterSpace,
+                                          Info->ShaderRegister)) {
+            if (!RC.BufferPtr)
+              return createStringError(inconvertibleErrorCode(),
+                                       "root constant '%s' has no buffer",
+                                       RC.Name.c_str());
+            Enc->setBuffer(GetGPUBuffer(RC.BufferPtr), 0, Match->MetalIndex);
+          }
+        } else if (RP.Kind == dx::RootParamKind::RootDescriptor) {
+          const auto &RR = std::get<dx::RootResource>(RP.Data);
+          auto Class = classify(RR.Kind);
+          if (!Class)
+            return createStringError(inconvertibleErrorCode(),
+                                     "root descriptor '%s': unsupported kind",
+                                     RR.Name.c_str());
+          auto *DV =
+              dyn_cast<object::DirectX::RootDescriptorView>(&*ParamOrErr);
+          if (!DV)
+            return createStringError(
+                inconvertibleErrorCode(),
+                "RootParameter '%s' is not a RootDescriptor", RR.Name.c_str());
+          auto Info = DV->read(RS.getVersion());
+          if (!Info)
+            return Info.takeError();
+          if (const auto *Match = FindReg(*Class, Info->RegisterSpace,
+                                          Info->ShaderRegister)) {
+            if (!RR.BufferPtr)
+              return createStringError(inconvertibleErrorCode(),
+                                       "root descriptor '%s' has no buffer",
+                                       RR.Name.c_str());
+            Enc->setBuffer(GetGPUBuffer(RR.BufferPtr), 0, Match->MetalIndex);
+          }
+        }
+      }
+    }
     const auto &G = P.DispatchParameters.DispatchGroupCount;
     Enc->dispatchThreadgroups(
         MTL::Size::Make(G[0], G[1], G[2]),
@@ -699,9 +943,14 @@ Error executeCompute(Pipeline &P) {
   }
 
   // Read results back into the pipeline's CPU buffers for verification.
-  for (auto &[CPU, GPU] : GPUBuffers)
-    memcpy(CPU->Data[0].get(), GPU->contents(), CPU->Size);
-  for (auto &[CPU, Tex] : GPUTextures) {
+  for (auto &[Key, GPU] : GPUBuffers)
+    memcpy(Key.first->Data[Key.second].get(), GPU->contents(), Key.first->Size);
+  for (auto &[Key, GPU] : GPUCounters)
+    Key.first->Counters[Key.second] =
+        *reinterpret_cast<const uint32_t *>(GPU->contents());
+  for (auto &[Key, Tex] : GPUTextures) {
+    CPUBuffer *CPU = Key.first;
+    uint32_t ArrIdx = Key.second;
     if (!(TextureUsages.at(CPU) & MTL::TextureUsageShaderWrite))
       continue;
     int W = std::max(1, CPU->OutputProps.Width);
@@ -726,7 +975,7 @@ Error executeCompute(Pipeline &P) {
     }
     size_t BytesPerPixel = CPU->getSingleElementSize() * CPU->Channels;
     size_t Offset = 0;
-    char *Base = CPU->Data[0].get();
+    char *Base = CPU->Data[ArrIdx].get();
     for (int Slice = 0; Slice < Slices; ++Slice) {
       for (int Mip = 0; Mip < Mips; ++Mip) {
         int MW = std::max(1, W >> Mip);
@@ -768,6 +1017,22 @@ int main(int ArgC, char **ArgV) {
   YIn >> PipelineDesc;
   ExitOnErr(errorCodeToError(YIn.error()));
 
+  for (const auto &Param : PipelineDesc.Settings.DX.RootParams) {
+    if (Param.Kind == dx::RootParamKind::Constant) {
+      const auto &RC = std::get<dx::RootConstant>(Param.Data);
+      if (RC.BufferPtr && RC.BufferPtr->ArraySize != 1)
+        ExitOnErr(createStringError(
+            std::errc::invalid_argument,
+            "Root constant cannot refer to resource arrays."));
+    } else if (Param.Kind == dx::RootParamKind::RootDescriptor) {
+      const auto &RR = std::get<dx::RootResource>(Param.Data);
+      if (RR.getArraySize() != 1)
+        ExitOnErr(createStringError(
+            std::errc::invalid_argument,
+            "Root descriptor cannot refer to resource arrays."));
+    }
+  }
+
   if (InputShader.size() != PipelineDesc.Shaders.size())
     ExitOnErr(createStringError(
         std::errc::invalid_argument,
@@ -778,6 +1043,9 @@ int main(int ArgC, char **ArgV) {
     ExitOnErr(errorCodeToError(Buf.getError()));
     PipelineDesc.Shaders[I].Shader = std::move(*Buf);
   }
+
+  if (Validation && setenv("MTL_DEBUG_LAYER", "1", 1) != 0)
+    ExitOnErr(errorCodeToError(std::error_code(errno, std::generic_category())));
 
   NS::AutoreleasePool *Pool = NS::AutoreleasePool::alloc()->init();
   Error ExecErr = PipelineDesc.isTraditionalRaster()

@@ -1,0 +1,8 @@
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/typed_buffer_int64.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s < %t.metal
+
+# CHECK-DAG: srv0[{{[^]]+}} * 2u + 1u]
+# CHECK-DAG: srv1[{{[^]]+}} * 4u + 3u]
+# CHECK-DAG: uav0[{{[^]]+}} * 2u + 1u] =
+# CHECK-DAG: uav1[{{[^]]+}} * 4u + 3u] =

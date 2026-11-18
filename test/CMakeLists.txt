@@ -60,6 +60,9 @@ if(LLVM_EXTERNAL_LIT)
   # into it.
   if(TARGET crucible-offload)
     add_dependencies(check-crucible crucible-offload)
+    if(TARGET crucible-api-query)
+      set(CRUCIBLE_API_QUERY_PATH $<TARGET_FILE:crucible-api-query>)
+    endif()
     configure_file(
       "${CMAKE_CURRENT_SOURCE_DIR}/offload/lit.site.cfg.py.in"
       "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py.gen"
@@ -73,6 +76,9 @@ if(LLVM_EXTERNAL_LIT)
       DEPENDS crucible-offload
       USES_TERMINAL
       COMMENT "Running llvm/offload-test-suite against crucible")
+    if(TARGET crucible-api-query)
+      add_dependencies(check-crucible-offload crucible-api-query)
+    endif()
   endif()
 else()
   message(WARNING
