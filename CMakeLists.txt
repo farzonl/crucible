@@ -80,6 +80,27 @@ if(APPLE)
   add_subdirectory(tools/crucible-run)
 endif()
 
+# llvm/offload-test-suite integration: builds crucible-offload (an
+# offloader-compatible runner that compiles DXIL with crucible and executes
+# on Metal with direct bindings) plus a check-crucible-offload lit target
+# over the suite's test tree.
+set(CRUCIBLE_OFFLOAD_SUITE_DIR "" CACHE PATH
+    "Path to an llvm/offload-test-suite checkout")
+if(NOT CRUCIBLE_OFFLOAD_SUITE_DIR)
+  foreach(candidate
+      "${CMAKE_SOURCE_DIR}/third_party/offload-test-suite"
+      "${CMAKE_SOURCE_DIR}/../offload-test-suite")
+    if(EXISTS "${candidate}/include/Support/Pipeline.h")
+      set(CRUCIBLE_OFFLOAD_SUITE_DIR "${candidate}")
+      break()
+    endif()
+  endforeach()
+endif()
+if(APPLE AND CRUCIBLE_OFFLOAD_SUITE_DIR)
+  message(STATUS "offload-test-suite: ${CRUCIBLE_OFFLOAD_SUITE_DIR}")
+  add_subdirectory(tools/crucible-offload)
+endif()
+
 if(CRUCIBLE_ENABLE_TESTS)
   enable_testing()
   add_subdirectory(test)

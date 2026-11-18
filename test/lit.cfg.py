@@ -11,7 +11,9 @@ config.name = "crucible"
 config.test_format = lit.formats.ShTest(execute_external=False)
 config.suffixes = [".test", ".hlsl", ".ll"]
 config.test_source_root = os.path.dirname(__file__)
-config.excludes = ["Inputs"]
+# "offload" hosts the offload-test-suite harness (its own lit suite rooted
+# elsewhere); keep this suite from descending into it.
+config.excludes = ["Inputs", "offload"]
 
 # Tool substitutions. Paths are provided by lit.site.cfg.py.
 config.substitutions.append(("%dxc", config.dxc))

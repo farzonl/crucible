@@ -78,6 +78,11 @@ std::string sanitizeIdentifier(StringRef Name, StringRef Fallback) {
 }
 
 std::string formatFloatLiteral(const APFloat &APF, bool IsHalf) {
+  if (APF.isInfinity())
+    return std::string(APF.isNegative() ? "-" : "") +
+           (IsHalf ? "HUGE_VALH" : "HUGE_VALF");
+  if (APF.isNaN())
+    return "NAN";
   SmallString<32> Str;
   APFloat V = APF;
   bool LosesInfo = false;
@@ -86,10 +91,6 @@ std::string formatFloatLiteral(const APFloat &APF, bool IsHalf) {
   raw_svector_ostream OS(Str);
   OS << format("%.9g", D);
   std::string S(Str.str());
-  if (S.find("inf") != std::string::npos)
-    return IsHalf ? "HUGE_VALH" : "HUGE_VALF";
-  if (S.find("nan") != std::string::npos)
-    return "NAN";
   if (S.find('.') == std::string::npos && S.find('e') == std::string::npos)
     S += ".0";
   S += IsHalf ? "h" : "f";

@@ -1,10 +1,7 @@
-# Runs the compliance suite on a Metal GPU and publishes the pass-rate
-# dashboard (pages/index.html) to GitHub Pages, mirroring Nacelle's
-# offload-compliance pipeline.
-#
-# Today this records crucible's own lit suite. Once the offload-test-suite
-# Metal integration lands (Milestone 4), point the lit invocation at
-# build-offload/test/metal instead -- the recorder is format-compatible.
+# Runs llvm/offload-test-suite on a Metal GPU through crucible-offload
+# (crucible's DirectX personality: DXIL -> MSL -> Metal, direct bindings)
+# and publishes the pass-rate dashboard (pages/index.html) to GitHub Pages,
+# mirroring Nacelle's offload-compliance pipeline.
 
 name: Compliance
 
@@ -30,6 +27,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout llvm/offload-test-suite
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-test-suite
+          path: third_party/offload-test-suite
 
       - name: Restore DXC SDK cache
         id: cache-sdk
@@ -62,7 +65,7 @@ jobs:
       - name: Install build dependencies
         run: |
           brew install llvm ninja
-          pip3 install --break-system-packages lit
+          pip3 install --break-system-packages lit psutil pyyaml
 
       - name: Configure and build
         run: |
@@ -73,11 +76,12 @@ jobs:
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --parallel
 
-      - name: Run compliance suite
+      - name: Run offload-test-suite compliance run
         env:
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/.sdk/lib
         run: |
-          lit -v --timeout=60 --output=offload-results.json build/test || true
+          lit -v --timeout=60 --output=offload-results.json \
+            build/test-offload || true
 
       - name: Restore historical compliance data cache
         uses: actions/cache/restore@v4

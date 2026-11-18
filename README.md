@@ -96,13 +96,34 @@ mapping, thread-group size, and the (possibly sanitized) MSL kernel name.
 ## Testing & compliance
 
 All testing is lit/FileCheck-driven (`test/FileCheck` for golden MSL +
-`-Werror` Apple-compile checks, `test/E2E` for GPU-verified dispatches). CI
-records every run's lit JSON with `scripts/record_offload_compliance.py` and
-publishes the pass-rate dashboard in `pages/` to GitHub Pages — the same
-pipeline that powers [Nacelle's compliance site](https://farzon.org/Nacelle/).
-The recorder is format-compatible with
-[llvm/offload-test-suite](https://github.com/llvm/offload-test-suite) lit
-output, which becomes the compliance target in Milestone 4.
+`-Werror` Apple-compile checks, `test/E2E` for GPU-verified dispatches).
+
+### offload-test-suite integration
+
+Crucible runs [llvm/offload-test-suite](https://github.com/llvm/offload-test-suite)
+natively: `tools/crucible-offload` is a drop-in `offloader` replacement that
+reuses the suite's YAML pipeline parser and ULP/epsilon verification rules,
+but compiles the DXIL with crucible and dispatches on Metal with
+reflection-driven direct bindings.
+
+**Crucible advertises itself as a DirectX implementation** — the MoltenVK
+model: identity is the API contract you implement (DXIL + D3D12 binding
+semantics), not the backend you use (Metal). The lit feature set is therefore
+`DirectX + Crucible` (driver tag) rather than `Metal`, so crucible is held to
+the D3D12 contract instead of inheriting metal-shaderconverter's waivers.
+
+```sh
+cmake -S . -B build -G Ninja \
+  -DCRUCIBLE_OFFLOAD_SUITE_DIR=/path/to/offload-test-suite   # auto-detected
+ninja -C build check-crucible-offload
+```
+
+Baseline at Milestone 2: **110 passed / 219 failed / 289 unsupported** of 619
+discovered tests (graphics, RT, wave ops, 16/64-bit types, and textures are
+still unimplemented). CI records every run with
+`scripts/record_offload_compliance.py` and publishes the dashboard in
+`pages/` to GitHub Pages — the same pipeline that powers
+[Nacelle's compliance site](https://farzon.org/Nacelle/).
 
 ## Third-party foundation
 
@@ -133,8 +154,10 @@ reinventing it:
 - [ ] **Milestone 3** — groupshared + barriers, atomics, wave ops
   (`simd_*`), SM 6.8 packed/vector dot products, benchmarks vs.
   `metal-shaderconverter`.
-- [ ] **Milestone 4** — offload-test-suite Metal integration and public
-  compliance dashboard; vertex/fragment stages.
+- [x] **Milestone 4 (partial)** — offload-test-suite integration
+  (`crucible-offload` + `check-crucible-offload`) and public compliance
+  dashboard. Remaining: textures, 16/64-bit types, resource arrays,
+  vertex/fragment stages.
 
 ## License
 

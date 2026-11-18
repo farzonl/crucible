@@ -50,6 +50,26 @@ if(LLVM_EXTERNAL_LIT)
   if(TARGET crucible-run)
     add_dependencies(check-crucible crucible-run)
   endif()
+
+  # llvm/offload-test-suite compliance run (crucible-offload backend).
+  # Lives outside this suite's directory so check-crucible doesn't recurse
+  # into it.
+  if(TARGET crucible-offload)
+    set(CRUCIBLE_OFFLOAD_PATH $<TARGET_FILE:crucible-offload>)
+    configure_file(
+      "${CMAKE_CURRENT_SOURCE_DIR}/offload/lit.site.cfg.py.in"
+      "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py.gen"
+      @ONLY)
+    file(GENERATE
+      OUTPUT "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py"
+      INPUT "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py.gen")
+    add_custom_target(check-crucible-offload
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv
+              "${CMAKE_BINARY_DIR}/test-offload"
+      DEPENDS crucible-offload
+      USES_TERMINAL
+      COMMENT "Running llvm/offload-test-suite against crucible")
+  endif()
 else()
   message(WARNING
     "lit not found; install with `pip install lit` or pass -DLLVM_EXTERNAL_LIT")
