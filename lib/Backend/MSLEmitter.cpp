@@ -63,23 +63,35 @@ struct Expr {
   int Prec = PrecPrimary;
 };
 
+std::string signedView(mlir::Type T, StringRef Value) {
+  if (T.isInteger(1))
+    return "(-int(" + Value.str() + "))";
+  StringRef Ty = T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
+  return ("as_type<" + Ty + ">(" + Value + ")").str();
+}
+
+std::string unsignedView(mlir::Type T, StringRef Value) {
+  StringRef Ty = T.isInteger(16) ? "ushort" : T.isInteger(64) ? "ulong" : "uint";
+  return (Ty + "(" + Value + ")").str();
+}
+
 // Source for on-demand MSL helper functions implementing exact DXIL
 // semantics where metal_stdlib differs (bit scans return -1 on zero input,
 // bitfield ops mask their operands, packed dot products, ballot shape,
 // compare-exchange result semantics).
 StringRef helperSource(StringRef Name) {
   if (Name == "crucible_firstbitlo")
-    return "static inline uint crucible_firstbitlo(uint v) {\n"
-           "  return v == 0u ? 0xffffffffu : ctz(v);\n"
+    return "template <typename T> static inline uint crucible_firstbitlo(T v) {\n"
+           "  return v == T(0) ? 0xffffffffu : uint(ctz(v));\n"
            "}\n";
   if (Name == "crucible_firstbithi")
-    return "static inline uint crucible_firstbithi(uint v) {\n"
-           "  return v == 0u ? 0xffffffffu : 31u - clz(v);\n"
+    return "template <typename T> static inline uint crucible_firstbithi(T v) {\n"
+           "  return v == T(0) ? 0xffffffffu : uint(clz(v));\n"
            "}\n";
   if (Name == "crucible_firstbitshi")
-    return "static inline uint crucible_firstbitshi(uint v) {\n"
-           "  if (as_type<int>(v) < 0) v = ~v;\n"
-           "  return v == 0u ? 0xffffffffu : 31u - clz(v);\n"
+    return "template <typename T> static inline uint crucible_firstbitshi(T v) {\n"
+           "  if ((v >> (sizeof(T) * 8 - 1)) != 0) v = T(~v);\n"
+           "  return v == T(0) ? 0xffffffffu : uint(clz(v));\n"
            "}\n";
   if (Name == "crucible_ubfe")
     return "static inline uint crucible_ubfe(uint width, uint offset, uint v) "
@@ -132,6 +144,37 @@ StringRef helperSource(StringRef Name) {
            "  uint64_t bits = (simd_vote::vote_t)v;\n"
            "  return uint4(uint(bits), uint(bits >> 32), 0u, 0u);\n"
            "}\n";
+  if (Name == "crucible_wave_wide")
+    return R"MSL(static inline ulong crucible_wave_shuffle(ulong v, ushort lane) {
+  return as_type<ulong>(simd_shuffle(as_type<uint2>(v), lane));
+}
+template <typename T, uint Op, bool Prefix>
+static inline T crucible_wave_wide(T v, uint lane) {
+  ulong bits = ulong((simd_vote::vote_t)simd_ballot(true));
+  T acc = Op == 1u ? T(1) : T(0);
+  bool first = true;
+  // Keep the shuffle converged on the original active mask, even for prefixes.
+  while (bits != 0ul) {
+    uint lo = uint(bits);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(bits >> 32));
+    T x = as_type<T>(crucible_wave_shuffle(as_type<ulong>(v), ushort(src)));
+    if (!Prefix || src < lane) {
+      if (Op == 0u) acc += x;
+      if (Op == 1u) acc *= x;
+      if (Op == 2u) acc = first ? x : min(acc, x);
+      if (Op == 3u) acc = first ? x : max(acc, x);
+      first = false;
+    }
+    bits &= bits - 1ul;
+  }
+  return acc;
+}
+)MSL";
+  if (Name == "crucible_wave_prefix_sum")
+    return "template <typename T> static inline T crucible_wave_prefix_sum(T v) {\n"
+           "  T sum = simd_prefix_exclusive_sum(v);\n"
+           "  return simd_is_first() ? T(0) : sum;\n"
+           "}\n";
   if (Name == "crucible_atomic_cmpxchg_device")
     return "static inline uint crucible_atomic_cmpxchg(device atomic_uint "
            "*p, uint cmp, uint val) {\n"
@@ -178,9 +221,9 @@ std::string sanitizeIdentifier(StringRef Name, StringRef Fallback) {
 std::string formatFloatLiteral(const APFloat &APF, bool IsHalf) {
   if (APF.isInfinity())
     return std::string(APF.isNegative() ? "-" : "") +
-           (IsHalf ? "HUGE_VALH" : "HUGE_VALF");
+           (IsHalf ? "half(HUGE_VALF)" : "HUGE_VALF");
   if (APF.isNaN())
-    return "NAN";
+    return IsHalf ? "half(NAN)" : "NAN";
   SmallString<32> Str;
   APFloat V = APF;
   bool LosesInfo = false;
@@ -325,6 +368,7 @@ private:
 
   // --- statements ---
   Error emitBlock(mlir::Block &B, unsigned Ind);
+  Error emitSwitch(mlir::scf::IndexSwitchOp Switch, unsigned Ind);
   Error emitStatement(mlir::Operation *Op, unsigned Ind);
   Error emitIf(mlir::scf::IfOp If, unsigned Ind);
   Error emitWhile(mlir::scf::WhileOp While, unsigned Ind);
@@ -345,6 +389,8 @@ private:
 //===----------------------------------------------------------------------===//
 
 Expected<std::string> Emitter::mslType(mlir::Type T) {
+  if (T.isIndex())
+    return std::string("long");
   if (T.isF32())
     return std::string("float");
   if (T.isF16())
@@ -389,6 +435,8 @@ Expected<Expr> Emitter::constant(mlir::Operation *Def) {
       return Expr{IA.getValue().isZero() ? "false" : "true", PrecPrimary};
     std::string S = std::to_string(IA.getValue().getZExtValue());
     S += IA.getType().isInteger(64) ? "ul" : "u";
+    if (IA.getType().isInteger(16))
+      S = "ushort(" + S + ")";
     return Expr{S, PrecPrimary};
   }
   if (auto FA = mlir::dyn_cast<mlir::FloatAttr>(ValAttr))
@@ -585,12 +633,12 @@ Error Emitter::inferElementTypes() {
       std::string Row;
       if (Elem.isF32())
         Row = "float4";
-      else if (Elem.isInteger(32))
+      else if (Elem.isInteger(16) || Elem.isInteger(32) ||
+               Elem.isInteger(64) || Elem.isF16())
         Row = "uint4";
       else {
         FirstError = "cbuffer '" + RS->ParamName +
-                     "' uses an unsupported element type (only 32-bit rows "
-                     "are supported so far)";
+                     "' uses an unsupported element type";
         return;
       }
       // Mixed float/uint rows canonicalize to float4; integer components are
@@ -892,22 +940,29 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   using namespace mlir::LLVM;
 
   if (auto Info = binOpInfo(Op)) {
-    auto L = exprFor(Op->getOperand(0), Info->Signed ? PrecUnknown : Info->Prec);
+    mlir::Type T = Op->getResult(0).getType();
+    int LPrec = Info->Prec == PrecShift ? PrecMul : Info->Prec;
+    auto L = exprFor(Op->getOperand(0), Info->Signed ? PrecUnknown : LPrec);
     if (!L)
       return L.takeError();
     auto R2 = exprFor(Op->getOperand(1),
-                      Info->Signed ? PrecUnknown : Info->Prec + 1);
+                      Info->Signed ? PrecUnknown : LPrec + 1);
     if (!R2)
       return R2.takeError();
     if (Info->Signed) {
-      if (mlir::isa<AShrOp>(Op))
-        return Expr{"as_type<uint>(as_type<int>(" + L->Text + ") >> " +
-                        R2->Text + ")",
-                    PrecPrimary};
-      return Expr{"as_type<uint>(as_type<int>(" + L->Text + ") " +
-                      Info->Spelling + " as_type<int>(" + R2->Text + "))",
+      return Expr{unsignedView(T, signedView(T, L->Text) + " " +
+                                     Info->Spelling + " " +
+                                     (mlir::isa<AShrOp>(Op)
+                                          ? R2->Text
+                                          : signedView(T, R2->Text))),
                   PrecPrimary};
     }
+    if (T.isInteger(16))
+      return Expr{"ushort(uint(" + L->Text + ") " + Info->Spelling +
+                      " uint(" + R2->Text + "))",
+                  PrecPrimary};
+    if (mlir::isa<FRemOp>(Op))
+      return Expr{"fmod(" + L->Text + ", " + R2->Text + ")", PrecPrimary};
     bool IsBool = Op->getResult(0).getType().isInteger(1);
     if (IsBool) {
       // i1 bitwise ops read better as logical operators (operands are pure).
@@ -977,8 +1032,8 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     if (!R2)
       return R2.takeError();
     if (Signed)
-      return Expr{"as_type<int>(" + L->Text + ") " + Sp + " as_type<int>(" +
-                      R2->Text + ")",
+      return Expr{signedView(Cmp.getLhs().getType(), L->Text) + " " + Sp + " " +
+                      signedView(Cmp.getRhs().getType(), R2->Text),
                   Prec};
     return Expr{L->Text + " " + Sp + " " + R2->Text, Prec};
   }
@@ -1073,8 +1128,8 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     if (!R2)
       return R2.takeError();
     if (Signed)
-      return Expr{"as_type<int>(" + L->Text + ") " + Sp + " as_type<int>(" +
-                      R2->Text + ")",
+      return Expr{signedView(Cmp.getLhs().getType(), L->Text) + " " + Sp + " " +
+                      signedView(Cmp.getRhs().getType(), R2->Text),
                   Prec};
     return Expr{L->Text + " " + Sp + " " + R2->Text, Prec};
   }
@@ -1143,6 +1198,18 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   }
 
   // Casts.
+  if (mlir::isa<mlir::arith::IndexCastOp, mlir::arith::IndexCastUIOp>(Op)) {
+    auto Src = exprFor(Op->getOperand(0), PrecUnknown);
+    if (!Src)
+      return Src.takeError();
+    auto DstTy = mslType(Op->getResult(0).getType());
+    if (!DstTy)
+      return DstTy.takeError();
+    mlir::Type T = Op->getOperand(0).getType();
+    if (!T.isIndex() && mlir::isa<mlir::arith::IndexCastOp>(Op))
+      Src->Text = signedView(T, Src->Text);
+    return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
+  }
   if (mlir::isa<TruncOp, ZExtOp, FPTruncOp, FPExtOp, FPToUIOp, UIToFPOp,
                 mlir::arith::ExtUIOp, mlir::arith::TruncIOp>(Op)) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
@@ -1151,6 +1218,9 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto DstTy = mslType(Op->getResult(0).getType());
     if (!DstTy)
       return DstTy.takeError();
+    if (mlir::isa<TruncOp, mlir::arith::TruncIOp>(Op) &&
+        Op->getResult(0).getType().isInteger(1))
+      return Expr{"bool((" + Src->Text + ") & 1u)", PrecPrimary};
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
   }
   if (mlir::isa<SExtOp, SIToFPOp, mlir::arith::ExtSIOp>(Op)) {
@@ -1160,13 +1230,18 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto DstTy = mslType(Op->getResult(0).getType());
     if (!DstTy)
       return DstTy.takeError();
-    return Expr{*DstTy + "(as_type<int>(" + Src->Text + "))", PrecPrimary};
+    return Expr{*DstTy + "(" +
+                    signedView(Op->getOperand(0).getType(), Src->Text) + ")",
+                PrecPrimary};
   }
   if (mlir::isa<FPToSIOp>(Op)) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
-    return Expr{"as_type<uint>(int(" + Src->Text + "))", PrecPrimary};
+    mlir::Type T = Op->getResult(0).getType();
+    StringRef Ty = T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
+    return Expr{unsignedView(T, (Ty + "(" + Src->Text + ")").str()),
+                PrecPrimary};
   }
   if (mlir::isa<BitcastOp>(Op)) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
@@ -1258,8 +1333,11 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     if (!B)
       return B.takeError();
     if (Signed)
-      return Expr{"as_type<uint>(" + Fn.str() + "(as_type<int>(" + A->Text +
-                      "), as_type<int>(" + B->Text + ")))",
+      return Expr{unsignedView(Args[1].getType(),
+                               Fn.str() + "(" +
+                                   signedView(Args[1].getType(), A->Text) +
+                                   ", " +
+                                   signedView(Args[2].getType(), B->Text) + ")"),
                   PrecPrimary};
     return Expr{Fn.str() + "(" + A->Text + ", " + B->Text + ")", PrecPrimary};
   }
@@ -1278,7 +1356,23 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     if (Op == DXILOp::FMad || Op == DXILOp::Fma)
       return Expr{"fma(" + A->Text + ", " + B->Text + ", " + C->Text + ")",
                   PrecPrimary};
-    return Expr{A->Text + " * " + B->Text + " + " + C->Text, PrecAdd};
+    mlir::Type T = Call.getResult().getType();
+    if (T.isInteger(16))
+      return Expr{"ushort(uint(" + A->Text + ") * uint(" + B->Text +
+                      ") + uint(" + C->Text + "))",
+                  PrecPrimary};
+    return Expr{"(" + A->Text + ") * (" + B->Text + ") + (" + C->Text + ")",
+                PrecAdd};
+  }
+
+  if (Op == DXILOp::LegacyF32ToF16 || Op == DXILOp::LegacyF16ToF32) {
+    auto A = exprFor(Args[1], PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{Op == DXILOp::LegacyF32ToF16
+                    ? "uint(as_type<ushort>(half(" + A->Text + ")))"
+                    : "float(as_type<half>(ushort(" + A->Text + ")))",
+                PrecPrimary};
   }
 
   // Bit scans with DXIL's -1-on-zero semantics.
@@ -1375,7 +1469,7 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
   // Wave operations -> Metal simdgroup functions.
   switch (Op) {
   case DXILOp::WaveIsFirstLane:
-    return Expr{"simd_is_first()", PrecPrimary};
+    return Expr{"simd_prefix_exclusive_sum(1u) == 0u", PrecEq};
   case DXILOp::WaveGetLaneIndex:
     UsesLane = true;
     return Expr{"lane", PrecPrimary};
@@ -1392,29 +1486,66 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
                     "(" + A->Text + ")",
                 PrecPrimary};
   }
+  case DXILOp::WaveAllBitCount:
+  case DXILOp::WavePrefixBitCount: {
+    auto A = exprFor(Args[1], PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{Op == DXILOp::WaveAllBitCount
+                    ? "simd_sum(uint(" + A->Text + "))"
+                    : "simd_prefix_exclusive_sum(uint(" + A->Text + "))",
+                PrecPrimary};
+  }
   case DXILOp::WaveActiveAllEqual: {
     auto A = exprFor(Args[1], PrecUnknown);
     if (!A)
       return A.takeError();
-    return Expr{"simd_all(" + A->Text + " == simd_broadcast_first(" + A->Text +
-                    "))",
-                PrecPrimary};
+    std::string First;
+    if (Args[1].getType().isInteger(1))
+      return Expr{"(simd_all(" + A->Text + ") || !simd_any(" + A->Text + "))",
+                  PrecPrimary};
+    if (Args[1].getType().isInteger(64)) {
+      First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
+              A->Text + ")))";
+    } else {
+      First = "simd_broadcast_first(" + A->Text + ")";
+    }
+    return Expr{"simd_all((" + A->Text + ") == " + First + ")", PrecPrimary};
   }
-  case DXILOp::WaveReadLaneAt: {
-    auto V = exprFor(Args[1], PrecUnknown);
-    if (!V)
-      return V.takeError();
-    auto L = exprFor(Args[2], PrecUnknown);
-    if (!L)
-      return L.takeError();
-    return Expr{"simd_shuffle(" + V->Text + ", ushort(" + L->Text + "))",
-                PrecPrimary};
-  }
+  case DXILOp::WaveReadLaneAt:
+  case DXILOp::QuadReadLaneAt:
+  case DXILOp::QuadOp:
   case DXILOp::WaveReadLaneFirst: {
     auto V = exprFor(Args[1], PrecUnknown);
     if (!V)
       return V.takeError();
-    return Expr{"simd_broadcast_first(" + V->Text + ")", PrecPrimary};
+    StringRef Fn;
+    std::string LaneArg;
+    if (Op == DXILOp::WaveReadLaneFirst) {
+      Fn = "simd_broadcast_first";
+    } else if (Op == DXILOp::QuadOp) {
+      auto Kind = constInt(Args[2]);
+      if (!Kind || *Kind > 2)
+        return makeError("invalid DXIL quad operation kind");
+      Fn = "quad_shuffle_xor";
+      LaneArg = ", " + std::to_string(*Kind + 1) + "u";
+    } else {
+      auto L = exprFor(Args[2], PrecUnknown);
+      if (!L)
+        return L.takeError();
+      Fn = Op == DXILOp::WaveReadLaneAt ? "simd_shuffle" : "quad_shuffle";
+      LaneArg = ", ushort(" + L->Text + ")";
+    }
+    mlir::Type T = Args[1].getType();
+    if (T.isInteger(1))
+      return Expr{"bool(" + Fn.str() + "(uint(" + V->Text + ")" + LaneArg +
+                      "))",
+                  PrecPrimary};
+    if (T.isInteger(64))
+      return Expr{"as_type<ulong>(" + Fn.str() + "(as_type<uint2>(" +
+                      V->Text + ")" + LaneArg + "))",
+                  PrecPrimary};
+    return Expr{Fn.str() + "(" + V->Text + LaneArg + ")", PrecPrimary};
   }
   case DXILOp::WaveActiveOp:
   case DXILOp::WavePrefixOp: {
@@ -1440,16 +1571,49 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     }
     if (Prefix && (Fn == "simd_min" || Fn == "simd_max"))
       return makeError("wave prefix min/max is not supported");
+    if (Fn.empty())
+      return makeError("invalid DXIL wave operation kind");
     auto V = exprFor(Args[1], PrecUnknown);
     if (!V)
       return V.takeError();
-    bool IsInt = Call.getResult().getType().isInteger(32);
-    bool IsSigned = *SignedOp == 0 && IsInt;
+    mlir::Type T = Call.getResult().getType();
+    bool IsSigned = *SignedOp == 0 && mlir::isa<mlir::IntegerType>(T);
     // Signed min/max (and ordering-sensitive prefix ops) need signed views;
     // sums/products are bit-identical for signed and unsigned.
-    if (IsSigned && (Fn == "simd_min" || Fn == "simd_max"))
-      return Expr{"as_type<uint>(" + Fn.str() + "(as_type<int>(" + V->Text +
-                      ")))",
+    bool SignedOrder = IsSigned && (Fn == "simd_min" || Fn == "simd_max");
+    if (T.isInteger(64)) {
+      requireHelper("crucible_wave_wide");
+      UsesLane |= Prefix;
+      std::string Text =
+          std::string("crucible_wave_wide<") + (SignedOrder ? "long" : "ulong") +
+          ", " + std::to_string(*Kind) + ", " + (Prefix ? "true" : "false") +
+          ">(" + (SignedOrder ? signedView(T, V->Text) : V->Text) + ", " +
+          (Prefix ? "lane" : "0u") + ")";
+      return Expr{SignedOrder ? unsignedView(T, Text) : Text, PrecPrimary};
+    }
+    if (SignedOrder)
+      return Expr{unsignedView(T, Fn.str() + "(" + signedView(T, V->Text) +
+                                     ")"),
+                  PrecPrimary};
+    if (Prefix && Fn == "simd_prefix_exclusive_sum" && IsFloat) {
+      requireHelper("crucible_wave_prefix_sum");
+      Fn = "crucible_wave_prefix_sum";
+    }
+    if (T.isInteger(16) && *Kind == 0) {
+      // Some Metal compilers merge identical narrow reductions across
+      // different control-flow masks. Capture the participating lanes.
+      requireHelper("crucible_wave_wide");
+      UsesLane |= Prefix;
+      return Expr{std::string("ushort(crucible_wave_wide<ulong, 0, ") +
+                      (Prefix ? "true>(ulong(" : "false>(ulong(") + V->Text +
+                      "), " + (Prefix ? "lane" : "0u") + "))",
+                  PrecPrimary};
+    }
+    if (T.isInteger(16) && *Kind == 1)
+      return Expr{"ushort(" + Fn.str() + "(uint(" + V->Text + ")))",
+                  PrecPrimary};
+    if (T.isF16() && (*Kind == 0 || *Kind == 1))
+      return Expr{"half(" + Fn.str() + "(float(" + V->Text + ")))",
                   PrecPrimary};
     return Expr{Fn.str() + "(" + V->Text + ")", PrecPrimary};
   }
@@ -1472,6 +1636,12 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     auto V = exprFor(Args[1], PrecUnknown);
     if (!V)
       return V.takeError();
+    if (Fn.empty())
+      return makeError("invalid DXIL wave bit operation kind");
+    if (Args[1].getType().isInteger(64))
+      return Expr{"as_type<ulong>(" + Fn.str() + "(as_type<uint2>(" +
+                      V->Text + ")))",
+                  PrecPrimary};
     return Expr{Fn.str() + "(" + V->Text + ")", PrecPrimary};
   }
   default:
@@ -1527,10 +1697,13 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
     break;
   }
   case ResourceKind::TypedBuffer: {
-    auto E = exprFor(Coord0, PrecAdd);
+    unsigned Width = RS.RB->TypedComponents;
+    auto E = exprFor(Coord0, Width > 1 ? PrecMul : PrecAdd);
     if (!E)
       return E.takeError();
     Index = E->Text;
+    if (Width > 1)
+      Index += " * " + std::to_string(Width) + "u";
     break;
   }
   default:
@@ -1568,6 +1741,15 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
   if (!Op)
     return makeError("extractvalue from unsupported call");
   auto Args = Call.getArgOperands();
+
+  if (*Op == DXILOp::UAddc) {
+    auto It = ValueNames.find(Call.getResult());
+    if (It == ValueNames.end() || Comp > 1)
+      return makeError("invalid extractvalue from uaddc");
+    return Expr{Comp == 0 ? "uint(" + It->second + ")"
+                          : "bool(" + It->second + " >> 32u)",
+                PrecPrimary};
+  }
 
   // Ballot aggregates were materialized as uint4 temporaries.
   if (*Op == DXILOp::WaveActiveBallot) {
@@ -1607,14 +1789,32 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     auto Row = exprFor(Args[2], PrecUnknown);
     if (!Row)
       return Row.takeError();
-    std::string Element = RS->ParamName + "[" + Row->Text + "]." +
-                          std::string(1, "xyzw"[Comp & 3]);
+    std::string RowText = RS->ParamName + "[" + Row->Text + "]";
     // Reinterpret when this load's element type differs from the canonical
     // row type (mixed float/uint cbuffers).
     auto Ret =
         mlir::cast<mlir::LLVM::LLVMStructType>(Call.getResult().getType());
-    bool LoadIsFloat = Ret.getBody()[0].isF32();
+    mlir::Type T = Ret.getBody()[0];
     bool RowIsFloat = RS->ElemType == "float4";
+    if (Comp >= Ret.getBody().size())
+      return makeError("cbuffer component out of range");
+    if (T.isInteger(64))
+      return Expr{"as_type<ulong2>(" + RowText + ")[" +
+                      std::to_string(Comp) + "]",
+                  PrecPrimary};
+    if (T.isF16() || T.isInteger(16)) {
+      bool Packed = Ret.getBody().size() == 8;
+      std::string Word = RowText + "." + "xyzw"[Packed ? Comp / 2 : Comp];
+      if (RowIsFloat)
+        Word = "as_type<uint>(" + Word + ")";
+      if (Packed && Comp % 2)
+        Word += " >> 16u";
+      std::string Bits = "ushort(" + Word + ")";
+      return Expr{T.isF16() ? "as_type<half>(" + Bits + ")" : Bits,
+                  PrecPrimary};
+    }
+    std::string Element = RowText + "." + "xyzw"[Comp];
+    bool LoadIsFloat = T.isF32();
     if (LoadIsFloat != RowIsFloat)
       Element = std::string("as_type<") + (LoadIsFloat ? "float" : "uint") +
                 ">(" + Element + ")";
@@ -1683,6 +1883,9 @@ Error Emitter::emitBufferStore(mlir::LLVM::CallOp Call, unsigned Ind) {
   if (!Mask)
     return makeError("dynamic store mask is not supported");
   for (unsigned Comp = 0; Comp < 4; ++Comp) {
+    if (RS->RB->Kind == ResourceKind::TypedBuffer &&
+        RS->RB->TypedComponents != 0 && Comp >= RS->RB->TypedComponents)
+      break;
     if (!(*Mask & (1u << Comp)))
       continue;
     auto Index = bufferIndexExpr(*RS, Args[2], Args[3], Comp);
@@ -1850,6 +2053,46 @@ Error Emitter::emitIf(mlir::scf::IfOp If, unsigned Ind) {
   return Error::success();
 }
 
+Error Emitter::emitSwitch(mlir::scf::IndexSwitchOp Switch, unsigned Ind) {
+  SmallVector<std::string, 2> ResultNames;
+  for (mlir::Value Res : Switch.getResults()) {
+    auto Ty = mslType(Res.getType());
+    if (!Ty)
+      return Ty.takeError();
+    std::string Name = freshName();
+    line(Ind, *Ty + " " + Name + ";");
+    ValueNames[Res] = Name;
+    ResultNames.push_back(Name);
+  }
+  auto Selector = exprFor(Switch.getArg(), PrecUnknown);
+  if (!Selector)
+    return Selector.takeError();
+  line(Ind, "switch (" + Selector->Text + ") {");
+  auto EmitCase = [&](mlir::Block &B, const std::string &Label) -> Error {
+    line(Ind + 1, Label + ": {");
+    if (Error E = emitBlock(B, Ind + 2))
+      return E;
+    auto Yield = mlir::cast<mlir::scf::YieldOp>(B.getTerminator());
+    for (auto [Name, V] : zip(ResultNames, Yield.getOperands())) {
+      auto E = exprFor(V, PrecUnknown);
+      if (!E)
+        return E.takeError();
+      line(Ind + 2, Name + " = " + E->Text + ";");
+    }
+    line(Ind + 2, "break;");
+    line(Ind + 1, "}");
+    return Error::success();
+  };
+  for (auto [I, Value] : enumerate(Switch.getCases()))
+    if (Error E = EmitCase(Switch.getCaseBlock(I),
+                           "case " + std::to_string(Value)))
+      return E;
+  if (Error E = EmitCase(Switch.getDefaultBlock(), "default"))
+    return E;
+  line(Ind, "}");
+  return Error::success();
+}
+
 // Returns true when the after-region only forwards its arguments 1:1 to
 // scf.yield -- the rotated do-while shape dxc commonly produces.
 static bool isTrivialAfterRegion(mlir::scf::WhileOp While) {
@@ -1968,6 +2211,8 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return emitIf(If, Ind);
   if (auto While = mlir::dyn_cast<mlir::scf::WhileOp>(Op))
     return emitWhile(While, Ind);
+  if (auto Switch = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(Op))
+    return emitSwitch(Switch, Ind);
   if (mlir::isa<mlir::scf::ForOp>(Op))
     return makeError("scf.for emission is not implemented yet");
 
@@ -2002,6 +2247,20 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     case DXILOp::AtomicBinOp:
     case DXILOp::AtomicCompareExchange:
       return emitDXAtomic(Call, *DXOp, Ind);
+    case DXILOp::UAddc: {
+      auto Args = Call.getArgOperands();
+      auto A = exprFor(Args[1], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      auto B = exprFor(Args[2], PrecUnknown);
+      if (!B)
+        return B.takeError();
+      std::string Name = freshName();
+      line(Ind, "ulong " + Name + " = ulong(" + A->Text + ") + ulong(" +
+                    B->Text + ");");
+      ValueNames[Call.getResult()] = Name;
+      return Error::success();
+    }
     case DXILOp::WaveActiveBallot: {
       // Aggregate result; materialize as a uint4 so extractvalue can swizzle.
       requireHelper("crucible_wave_ballot");

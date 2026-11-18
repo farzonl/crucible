@@ -55,6 +55,7 @@ enum class DXILOp : uint32_t {
   IMin = 38,
   UMax = 39,
   UMin = 40,
+  UAddc = 44,
   // Tertiary
   FMad = 46,
   Fma = 47,
@@ -96,6 +97,12 @@ enum class DXILOp : uint32_t {
   WaveActiveOp = 119,
   WaveActiveBit = 120,
   WavePrefixOp = 121,
+  QuadReadLaneAt = 122,
+  QuadOp = 123,
+  LegacyF32ToF16 = 130,
+  LegacyF16ToF32 = 131,
+  WaveAllBitCount = 135,
+  WavePrefixBitCount = 136,
   // SM 6.2+ raw/structured buffer access
   RawBufferLoad = 139,
   RawBufferStore = 140,

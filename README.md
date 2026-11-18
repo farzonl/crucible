@@ -177,8 +177,12 @@ is the current optimization target.
   `metal-shaderconverter`.
 - [x] **Milestone 4 (partial)** — offload-test-suite integration
   (`crucible-offload` + `check-crucible-offload`) and public compliance
-  dashboard. Remaining: textures, 16/64-bit types, resource arrays,
-  vertex/fragment stages.
+  dashboard. Scalar `half`, `i16`, and `i64` are enabled in compliance tests.
+  Wave and quad operations use Metal SIMD builtins. The backend uses
+  ballot and shuffle for 64-bit arithmetic reductions/scans and for
+  16-bit integer sums that need to preserve the active-lane mask.
+  Remaining: textures, resource arrays, 64-bit atomics, fixed wave-size
+  selection, and vertex/fragment stages.
 
 ## License
 

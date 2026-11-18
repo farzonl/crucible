@@ -1,0 +1,13 @@
+# RUN: %dxc -T cs_6_2 -E main -enable-16bit-types -Fo %t.dxil %S/../Inputs/native_width_wave.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s < %t.metal
+
+# CHECK: constant uint4* cb0
+# CHECK: ushort(cb0[{{.*}}].x >> 16u)
+# CHECK: as_type<ulong2>(cb0[
+# CHECK-SAME: as_type<half>(ushort(cb0[
+# CHECK: if (
+# CHECK: crucible_wave_wide<ulong, 0, false>
+# CHECK: crucible_wave_wide<ulong, 0, true>
+# CHECK: simd_sum(uint(
+# CHECK: simd_shuffle(uint(

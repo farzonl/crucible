@@ -14,9 +14,11 @@
 #include "Frontend.h"
 #include "crucible/Diagnostic.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -86,7 +88,10 @@ static void parseExtendedProps(const MDNode *Props, ResourceBinding &RB) {
   }
 }
 
+using ResourceWidths = DenseMap<const Metadata *, unsigned>;
+
 static void parseResourceList(const MDNode *List, ResourceClass Class,
+                              const ResourceWidths &Widths,
                               std::vector<ResourceBinding> &Out) {
   if (!List)
     return;
@@ -130,11 +135,14 @@ static void parseResourceList(const MDNode *List, ResourceClass Class,
       RB.Kind = ResourceKind::Sampler;
       break;
     }
+    if (RB.Kind == ResourceKind::TypedBuffer)
+      RB.TypedComponents = Widths.lookup(Rec->getOperand(1).get());
     Out.push_back(std::move(RB));
   }
 }
 
-static void parseResources(const Module &M, Reflection &R) {
+static void parseResources(const Module &M, const ResourceWidths &Widths,
+                           Reflection &R) {
   const NamedMDNode *Res = M.getNamedMetadata("dx.resources");
   if (!Res || Res->getNumOperands() == 0)
     return;
@@ -143,13 +151,13 @@ static void parseResources(const Module &M, Reflection &R) {
     return;
   // Root operands: {SRVs, UAVs, CBVs, Samplers}
   parseResourceList(dyn_cast_or_null<MDNode>(Root->getOperand(0).get()),
-                    ResourceClass::SRV, R.Resources);
+                    ResourceClass::SRV, Widths, R.Resources);
   parseResourceList(dyn_cast_or_null<MDNode>(Root->getOperand(1).get()),
-                    ResourceClass::UAV, R.Resources);
+                    ResourceClass::UAV, Widths, R.Resources);
   parseResourceList(dyn_cast_or_null<MDNode>(Root->getOperand(2).get()),
-                    ResourceClass::CBV, R.Resources);
+                    ResourceClass::CBV, Widths, R.Resources);
   parseResourceList(dyn_cast_or_null<MDNode>(Root->getOperand(3).get()),
-                    ResourceClass::Sampler, R.Resources);
+                    ResourceClass::Sampler, Widths, R.Resources);
 }
 
 static ShaderStage parseStage(StringRef Name) {
@@ -226,6 +234,27 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
       [](StringRef, StringRef DL) -> std::optional<std::string> {
         return upgradeDataLayout(DL);
       });
+  ResourceWidths Widths;
+  Callbacks.MDType = [&](Metadata **MD, unsigned ID, GetTypeByIDTy GetType,
+                         GetContainedTypeIDTy GetContained) {
+    if (!isa<PointerType>(GetType(ID)))
+      return;
+    auto *Ty = dyn_cast_or_null<StructType>(GetType(GetContained(ID, 0)));
+    if (!Ty || !Ty->hasName() || Ty->isOpaque() || Ty->getNumElements() != 1 ||
+        !(Ty->getName().starts_with("class.Buffer<") ||
+          Ty->getName().starts_with("class.RWBuffer<")))
+      return;
+    Type *Elem = Ty->getElementType(0);
+    auto *Vec = dyn_cast<FixedVectorType>(Elem);
+    unsigned Components = Vec ? Vec->getNumElements() : 1;
+    Type *Scalar = Elem->getScalarType();
+    if (Components > 4 || !(Scalar->isIntegerTy() || Scalar->isFloatingPointTy()))
+      return;
+    // Typed undef symbols with different pointees become the same opaque
+    // pointer value. Keep the metadata records distinct until reflection.
+    *MD = MDNode::getDistinct(Ctx, {*MD});
+    Widths.try_emplace(*MD, Components);
+  };
 
   auto ModOrErr = parseBitcodeFile(
       MemoryBufferRef(*Bitcode, Buf.getBufferIdentifier()), Ctx, Callbacks);
@@ -249,7 +278,7 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
       }
     }
   }
-  parseResources(M, Shader.Reflect);
+  parseResources(M, Widths, Shader.Reflect);
 
   auto EntryOrErr = parseEntryPoints(M, Shader.Reflect, EntryOverride);
   if (!EntryOrErr)
@@ -275,8 +304,8 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
   FunctionPassManager FPM;
   FPM.addPass(PromotePass());
   FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
-  FPM.addPass(LowerSwitchPass());
   FPM.addPass(SimplifyCFGPass());
+  FPM.addPass(LowerSwitchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
   MPM.run(M, MAM);
 

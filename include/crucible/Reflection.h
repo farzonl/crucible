@@ -60,6 +60,7 @@ struct ResourceBinding {
   uint32_t LowerBound = 0;
   uint32_t RangeSize = 1;
   uint32_t ElementStride = 0; ///< Structured buffer stride; CBV size in bytes.
+  uint32_t TypedComponents = 0; ///< Number of scalar components in a typed buffer.
   bool GloballyCoherent = false;
   bool HasCounter = false;
 

@@ -1,0 +1,10 @@
+# REQUIRES: gpu
+# RUN: %dxc -T cs_6_2 -E main -enable-16bit-types -Fo %t.dxil %S/../Inputs/native_width_wave.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 8,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:u32:8:zero \
+# RUN:   --buffer 1:u32:4:0xfffc4000,0,0,1 | FileCheck %s
+
+# scale=2, divisor=-4, base=1<<32. Even lanes add the sum/count of
+# the four active lanes and their exclusive prefix. Odd lanes skip the wave.
+# CHECK: buffer0: 24 2 28 6 35 10 44 14

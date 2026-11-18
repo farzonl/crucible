@@ -30,6 +30,8 @@ config.available_features.add("DirectX")
 config.available_features.add("Crucible")
 config.available_features.add("DXC")
 config.available_features.add("Darwin")
+# Scalar shader operations, not the separate 64-bit atomic capabilities.
+config.available_features.update(["Half", "Int16", "Int64"])
 
 # Substitution order matters: %dxc_target_lib before %dxc_target.
 config.substitutions.append(("%dxc_target_lib", config.dxc))
