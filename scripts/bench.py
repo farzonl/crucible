@@ -160,7 +160,13 @@ def main():
         device = json.loads(device.stdout)["SPDisplaysDataType"][0][
             "sppci_model"]
     except Exception:
-        device = "Unknown GPU"
+        # Paravirtualized CI GPUs don't report a model; the CPU brand is the
+        # closest stable identifier on Apple Silicon.
+        try:
+            device = run(["sysctl", "-n",
+                          "machdep.cpu.brand_string"]).stdout.strip()
+        except Exception:
+            device = "Unknown GPU"
 
     rows = []
     with tempfile.TemporaryDirectory() as td:

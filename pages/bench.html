@@ -693,11 +693,11 @@
 
     <section class="card chart-card" aria-labelledby="mem-trend-title">
       <div class="card-header">
-        <h2 id="mem-trend-title">Historical Memory Usage Over Commits (Peak RSS MB, lower is better)</h2>
+        <h2 id="mem-trend-title">Shader Compile Time Over Commits (ms, lower is better)</h2>
         <div class="legend" id="mem-trend-legend"></div>
       </div>
       <div class="canvas-wrap" id="mem-trend-wrap">
-        <canvas id="mem-trend-canvas" aria-label="Line chart of peak memory usage across commits"></canvas>
+        <canvas id="mem-trend-canvas" aria-label="Line chart of shader compile time across commits"></canvas>
         <div class="tooltip" id="mem-trend-tooltip" role="status" aria-live="polite"></div>
       </div>
     </section>
@@ -709,9 +709,9 @@
           <select id="sort-metric" class="meta-pill" aria-label="Sort by metric">
             <option value="medianMs:asc">Sort: Hot (ms) ↑</option>
             <option value="coldMs:asc">Sort: Cold (ms) ↑</option>
-            <option value="shortJobMs:asc">Sort: Short (ms) ↑</option>
-            <option value="longJobMs:asc">Sort: Long (ms) ↑</option>
-            <option value="peakRssMb:asc">Sort: Peak (MB) ↑</option>
+            <option value="firstDispatchMs:asc">Sort: First Dispatch (ms) ↑</option>
+            <option value="minMs:asc">Sort: Min GPU (ms) ↑</option>
+            <option value="compileMs:asc">Sort: Compile (ms) ↑</option>
             <option value="default:asc">Sort: Suite Order</option>
           </select>
           <select id="page-size" class="meta-pill" aria-label="Rows per page">
@@ -740,7 +740,7 @@
       </div>
       <div tabindex="0" role="region" aria-labelledby="bench-table-caption" class="table-wrapper">
         <table class="bench-table">
-          <caption id="bench-table-caption">Selected commit shader, regime &amp; memory profile timings (click column headers to sort)</caption>
+          <caption id="bench-table-caption">Selected commit per-shader timings (click column headers to sort)</caption>
           <thead>
             <tr>
               <th scope="col" class="sortable" data-sort="benchName">Benchmark</th>
@@ -748,9 +748,9 @@
               <th scope="col" class="sortable" data-sort="backend">Backend</th>
               <th scope="col" class="sortable" data-sort="coldMs">Cold (ms)</th>
               <th scope="col" class="sortable" data-sort="medianMs">Hot (ms)</th>
-              <th scope="col" class="sortable" data-sort="shortJobMs">Short (ms)</th>
-              <th scope="col" class="sortable" data-sort="longJobMs">Long (ms)</th>
-              <th scope="col" class="sortable" data-sort="peakRssMb">Peak (MB)</th>
+              <th scope="col" class="sortable" data-sort="firstDispatchMs">First (ms)</th>
+              <th scope="col" class="sortable" data-sort="minMs">Min (ms)</th>
+              <th scope="col" class="sortable" data-sort="compileMs">Compile (ms)</th>
               <th scope="col" class="sortable" data-sort="status">Status</th>
             </tr>
           </thead>
@@ -989,11 +989,10 @@
       }
 
       const regimeSpecs = [
-        { regime: "Cold JIT", field: "coldMs", unit: "ms" },
-        { regime: "Hot JIT", field: "medianMs", unit: "ms" },
-        { regime: "Short-Running Job", field: "shortJobMs", unit: "ms" },
-        { regime: "Long-Running Job", field: "longJobMs", unit: "ms" },
-        { regime: "Lowest Peak Memory", field: "peakRssMb", unit: "MB" },
+        { regime: "Cold Start", field: "coldMs", unit: "ms" },
+        { regime: "Steady-State GPU", field: "medianMs", unit: "ms" },
+        { regime: "Best GPU Sample", field: "minMs", unit: "ms" },
+        { regime: "Shader Compile", field: "compileMs", unit: "ms" },
       ];
       const regimeWinners = regimeSpecs.map(({ regime, field, unit }) => {
         const gms = computePenalizedBackendGeomeans(suites, field, {
@@ -1099,9 +1098,9 @@
 
     function getMemoryScopeKey(scope) {
       const [mode, param] = scope.split(":");
-      if (mode === "cat") return `cat:${param}:peakRssMb`;
-      if (mode === "shader") return `shader:${param}:peakRssMb`;
-      return "regime:all:peakRssMb";
+      if (mode === "cat") return `cat:${param}:compileMs`;
+      if (mode === "shader") return `shader:${param}:compileMs`;
+      return "regime:all:compileMs";
     }
 
     function renderKPIs(idx) {
@@ -1158,11 +1157,10 @@
 
     function scopeForRegimeWinner(regime) {
       const map = {
-        "Cold JIT": "regime:all:coldMs",
-        "Hot JIT": "regime:all:medianMs",
-        "Short-Running Job": "regime:all:shortJobMs",
-        "Long-Running Job": "regime:all:longJobMs",
-        "Lowest Peak Memory": "regime:all:peakRssMb",
+        "Cold Start": "regime:all:coldMs",
+        "Steady-State GPU": "regime:all:medianMs",
+        "Best GPU Sample": "regime:all:minMs",
+        "Shader Compile": "regime:all:compileMs",
       };
       const scope = map[regime] || null;
       if (!scope) return null;
@@ -1245,7 +1243,7 @@
         if (!byCat.has(cat)) byCat.set(cat, []);
         byCat.get(cat).push(r);
       }
-      const fields = ["coldMs", "medianMs", "shortJobMs", "longJobMs", "peakRssMb"];
+      const fields = ["coldMs", "medianMs", "minMs", "compileMs", "firstDispatchMs"];
       const out = [];
       for (const [cat, catRows] of byCat.entries()) {
         const maxByField = {};
@@ -1285,9 +1283,9 @@
               backend,
               coldMs: penalizedMean("coldMs"),
               medianMs: penalizedMean("medianMs"),
-              shortJobMs: penalizedMean("shortJobMs"),
-              longJobMs: penalizedMean("longJobMs"),
-              peakRssMb: penalizedMean("peakRssMb"),
+              minMs: penalizedMean("minMs"),
+              compileMs: penalizedMean("compileMs"),
+              firstDispatchMs: penalizedMean("firstDispatchMs"),
               ran: true,
               status: missingCount > 0 ? `AVG (${ranRows.length}/${totalTests} · penalized)` : `AVG (${ranRows.length}/${totalTests})`,
             });
@@ -1299,9 +1297,9 @@
               backend,
               coldMs: 0,
               medianMs: 0,
-              shortJobMs: 0,
-              longJobMs: 0,
-              peakRssMb: 0,
+              minMs: 0,
+              compileMs: 0,
+              firstDispatchMs: 0,
               ran: false,
               status: group[0].status,
             });
@@ -1324,7 +1322,7 @@
       }
       if (sortField === "default") return filtered;
 
-      const numericFields = new Set(["coldMs", "medianMs", "shortJobMs", "longJobMs", "peakRssMb"]);
+      const numericFields = new Set(["coldMs", "medianMs", "minMs", "compileMs", "firstDispatchMs"]);
       const isNum = numericFields.has(sortField);
       const valOf = (r) => {
         if (!r.ran) return isNum ? (sortDir === "asc" ? Infinity : -Infinity) : "~~~";
@@ -1413,9 +1411,9 @@
         return;
       }
 
-      const barMetric = (sortField === "coldMs" || sortField === "shortJobMs" || sortField === "longJobMs" || sortField === "peakRssMb")
+      const barMetric = (sortField === "coldMs" || sortField === "minMs" || sortField === "compileMs" || sortField === "firstDispatchMs")
         ? sortField : "medianMs";
-      const unit = barMetric === "peakRssMb" ? "MB" : "ms";
+      const unit = "ms";
       const valOf = (r) => barMetric === "coldMs" ? Number(r.coldMs || r.compileMs || 0) : Number(r[barMetric] || 0);
       const maxVal = Math.max(...ran.map(valOf), 0.1);
       const labels = ran.map(r => `${formatBenchName(r)} · ${r.backend}`);
@@ -1432,7 +1430,7 @@
         const v = valOf(r);
         const w = Math.max(4, (v / maxVal) * barW);
         const label = labels[i];
-        const valText = `${barMetric === "peakRssMb" ? v.toFixed(1) : v.toFixed(2)} ${unit}`;
+        const valText = `${v.toFixed(2)} ${unit}`;
         return `
           <g transform="translate(0, ${y})">
             <text x="${padLeft - 14}" y="19" text-anchor="end" font-size="11" font-family="var(--font-mono)" fill="var(--text)">${escapeHtml(label)}</text>
@@ -1463,9 +1461,9 @@
           <td>${escapeHtml(r.backend)}</td>
           <td>${r.ran && r.coldMs ? r.coldMs.toFixed(2) : (r.ran ? r.compileMs.toFixed(2) : "—")}</td>
           <td>${r.ran ? r.medianMs.toFixed(2) : "—"}</td>
-          <td>${r.ran && r.shortJobMs ? r.shortJobMs.toFixed(2) : "—"}</td>
-          <td>${r.ran && r.longJobMs ? r.longJobMs.toFixed(2) : "—"}</td>
-          <td>${r.ran && r.peakRssMb ? r.peakRssMb.toFixed(1) : "—"}</td>
+          <td>${r.ran && r.firstDispatchMs ? r.firstDispatchMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.minMs ? r.minMs.toFixed(2) : "—"}</td>
+          <td>${r.ran && r.compileMs ? r.compileMs.toFixed(2) : "—"}</td>
           <td>${escapeHtml(r.status)}</td>
         </tr>`).join("");
     }
@@ -1641,21 +1639,14 @@
       }
 
       const overallOpts = [
-        { val: "overall:all:medianMs", label: "Overall Geomean (All Stages, ms)" },
-        { val: "regime:all:coldMs", label: "Regime: Cold JIT Time (geomean ms)" },
-        { val: "regime:all:medianMs", label: "Regime: Hot JIT Time (geomean ms)" },
-        { val: "regime:all:shortJobMs", label: "Regime: Short-Running Job (geomean ms)" },
-        { val: "regime:all:longJobMs", label: "Regime: Long-Running Job (geomean ms)" },
-        { val: "regime:all:peakRssMb", label: "Regime: Lowest Peak Memory (geomean MB)" },
+        { val: "overall:all:medianMs", label: "Overall Geomean (All Workloads, ms)" },
+        { val: "regime:all:coldMs", label: "Cold Start: compile + first dispatch (geomean ms)" },
+        { val: "regime:all:medianMs", label: "Steady-State GPU time (geomean ms)" },
+        { val: "regime:all:minMs", label: "Best GPU sample (geomean ms)" },
+        { val: "regime:all:compileMs", label: "Shader compile time (geomean ms)" },
       ];
       const stageOpts = [
-        { val: "cat:Compute:medianMs", label: "Stage Avg: Compute (ms)" },
-        { val: "cat:Vertex:medianMs", label: "Stage Avg: Vertex (ms)" },
-        { val: "cat:Pixel:medianMs", label: "Stage Avg: Pixel (ms)" },
-        { val: "cat:Geometry:medianMs", label: "Stage Avg: Geometry (ms)" },
-        { val: "cat:Tessellation:medianMs", label: "Stage Avg: Tessellation (ms)" },
-        { val: "cat:Ray Tracing:medianMs", label: "Stage Avg: Ray Tracing (ms)" },
-        { val: "cat:Mesh:medianMs", label: "Stage Avg: Mesh (ms)" },
+        { val: "cat:Compute:medianMs", label: "Category Avg: Compute (ms)" },
       ];
       const shaderOpts = [...seenShaders.entries()].map(([id, info]) => ({
         val: `shader:${id}:medianMs`,
