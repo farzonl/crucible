@@ -393,11 +393,11 @@
     .bench-table {
       --label-2: "Category";
       --label-3: "Backend";
-      --label-4: "Cold (ms)";
-      --label-5: "Hot (ms)";
-      --label-6: "Short (ms)";
-      --label-7: "Long (ms)";
-      --label-8: "Peak (MB)";
+      --label-4: "Cold Start (ms)";
+      --label-5: "GPU Median (ms)";
+      --label-6: "First Dispatch (ms)";
+      --label-7: "GPU Min (ms)";
+      --label-8: "Compile (ms)";
       --label-9: "Score";
       --label-10: "Status";
     }
@@ -746,8 +746,8 @@
               <th scope="col" class="sortable" data-sort="benchName">Benchmark</th>
               <th scope="col" class="sortable" data-sort="category">Category</th>
               <th scope="col" class="sortable" data-sort="backend">Backend</th>
-              <th scope="col" class="sortable" data-sort="coldMs">Cold (ms)</th>
-              <th scope="col" class="sortable" data-sort="medianMs">Hot (ms)</th>
+              <th scope="col" class="sortable" data-sort="coldMs">Cold Start (ms)</th>
+              <th scope="col" class="sortable" data-sort="medianMs">GPU Median (ms)</th>
               <th scope="col" class="sortable" data-sort="firstDispatchMs">First (ms)</th>
               <th scope="col" class="sortable" data-sort="minMs">Min (ms)</th>
               <th scope="col" class="sortable" data-sort="compileMs">Compile (ms)</th>
