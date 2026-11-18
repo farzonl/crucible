@@ -6,6 +6,10 @@ if(NOT DXC_EXECUTABLE)
   message(WARNING "dxc not found; tests that compile HLSL will fail")
 endif()
 
+if(TARGET crucible-offload)
+  set(CRUCIBLE_OFFLOAD_PATH $<TARGET_FILE:crucible-offload>)
+endif()
+
 find_program(FILECHECK_EXECUTABLE FileCheck
   HINTS "${LLVM_TOOLS_BINARY_DIR}")
 if(NOT FILECHECK_EXECUTABLE)
@@ -55,7 +59,7 @@ if(LLVM_EXTERNAL_LIT)
   # Lives outside this suite's directory so check-crucible doesn't recurse
   # into it.
   if(TARGET crucible-offload)
-    set(CRUCIBLE_OFFLOAD_PATH $<TARGET_FILE:crucible-offload>)
+    add_dependencies(check-crucible crucible-offload)
     configure_file(
       "${CMAKE_CURRENT_SOURCE_DIR}/offload/lit.site.cfg.py.in"
       "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py.gen"

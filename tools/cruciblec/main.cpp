@@ -43,6 +43,9 @@ static cl::opt<std::string> EntryPoint("entry",
 static cl::opt<std::string> MSLStd("msl-std",
                                    cl::desc("MSL language standard (default metal3.1)"),
                                    cl::init("metal3.1"), cl::cat(CrucibleCat));
+static cl::opt<bool> FlushDenormsF32("ftz",
+                                     cl::desc("Flush f32 denormals to zero around math builtins"),
+                                     cl::cat(CrucibleCat));
 
 static int reportError(Error E) {
   logAllUnhandledErrors(std::move(E), errs(), "cruciblec: error: ");
@@ -107,6 +110,7 @@ int main(int argc, char **argv) {
   crucible::Options Opts;
   Opts.EntryPoint = EntryPoint;
   Opts.MSLStd = MSLStd;
+  Opts.FlushDenormsF32 = FlushDenormsF32;
 
   auto Result =
       crucible::compileDXILToMSL((*BufOrErr)->getMemBufferRef(), Opts);

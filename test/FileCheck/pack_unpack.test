@@ -1,0 +1,13 @@
+# DXIL -> MSL golden + -Werror compile test for SM 6.6 Pack4x8 and Unpack4x8.
+
+# RUN: %dxc -T cs_6_6 -E main -Fo %t.dxil %S/../Inputs/pack_unpack.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air
+
+# CHECK: template <uint Mode>
+# CHECK: static inline uint crucible_pack4x8(int4 v)
+# CHECK: as_type<uint4>(int4(as_type<char4>(
+# CHECK: crucible_pack4x8<1u>(int4(
+# CHECK: crucible_pack4x8<2u>(int4(
+# CHECK: crucible_pack4x8<0u>(int4(

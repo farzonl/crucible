@@ -1,0 +1,18 @@
+# DXIL -> MSL golden + -Werror compile test for Texture2D Load, RWTexture2D write, and GetDimensions.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/texture_rw_dims.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air
+
+# CHECK: #include <metal_stdlib>
+# CHECK: using namespace metal;
+# CHECK: kernel void main0(
+# CHECK-DAG: texture2d<float, access::read> {{.*}} {{\[\[}}texture(0){{\]\]}}
+# CHECK-DAG: texture2d<float, access::read_write> {{.*}} {{\[\[}}texture(1){{\]\]}}
+# CHECK-DAG: device uint* {{.*}} {{\[\[}}buffer(0){{\]\]}}
+# CHECK: .get_width(0u)
+# CHECK: .get_height(0u)
+# CHECK: .get_num_mip_levels()
+# CHECK: .read(uint2(
+# CHECK: .write(float4(

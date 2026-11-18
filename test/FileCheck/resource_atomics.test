@@ -1,0 +1,17 @@
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/resource_atomics.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --reflect %t.json
+# RUN: FileCheck %s < %t.metal
+# RUN: FileCheck %s --check-prefix=REFLECT < %t.json
+
+# CHECK: while (!tex.atomic_compare_exchange_weak(coord, &expected, vec<T, 4>(desired)))
+# CHECK: if (expected.x != compare) break;
+# CHECK-LABEL: kernel void main0(
+# CHECK-DAG: texture2d<uint, access::read_write> uav0
+# CHECK-DAG: texture2d<int, access::read_write> uav1
+# CHECK: uav0.atomic_exchange(uint2(
+# CHECK: crucible_atomic_cmpxchg_texture2d(uav0, uint2(
+# CHECK: as_type<uint>(uav1.atomic_fetch_min(uint2(
+# CHECK: atomic_fetch_xor_explicit((device atomic_uint *)&uav2[1u]
+
+# REFLECT-COUNT-2: "requiresTextureAtomics": true
+# REFLECT-NOT: "requiresTextureAtomics": true

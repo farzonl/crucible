@@ -23,6 +23,10 @@ config.substitutions.append(("FileCheck", config.filecheck))
 if config.crucible_run:
     config.substitutions.append(("%crucible-run", config.crucible_run))
 
+if config.crucible_offload:
+    config.substitutions.append(("%crucible-offload", config.crucible_offload))
+    config.available_features.add("offload-runner")
+
 # Feature flags:
 #   metal-tools -- Apple's `xcrun metal` toolchain is available, so emitted
 #                  MSL can be compiled with -Werror.

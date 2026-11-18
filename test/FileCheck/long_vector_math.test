@@ -1,0 +1,9 @@
+# RUN: %dxc -T cs_6_9 -E main -Fo %t.dxil %S/../Inputs/long_vector_math.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s < %t.metal
+
+# CHECK-LABEL: kernel void main0(
+# CHECK: uint {{v[0-9]+}}[5];
+# CHECK: {{v[0-9]+}}[4]
+# CHECK: as_type<int>(
+# CHECK: uav0[

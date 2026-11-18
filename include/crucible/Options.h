@@ -31,6 +31,9 @@ struct Options {
   /// Entry point to compile when the container exports multiple (libraries).
   /// Empty selects the sole entry point.
   std::string EntryPoint;
+
+  /// Flush f32 denormals to signed zero around math builtins (D3D12 FTZ).
+  bool FlushDenormsF32 = false;
 };
 
 } // namespace crucible

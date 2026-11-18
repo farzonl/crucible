@@ -1,0 +1,18 @@
+# RUN: %dxc -T vs_6_0 -E vs -Fo %t.vs %S/../Inputs/graphics_varyings.hlsl
+# RUN: %dxc -T ps_6_0 -E ps -Fo %t.ps %S/../Inputs/graphics_varyings.hlsl
+# RUN: %cruciblec %t.vs -o %t.vs.metal
+# RUN: %cruciblec %t.ps -o %t.ps.metal
+# RUN: FileCheck %s --check-prefix=VERTEX < %t.vs.metal
+# RUN: FileCheck %s --check-prefix=PIXEL < %t.ps.metal
+
+# VERTEX: {{\[\[}}attribute(0)
+# VERTEX: {{\[\[}}position
+# VERTEX: {{\[\[}}user(crucible_636f6c6f72_2)
+# VERTEX: vertex CrucibleStageOut vs(
+
+# PIXEL-DAG: {{\[\[}}position
+# PIXEL-DAG: {{\[\[}}user(crucible_636f6c6f72_2), center_perspective
+# PIXEL: {{\[\[}}color(0)
+# PIXEL: fragment CrucibleStageOut ps(
+# PIXEL-DAG: dfdx(
+# PIXEL-DAG: quad_broadcast(dfdy(

@@ -50,10 +50,32 @@ enum class ResourceKind : uint8_t {
   TBuffer = 15,
 };
 
+/// DXIL element component type (matches hlsl::DXIL::ComponentType).
+enum class ComponentType : uint8_t {
+  Invalid = 0,
+  I1 = 1,
+  I16 = 2,
+  U16 = 3,
+  I32 = 4,
+  U32 = 5,
+  I64 = 6,
+  U64 = 7,
+  F16 = 8,
+  F32 = 9,
+  F64 = 10,
+  SNormF16 = 11,
+  UNormF16 = 12,
+  SNormF32 = 13,
+  UNormF32 = 14,
+  SNormF64 = 15,
+  UNormF64 = 16,
+};
+
 /// One DXIL register range mapped to a Metal binding slot.
 struct ResourceBinding {
   ResourceClass Class = ResourceClass::SRV;
   ResourceKind Kind = ResourceKind::Invalid;
+  ComponentType ElementType = ComponentType::Invalid;
   uint32_t RecordID = 0; ///< DXIL range ID (unique per class).
   std::string Name;      ///< HLSL-visible name, may be empty.
   uint32_t Space = 0;
@@ -63,9 +85,21 @@ struct ResourceBinding {
   uint32_t TypedComponents = 0; ///< Number of scalar components in a typed buffer.
   bool GloballyCoherent = false;
   bool HasCounter = false;
+  bool RequiresTextureAtomics = false; ///< Requires MTLTextureUsageShaderAtomic.
 
   /// Assigned Metal slot ([[buffer(n)]] / [[texture(n)]] / [[sampler(n)]]).
   uint32_t MetalIndex = 0;
+};
+
+struct StageParameter {
+  std::string Semantic;
+  uint32_t SemanticIndex;
+  uint32_t ID;
+  ComponentType Type;
+  uint32_t Kind; ///< DXIL semantic kind.
+  uint32_t Interpolation; ///< DXIL interpolation mode.
+  uint32_t Rows;
+  uint32_t Columns;
 };
 
 /// Full reflection for one compiled entry point.
@@ -79,6 +113,7 @@ struct Reflection {
   std::string MSLEntryName;
   std::array<uint32_t, 3> NumThreads = {1, 1, 1};
   std::vector<ResourceBinding> Resources;
+  std::vector<StageParameter> Inputs, Outputs;
 
   /// Serialize the (space, register, kind) -> metal_index mapping as JSON.
   std::string toJSON() const;

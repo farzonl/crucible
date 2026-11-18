@@ -19,11 +19,14 @@
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/DXILUpgrade.h"
@@ -83,7 +86,9 @@ static void parseExtendedProps(const MDNode *Props, ResourceBinding &RB) {
   for (unsigned I = 0, E = Props->getNumOperands(); I + 1 < E; I += 2) {
     uint64_t Tag = mdUInt(Props->getOperand(I));
     uint64_t Val = mdUInt(Props->getOperand(I + 1));
-    if (Tag == kDxilStructuredBufferElementSizeTag)
+    if (Tag == kDxilElementTypeTag)
+      RB.ElementType = static_cast<ComponentType>(Val);
+    else if (Tag == kDxilStructuredBufferElementSizeTag)
       RB.ElementStride = static_cast<uint32_t>(Val);
   }
 }
@@ -195,6 +200,29 @@ static void parseEntryProps(const MDNode *Props, Reflection &R) {
   }
 }
 
+static Error parseStageParameters(const MDNode *List,
+                                  std::vector<StageParameter> &Out) {
+  if (!List)
+    return Error::success();
+  for (const MDOperand &Operand : List->operands()) {
+    auto *N = dyn_cast_or_null<MDNode>(Operand.get());
+    if (!N || N->getNumOperands() < 8)
+      return makeError("invalid DXIL stage signature element");
+    auto *Indices = dyn_cast_or_null<MDNode>(N->getOperand(4).get());
+    if (!Indices || Indices->getNumOperands() == 0)
+      return makeError("missing DXIL signature semantic index");
+    Out.push_back({mdString(N->getOperand(1)).str(),
+                   static_cast<uint32_t>(mdUInt(Indices->getOperand(0))),
+                   static_cast<uint32_t>(mdUInt(N->getOperand(0))),
+                   static_cast<ComponentType>(mdUInt(N->getOperand(2))),
+                   static_cast<uint32_t>(mdUInt(N->getOperand(3))),
+                   static_cast<uint32_t>(mdUInt(N->getOperand(5))),
+                   static_cast<uint32_t>(mdUInt(N->getOperand(6))),
+                   static_cast<uint32_t>(mdUInt(N->getOperand(7)))});
+  }
+  return Error::success();
+}
+
 static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
                                              StringRef EntryOverride) {
   const NamedMDNode *EPs = M.getNamedMetadata("dx.entryPoints");
@@ -213,6 +241,18 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
     if (!F)
       continue;
     R.EntryName = Name.str();
+    if (R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel) {
+      if (auto *Sig = dyn_cast_or_null<MDNode>(EP->getOperand(2).get())) {
+        if (Sig->getNumOperands() < 2)
+          return makeError("invalid DXIL entry signature");
+        if (Error E = parseStageParameters(
+                dyn_cast_or_null<MDNode>(Sig->getOperand(0).get()), R.Inputs))
+          return E;
+        if (Error E = parseStageParameters(
+                dyn_cast_or_null<MDNode>(Sig->getOperand(1).get()), R.Outputs))
+          return E;
+      }
+    }
     parseEntryProps(dyn_cast_or_null<MDNode>(EP->getOperand(4).get()), R);
     return F;
   }
@@ -223,6 +263,85 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
 //===----------------------------------------------------------------------===//
 // loadDXIL
 //===----------------------------------------------------------------------===//
+
+namespace {
+class LowerLongVectorsPass : public PassInfoMixin<LowerLongVectorsPass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
+    auto IsLongVector = [](Type *T) {
+      auto *VT = dyn_cast<FixedVectorType>(T);
+      return VT && VT->getNumElements() > 4;
+    };
+    bool HasLongVector = false;
+    SmallVector<CallInst *, 4> DXCalls;
+    for (Instruction &I : instructions(F)) {
+      if (!IsLongVector(I.getType()) &&
+          none_of(I.operands(), [&](const Use &U) {
+            return IsLongVector(U->getType());
+          }))
+        continue;
+      HasLongVector = true;
+      auto *Call = dyn_cast<CallInst>(&I);
+      if (Call && Call->getCalledFunction() &&
+          Call->getCalledFunction()->getName().starts_with("dx.op."))
+        DXCalls.push_back(Call);
+    }
+    if (!HasLongVector)
+      return PreservedAnalyses::all();
+
+    // Expose the DXIL operations as ordinary IR before LLVM scalarizes
+    // the surrounding vector arithmetic, extracts, and memory accesses.
+    for (CallInst *Call : DXCalls) {
+      if (Call->arg_size() != 3)
+        continue;
+      auto *Opcode = dyn_cast<ConstantInt>(Call->getArgOperand(0));
+      Value *A = Call->getArgOperand(1), *B = Call->getArgOperand(2);
+      auto *VT = dyn_cast<FixedVectorType>(A->getType());
+      if (!Opcode || !VT || !IsLongVector(VT) || B->getType() != VT)
+        continue;
+      IRBuilder<> Builder(Call);
+      Value *Result;
+      switch (Opcode->getZExtValue()) {
+      case 37: // IMax
+      case 38: // IMin
+      case 39: // UMax
+      case 40: { // UMin
+        if (Call->getType() != VT || !VT->getElementType()->isIntegerTy())
+          continue;
+        auto Pred = Opcode->equalsInt(37) ? CmpInst::ICMP_SGT
+                    : Opcode->equalsInt(38) ? CmpInst::ICMP_SLT
+                    : Opcode->equalsInt(39) ? CmpInst::ICMP_UGT
+                                           : CmpInst::ICMP_ULT;
+        Result = Builder.CreateSelect(Builder.CreateICmp(Pred, A, B), A, B);
+        break;
+      }
+      case 311: { // FDot
+        Type *Elem = VT->getElementType();
+        if (Call->getType() != Elem || !(Elem->isHalfTy() || Elem->isFloatTy()))
+          continue;
+        Builder.setFastMathFlags(Call->getFastMathFlags());
+        Result = nullptr;
+        for (unsigned Lane = 0; Lane != VT->getNumElements(); ++Lane) {
+          Value *Product =
+              Builder.CreateFMul(Builder.CreateExtractElement(A, Lane),
+                                 Builder.CreateExtractElement(B, Lane));
+          Result = Result ? Builder.CreateFAdd(Result, Product) : Product;
+        }
+        break;
+      }
+      default:
+        continue;
+      }
+      Call->replaceAllUsesWith(Result);
+      Call->eraseFromParent();
+    }
+    ScalarizerPassOptions Options;
+    Options.ScalarizeLoadStore = true;
+    ScalarizerPass(Options).run(F, AM);
+    return PreservedAnalyses::none();
+  }
+};
+} // namespace
 
 Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
                                 StringRef EntryOverride) {
@@ -303,6 +422,7 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
   MPM.addPass(DXILUpgradePass());
   FunctionPassManager FPM;
   FPM.addPass(PromotePass());
+  FPM.addPass(LowerLongVectorsPass());
   FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
   FPM.addPass(SimplifyCFGPass());
   FPM.addPass(LowerSwitchPass());

@@ -1,4 +1,5 @@
 build/
+.cache/
 .sdk/
 .toolchains/
 .compliance-cache/

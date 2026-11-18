@@ -18,6 +18,8 @@ namespace crucible {
 /// DirectXShaderCompiler's DxilConstants.h). Only the subset the backend
 /// currently understands is listed; extend alongside IntrinsicMap.cpp.
 enum class DXILOp : uint32_t {
+  LoadInput = 4,
+  StoreOutput = 5,
   // Unary float
   FAbs = 6,
   Saturate = 7,
@@ -72,13 +74,25 @@ enum class DXILOp : uint32_t {
   // Resources
   CreateHandle = 57,
   CBufferLoadLegacy = 59,
+  SampleLevel = 62,
+  SampleGrad = 63,
+  TextureLoad = 66,
+  TextureStore = 67,
   BufferLoad = 68,
   BufferStore = 69,
+  GetDimensions = 72,
+  TextureGather = 73,
+  TextureGatherCmp = 74,
   // Atomics
   AtomicBinOp = 78,
   AtomicCompareExchange = 79,
   // Synchronization
   Barrier = 80,
+  Discard = 82,
+  DerivCoarseX = 83,
+  DerivCoarseY = 84,
+  DerivFineX = 85,
+  DerivFineY = 86,
   // Compute IDs
   ThreadId = 93,
   GroupId = 94,
@@ -110,9 +124,11 @@ enum class DXILOp : uint32_t {
   Dot2AddHalf = 162,
   Dot4AddI8Packed = 163,
   Dot4AddU8Packed = 164,
-  // SM 6.6 resource handles
+  // SM 6.6 resource handles & pack/unpack
   AnnotateHandle = 216,
   CreateHandleFromBinding = 217,
+  Unpack4x8 = 219,
+  Pack4x8 = 220,
 };
 
 /// hlsl::DXIL::AtomicBinOpCode (operand 2 of dx.op.atomicBinOp).

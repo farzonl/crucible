@@ -178,11 +178,23 @@ is the current optimization target.
 - [x] **Milestone 4 (partial)** — offload-test-suite integration
   (`crucible-offload` + `check-crucible-offload`) and public compliance
   dashboard. Scalar `half`, `i16`, and `i64` are enabled in compliance tests.
+  Long-vector integer `abs` and integer/float `dot` use LLVM's Scalarizer
+  rather than relying on Metal vector types wider than four lanes.
   Wave and quad operations use Metal SIMD builtins. The backend uses
   ballot and shuffle for 64-bit arithmetic reductions/scans and for
   16-bit integer sums that need to preserve the active-lane mask.
-  Remaining: textures, resource arrays, 64-bit atomics, fixed wave-size
-  selection, and vertex/fragment stages.
+  32-bit resource atomics cover raw, structured, and typed UAV buffers
+  and integer `RWTexture2D`. When binding a texture whose reflection has
+  `requiresTextureAtomics` set, use `MTLTextureUsageShaderAtomic` and an
+  `R32Uint` or `R32Sint` pixel format.
+  Remaining: broader texture and sampler support, resource arrays, 64-bit
+  atomics, and fixed wave-size selection.
+- [x] **Graphics (initial)** — DXIL vertex/pixel signatures lower to Metal
+  attributes, interpolated varyings, position, and color outputs. The
+  offload runner executes single-draw, single-color-target raster pipelines
+  without shader resources, including fragment discard and derivatives.
+  Graphics resource binding, depth/stencil, multisampling, geometry, and
+  tessellation remain unsupported.
 
 ## License
 

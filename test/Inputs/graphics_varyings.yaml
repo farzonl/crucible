@@ -1,0 +1,39 @@
+---
+Shaders:
+  - Stage: Vertex
+    Entry: vs
+  - Stage: Pixel
+    Entry: ps
+Buffers:
+  - Name: Vertices
+    Format: Float32
+    Stride: 8
+    Data: [-1, -1, -1, 1, 1, 1, 1, 1, 1, -1, -1, -1]
+  - Name: Output
+    Format: Float32
+    Channels: 4
+    FillSize: 64
+    OutputProps:
+      Width: 2
+      Height: 2
+      Depth: 1
+  - Name: Expected
+    Format: Float32
+    Channels: 4
+    Data: [0.375, 0.625, 1, 1, 0.625, 0.625, 1, 1,
+           0.375, 0.375, 1, 1, 0.625, 0.375, 1, 1]
+Bindings:
+  VertexBuffer: Vertices
+  VertexAttributes:
+    - Format: Float32
+      Channels: 2
+      Offset: 0
+      Name: POSITION
+  RenderTarget: Output
+DescriptorSets: []
+Results:
+  - Result: Interpolated varyings and derivatives
+    Rule: BufferExact
+    Actual: Output
+    Expected: Expected
+...

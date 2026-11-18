@@ -1,0 +1,9 @@
+# REQUIRES: gpu
+# RUN: %dxc -T cs_6_9 -E main -Fo %t.dxil %S/../Inputs/long_vector_math.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 1,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:i32:5:iota --buffer 1:i32:8:zero \
+# RUN:   | FileCheck %s
+
+# Signed dot, unsigned dot, twice the floating-point dot, and all abs lanes.
+# CHECK: buffer1: -5 40 95 3 2 1 0 1
