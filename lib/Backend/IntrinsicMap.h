@@ -80,6 +80,7 @@ enum class DXILOp : uint32_t {
   TextureStore = 67,
   BufferLoad = 68,
   BufferStore = 69,
+  BufferUpdateCounter = 70,
   GetDimensions = 72,
   TextureGather = 73,
   TextureGatherCmp = 74,
@@ -98,6 +99,9 @@ enum class DXILOp : uint32_t {
   GroupId = 94,
   ThreadIdInGroup = 95,
   FlattenedThreadIdInGroup = 96,
+  LoadPatchConstant = 104,
+  DomainLocation = 105,
+  PrimitiveID = 108,
   // Wave ops
   WaveIsFirstLane = 110,
   WaveGetLaneIndex = 111,

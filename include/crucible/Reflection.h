@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -82,13 +83,15 @@ struct ResourceBinding {
   uint32_t LowerBound = 0;
   uint32_t RangeSize = 1;
   uint32_t ElementStride = 0; ///< Structured buffer stride; CBV size in bytes.
-  uint32_t TypedComponents = 0; ///< Number of scalar components in a typed buffer.
+  uint32_t TypedComponents = 0; ///< Number of DXIL storage components per element.
   bool GloballyCoherent = false;
   bool HasCounter = false;
   bool RequiresTextureAtomics = false; ///< Requires MTLTextureUsageShaderAtomic.
 
   /// Assigned Metal slot ([[buffer(n)]] / [[texture(n)]] / [[sampler(n)]]).
   uint32_t MetalIndex = 0;
+  /// Assigned Metal [[buffer(n)]] slot for UAV atomic counter (when HasCounter).
+  uint32_t CounterMetalIndex = 0;
 };
 
 struct StageParameter {
@@ -100,6 +103,18 @@ struct StageParameter {
   uint32_t Interpolation; ///< DXIL interpolation mode.
   uint32_t Rows;
   uint32_t Columns;
+  std::vector<uint32_t> RowSemanticIndices;
+};
+
+enum class TessellationDomain : uint8_t { Triangle = 2, Quad = 3 };
+
+struct DomainInterface {
+  TessellationDomain Domain;
+  uint32_t ControlPointCount;
+  std::vector<StageParameter> PatchConstants;
+  // Each patch contains its control points (Inputs order), then its patch
+  // constants. Each signature element is packed row-major as 32-bit words.
+  static constexpr uint32_t DataMetalIndex = 30;
 };
 
 /// Full reflection for one compiled entry point.
@@ -114,6 +129,9 @@ struct Reflection {
   std::array<uint32_t, 3> NumThreads = {1, 1, 1};
   std::vector<ResourceBinding> Resources;
   std::vector<StageParameter> Inputs, Outputs;
+  std::optional<DomainInterface> Domain;
+  bool HasBufferDimensions = false;
+  uint32_t BufferSizesMetalIndex = UINT32_MAX;
 
   /// Serialize the (space, register, kind) -> metal_index mapping as JSON.
   std::string toJSON() const;

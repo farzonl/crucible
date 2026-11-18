@@ -69,20 +69,39 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
 
   uint32_t NextBuffer = 0, NextTexture = 0, NextSampler = 0;
   for (ResourceBinding *RB : Order) {
-    if (RB->RangeSize != 1)
-      return makeError("resource '{0}': descriptor arrays (range size {1}) "
-                       "are not supported yet",
-                       RB->Name, RB->RangeSize);
-    if (RB->Class == ResourceClass::Sampler)
-      RB->MetalIndex = NextSampler++;
-    else if (isTexture(*RB))
-      RB->MetalIndex = NextTexture++;
-    else if (isBufferLike(*RB))
-      RB->MetalIndex = NextBuffer++;
-    else
+    if (RB->RangeSize == 0xFFFFFFFFu) {
+      for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
+        if (O.Class == RB->Class && O.Space == RB->Space &&
+            O.Register == RB->LowerBound && O.Size > 0) {
+          RB->RangeSize = O.Size;
+          break;
+        }
+      }
+    }
+    if (RB->RangeSize == 0 || RB->RangeSize == 0xFFFFFFFFu)
+      return makeError("resource '{0}': unbounded descriptor arrays with "
+                       "dynamic indexing are not supported yet",
+                       RB->Name);
+    if (RB->Class == ResourceClass::Sampler) {
+      RB->MetalIndex = NextSampler;
+      NextSampler += RB->RangeSize;
+    } else if (isTexture(*RB)) {
+      RB->MetalIndex = NextTexture;
+      NextTexture += RB->RangeSize;
+    } else if (isBufferLike(*RB)) {
+      RB->MetalIndex = NextBuffer;
+      NextBuffer += RB->RangeSize;
+      if (RB->HasCounter) {
+        RB->CounterMetalIndex = NextBuffer;
+        NextBuffer += RB->RangeSize;
+      }
+    } else {
       return makeError("resource '{0}': unsupported resource kind {1}",
                        RB->Name, static_cast<unsigned>(RB->Kind));
+    }
   }
+  if (R.HasBufferDimensions)
+    R.BufferSizesMetalIndex = NextBuffer++;
   return llvm::Error::success();
 }
 

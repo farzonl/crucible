@@ -3,6 +3,7 @@
 # crucible-offload (DXIL -> crucible -> MSL -> Metal, direct bindings).
 
 import os
+import platform
 
 import lit.formats
 
@@ -30,6 +31,8 @@ config.available_features.add("DirectX")
 config.available_features.add("Crucible")
 config.available_features.add("DXC")
 config.available_features.add("Darwin")
+if platform.machine().lower() in ("arm64", "aarch64"):
+    config.available_features.add("host-arm64")
 # Scalar shader operations, not the separate 64-bit atomic capabilities.
 config.available_features.update(["Half", "Int16", "Int64"])
 
@@ -37,6 +40,8 @@ config.available_features.update(["Half", "Int16", "Int64"])
 config.substitutions.append(("%dxc_target_lib", config.dxc))
 config.substitutions.append(("%dxc_target", config.dxc))
 config.substitutions.append(("%offloader", config.crucible_offload))
+if config.crucible_api_query:
+    config.substitutions.append(("%api_query", config.crucible_api_query))
 for tool in ["FileCheck", "split-file", "obj2yaml", "not"]:
     config.substitutions.append(
-        (tool, os.path.join(config.llvm_tools_dir, tool)))
+        (rf"(?<!\S){tool}(?=\s|$)", os.path.join(config.llvm_tools_dir, tool)))

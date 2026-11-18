@@ -24,6 +24,14 @@ target_include_directories(offload-suite-support PUBLIC
 target_compile_options(offload-suite-support PRIVATE ${CRUCIBLE_COMMON_FLAGS})
 target_link_libraries(offload-suite-support PUBLIC ${CRUCIBLE_LLVM_LIBS})
 
+set(OFFLOAD_HOST_INFO "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/HostInfo.cpp")
+if(EXISTS "${OFFLOAD_HOST_INFO}")
+  add_executable(crucible-api-query api-query.cpp "${OFFLOAD_HOST_INFO}")
+  target_compile_definitions(crucible-api-query PRIVATE OFFLOADTEST_HAVE_SYSCTLBYNAME)
+  target_compile_options(crucible-api-query PRIVATE ${CRUCIBLE_COMMON_FLAGS})
+  target_link_libraries(crucible-api-query PRIVATE offload-suite-support)
+endif()
+
 # Pure C++ via the suite's vendored metal-cpp (LLVM headers are not
 # Objective-C++ clean).
 add_executable(crucible-offload main.cpp)

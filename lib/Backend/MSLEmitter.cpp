@@ -329,9 +329,14 @@ private:
     bool IsDepthSampled = false;
   };
 
+  struct HandleRef {
+    ResState *RS = nullptr;
+    mlir::Value RegIdx;
+  };
+
   std::vector<ResState> ResStates; // parallel to R.Resources
-  DenseMap<mlir::Operation *, ResState *> HandleMap; // handle def -> resource
-  DenseMap<mlir::Value, std::string> ValueNames;     // declared locals
+  DenseMap<mlir::Operation *, HandleRef> HandleMap; // handle def -> resource
+  DenseMap<mlir::Value, std::string> ValueNames;    // declared locals
   unsigned NextTemp = 0;
   bool UsesDTid = false, UsesGTid = false, UsesGid = false, UsesGidx = false;
   bool UsesLane = false, UsesLaneCount = false;
@@ -362,8 +367,10 @@ private:
   Error resolveHandles();
   ResState *stateFor(mlir::Value Handle) {
     auto It = HandleMap.find(Handle.getDefiningOp());
-    return It == HandleMap.end() ? nullptr : It->second;
+    return It == HandleMap.end() ? nullptr : It->second.RS;
   }
+  Expected<std::string> resourceExpr(mlir::Value Handle,
+                                     StringRef Suffix = "");
   Error inferElementTypes();
 
   // --- expressions ---
@@ -415,32 +422,59 @@ private:
   Expected<std::string> kernelSignature();
   Expected<std::string> stageStruct(bool Input);
   Expected<std::string> stageElement(mlir::LLVM::CallOp Call, bool Input);
+  Expected<Expr> domainLoad(mlir::LLVM::CallOp Call, bool IsConstant);
 };
 
 namespace {
 enum SemanticKind : unsigned {
   UserSemantic = 0, VertexID = 1, InstanceID = 2, Position = 3,
-  FrontFace = 13, ColorTarget = 16,
+  ClipDistance = 6, PrimitiveID = 10, FrontFace = 13, ColorTarget = 16,
+  Depth = 17, DepthLess = 18, DepthGreater = 19,
 };
 
-std::string varyingName(const StageParameter &P) {
+unsigned clipDistanceOffset(ArrayRef<StageParameter> Params) {
+  unsigned Offset = 0;
+  for (const auto &P : Params)
+    if (P.Kind == ClipDistance)
+      Offset += P.Rows * P.Columns;
+  return Offset;
+}
+
+std::string varyingName(const StageParameter &P, unsigned Row) {
   return "crucible_" + toHex(StringRef(P.Semantic).lower(), true) + "_" +
-         std::to_string(P.SemanticIndex);
+         std::to_string(P.RowSemanticIndices[Row]);
+}
+
+std::string signatureField(const StageParameter &P, unsigned Row) {
+  std::string Name = "sig" + std::to_string(P.ID);
+  if (P.Rows > 1)
+    Name += "_" + std::to_string(Row);
+  return Name;
 }
 } // namespace
 
 Expected<std::string> Emitter::stageStruct(bool Input) {
-  bool Vertex = R.Stage == ShaderStage::Vertex;
+  bool Vertex = R.Stage == ShaderStage::Vertex || R.Domain.has_value();
   std::string Text;
   raw_string_ostream OS(Text);
   OS << "struct " << (Input ? "CrucibleStageIn" : "CrucibleStageOut")
      << " {\n";
   unsigned Count = 0;
-  for (const StageParameter &P : Input ? R.Inputs : R.Outputs) {
+  const auto &Params = Input ? R.Inputs : R.Outputs;
+  for (const StageParameter &P : Params) {
     if (Input && ((Vertex && (P.Kind == VertexID || P.Kind == InstanceID)) ||
-                  (!Vertex && P.Kind == FrontFace)))
+                  (!Vertex && (P.Kind == FrontFace || P.Kind == PrimitiveID))))
       continue;
-    if (P.Rows != 1 || P.Columns < 1 || P.Columns > 4)
+    if (Vertex && !Input && P.Kind == ClipDistance) {
+      if (P.Type != ComponentType::F32 || !P.Rows || P.Rows > 8 ||
+          !P.Columns || P.Columns > 4)
+        return makeError("invalid DXIL clip-distance signature");
+      continue;
+    }
+    bool UserVarying = Vertex != Input && P.Kind == UserSemantic;
+    if (!P.Rows || (P.Rows != 1 && !UserVarying) ||
+        P.Columns < 1 || P.Columns > 4 ||
+        (UserVarying && P.RowSemanticIndices.size() != P.Rows))
       return makeError("unsupported stage signature shape for '{0}'", P.Semantic);
     StringRef Type;
     switch (P.Type) {
@@ -458,9 +492,17 @@ Expected<std::string> Emitter::stageStruct(bool Input) {
       Attr = "position";
     else if (!Vertex && !Input && P.Kind == ColorTarget)
       Attr = "color(" + std::to_string(P.SemanticIndex) + ")";
-    else if (Vertex != Input && P.Kind == UserSemantic) {
-      Attr = "user(" + varyingName(P) + ")";
-      if (Input) {
+    else if (!Vertex && !Input && Type == "float" && P.Columns == 1 &&
+             (P.Kind == Depth || P.Kind == DepthLess || P.Kind == DepthGreater))
+      Attr = P.Kind == Depth       ? "depth(any)"
+             : P.Kind == DepthLess ? "depth(less)"
+                                   : "depth(greater)";
+    else if (!UserVarying)
+      return makeError("unsupported stage semantic '{0}'", P.Semantic);
+    for (unsigned Row = 0; Row < P.Rows; ++Row) {
+      std::string RowAttr =
+          UserVarying ? "user(" + varyingName(P, Row) + ")" : Attr;
+      if (UserVarying && Input) {
         static constexpr const char *Modes[] = {
             "", "flat", "center_perspective", "centroid_perspective",
             "center_no_perspective", "centroid_no_perspective",
@@ -468,16 +510,23 @@ Expected<std::string> Emitter::stageStruct(bool Input) {
         if (P.Interpolation >= std::size(Modes))
           return makeError("unsupported interpolation for '{0}'", P.Semantic);
         if (P.Interpolation != 0)
-          Attr += std::string(", ") + Modes[P.Interpolation];
+          RowAttr += std::string(", ") + Modes[P.Interpolation];
       }
-    } else {
-      return makeError("unsupported stage semantic '{0}'", P.Semantic);
+      OS << "  " << Type;
+      if (P.Columns > 1)
+        OS << P.Columns;
+      OS << " " << signatureField(P, Row) << " [[" << RowAttr << "]];\n";
+      ++Count;
     }
-    OS << "  " << Type;
-    if (P.Columns > 1)
-      OS << P.Columns;
-    OS << " sig" << P.ID << " [[" << Attr << "]];\n";
-    ++Count;
+  }
+  if (Vertex && !Input) {
+    unsigned ClipCount = clipDistanceOffset(Params);
+    if (ClipCount > 8)
+      return makeError("too many DXIL clip-distance components");
+    if (ClipCount) {
+      OS << "  float clipDistances [[clip_distance]] [" << ClipCount << "];\n";
+      ++Count;
+    }
   }
   OS << "};\n\n";
   return Count ? Text : std::string();
@@ -485,7 +534,8 @@ Expected<std::string> Emitter::stageStruct(bool Input) {
 
 Expected<std::string> Emitter::stageElement(mlir::LLVM::CallOp Call,
                                              bool Input) {
-  if (R.Stage != ShaderStage::Vertex && R.Stage != ShaderStage::Pixel)
+  if (R.Stage != ShaderStage::Vertex && R.Stage != ShaderStage::Pixel &&
+      !(R.Domain && !Input))
     return makeError("graphics signature access outside a graphics stage");
   auto Args = Call.getArgOperands();
   auto ID = constInt(Args[1]);
@@ -495,7 +545,7 @@ Expected<std::string> Emitter::stageElement(mlir::LLVM::CallOp Call,
   auto P = llvm::find_if(Params, [&](const StageParameter &S) {
     return ID && S.ID == *ID;
   });
-  if (P == Params.end() || P->Rows != 1 || Row != 0 || !Col || *Col >= P->Columns)
+  if (P == Params.end() || !Row || *Row >= P->Rows || !Col || *Col >= P->Columns)
     return makeError("unsupported DXIL signature component access");
   if (Input && R.Stage == ShaderStage::Vertex && P->Kind == VertexID)
     return std::string("crucible_vertex_id");
@@ -503,11 +553,68 @@ Expected<std::string> Emitter::stageElement(mlir::LLVM::CallOp Call,
     return std::string("crucible_instance_id");
   if (Input && R.Stage == ShaderStage::Pixel && P->Kind == FrontFace)
     return std::string("crucible_front_face");
-  std::string Access = std::string(Input ? "stageIn.sig" : "stageOut.sig") +
-                       std::to_string(*ID);
+  if (Input && R.Stage == ShaderStage::Pixel && P->Kind == PrimitiveID)
+    return std::string("crucible_primitive_id");
+  if (!Input && (R.Stage == ShaderStage::Vertex || R.Domain) &&
+      P->Kind == ClipDistance) {
+    unsigned Offset = clipDistanceOffset(ArrayRef(Params).take_front(
+        std::distance(Params.begin(), P)));
+    return "stageOut.clipDistances[" +
+           std::to_string(Offset + *Row * P->Columns + *Col) + "]";
+  }
+  std::string Access = std::string(Input ? "stageIn." : "stageOut.") +
+                       signatureField(*P, *Row);
   if (P->Columns > 1)
     Access += "[" + std::to_string(*Col) + "]";
   return Access;
+}
+
+static unsigned signatureWordCount(ArrayRef<StageParameter> Params) {
+  unsigned Words = 0;
+  for (const auto &P : Params)
+    Words += P.Rows * P.Columns;
+  return Words;
+}
+
+Expected<Expr> Emitter::domainLoad(mlir::LLVM::CallOp Call, bool IsConstant) {
+  auto Args = Call.getArgOperands();
+  if (Args.size() != (IsConstant ? 4u : 5u))
+    return makeError("invalid DXIL domain signature load");
+  auto ID = constInt(Args[1]);
+  auto Row = constInt(Args[2]);
+  auto Col = constInt(Args[3]);
+  const auto &Params = IsConstant ? R.Domain->PatchConstants : R.Inputs;
+  auto P = llvm::find_if(Params, [&](const StageParameter &S) {
+    return ID && S.ID == *ID;
+  });
+  if (P == Params.end() || !Row || *Row >= P->Rows || !Col || *Col >= P->Columns)
+    return makeError("unsupported DXIL domain signature component access");
+  unsigned CPWords = signatureWordCount(R.Inputs);
+  unsigned ConstantBase = CPWords * R.Domain->ControlPointCount;
+  unsigned PatchWords = ConstantBase + signatureWordCount(R.Domain->PatchConstants);
+  unsigned Offset = signatureWordCount(ArrayRef(Params).take_front(
+                        std::distance(Params.begin(), P))) +
+                    *Row * P->Columns + *Col;
+  std::string Index = "crucible_patch_id * " + std::to_string(PatchWords) + "u";
+  if (IsConstant) {
+    Offset += ConstantBase;
+  } else {
+    if (auto CP = constInt(Args[4]); CP && *CP >= R.Domain->ControlPointCount)
+      return makeError("DXIL domain control-point index out of range");
+    auto CP = exprFor(Args[4], PrecMul);
+    if (!CP)
+      return CP.takeError();
+    Index += " + " + CP->Text + " * " + std::to_string(CPWords) + "u";
+  }
+  if (Offset)
+    Index += " + " + std::to_string(Offset) + "u";
+  std::string Word = "crucible_patch_data[" + Index + "]";
+  auto T = Call.getResult().getType();
+  if (T.isF32())
+    return Expr{"as_type<float>(" + Word + ")", PrecPrimary};
+  if (T.isInteger(32))
+    return Expr{std::move(Word), PrecPrimary};
+  return makeError("domain signature loads require 32-bit components");
 }
 
 //===----------------------------------------------------------------------===//
@@ -631,17 +738,11 @@ Error Emitter::resolveHandles() {
         FirstError = "createHandle references unknown resource range";
         return;
       }
-      HandleMap[Call] = RS;
+      HandleMap[Call] = HandleRef{RS, Args[3]};
       break;
     }
     case DXILOp::CreateHandleFromBinding: {
       // (op, resBind:{lb,ub,space,class}, index:i32, nonUniform:i1)
-      auto Index = constInt(Args[2]);
-      if (!Index) {
-        FirstError =
-            "dynamic createHandleFromBinding operands are not supported";
-        return;
-      }
       uint32_t LB = 0, Space = 0, Class = 0;
       if (auto *Def = Args[1].getDefiningOp()) {
         // The importer materializes the ResBind aggregate as a chain of
@@ -664,14 +765,16 @@ Error Emitter::resolveHandles() {
             break;
         }
       }
-      (void)LB;
+      uint32_t LookupReg = LB;
+      if (auto Index = constInt(Args[2]))
+        LookupReg = static_cast<uint32_t>(*Index);
       ResState *RS = FindByRegister(static_cast<ResourceClass>(Class), Space,
-                                    static_cast<uint32_t>(*Index));
+                                    LookupReg);
       if (!RS) {
         FirstError = "createHandleFromBinding references unknown binding";
         return;
       }
-      HandleMap[Call] = RS;
+      HandleMap[Call] = HandleRef{RS, Args[2]};
       break;
     }
     default:
@@ -691,13 +794,36 @@ Error Emitter::resolveHandles() {
       auto Op = dxOpcode(Call);
       if (!Op || *Op != DXILOp::AnnotateHandle)
         return;
-      if (ResState *RS = stateFor(Call.getArgOperands()[1])) {
-        HandleMap[Call] = RS;
+      auto It = HandleMap.find(Call.getArgOperands()[1].getDefiningOp());
+      if (It != HandleMap.end()) {
+        HandleMap[Call] = It->second;
         Changed = true;
       }
     });
   }
   return Error::success();
+}
+
+Expected<std::string> Emitter::resourceExpr(mlir::Value Handle,
+                                           StringRef Suffix) {
+  auto It = HandleMap.find(Handle.getDefiningOp());
+  if (It == HandleMap.end())
+    return makeError("unresolved resource handle");
+  const HandleRef &HR = It->second;
+  std::string Base = HR.RS->ParamName + Suffix.str();
+  if (HR.RS->RB->RangeSize == 1)
+    return Base;
+  if (auto C = constInt(HR.RegIdx)) {
+    uint32_t Offset = static_cast<uint32_t>(*C) - HR.RS->RB->LowerBound;
+    return Base + "[" + std::to_string(Offset) + "u]";
+  }
+  auto E = exprFor(HR.RegIdx, PrecAdd);
+  if (!E)
+    return E.takeError();
+  if (HR.RS->RB->LowerBound == 0)
+    return Base + "[" + E->Text + "]";
+  return Base + "[" + E->Text + " - " +
+         std::to_string(HR.RS->RB->LowerBound) + "u]";
 }
 
 static bool isTextureKind(ResourceKind K) {
@@ -820,10 +946,17 @@ Error Emitter::inferElementTypes() {
       break;
     }
     case DXILOp::AtomicBinOp:
-    case DXILOp::AtomicCompareExchange:
+    case DXILOp::AtomicCompareExchange: {
       // Atomics operate on 32-bit integer views.
+      ResState *RS = stateFor(Args[1]);
+      if (RS && isTextureKind(RS->RB->Kind)) {
+        RS->RB->RequiresTextureAtomics = true;
+        if (RS->ElemType == "float")
+          RS->ElemType = "uint";
+      }
       Record(Args[1], Args[6].getType());
       break;
+    }
     case DXILOp::CBufferLoadLegacy: {
       auto Ret = mlir::cast<mlir::LLVM::LLVMStructType>(
           Call.getResult().getType());
@@ -1491,6 +1624,20 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
 
 Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
   auto Args = Call.getArgOperands();
+  if (R.Domain) {
+    if (Op == DXILOp::LoadInput || Op == DXILOp::LoadPatchConstant)
+      return domainLoad(Call, Op == DXILOp::LoadPatchConstant);
+    if (Op == DXILOp::PrimitiveID)
+      return Expr{"crucible_patch_id", PrecPrimary};
+    if (Op == DXILOp::DomainLocation) {
+      auto Lane = Args.size() == 2 ? constInt(Args[1]) : std::nullopt;
+      unsigned Dim = R.Domain->Domain == TessellationDomain::Triangle ? 3 : 2;
+      if (!Lane || *Lane >= Dim)
+        return makeError("invalid DXIL domain location component");
+      return Expr{"crucible_domain_location[" + std::to_string(*Lane) + "]",
+                  PrecPrimary};
+    }
+  }
   if (Op == DXILOp::LoadInput) {
     auto Access = stageElement(Call, true);
     if (!Access)
@@ -2033,6 +2180,30 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     ResState *RS = stateFor(Args[1]);
     if (!RS)
       return makeError("getDimensions through unresolved handle");
+    if (!isTextureKind(RS->RB->Kind)) {
+      if (Comp != 0)
+        return makeError("buffer getDimensions only supports component 0");
+      auto It = HandleMap.find(Args[1].getDefiningOp());
+      if (It == HandleMap.end())
+        return makeError("unresolved resource handle");
+      std::string Slot = std::to_string(RS->RB->MetalIndex) + "u";
+      if (RS->RB->RangeSize > 1) {
+        if (auto C = constInt(It->second.RegIdx)) {
+          uint32_t Offset = static_cast<uint32_t>(*C) - RS->RB->LowerBound;
+          Slot = std::to_string(RS->RB->MetalIndex + Offset) + "u";
+        } else {
+          auto E = exprFor(It->second.RegIdx, PrecAdd);
+          if (!E)
+            return E.takeError();
+          Slot = std::to_string(RS->RB->MetalIndex) + "u + (" + E->Text +
+                 " - " + std::to_string(RS->RB->LowerBound) + "u)";
+        }
+      }
+      return Expr{"crucible_buf_dims[" + Slot + "]", PrecPrimary};
+    }
+    auto RName = resourceExpr(Args[1]);
+    if (!RName)
+      return RName.takeError();
     std::string MipArg;
     if (!isUndefLike(Args[2])) {
       auto M = exprFor(Args[2], PrecUnknown);
@@ -2049,19 +2220,19 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     std::string MipCall = SupportsMipArg ? MipArg : std::string();
     switch (Comp) {
     case 0:
-      return Expr{RS->ParamName + ".get_width(" + MipCall + ")", PrecPrimary};
+      return Expr{*RName + ".get_width(" + MipCall + ")", PrecPrimary};
     case 1:
       if (K == ResourceKind::Texture1DArray)
-        return Expr{RS->ParamName + ".get_array_size()", PrecPrimary};
-      return Expr{RS->ParamName + ".get_height(" + MipCall + ")", PrecPrimary};
+        return Expr{*RName + ".get_array_size()", PrecPrimary};
+      return Expr{*RName + ".get_height(" + MipCall + ")", PrecPrimary};
     case 2:
       if (K == ResourceKind::Texture3D)
-        return Expr{RS->ParamName + ".get_depth(" + MipCall + ")", PrecPrimary};
-      return Expr{RS->ParamName + ".get_array_size()", PrecPrimary};
+        return Expr{*RName + ".get_depth(" + MipCall + ")", PrecPrimary};
+      return Expr{*RName + ".get_array_size()", PrecPrimary};
     case 3:
       if (K == ResourceKind::Texture2DMS || K == ResourceKind::Texture2DMSArray)
-        return Expr{RS->ParamName + ".get_num_samples()", PrecPrimary};
-      return Expr{RS->ParamName + ".get_num_mip_levels()", PrecPrimary};
+        return Expr{*RName + ".get_num_samples()", PrecPrimary};
+      return Expr{*RName + ".get_num_mip_levels()", PrecPrimary};
     default:
       return makeError("getDimensions component out of range");
     }
@@ -2082,10 +2253,13 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     ResState *RS = stateFor(Args[1]);
     if (!RS)
       return makeError("buffer load through unresolved handle");
+    auto RName = resourceExpr(Args[1]);
+    if (!RName)
+      return RName.takeError();
     auto Index = bufferIndexExpr(*RS, Args[2], Args[3], Comp);
     if (!Index)
       return Index.takeError();
-    std::string Element = RS->ParamName + "[" + *Index + "]";
+    std::string Element = *RName + "[" + *Index + "]";
     // Reinterpret when this load's type differs from the canonical element
     // type (same-size mixed-type access).
     auto Ret =
@@ -2102,10 +2276,13 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     ResState *RS = stateFor(Args[1]);
     if (!RS)
       return makeError("cbuffer load through unresolved handle");
+    auto RName = resourceExpr(Args[1]);
+    if (!RName)
+      return RName.takeError();
     auto Row = exprFor(Args[2], PrecUnknown);
     if (!Row)
       return Row.takeError();
-    std::string RowText = RS->ParamName + "[" + Row->Text + "]";
+    std::string RowText = *RName + "[" + Row->Text + "]";
     // Reinterpret when this load's element type differs from the canonical
     // row type (mixed float/uint cbuffers).
     auto Ret =
@@ -2195,6 +2372,9 @@ Error Emitter::emitBufferStore(mlir::LLVM::CallOp Call, unsigned Ind) {
   ResState *RS = stateFor(Args[1]);
   if (!RS)
     return makeError("buffer store through unresolved handle");
+  auto RName = resourceExpr(Args[1]);
+  if (!RName)
+    return RName.takeError();
   auto Mask = constInt(Args[8]);
   if (!Mask)
     return makeError("dynamic store mask is not supported");
@@ -2216,7 +2396,7 @@ Error Emitter::emitBufferStore(mlir::LLVM::CallOp Call, unsigned Ind) {
       return StoreTy.takeError();
     if (*StoreTy != RS->ElemType)
       Value = "as_type<" + RS->ElemType + ">(" + Value + ")";
-    line(Ind, RS->ParamName + "[" + *Index + "] = " + Value + ";");
+    line(Ind, *RName + "[" + *Index + "] = " + Value + ";");
   }
   return Error::success();
 }
@@ -2247,7 +2427,10 @@ Error Emitter::emitTextureLoad(mlir::LLVM::CallOp Call, unsigned Ind) {
   if (!C0)
     return C0.takeError();
 
-  std::string CallExpr = RS->ParamName + ".read(";
+  auto RName = resourceExpr(Args[1]);
+  if (!RName)
+    return RName.takeError();
+  std::string CallExpr = *RName + ".read(";
   bool HasMip = !isUndefLike(Args[2]);
   bool IsUAV = RS->RB->Class == ResourceClass::UAV;
 
@@ -2435,8 +2618,11 @@ Error Emitter::emitTextureStore(mlir::LLVM::CallOp Call, unsigned Ind) {
                      RS->ParamName);
   }
 
-  line(Ind, RS->ParamName + ".write(" + VecExpr + ", " + CoordArgs + ");");
-  line(Ind, RS->ParamName + ".fence();");
+  auto RName = resourceExpr(Args[1]);
+  if (!RName)
+    return RName.takeError();
+  line(Ind, *RName + ".write(" + VecExpr + ", " + CoordArgs + ");");
+  line(Ind, *RName + ".fence();");
   return Error::success();
 }
 
@@ -2571,12 +2757,19 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
     }
   }
 
-  std::string CallExpr = RS->ParamName + ".";
+  auto RName = resourceExpr(Args[1]);
+  if (!RName)
+    return RName.takeError();
+  auto SName = resourceExpr(Args[2]);
+  if (!SName)
+    return SName.takeError();
+
+  std::string CallExpr = *RName + ".";
   if (Op == DXILOp::SampleLevel) {
     auto Lod = exprFor(Args[10], PrecUnknown);
     if (!Lod)
       return Lod.takeError();
-    CallExpr += "sample(" + Samp->ParamName + ", " + Coord;
+    CallExpr += "sample(" + *SName + ", " + Coord;
     if (!Slice.empty())
       CallExpr += ", " + Slice;
     CallExpr += ", level(" + Lod->Text + ")";
@@ -2614,7 +2807,7 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
       DDX = "float3(" + DX0->Text + ", " + DX1->Text + ", " + DX2->Text + ")";
       DDY = "float3(" + DY0->Text + ", " + DY1->Text + ", " + DY2->Text + ")";
     }
-    CallExpr += "sample(" + Samp->ParamName + ", " + Coord;
+    CallExpr += "sample(" + *SName + ", " + Coord;
     if (!Slice.empty())
       CallExpr += ", " + Slice;
     CallExpr += ", " + GradKind + "(" + DDX + ", " + DDY + ")";
@@ -2633,7 +2826,7 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
       return makeError("invalid textureGather channel");
     static const char *const Comps[4] = {"component::x", "component::y",
                                          "component::z", "component::w"};
-    CallExpr += "gather(" + Samp->ParamName + ", " + Coord;
+    CallExpr += "gather(" + *SName + ", " + Coord;
     if (!Slice.empty())
       CallExpr += ", " + Slice;
     if (!Offset.empty())
@@ -2646,7 +2839,7 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
     auto Cmp = exprFor(Args[10], PrecUnknown);
     if (!Cmp)
       return Cmp.takeError();
-    CallExpr += "gather_compare(" + Samp->ParamName + ", " + Coord;
+    CallExpr += "gather_compare(" + *SName + ", " + Coord;
     if (!Slice.empty())
       CallExpr += ", " + Slice;
     CallExpr += ", " + Cmp->Text;
@@ -2703,6 +2896,9 @@ Error Emitter::emitDXAtomic(mlir::LLVM::CallOp Call, DXILOp Op, unsigned Ind) {
     return makeError("resource atomics require a 32-bit UAV");
 
   const unsigned Coord0 = Op == DXILOp::AtomicBinOp ? 3 : 2;
+  auto RName = resourceExpr(Args[1]);
+  if (!RName)
+    return RName.takeError();
   bool IsTexture = isTextureKind(RS->RB->Kind);
   std::string Coord, LV;
   if (IsTexture) {
@@ -2720,7 +2916,7 @@ Error Emitter::emitDXAtomic(mlir::LLVM::CallOp Call, DXILOp Op, unsigned Ind) {
     auto Index = bufferIndexExpr(*RS, Args[Coord0], Args[Coord0 + 1], 0);
     if (!Index)
       return Index.takeError();
-    LV = RS->ParamName + "[" + *Index + "]";
+    LV = *RName + "[" + *Index + "]";
   }
   auto TextureOperand = [&](StringRef V) -> std::string {
     return RS->ElemType == "int" ? ("as_type<int>(" + V + ")").str()
@@ -2777,7 +2973,7 @@ Error Emitter::emitDXAtomic(mlir::LLVM::CallOp Call, DXILOp Op, unsigned Ind) {
       if ((Fn == "atomic_fetch_min" || Fn == "atomic_fetch_max") &&
           Signed != (RS->ElemType == "int"))
         return makeError("texture atomic min/max signedness does not match the texture");
-      Text = TextureResult(RS->ParamName + "." + Fn.str() + "(" + Coord +
+      Text = TextureResult(*RName + "." + Fn.str() + "(" + Coord +
                            ", " + RS->ElemType + "4(" +
                            TextureOperand(V->Text) + ")).x");
     } else if (Signed)
@@ -2796,7 +2992,7 @@ Error Emitter::emitDXAtomic(mlir::LLVM::CallOp Call, DXILOp Op, unsigned Ind) {
     if (IsTexture) {
       requireHelper("crucible_atomic_cmpxchg_texture2d");
       Text = TextureResult("crucible_atomic_cmpxchg_texture2d(" +
-                           RS->ParamName + ", " + Coord + ", " +
+                           *RName + ", " + Coord + ", " +
                            TextureOperand(Cmp->Text) + ", " +
                            TextureOperand(V->Text) + ")");
     } else {
@@ -3069,6 +3265,36 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     case DXILOp::BufferStore:
     case DXILOp::RawBufferStore:
       return emitBufferStore(Call, Ind);
+    case DXILOp::BufferUpdateCounter: {
+      auto Args = Call.getArgOperands();
+      ResState *RS = stateFor(Args[1]);
+      if (!RS || !RS->RB->HasCounter)
+        return makeError("bufferUpdateCounter on resource without counter");
+      auto Inc = constInt(Args[2]);
+      if (!Inc)
+        return makeError("dynamic bufferUpdateCounter increment is not supported");
+      int8_t IncVal = static_cast<int8_t>(*Inc);
+      if (IncVal != 1 && IncVal != -1)
+        return makeError("unsupported bufferUpdateCounter increment {0}",
+                         static_cast<int>(IncVal));
+      auto CPtr = resourceExpr(Args[1], "_counter");
+      if (!CPtr)
+        return CPtr.takeError();
+      std::string ExprText =
+          IncVal == 1
+              ? "atomic_fetch_add_explicit(" + *CPtr +
+                    ", 1u, memory_order_relaxed)"
+              : "(atomic_fetch_sub_explicit(" + *CPtr +
+                    ", 1u, memory_order_relaxed) - 1u)";
+      if (!Call.getResult().use_empty()) {
+        std::string Name = freshName();
+        line(Ind, "uint " + Name + " = " + ExprText + ";");
+        ValueNames[Call.getResult()] = Name;
+      } else {
+        line(Ind, ExprText + ";");
+      }
+      return Error::success();
+    }
     case DXILOp::TextureLoad:
       return emitTextureLoad(Call, Ind);
     case DXILOp::TextureStore:
@@ -3312,9 +3538,14 @@ Expected<std::string> Emitter::kernelSignature() {
   raw_string_ostream OS(Sig);
   if (R.Stage == ShaderStage::Compute)
     OS << "kernel void ";
-  else
-    OS << (R.Stage == ShaderStage::Vertex ? "vertex " : "fragment ")
+  else {
+    if (R.Domain)
+      OS << "[[patch("
+         << (R.Domain->Domain == TessellationDomain::Triangle ? "triangle" : "quad")
+         << ", " << R.Domain->ControlPointCount << ")]]\n";
+    OS << (R.Stage == ShaderStage::Pixel ? "fragment " : "vertex ")
        << "CrucibleStageOut ";
+  }
   OS << R.MSLEntryName << "(\n";
 
   std::vector<const ResState *> Sorted;
@@ -3333,7 +3564,19 @@ Expected<std::string> Emitter::kernelSignature() {
   };
 
   bool HasInput = false;
-  for (const StageParameter &P : R.Inputs) {
+  if (R.Domain) {
+    Sep();
+    OS << "    float"
+       << (R.Domain->Domain == TessellationDomain::Triangle ? "3" : "2")
+       << " crucible_domain_location [[position_in_patch]]";
+    Sep();
+    OS << "    uint crucible_patch_id [[patch_id]]";
+    Sep();
+    OS << "    const device uint* crucible_patch_data [[buffer("
+       << DomainInterface::DataMetalIndex << ")]]";
+  }
+  for (const StageParameter &P : R.Domain ? ArrayRef<StageParameter>()
+                                        : ArrayRef(R.Inputs)) {
     if (R.Stage == ShaderStage::Vertex && P.Kind == VertexID) {
       Sep();
       OS << "    uint crucible_vertex_id [[vertex_id]]";
@@ -3343,6 +3586,9 @@ Expected<std::string> Emitter::kernelSignature() {
     } else if (R.Stage == ShaderStage::Pixel && P.Kind == FrontFace) {
       Sep();
       OS << "    bool crucible_front_face [[front_facing]]";
+    } else if (R.Stage == ShaderStage::Pixel && P.Kind == PrimitiveID) {
+      Sep();
+      OS << "    uint crucible_primitive_id [[primitive_id]]";
     } else {
       HasInput = true;
     }
@@ -3376,8 +3622,13 @@ Expected<std::string> Emitter::kernelSignature() {
           return makeError("unsupported depth texture kind for '{0}'",
                            RS->ParamName);
         }
-        OS << "    " << TexType << "<float, access::sample> " << RS->ParamName
-           << " [[texture(" << RB.MetalIndex << ")]]";
+        std::string Elem = std::string(TexType) + "<float, access::sample>";
+        if (RB.RangeSize > 1)
+          OS << "    array<" << Elem << ", " << RB.RangeSize << "> "
+             << RS->ParamName << " [[texture(" << RB.MetalIndex << ")]]";
+        else
+          OS << "    " << Elem << " " << RS->ParamName << " [[texture("
+             << RB.MetalIndex << ")]]";
         continue;
       }
       switch (RB.Kind) {
@@ -3414,28 +3665,56 @@ Expected<std::string> Emitter::kernelSignature() {
       const char *Access = RB.Class == ResourceClass::UAV ? "access::read_write"
                            : RS->IsSampled                ? "access::sample"
                                                           : "access::read";
-      OS << "    " << TexType << "<" << RS->ElemType << ", " << Access << "> "
-         << RS->ParamName << " [[texture(" << RB.MetalIndex << ")]]";
+      std::string Elem =
+          std::string(TexType) + "<" + RS->ElemType + ", " + Access + ">";
+      if (RB.RangeSize > 1)
+        OS << "    array<" << Elem << ", " << RB.RangeSize << "> "
+           << RS->ParamName << " [[texture(" << RB.MetalIndex << ")]]";
+      else
+        OS << "    " << Elem << " " << RS->ParamName << " [[texture("
+           << RB.MetalIndex << ")]]";
       continue;
     }
-    switch (RB.Class) {
-    case ResourceClass::SRV:
-      OS << "    device const " << RS->ElemType << "* " << RS->ParamName
-         << " [[buffer(" << RB.MetalIndex << ")]]";
-      break;
-    case ResourceClass::UAV:
-      OS << "    device " << RS->ElemType << "* " << RS->ParamName
-         << " [[buffer(" << RB.MetalIndex << ")]]";
-      break;
-    case ResourceClass::CBV:
-      OS << "    constant " << RS->ElemType << "* " << RS->ParamName
-         << " [[buffer(" << RB.MetalIndex << ")]]";
-      break;
-    case ResourceClass::Sampler:
-      OS << "    sampler " << RS->ParamName << " [[sampler(" << RB.MetalIndex
-         << ")]]";
-      break;
+    if (RB.Class == ResourceClass::Sampler) {
+      if (RB.RangeSize > 1)
+        OS << "    array<sampler, " << RB.RangeSize << "> " << RS->ParamName
+           << " [[sampler(" << RB.MetalIndex << ")]]";
+      else
+        OS << "    sampler " << RS->ParamName << " [[sampler(" << RB.MetalIndex
+           << ")]]";
+      continue;
     }
+    const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
+                            : RB.Class == ResourceClass::UAV ? "device "
+                                                             : "constant ";
+    if (RB.RangeSize == 1) {
+      OS << "    " << PtrPrefix << RS->ElemType << "* " << RS->ParamName
+         << " [[buffer(" << RB.MetalIndex << ")]]";
+    } else {
+      for (uint32_t I = 0; I < RB.RangeSize; ++I) {
+        if (I)
+          OS << ",\n";
+        OS << "    " << PtrPrefix << RS->ElemType << "* " << RS->ParamName
+           << "_" << I << " [[buffer(" << (RB.MetalIndex + I) << ")]]";
+      }
+    }
+    if (RB.HasCounter) {
+      if (RB.RangeSize == 1) {
+        OS << ",\n    device atomic_uint* " << RS->ParamName
+           << "_counter [[buffer(" << RB.CounterMetalIndex << ")]]";
+      } else {
+        for (uint32_t I = 0; I < RB.RangeSize; ++I) {
+          OS << ",\n    device atomic_uint* " << RS->ParamName
+             << "_counter_" << I << " [[buffer(" << (RB.CounterMetalIndex + I)
+             << ")]]";
+        }
+      }
+    }
+  }
+  if (R.HasBufferDimensions) {
+    Sep();
+    OS << "    constant uint* crucible_buf_dims [[buffer("
+       << R.BufferSizesMetalIndex << ")]]";
   }
 
   if (UsesDTid) {
@@ -3471,20 +3750,25 @@ Expected<std::string> Emitter::kernelSignature() {
 //===----------------------------------------------------------------------===//
 
 Expected<std::string> Emitter::run() {
-  bool Graphics = R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel;
+  bool Graphics = R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel ||
+                  R.Domain.has_value();
   if (!Graphics && R.Stage != ShaderStage::Compute)
-    return makeError("only compute, vertex and pixel shaders are supported");
+    return makeError("unsupported shader stage (expected compute, vertex, pixel or domain)");
+  if (R.Domain && (!R.Resources.empty() || R.HasBufferDimensions))
+    return makeError("domain shaders with descriptor resources are not supported");
   std::string Input, Output;
   if (Graphics) {
-    auto In = stageStruct(true);
-    if (!In)
-      return In.takeError();
+    if (!R.Domain) {
+      auto In = stageStruct(true);
+      if (!In)
+        return In.takeError();
+      Input = std::move(*In);
+    }
     auto Out = stageStruct(false);
     if (!Out)
       return Out.takeError();
     if (Out->empty())
       return makeError("graphics shaders require a supported stage output");
-    Input = std::move(*In);
     Output = std::move(*Out);
   }
   R.MSLEntryName = sanitizeIdentifier(R.EntryName, "kernel_main");
@@ -3506,13 +3790,43 @@ Expected<std::string> Emitter::run() {
   raw_string_ostream OS(Out);
   OS << "// Generated by crucible from DXIL (" << R.EntryName << ", "
      << (R.Stage == ShaderStage::Vertex ? "vs_" :
-         R.Stage == ShaderStage::Pixel ? "ps_" : "cs_")
+         R.Stage == ShaderStage::Pixel ? "ps_" :
+         R.Stage == ShaderStage::Domain ? "ds_" : "cs_")
      << R.ShaderModelMajor << "_" << R.ShaderModelMinor << ")\n"
      << "#include <metal_stdlib>\n"
      << "using namespace metal;\n\n";
   for (const std::string &H : HelperOrder)
     OS << helperSource(H) << "\n";
-  OS << Input << Output << *Sig << " {\n" << GroupsharedDecls;
+  std::string ArrayDecls;
+  for (const ResState &RS : ResStates) {
+    const ResourceBinding &RB = *RS.RB;
+    if (RB.RangeSize <= 1 || isTextureKind(RB.Kind) ||
+        RB.Class == ResourceClass::Sampler)
+      continue;
+    const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
+                            : RB.Class == ResourceClass::UAV ? "device "
+                                                             : "constant ";
+    ArrayDecls += "  " + std::string(PtrPrefix) + RS.ElemType + "* " +
+                  RS.ParamName + "[" + std::to_string(RB.RangeSize) + "] = {";
+    for (uint32_t I = 0; I < RB.RangeSize; ++I) {
+      if (I)
+        ArrayDecls += ", ";
+      ArrayDecls += RS.ParamName + "_" + std::to_string(I);
+    }
+    ArrayDecls += "};\n";
+    if (RB.HasCounter) {
+      ArrayDecls += "  device atomic_uint* " + RS.ParamName + "_counter[" +
+                    std::to_string(RB.RangeSize) + "] = {";
+      for (uint32_t I = 0; I < RB.RangeSize; ++I) {
+        if (I)
+          ArrayDecls += ", ";
+        ArrayDecls += RS.ParamName + "_counter_" + std::to_string(I);
+      }
+      ArrayDecls += "};\n";
+    }
+  }
+
+  OS << Input << Output << *Sig << " {\n" << ArrayDecls << GroupsharedDecls;
   if (Graphics)
     OS << "  CrucibleStageOut stageOut = {};\n";
   OS << Body;

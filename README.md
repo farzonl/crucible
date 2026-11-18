@@ -118,6 +118,10 @@ cmake -S . -B build -G Ninja \
 ninja -C build check-crucible-offload
 ```
 
+Pass `--validation-layer` to `crucible-offload` to enable Metal API Validation.
+The offload lit harness uses `crucible-api-query` for host information when
+the suite checkout includes its `HostInfo` support code.
+
 Baseline at Milestone 2: **110 passed / 219 failed / 289 unsupported** of 619
 discovered tests (graphics, RT, wave ops, 16/64-bit types, and textures are
 still unimplemented). CI records every run with
@@ -178,6 +182,8 @@ is the current optimization target.
 - [x] **Milestone 4 (partial)** — offload-test-suite integration
   (`crucible-offload` + `check-crucible-offload`) and public compliance
   dashboard. Scalar `half`, `i16`, and `i64` are enabled in compliance tests.
+  Typed buffer loads and stores preserve DXIL's packed 32-bit word layout
+  for scalar and two-component 64-bit integers.
   Long-vector integer `abs` and integer/float `dot` use LLVM's Scalarizer
   rather than relying on Metal vector types wider than four lanes.
   Wave and quad operations use Metal SIMD builtins. The backend uses
@@ -190,11 +196,13 @@ is the current optimization target.
   Remaining: broader texture and sampler support, resource arrays, 64-bit
   atomics, and fixed wave-size selection.
 - [x] **Graphics (initial)** — DXIL vertex/pixel signatures lower to Metal
-  attributes, interpolated varyings, position, and color outputs. The
-  offload runner executes single-draw, single-color-target raster pipelines
-  without shader resources, including fragment discard and derivatives.
-  Graphics resource binding, depth/stencil, multisampling, geometry, and
-  tessellation remain unsupported.
+  attributes, interpolated varyings (including array and matrix varyings),
+  position, primitive ID, clip-distance outputs, and color and depth outputs.
+  The offload runner executes single-draw, single-color-target raster
+  pipelines with buffer bindings, fragment discard, and derivatives. It
+  uses a transient depth attachment for shaders that write depth.
+  Graphics textures and samplers, stencil, multisampling, cull distance,
+  geometry, and tessellation remain unsupported.
 
 ## License
 

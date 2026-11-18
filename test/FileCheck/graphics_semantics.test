@@ -1,0 +1,28 @@
+# RUN: %dxc -T vs_6_0 -E vs -Fo %t.vs %S/../Inputs/graphics_semantics.hlsl
+# RUN: %cruciblec %t.vs -o %t.vs.metal
+# RUN: FileCheck %s --check-prefix=VERTEX < %t.vs.metal
+# RUN: %dxc -T ps_6_0 -E ps -Fo %t.ps %S/../Inputs/graphics_semantics.hlsl
+# RUN: %cruciblec %t.ps -o %t.ps.metal
+# RUN: FileCheck %s --check-prefixes=PIXEL,ANY < %t.ps.metal
+# RUN: %dxc -T ps_6_0 -E ps -DDEPTH_SEMANTIC=SV_DepthLessEqual -Fo %t.less.ps %S/../Inputs/graphics_semantics.hlsl
+# RUN: %cruciblec %t.less.ps -o %t.less.metal
+# RUN: FileCheck %s --check-prefixes=PIXEL,LESS < %t.less.metal
+# RUN: %dxc -T ps_6_0 -E ps -DDEPTH_SEMANTIC=SV_DepthGreaterEqual -Fo %t.greater.ps %S/../Inputs/graphics_semantics.hlsl
+# RUN: %cruciblec %t.greater.ps -o %t.greater.metal
+# RUN: FileCheck %s --check-prefixes=PIXEL,GREATER < %t.greater.metal
+
+# VERTEX-DAG: float2 sig{{[0-9]+}}_0 {{\[\[}}user(crucible_746578636f6f7264_3)
+# VERTEX-DAG: float2 sig{{[0-9]+}}_1 {{\[\[}}user(crucible_746578636f6f7264_4)
+# VERTEX-DAG: float clipDistances {{\[\[}}clip_distance{{\]\]}} [3];
+# VERTEX: vertex CrucibleStageOut vs(
+# VERTEX-DAG: stageOut.clipDistances[0] =
+# VERTEX-DAG: stageOut.clipDistances[1] =
+# VERTEX-DAG: stageOut.clipDistances[2] =
+
+# PIXEL-DAG: float2 sig{{[0-9]+}}_0 {{\[\[}}user(crucible_746578636f6f7264_3), center_perspective
+# PIXEL-DAG: float2 sig{{[0-9]+}}_1 {{\[\[}}user(crucible_746578636f6f7264_4), center_perspective
+# ANY: {{\[\[}}depth(any)
+# LESS: {{\[\[}}depth(less)
+# GREATER: {{\[\[}}depth(greater)
+# PIXEL: fragment CrucibleStageOut ps(
+# PIXEL: uint crucible_primitive_id {{\[\[}}primitive_id

@@ -8,8 +8,11 @@
 #ifndef CRUCIBLE_OPTIONS_H
 #define CRUCIBLE_OPTIONS_H
 
+#include "crucible/Reflection.h"
+
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace crucible {
 
@@ -20,6 +23,13 @@ enum class BindingMode : uint8_t {
   Direct,
   /// Compact custom argument buffer (not yet implemented).
   ArgumentBuffer,
+};
+
+struct ArraySizeOverride {
+  ResourceClass Class = ResourceClass::SRV;
+  uint32_t Space = 0;
+  uint32_t Register = 0;
+  uint32_t Size = 1;
 };
 
 struct Options {
@@ -34,6 +44,9 @@ struct Options {
 
   /// Flush f32 denormals to signed zero around math builtins (D3D12 FTZ).
   bool FlushDenormsF32 = false;
+
+  /// Explicit array sizes for unbounded DXIL resource arrays (rangeSize == -1).
+  std::vector<ArraySizeOverride> ArraySizeOverrides;
 };
 
 } // namespace crucible
