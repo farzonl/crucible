@@ -707,8 +707,8 @@
         <h2 id="bar-title">Selected Commit Comparison</h2>
         <div class="controls-row">
           <select id="sort-metric" class="meta-pill" aria-label="Sort by metric">
-            <option value="medianMs:asc">Sort: Hot (ms) ↑</option>
-            <option value="coldMs:asc">Sort: Cold (ms) ↑</option>
+            <option value="medianMs:asc">Sort: Steady-State GPU (ms) ↑</option>
+            <option value="coldMs:asc">Sort: Cold Start (ms) ↑</option>
             <option value="firstDispatchMs:asc">Sort: First Dispatch (ms) ↑</option>
             <option value="minMs:asc">Sort: Min GPU (ms) ↑</option>
             <option value="compileMs:asc">Sort: Compile (ms) ↑</option>
@@ -728,7 +728,7 @@
 
     <section class="card" aria-labelledby="bench-table-caption">
       <div class="card-header">
-        <h2 id="bench-table-title">Shader, Regime &amp; Memory Profile Timings</h2>
+        <h2 id="bench-table-title">Per-Shader Timings</h2>
         <div class="controls-row">
           <select id="table-page-size" class="meta-pill" aria-label="Table rows per page">
             <option value="12">12 / page</option>
