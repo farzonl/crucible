@@ -38,12 +38,6 @@
       --accent-dark: #38bdf8;
       --crucible-light: #0284c7;
       --crucible-dark: #38bdf8;
-      --warp-light: #7c3aed;
-      --warp-dark: #a78bfa;
-      --llvmpipe-light: #15803d;
-      --llvmpipe-dark: #4ade80;
-      --swift-light: #c2410c;
-      --swift-dark: #fb923c;
 
       --bg: var(--bg-light);
       --surface: var(--surface-light);
@@ -53,9 +47,6 @@
       --muted: var(--muted-light);
       --accent: var(--accent-light);
       --c-crucible: var(--crucible-light);
-      --c-warp: var(--warp-light);
-      --c-llvmpipe: var(--llvmpipe-light);
-      --c-swift: var(--swift-light);
 
       --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -75,9 +66,6 @@
         --muted: var(--muted-dark);
         --accent: var(--accent-dark);
         --c-crucible: var(--crucible-dark);
-        --c-warp: var(--warp-dark);
-        --c-llvmpipe: var(--llvmpipe-dark);
-        --c-swift: var(--swift-dark);
       }
     }
 
@@ -91,9 +79,6 @@
       --muted: var(--muted-dark);
       --accent: var(--accent-dark);
       --c-crucible: var(--crucible-dark);
-      --c-warp: var(--warp-dark);
-      --c-llvmpipe: var(--llvmpipe-dark);
-      --c-swift: var(--swift-dark);
     }
 
     @media (forced-colors: active) {
@@ -106,9 +91,6 @@
         --muted: GrayText;
         --accent: LinkText;
         --c-crucible: CanvasText;
-        --c-warp: CanvasText;
-        --c-llvmpipe: CanvasText;
-        --c-swift: CanvasText;
       }
     }
 
@@ -651,11 +633,6 @@
     <section aria-label="Global benchmark scope and summary" style="display: grid; gap: 1rem;">
       <div class="card-header">
         <div class="controls-row">
-          <label for="platform-select" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Platform:</label>
-          <select id="platform-select" class="meta-pill" aria-label="Select benchmark platform">
-            <option value="macos">macOS</option>
-            <option value="windows">Windows</option>
-          </select>
           <label for="global-scope" style="font-size: 0.85rem; color: var(--muted); font-family: var(--font-mono); font-weight: 600;">Scope &amp; Metric:</label>
           <select id="global-scope" class="meta-pill" aria-label="Select global benchmark scope and metric"></select>
           <select id="commit-window" class="meta-pill" aria-label="Limit commits shown in trend charts">
@@ -762,40 +739,21 @@
   </main>
 
   <script>
-    const FALLBACK_BENCH = [
-      {
-        sha: "6bcd6be000000000000000000000000000000000",
-        shortSha: "6bcd6be",
-        message: "Sample preview (awaiting first Windows benchmark CI run)",
-        timestamp: new Date().toISOString(),
-        results: [
-          { backend: "Metal (crucible)", shaderFormat: "DXIL", ran: true, compileMs: 12.0, medianMs: 8.5, minMs: 8.1, peakRssMb: 68.2, status: "OK" },
-          { backend: "Metal (crucible)", shaderFormat: "DXIL", ran: true, compileMs: 14.0, medianMs: 6.2, minMs: 5.9, peakRssMb: 68.1, status: "OK" },
-          { backend: "Microsoft WARP", shaderFormat: "DXIL", ran: true, compileMs: 10.5, medianMs: 9.8, minMs: 9.4, peakRssMb: 84.5, status: "OK" },
-          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.2, medianMs: 11.4, minMs: 10.9, peakRssMb: 79.0, status: "OK" },
-          { backend: "Vulkan (SwiftShader)", shaderFormat: "SPIR-V", ran: true, compileMs: 22.0, medianMs: 16.5, minMs: 15.8, peakRssMb: 92.3, status: "OK" }
-        ]
-      }
-    ];
-
     const FALLBACK_BENCH_MACOS = [
       {
-        sha: "6bcd6be000000000000000000000000000000000",
-        shortSha: "6bcd6be",
+        sha: "0000000000000000000000000000000000000000",
+        shortSha: "0000000",
         message: "Sample preview (awaiting first macOS benchmark CI run)",
         timestamp: new Date().toISOString(),
         os: "macOS",
         results: [
-          { backend: "Metal (crucible)", shaderFormat: "DXIL", ran: true, compileMs: 11.2, medianMs: 6.4, minMs: 6.1, peakRssMb: 64.0, status: "OK" },
-          { backend: "Metal (IRConverter)", shaderFormat: "DXIL", ran: true, compileMs: 19.5, medianMs: 1.8, minMs: 1.6, peakRssMb: 88.0, status: "OK" },
-          { backend: "Vulkan (MoltenVK)", shaderFormat: "SPIR-V", ran: true, compileMs: 16.0, medianMs: 2.3, minMs: 2.1, peakRssMb: 82.0, status: "OK" },
-          { backend: "Vulkan (KosmicKrisp)", shaderFormat: "SPIR-V", ran: true, compileMs: 17.5, medianMs: 2.9, minMs: 2.7, peakRssMb: 85.0, status: "OK" },
-          { backend: "Vulkan (llvmpipe)", shaderFormat: "SPIR-V", ran: true, compileMs: 18.0, medianMs: 10.5, minMs: 10.1, peakRssMb: 78.0, status: "OK" }
+          { backend: "Metal (crucible)", shaderFormat: "DXIL->MSL", ran: true, compileMs: 11.2, medianMs: 6.4, minMs: 6.1, status: "OK" },
+          { backend: "Metal (IRConverter)", shaderFormat: "DXIL->AIR", ran: true, compileMs: 19.5, medianMs: 1.8, minMs: 1.6, status: "OK" }
         ]
       }
     ];
 
-    let activePlatform = "windows";
+    let activePlatform = "macos";
     let benchHistory = [];
     let selectedIndex = 0;
     let hoveredIndex = -1;
@@ -871,11 +829,6 @@
 
     const BACKEND_FAMILIES = [
       { key: "crucible", label: "Metal (crucible)", color: "#0284c7", cssVarName: "--c-crucible", match: b => b.includes("crucible") },
-      { key: "warp", label: "Microsoft WARP", color: "#7c3aed", cssVarName: "--c-warp", match: b => b.includes("warp") },
-      { key: "llvmpipe", label: "Mesa llvmpipe", color: "#15803d", cssVarName: "--c-llvmpipe", match: b => b.includes("llvmpipe") },
-      { key: "swift", label: "SwiftShader", color: "#c2410c", cssVarName: "--c-swift", match: b => b.includes("swiftshader") },
-      { key: "moltenvk", label: "Vulkan (MoltenVK)", color: "#0d9488", match: b => b.includes("moltenvk") },
-      { key: "kosmickrisp", label: "Vulkan (KosmicKrisp)", color: "#db2777", match: b => b.includes("kosmickrisp") },
       { key: "metal", label: "Metal (IRConverter)", color: "#ca8a04", match: b => b.includes("irconverter") },
     ];
 
@@ -1121,7 +1074,7 @@
         grid.innerHTML = families.map(f => {
           const item = m[f.key];
           const memItem = memM[f.key];
-          const memSuffix = memItem ? ` · ${memItem.val.toFixed(1)} MB peak` : "";
+          const memSuffix = memItem ? ` · compile ${memItem.val.toFixed(1)} ms` : "";
           const col = f.cssVarName ? `var(${f.cssVarName})` : f.color;
           return `
             <article class="card" style="gap: 0.25rem;">
@@ -1722,7 +1675,7 @@
 
     function setupInteraction() {
       document.getElementById("platform-select")?.addEventListener("change", (e) => {
-        const nextPlatform = e.target.value === "macos" ? "macos" : "windows";
+        const nextPlatform = "macos";
         const url = new URL(window.location.href);
         url.searchParams.set("os", nextPlatform);
         window.history.replaceState({}, "", url);
@@ -1800,14 +1753,12 @@
     }
 
     async function loadPlatformData(platform) {
-      activePlatform = platform === "macos" ? "macos" : "windows";
-      const dataPath = activePlatform === "macos" ? "data/bench-history-macos.json" : "data/bench-history.json";
-      const fallback = activePlatform === "macos" ? FALLBACK_BENCH_MACOS : FALLBACK_BENCH;
+      activePlatform = "macos";
+      const dataPath = "data/bench-history-macos.json";
+      const fallback = FALLBACK_BENCH_MACOS;
       const sel = document.getElementById("platform-select");
       if (sel) sel.value = activePlatform;
-      document.title = activePlatform === "macos"
-        ? "Crucible — macOS DXIL-to-Metal Benchmarks"
-        : "Crucible — Shader Benchmarks";
+      document.title = "Crucible — macOS DXIL-to-Metal Benchmarks";
       try {
         const resp = await fetch(dataPath, { cache: "no-store" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1824,9 +1775,7 @@
     }
 
     async function init() {
-      const params = new URLSearchParams(window.location.search);
-      const osParam = (params.get("os") || "").toLowerCase();
-      const initialPlatform = osParam === "windows" ? "windows" : "macos";
+      const initialPlatform = "macos";
       setupThemeToggle();
       await loadPlatformData(initialPlatform);
       setupInteraction();
