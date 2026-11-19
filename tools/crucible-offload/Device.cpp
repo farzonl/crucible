@@ -479,7 +479,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   bool HasStencil = P.Stencil && P.Stencil->Enabled;
   if (B.SampleCount < 1 ||
       (B.SampleCount > 1 && !Device->supportsTextureSampleCount(B.SampleCount)) ||
-      B.getViewportCount() != 1 || !P.PushConstants.empty() ||
+      B.getViewportCount() < 1 || !P.PushConstants.empty() ||
       P.ShadingRate != FragmentShadingRate::Rate1x1)
     return Fail("unsupported raster pipeline state");
 
@@ -1174,11 +1174,19 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
     if (!Vertices)
       return Fail("cannot allocate Metal vertex buffer");
   }
-  auto VP = B.getViewports().front();
-  auto Sc = B.getScissors().front();
-  if (Sc.X < 0 || Sc.Y < 0 || static_cast<size_t>(Sc.X) + Sc.Width > Width ||
-      static_cast<size_t>(Sc.Y) + Sc.Height > Height)
-    return Fail("scissor exceeds the render target");
+  std::vector<MTL::Viewport> VPs;
+  for (const auto &VP : B.getViewports())
+    VPs.push_back({VP.X, VP.Y, VP.Width, VP.Height, VP.MinDepth, VP.MaxDepth});
+  std::vector<MTL::ScissorRect> Scs;
+  for (const auto &Sc : B.getScissors()) {
+    if (Sc.X < 0 || Sc.Y < 0 || static_cast<size_t>(Sc.X) + Sc.Width > Width ||
+        static_cast<size_t>(Sc.Y) + Sc.Height > Height)
+      return Fail("scissor exceeds the render target");
+    Scs.push_back({static_cast<size_t>(Sc.X), static_cast<size_t>(Sc.Y),
+                   Sc.Width, Sc.Height});
+  }
+  while (Scs.size() < VPs.size())
+    Scs.push_back(Scs.empty() ? MTL::ScissorRect{0, 0, Width, Height} : Scs.back());
   auto *Pass = MTL::RenderPassDescriptor::renderPassDescriptor();
   NS::SharedPtr<MTL::Texture> DepthStencilTarget;
   NS::SharedPtr<MTL::DepthStencilState> DepthStencilState;
@@ -1245,9 +1253,8 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   if (HasStencil)
     Enc->setStencilReferenceValue(0);
   Enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
-  Enc->setViewport({VP.X, VP.Y, VP.Width, VP.Height, VP.MinDepth, VP.MaxDepth});
-  Enc->setScissorRect({static_cast<size_t>(Sc.X), static_cast<size_t>(Sc.Y),
-                       Sc.Width, Sc.Height});
+  Enc->setViewports(VPs.data(), VPs.size());
+  Enc->setScissorRects(Scs.data(), Scs.size());
   if (Vertices)
     Enc->setVertexBuffer(Vertices.get(), 0, VertexDataSlot);
   for (auto [Vertex, Slot, GPU] : BufferBindings)
@@ -1278,6 +1285,233 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   for (auto &[CPU, Tex] : RasterTextures)
     if (RasterTextureUsages.at(CPU) & MTL::TextureUsageShaderWrite)
       readbackMetalTexture(Tex.get(), CPU, RasterTextureKinds.at(CPU));
+  return Error::success();
+}
+
+Error executeMeshRaster(Pipeline &P, MTL::Device *Device) {
+  auto Fail = [](StringRef Msg) {
+    return createStringError(inconvertibleErrorCode(), Msg);
+  };
+  if (!P.isMeshShaderRaster())
+    return Fail("expected a mesh-shader raster pipeline");
+  const auto &B = P.Bindings;
+  if (!B.RTargetBufferPtr || B.RTargetBufferPtr->Data.empty())
+    return Fail("mesh raster pipeline has no RenderTarget");
+  CPUBuffer *Output = B.RTargetBufferPtr;
+  const auto &Props = Output->OutputProps;
+  size_t Width = Props.Width ? Props.Width : 1;
+  size_t Height = Props.Height ? Props.Height : 1;
+  size_t Depth = Props.Depth ? Props.Depth : 1;
+  auto PF = pixelFormatFor(Output->Format, Output->Channels);
+  if (!PF)
+    return PF.takeError();
+  size_t BPP = Output->getSingleElementSize() * Output->Channels;
+  size_t Pitch = Width * BPP;
+  if (!BPP || Depth != 1 || Output->Size < Pitch * Height)
+    return Fail("unsupported mesh raster RenderTarget layout");
+  bool HasStencil = P.Stencil && P.Stencil->Enabled;
+
+  const Shader *AS = nullptr, *MS = nullptr, *PS = nullptr;
+  for (const Shader &S : P.Shaders) {
+    if (S.Stage == Stages::Amplification)
+      AS = &S;
+    else if (S.Stage == Stages::Mesh)
+      MS = &S;
+    else if (S.Stage == Stages::Pixel)
+      PS = &S;
+  }
+  if (!MS || !PS)
+    return Fail("mesh raster pipeline requires Mesh and Pixel shaders");
+
+  auto CO = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
+  CO->setFastMathEnabled(false);
+
+  auto CompileShader = [&](const Shader &S)
+      -> Expected<std::pair<NS::SharedPtr<MTL::Function>, crucible::Reflection>> {
+    crucible::Options Opts;
+    Opts.EmulateF64 = true;
+    auto Compiled =
+        crucible::compileDXILToMSL(S.Shader->getMemBufferRef(), Opts);
+    if (!Compiled)
+      return Compiled.takeError();
+    NS::Error *NErr = nullptr;
+    auto *Src =
+        NS::String::string(Compiled->MSL.c_str(), NS::UTF8StringEncoding);
+    auto Lib = NS::TransferPtr(Device->newLibrary(Src, CO.get(), &NErr));
+    if (!Lib)
+      return mtlError("MSL compilation failed", NErr);
+    auto *FnName = NS::String::string(Compiled->Reflect.MSLEntryName.c_str(),
+                                      NS::UTF8StringEncoding);
+    auto Fn = NS::TransferPtr(Lib->newFunction(FnName));
+    if (!Fn)
+      return Fail("compiled Metal library has no entry point");
+    return std::make_pair(std::move(Fn), std::move(Compiled->Reflect));
+  };
+
+  NS::SharedPtr<MTL::Function> ObjFn, MeshFn, FragFn;
+  crucible::Reflection ObjRefl, MeshRefl, FragRefl;
+  if (AS) {
+    auto R = CompileShader(*AS);
+    if (!R)
+      return R.takeError();
+    ObjFn = std::move(R->first);
+    ObjRefl = std::move(R->second);
+  }
+  {
+    auto R = CompileShader(*MS);
+    if (!R)
+      return R.takeError();
+    MeshFn = std::move(R->first);
+    MeshRefl = std::move(R->second);
+  }
+  {
+    auto R = CompileShader(*PS);
+    if (!R)
+      return R.takeError();
+    FragFn = std::move(R->first);
+    FragRefl = std::move(R->second);
+  }
+
+  auto Desc = NS::TransferPtr(MTL::MeshRenderPipelineDescriptor::alloc()->init());
+  if (ObjFn)
+    Desc->setObjectFunction(ObjFn.get());
+  Desc->setMeshFunction(MeshFn.get());
+  Desc->setFragmentFunction(FragFn.get());
+  Desc->colorAttachments()->object(0)->setPixelFormat(*PF);
+  if (B.SampleCount > 1)
+    Desc->setRasterSampleCount(B.SampleCount);
+  MTL::PixelFormat DepthStencilFormat =
+      HasStencil ? MTL::PixelFormatDepth32Float_Stencil8
+                 : MTL::PixelFormatDepth32Float;
+  Desc->setDepthAttachmentPixelFormat(DepthStencilFormat);
+  if (HasStencil)
+    Desc->setStencilAttachmentPixelFormat(DepthStencilFormat);
+
+  NS::Error *NErr = nullptr;
+  auto PSO = NS::TransferPtr(Device->newRenderPipelineState(
+      Desc.get(), MTL::PipelineOptionNone, nullptr, &NErr));
+  if (!PSO)
+    return mtlError("mesh render pipeline state creation failed", NErr);
+
+  auto *TexDesc =
+      MTL::TextureDescriptor::texture2DDescriptor(*PF, Width, Height, false);
+  TexDesc->setStorageMode(MTL::StorageModeShared);
+  TexDesc->setUsage(MTL::TextureUsageRenderTarget);
+  auto Target = NS::TransferPtr(Device->newTexture(TexDesc));
+  NS::SharedPtr<MTL::Texture> MSAATarget;
+  if (B.SampleCount > 1) {
+    auto *MSAADesc =
+        MTL::TextureDescriptor::texture2DDescriptor(*PF, Width, Height, false);
+    MSAADesc->setTextureType(MTL::TextureType2DMultisample);
+    MSAADesc->setSampleCount(B.SampleCount);
+    MSAADesc->setStorageMode(MTL::StorageModePrivate);
+    MSAADesc->setUsage(MTL::TextureUsageRenderTarget);
+    MSAATarget = NS::TransferPtr(Device->newTexture(MSAADesc));
+    if (!MSAATarget)
+      return Fail("cannot allocate Metal MSAA render target");
+  }
+  auto Queue = NS::TransferPtr(Device->newCommandQueue());
+  if (!Target || !Queue)
+    return Fail("cannot allocate Metal render target or queue");
+
+  std::vector<MTL::Viewport> VPs;
+  for (const auto &VP : B.getViewports())
+    VPs.push_back({VP.X, VP.Y, VP.Width, VP.Height, VP.MinDepth, VP.MaxDepth});
+  std::vector<MTL::ScissorRect> Scs;
+  for (const auto &Sc : B.getScissors()) {
+    if (Sc.X < 0 || Sc.Y < 0 || static_cast<size_t>(Sc.X) + Sc.Width > Width ||
+        static_cast<size_t>(Sc.Y) + Sc.Height > Height)
+      return Fail("scissor exceeds the render target");
+    Scs.push_back({static_cast<size_t>(Sc.X), static_cast<size_t>(Sc.Y),
+                   Sc.Width, Sc.Height});
+  }
+  while (Scs.size() < VPs.size())
+    Scs.push_back(Scs.empty() ? MTL::ScissorRect{0, 0, Width, Height} : Scs.back());
+
+  auto *Pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+  auto *DSDesc = MTL::TextureDescriptor::texture2DDescriptor(
+      DepthStencilFormat, Width, Height, false);
+  if (B.SampleCount > 1) {
+    DSDesc->setTextureType(MTL::TextureType2DMultisample);
+    DSDesc->setSampleCount(B.SampleCount);
+  }
+  DSDesc->setStorageMode(MTL::StorageModePrivate);
+  DSDesc->setUsage(MTL::TextureUsageRenderTarget);
+  auto DepthStencilTarget = NS::TransferPtr(Device->newTexture(DSDesc));
+  auto DS = NS::TransferPtr(MTL::DepthStencilDescriptor::alloc()->init());
+  DS->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
+  DS->setDepthWriteEnabled(true);
+  if (HasStencil) {
+    auto StencilDesc = NS::TransferPtr(MTL::StencilDescriptor::alloc()->init());
+    StencilDesc->setStencilCompareFunction(metalCompare(P.Stencil->ComparisonOp));
+    StencilDesc->setStencilFailureOperation(MTL::StencilOperationKeep);
+    StencilDesc->setDepthFailureOperation(MTL::StencilOperationKeep);
+    StencilDesc->setDepthStencilPassOperation(MTL::StencilOperationKeep);
+    StencilDesc->setReadMask(0xff);
+    StencilDesc->setWriteMask(0xff);
+    DS->setFrontFaceStencil(StencilDesc.get());
+    DS->setBackFaceStencil(StencilDesc.get());
+  }
+  auto DepthStencilState =
+      NS::TransferPtr(Device->newDepthStencilState(DS.get()));
+  if (!DepthStencilTarget || !DepthStencilState)
+    return Fail("cannot allocate Metal depth/stencil target or state");
+  auto *DepthAttachment = Pass->depthAttachment();
+  DepthAttachment->setTexture(DepthStencilTarget.get());
+  DepthAttachment->setLoadAction(MTL::LoadActionClear);
+  DepthAttachment->setClearDepth(1.0);
+  DepthAttachment->setStoreAction(MTL::StoreActionDontCare);
+  if (HasStencil) {
+    auto *StencilAttachment = Pass->stencilAttachment();
+    StencilAttachment->setTexture(DepthStencilTarget.get());
+    StencilAttachment->setLoadAction(MTL::LoadActionClear);
+    StencilAttachment->setClearStencil(P.Stencil->ClearValue);
+    StencilAttachment->setStoreAction(MTL::StoreActionDontCare);
+  }
+
+  auto *Color = Pass->colorAttachments()->object(0);
+  if (MSAATarget) {
+    Color->setTexture(MSAATarget.get());
+    Color->setResolveTexture(Target.get());
+    Color->setStoreAction(MTL::StoreActionMultisampleResolve);
+  } else {
+    Color->setTexture(Target.get());
+    Color->setStoreAction(MTL::StoreActionStore);
+  }
+  Color->setLoadAction(MTL::LoadActionClear);
+  Color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+
+  auto *Cmd = Queue->commandBuffer();
+  if (!Cmd)
+    return Fail("cannot allocate Metal render command buffer");
+  auto *Enc = Cmd->renderCommandEncoder(Pass);
+  if (!Enc)
+    return Fail("cannot allocate Metal render command encoder");
+  Enc->setRenderPipelineState(PSO.get());
+  Enc->setDepthStencilState(DepthStencilState.get());
+  if (HasStencil)
+    Enc->setStencilReferenceValue(0);
+  Enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
+  Enc->setViewports(VPs.data(), VPs.size());
+  Enc->setScissorRects(Scs.data(), Scs.size());
+
+  const auto &Grid = P.DispatchParameters.DispatchGroupCount;
+  MTL::Size Threadgroups = MTL::Size::Make(
+      Grid[0] ? Grid[0] : 1, Grid[1] ? Grid[1] : 1, Grid[2] ? Grid[2] : 1);
+  MTL::Size ObjTG = ObjFn
+      ? MTL::Size::Make(ObjRefl.NumThreads[0], ObjRefl.NumThreads[1],
+                        ObjRefl.NumThreads[2])
+      : MTL::Size::Make(1, 1, 1);
+  MTL::Size MeshTG = MTL::Size::Make(
+      MeshRefl.NumThreads[0], MeshRefl.NumThreads[1], MeshRefl.NumThreads[2]);
+  Enc->drawMeshThreadgroups(Threadgroups, ObjTG, MeshTG);
+  Enc->endEncoding();
+  Cmd->commit();
+  Cmd->waitUntilCompleted();
+  if (Cmd->status() == MTL::CommandBufferStatusError)
+    return mtlError("GPU mesh rendering failed", Cmd->error());
+  Target->getBytes(Output->Data[0].get(), Pitch,
+                   MTL::Region::Make2D(0, 0, Width, Height), 0);
   return Error::success();
 }
 
@@ -1704,6 +1938,8 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
       BufferDims.resize(R.BufferSizesMetalIndex + 1, 0);
     for (DescriptorSet &Set : P.Sets) {
       for (Resource &Res : Set.Resources) {
+        if (Res.HeapIndex)
+          continue;
         auto Class = classify(Res.Kind);
         if (!Class)
           return createStringError(
@@ -1907,6 +2143,78 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
           MTL::ResourceStorageModeShared);
       BufferBinds.push_back({R.InstanceContributionMetalIndex, ContribBuf});
     }
+    std::vector<std::pair<MTL::Resource *, MTL::ResourceUsage>> HeapUseRes;
+    if (R.ResourceHeapMetalIndex != UINT32_MAX ||
+        R.CounterHeapMetalIndex != UINT32_MAX ||
+        R.SamplerHeapMetalIndex != UINT32_MAX) {
+      std::vector<uint64_t> ResHeapAddrs, CounterHeapAddrs, SamplerHeapAddrs;
+      for (const DescriptorSet &DS : P.Sets) {
+        for (const offloadtest::Resource &Res : DS.Resources) {
+          if (!Res.HeapIndex)
+            continue;
+          uint32_t Idx = *Res.HeapIndex;
+          if (Res.Kind == offloadtest::ResourceKind::Sampler) {
+            if (SamplerHeapAddrs.size() <= Idx)
+              SamplerHeapAddrs.resize(Idx + 1, 0);
+            SamplerHeapAddrs[Idx] =
+                GetGPUSampler(Res.SamplerPtr)->gpuResourceID()._impl;
+          } else if (isTextureResource(Res.Kind)) {
+            TextureKinds[Res.BufferPtr] = Res.Kind;
+            TextureUsages[Res.BufferPtr] |= Res.isReadWrite()
+                ? (MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite)
+                : MTL::TextureUsageShaderRead;
+            auto Tex = GetGPUTexture(Res.BufferPtr, 0);
+            if (!Tex)
+              return Tex.takeError();
+            if (ResHeapAddrs.size() <= Idx)
+              ResHeapAddrs.resize(Idx + 1, 0);
+            ResHeapAddrs[Idx] = (*Tex)->gpuResourceID()._impl;
+            HeapUseRes.push_back(
+                {*Tex, Res.isReadWrite()
+                           ? (MTL::ResourceUsageRead | MTL::ResourceUsageWrite)
+                           : MTL::ResourceUsageRead});
+          } else if (Res.BufferPtr) {
+            MTL::Buffer *Buf = GetGPUBuffer(Res.BufferPtr, 0);
+            if (ResHeapAddrs.size() <= Idx)
+              ResHeapAddrs.resize(Idx + 1, 0);
+            ResHeapAddrs[Idx] = Buf->gpuAddress();
+            HeapUseRes.push_back(
+                {Buf, Res.isReadWrite()
+                          ? (MTL::ResourceUsageRead | MTL::ResourceUsageWrite)
+                          : MTL::ResourceUsageRead});
+            if (Res.HasCounter) {
+              MTL::Buffer *CBuf = GetGPUCounter(Res.BufferPtr, 0);
+              if (CounterHeapAddrs.size() <= Idx)
+                CounterHeapAddrs.resize(Idx + 1, 0);
+              CounterHeapAddrs[Idx] = CBuf->gpuAddress();
+              HeapUseRes.push_back(
+                  {CBuf, MTL::ResourceUsageRead | MTL::ResourceUsageWrite});
+            }
+          }
+        }
+      }
+      if (R.ResourceHeapMetalIndex != UINT32_MAX) {
+        MTL::Buffer *HBuf = Device->newBuffer(
+            ResHeapAddrs.data(),
+            std::max<size_t>(ResHeapAddrs.size() * sizeof(uint64_t), 16),
+            MTL::ResourceStorageModeShared);
+        BufferBinds.push_back({R.ResourceHeapMetalIndex, HBuf});
+      }
+      if (R.CounterHeapMetalIndex != UINT32_MAX) {
+        MTL::Buffer *CBuf = Device->newBuffer(
+            CounterHeapAddrs.data(),
+            std::max<size_t>(CounterHeapAddrs.size() * sizeof(uint64_t), 16),
+            MTL::ResourceStorageModeShared);
+        BufferBinds.push_back({R.CounterHeapMetalIndex, CBuf});
+      }
+      if (R.SamplerHeapMetalIndex != UINT32_MAX) {
+        MTL::Buffer *SBuf = Device->newBuffer(
+            SamplerHeapAddrs.data(),
+            std::max<size_t>(SamplerHeapAddrs.size() * sizeof(uint64_t), 16),
+            MTL::ResourceStorageModeShared);
+        BufferBinds.push_back({R.SamplerHeapMetalIndex, SBuf});
+      }
+    }
 
     MTL::CommandBuffer *Cmd = Queue->commandBuffer();
     MTL::ComputeCommandEncoder *Enc = Cmd->computeCommandEncoder();
@@ -1922,6 +2230,8 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
     if (!ASBinds.empty())
       for (MTL::AccelerationStructure *BLAS : BuiltBLAS)
         Enc->useResource(BLAS, MTL::ResourceUsageRead);
+    for (auto &[ResPtr, Usage] : HeapUseRes)
+      Enc->useResource(ResPtr, Usage);
     const auto &G = P.DispatchParameters.DispatchGroupCount;
     Enc->dispatchThreadgroups(
         MTL::Size::Make(G[0], G[1], G[2]),
@@ -2036,7 +2346,11 @@ public:
           {"DoublePrecisionFloatShaderOps", true},
           {"AtomicInt64OnGroupSharedSupported", false},
           {"AtomicInt64OnTypedResourceSupported", false},
-          {"SM_6_9", true}, {"WaveMultiPrefix", true},
+          {"SM_6_8", true}, {"SM_6_9", true},
+          {"WaveMultiPrefix", true}, {"WaveSize_32", true},
+          {"LodClamp", true}, {"ShaderStencilRef", true},
+          {"Float32GroupSharedAtomics", true}, {"MeshShader", true},
+          {"ResourceBindingTier3", true}, {"multi-viewport", true},
           {"acceleration-structure", this->Metal->supportsRaytracing()},
           {"raytracing-pipeline", this->Metal->supportsRaytracing()}})
       Caps.try_emplace(Name, makeCapability(Name, Enabled));
@@ -2055,8 +2369,9 @@ public:
     auto Pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
     if (auto Err = validateRootParameters(P))
       return Err;
-    return P.isTraditionalRaster() ? executeRaster(P, Metal.get())
-                                   : executeCompute(P, Metal.get());
+    return P.isTraditionalRaster()  ? executeRaster(P, Metal.get())
+           : P.isMeshShaderRaster() ? executeMeshRaster(P, Metal.get())
+                                    : executeCompute(P, Metal.get());
   }
 
   Queue &getGraphicsQueue() override {

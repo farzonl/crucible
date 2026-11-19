@@ -75,6 +75,7 @@ enum class DXILOp : uint32_t {
   CreateHandle = 57,
   CBufferLoadLegacy = 59,
   Sample = 60,
+  SampleBias = 61,
   SampleLevel = 62,
   SampleGrad = 63,
   SampleCmp = 64,
@@ -174,11 +175,22 @@ enum class DXILOp : uint32_t {
   // SM 6.5 wave multi-prefix ops
   WaveMultiPrefixOp = 166,
   WaveMultiPrefixBitCount = 167,
+  // SM 6.5 mesh / amplification shader ops
+  SetMeshOutputCounts = 168,
+  EmitIndices = 169,
+  GetMeshPayload = 170,
+  StoreVertexOutput = 171,
+  StorePrimitiveOutput = 172,
+  DispatchMesh = 173,
   // SM 6.6 resource handles & pack/unpack
   AnnotateHandle = 216,
   CreateHandleFromBinding = 217,
+  CreateHandleFromHeap = 218,
   Unpack4x8 = 219,
   Pack4x8 = 220,
+  // SM 6.8 barriers
+  BarrierByMemoryType = 244,
+  BarrierByMemoryHandle = 245,
 };
 
 /// hlsl::DXIL::AtomicBinOpCode (operand 2 of dx.op.atomicBinOp).

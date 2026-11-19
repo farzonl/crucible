@@ -50,8 +50,11 @@ if target["Features"]["Int64ShaderOps"]:
     config.available_features.add("Int64")
 if target["Features"].get("DoublePrecisionFloatShaderOps", False):
     config.available_features.add("Double")
-for feature in ("SM_6_9", "WaveMultiPrefix", "acceleration-structure",
-                "raytracing-pipeline"):
+for feature in ("SM_6_8", "SM_6_9", "WaveMultiPrefix",
+                "WaveSize_32", "LodClamp", "ShaderStencilRef",
+                "Float32GroupSharedAtomics", "MeshShader",
+                "ResourceBindingTier3", "multi-viewport",
+                "acceleration-structure", "raytracing-pipeline"):
     if target["Features"].get(feature, False):
         config.available_features.add(feature)
 

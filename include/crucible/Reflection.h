@@ -110,6 +110,19 @@ struct StageParameter {
 
 enum class TessellationDomain : uint8_t { Isoline = 1, Triangle = 2, Quad = 3 };
 
+enum class MeshOutputTopology : uint8_t { Line = 1, Triangle = 2 };
+
+struct MeshInterface {
+  MeshOutputTopology Topology = MeshOutputTopology::Triangle;
+  uint32_t MaxVertexCount = 0;
+  uint32_t MaxPrimitiveCount = 0;
+  uint32_t PayloadSize = 0;
+};
+
+struct AmplificationInterface {
+  uint32_t PayloadSize = 0;
+};
+
 enum class TessellationPartitioning : uint8_t {
   Integer = 1,
   Pow2 = 2,
@@ -180,10 +193,18 @@ struct Reflection {
   std::optional<DomainInterface> Domain;
   std::optional<HullInterface> Hull;
   std::optional<GeometryInterface> Geometry;
+  std::optional<MeshInterface> Mesh;
+  std::optional<AmplificationInterface> Amplification;
   bool HasBufferDimensions = false;
   uint32_t BufferSizesMetalIndex = UINT32_MAX;
   bool HasInstanceContribution = false;
   uint32_t InstanceContributionMetalIndex = UINT32_MAX;
+  bool HasResourceHeap = false;
+  uint32_t ResourceHeapMetalIndex = UINT32_MAX;
+  bool HasCounterHeap = false;
+  uint32_t CounterHeapMetalIndex = UINT32_MAX;
+  bool HasSamplerHeap = false;
+  uint32_t SamplerHeapMetalIndex = UINT32_MAX;
   std::vector<RTShaderInfo> RTShaders;
 
   /// Serialize the (space, register, kind) -> metal_index mapping as JSON.
