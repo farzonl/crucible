@@ -46,6 +46,9 @@ static cl::opt<std::string> MSLStd("msl-std",
 static cl::opt<bool> FlushDenormsF32("ftz",
                                      cl::desc("Flush f32 denormals to zero around math builtins"),
                                      cl::cat(CrucibleCat));
+static cl::opt<bool> EmulateF64("emulate-f64",
+                                cl::desc("Emulate double (f64) operations using software IEEE-754 binary64"),
+                                cl::cat(CrucibleCat));
 
 static int reportError(Error E) {
   logAllUnhandledErrors(std::move(E), errs(), "cruciblec: error: ");
@@ -111,6 +114,7 @@ int main(int argc, char **argv) {
   Opts.EntryPoint = EntryPoint;
   Opts.MSLStd = MSLStd;
   Opts.FlushDenormsF32 = FlushDenormsF32;
+  Opts.EmulateF64 = EmulateF64;
 
   auto Result =
       crucible::compileDXILToMSL((*BufOrErr)->getMemBufferRef(), Opts);

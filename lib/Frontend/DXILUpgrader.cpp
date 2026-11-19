@@ -26,6 +26,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Scalar/LoopUnrollPass.h"
 #include "llvm/Transforms/Scalar/Scalarizer.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
@@ -257,7 +258,9 @@ static ShaderStage parseStage(StringRef Name) {
 // DXIL entry-point property tags (hlsl::DXIL::EntryPropsTag).
 enum : uint32_t {
   kDxilShaderFlagsTag = 0,
+  kDxilGSStateTag = 1,
   kDxilDSStateTag = 2,
+  kDxilHSStateTag = 3,
   kDxilNumThreadsTag = 4,
   kDxilShaderKindTag = 8,
 };
@@ -333,9 +336,10 @@ static Error parseDomainInterface(const MDNode *Props, const MDNode *Sig,
       return makeError("invalid DXIL domain shader state");
     auto Kind = mdUInt(State->getOperand(0));
     auto Count = mdUInt(State->getOperand(1));
-    if (Kind != static_cast<unsigned>(TessellationDomain::Triangle) &&
+    if (Kind != static_cast<unsigned>(TessellationDomain::Isoline) &&
+        Kind != static_cast<unsigned>(TessellationDomain::Triangle) &&
         Kind != static_cast<unsigned>(TessellationDomain::Quad))
-      return makeError("only triangle and quad tessellation domains are supported");
+      return makeError("unsupported DXIL tessellation domain");
     if (Count < 1 || Count > 32)
       return makeError("invalid DXIL domain control-point count");
     R.Domain = DomainInterface{static_cast<TessellationDomain>(Kind),
@@ -358,6 +362,74 @@ static Error parseDomainInterface(const MDNode *Props, const MDNode *Sig,
     return Error::success();
   }
   return makeError("missing DXIL domain shader state");
+}
+
+static Error parseHullInterface(const MDNode *Props, const MDNode *Sig,
+                              Reflection &R) {
+  if (!Props || !Sig || Sig->getNumOperands() < 3)
+    return makeError("missing DXIL hull shader metadata");
+  for (unsigned I = 0; I + 1 < Props->getNumOperands(); I += 2) {
+    if (mdUInt(Props->getOperand(I)) != kDxilHSStateTag)
+      continue;
+    auto *State = dyn_cast_or_null<MDNode>(Props->getOperand(I + 1).get());
+    if (!State || State->getNumOperands() < 7)
+      return makeError("invalid DXIL hull shader state");
+    auto *PCFMD = dyn_cast_or_null<ValueAsMetadata>(State->getOperand(0).get());
+    auto *PCF = PCFMD ? dyn_cast<Function>(PCFMD->getValue()) : nullptr;
+    if (!PCF)
+      return makeError("missing DXIL hull patch-constant function");
+    auto InputCP = mdUInt(State->getOperand(1));
+    auto OutputCP = mdUInt(State->getOperand(2));
+    auto Domain = mdUInt(State->getOperand(3));
+    auto Partitioning = mdUInt(State->getOperand(4));
+    auto OutputPrim = mdUInt(State->getOperand(5));
+    float MaxTess = 64.0f;
+    if (auto *C = dyn_cast_or_null<ConstantAsMetadata>(State->getOperand(6).get()))
+      if (auto *CFP = dyn_cast<ConstantFP>(C->getValue()))
+        MaxTess = CFP->getValueAPF().convertToFloat();
+    if (Domain != static_cast<unsigned>(TessellationDomain::Isoline) &&
+        Domain != static_cast<unsigned>(TessellationDomain::Triangle) &&
+        Domain != static_cast<unsigned>(TessellationDomain::Quad))
+      return makeError("unsupported DXIL hull tessellation domain");
+    if (InputCP < 1 || InputCP > 32 || OutputCP < 1 || OutputCP > 32)
+      return makeError("invalid DXIL hull control-point count");
+    HullInterface HI;
+    HI.Domain = static_cast<TessellationDomain>(Domain);
+    HI.Partitioning = static_cast<TessellationPartitioning>(Partitioning);
+    HI.OutputPrimitive = static_cast<TessellationOutputPrimitive>(OutputPrim);
+    HI.InputControlPointCount = static_cast<uint32_t>(InputCP);
+    HI.OutputControlPointCount = static_cast<uint32_t>(OutputCP);
+    HI.MaxTessFactor = MaxTess;
+    HI.PatchConstantFuncName = PCF->getName().str();
+    if (Error E = parseStageParameters(
+            dyn_cast_or_null<MDNode>(Sig->getOperand(2).get()),
+            HI.PatchConstants))
+      return E;
+    R.Hull = std::move(HI);
+    return Error::success();
+  }
+  return makeError("missing DXIL hull shader state");
+}
+
+static Error parseGeometryInterface(const MDNode *Props, Reflection &R) {
+  if (!Props)
+    return makeError("missing DXIL geometry shader metadata");
+  for (unsigned I = 0; I + 1 < Props->getNumOperands(); I += 2) {
+    if (mdUInt(Props->getOperand(I)) != kDxilGSStateTag)
+      continue;
+    auto *State = dyn_cast_or_null<MDNode>(Props->getOperand(I + 1).get());
+    if (!State || State->getNumOperands() < 5)
+      return makeError("invalid DXIL geometry shader state");
+    GeometryInterface GI;
+    GI.InputPrimitive = static_cast<uint32_t>(mdUInt(State->getOperand(0)));
+    GI.MaxVertexCount = static_cast<uint32_t>(mdUInt(State->getOperand(1)));
+    GI.InstanceCount = static_cast<uint32_t>(mdUInt(State->getOperand(2)));
+    GI.OutputTopology = static_cast<uint32_t>(mdUInt(State->getOperand(3)));
+    GI.StreamMask = static_cast<uint32_t>(mdUInt(State->getOperand(4)));
+    R.Geometry = std::move(GI);
+    return Error::success();
+  }
+  return makeError("missing DXIL geometry shader state");
 }
 
 static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
@@ -413,7 +485,8 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
     auto *Sig = dyn_cast_or_null<MDNode>(EP->getOperand(2).get());
     auto *Props = dyn_cast_or_null<MDNode>(EP->getOperand(4).get());
     if (R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel ||
-        R.Stage == ShaderStage::Domain) {
+        R.Stage == ShaderStage::Domain || R.Stage == ShaderStage::Hull ||
+        R.Stage == ShaderStage::Geometry) {
       if (Sig) {
         if (Sig->getNumOperands() < 2)
           return makeError("invalid DXIL entry signature");
@@ -427,6 +500,12 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
     }
     if (R.Stage == ShaderStage::Domain)
       if (Error E = parseDomainInterface(Props, Sig, R))
+        return E;
+    if (R.Stage == ShaderStage::Hull)
+      if (Error E = parseHullInterface(Props, Sig, R))
+        return E;
+    if (R.Stage == ShaderStage::Geometry)
+      if (Error E = parseGeometryInterface(Props, R))
         return E;
     parseEntryProps(Props, R);
     return F;
@@ -881,6 +960,9 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
   FunctionPassManager FPM;
   FPM.addPass(PromotePass());
   FPM.addPass(LowerLongVectorsPass());
+  FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+  FPM.addPass(SimplifyCFGPass());
+  FPM.addPass(createFunctionToLoopPassAdaptor(LoopFullUnrollPass(3)));
   FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
   FPM.addPass(SimplifyCFGPass());
   FPM.addPass(LowerSwitchPass());

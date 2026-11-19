@@ -48,6 +48,8 @@ if target["Features"]["Native16BitShaderOpsSupported"]:
     config.available_features.update(["Half", "Int16"])
 if target["Features"]["Int64ShaderOps"]:
     config.available_features.add("Int64")
+if target["Features"].get("DoublePrecisionFloatShaderOps", False):
+    config.available_features.add("Double")
 for feature in ("SM_6_9", "WaveMultiPrefix", "acceleration-structure",
                 "raytracing-pipeline"):
     if target["Features"].get(feature, False):
