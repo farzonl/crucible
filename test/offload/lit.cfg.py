@@ -44,16 +44,36 @@ config.available_features.update(
 )
 if host["Architecture"].lower() in ("arm64", "aarch64"):
     config.available_features.add("host-arm64")
-if target["Features"]["Native16BitShaderOpsSupported"]:
+features = target["Features"]
+if features.get("Native16BitShaderOpsSupported", False):
     config.available_features.update(["Half", "Int16"])
-if target["Features"]["Int64ShaderOps"]:
+if features.get("Int64ShaderOps", False):
     config.available_features.add("Int64")
-if target["Features"].get("DoublePrecisionFloatShaderOps", False):
+if features.get("DoublePrecisionFloatShaderOps", False):
     config.available_features.add("Double")
-for feature in ("SM_6_9", "WaveMultiPrefix", "acceleration-structure",
-                "raytracing-pipeline"):
-    if target["Features"].get(feature, False):
-        config.available_features.add(feature)
+if features.get("WaveOps", False):
+    config.available_features.add("WaveMultiPrefix")
+    if features.get("WaveLaneCountMin", 0) <= 32 <= features.get("WaveLaneCountMax", 0):
+        config.available_features.add("WaveSize_32")
+if features.get("ResourceBindingTier", 0) >= 3:
+    config.available_features.add("ResourceBindingTier3")
+if features.get("TiledResourcesTier", 0) >= 2:
+    config.available_features.add("LodClamp")
+if features.get("MeshShaderTier", "NotSupported") != "NotSupported":
+    config.available_features.add("MeshShader")
+if features.get("PSSpecifiedStencilRefSupported", False):
+    config.available_features.add("ShaderStencilRef")
+if features.get("VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation", False):
+    config.available_features.add("multi-viewport")
+if features.get("RaytracingTier", "NotSupported") != "NotSupported":
+    config.available_features.update(["acceleration-structure", "raytracing-pipeline"])
+config.available_features.add("Float32GroupSharedAtomics")
+# SM_6_6 is withheld until 64-bit buffer atomics are supported on Metal.
+sm = str(features.get("HighestShaderModel", "6.0"))
+if sm >= "6.8":
+    config.available_features.add("SM_6_8")
+if sm >= "6.9":
+    config.available_features.add("SM_6_9")
 
 # Substitution order matters: %dxc_target_lib before %dxc_target.
 config.substitutions.append(("%dxc_target_lib", config.dxc))

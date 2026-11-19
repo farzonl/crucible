@@ -263,6 +263,8 @@ enum : uint32_t {
   kDxilHSStateTag = 3,
   kDxilNumThreadsTag = 4,
   kDxilShaderKindTag = 8,
+  kDxilMSStateTag = 9,
+  kDxilASStateTag = 10,
 };
 
 static StringRef unmangleDXILName(StringRef S) {
@@ -432,6 +434,56 @@ static Error parseGeometryInterface(const MDNode *Props, Reflection &R) {
   return makeError("missing DXIL geometry shader state");
 }
 
+static Error parseMeshInterface(const MDNode *Props, Reflection &R) {
+  if (!Props)
+    return makeError("missing DXIL mesh shader metadata");
+  for (unsigned I = 0, E = Props->getNumOperands(); I + 1 < E; I += 2) {
+    if (mdUInt(Props->getOperand(I)) != kDxilMSStateTag)
+      continue;
+    auto *State = dyn_cast_or_null<MDNode>(Props->getOperand(I + 1).get());
+    if (!State || State->getNumOperands() < 5)
+      return makeError("invalid DXIL mesh shader state");
+    if (const auto *NT = dyn_cast_or_null<MDNode>(State->getOperand(0).get())) {
+      for (unsigned D = 0; D < 3 && D < NT->getNumOperands(); ++D)
+        R.NumThreads[D] = static_cast<uint32_t>(mdUInt(NT->getOperand(D), 1));
+    }
+    MeshInterface MI;
+    MI.MaxVertexCount = static_cast<uint32_t>(mdUInt(State->getOperand(1)));
+    MI.MaxPrimitiveCount = static_cast<uint32_t>(mdUInt(State->getOperand(2)));
+    uint64_t Topo = mdUInt(State->getOperand(3));
+    if (Topo == 1)
+      MI.Topology = MeshOutputTopology::Line;
+    else if (Topo == 2)
+      MI.Topology = MeshOutputTopology::Triangle;
+    else
+      return makeError("unsupported mesh shader output topology {0}", Topo);
+    MI.PayloadSize = static_cast<uint32_t>(mdUInt(State->getOperand(4)));
+    R.Mesh = std::move(MI);
+    return Error::success();
+  }
+  return makeError("missing DXIL mesh shader state");
+}
+
+static Error parseAmplificationInterface(const MDNode *Props, Reflection &R) {
+  if (!Props)
+    return makeError("missing DXIL amplification shader metadata");
+  for (unsigned I = 0, E = Props->getNumOperands(); I + 1 < E; I += 2) {
+    if (mdUInt(Props->getOperand(I)) != kDxilASStateTag)
+      continue;
+    auto *State = dyn_cast_or_null<MDNode>(Props->getOperand(I + 1).get());
+    if (!State || State->getNumOperands() < 2)
+      return makeError("invalid DXIL amplification shader state");
+    if (const auto *NT = dyn_cast_or_null<MDNode>(State->getOperand(0).get())) {
+      for (unsigned D = 0; D < 3 && D < NT->getNumOperands(); ++D)
+        R.NumThreads[D] = static_cast<uint32_t>(mdUInt(NT->getOperand(D), 1));
+    }
+    R.Amplification =
+        AmplificationInterface{static_cast<uint32_t>(mdUInt(State->getOperand(1)))};
+    return Error::success();
+  }
+  return makeError("missing DXIL amplification shader state");
+}
+
 static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
                                              StringRef EntryOverride) {
   const NamedMDNode *EPs = M.getNamedMetadata("dx.entryPoints");
@@ -486,7 +538,7 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
     auto *Props = dyn_cast_or_null<MDNode>(EP->getOperand(4).get());
     if (R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel ||
         R.Stage == ShaderStage::Domain || R.Stage == ShaderStage::Hull ||
-        R.Stage == ShaderStage::Geometry) {
+        R.Stage == ShaderStage::Geometry || R.Stage == ShaderStage::Mesh) {
       if (Sig) {
         if (Sig->getNumOperands() < 2)
           return makeError("invalid DXIL entry signature");
@@ -506,6 +558,12 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
         return E;
     if (R.Stage == ShaderStage::Geometry)
       if (Error E = parseGeometryInterface(Props, R))
+        return E;
+    if (R.Stage == ShaderStage::Mesh)
+      if (Error E = parseMeshInterface(Props, R))
+        return E;
+    if (R.Stage == ShaderStage::Amplification)
+      if (Error E = parseAmplificationInterface(Props, R))
         return E;
     parseEntryProps(Props, R);
     return F;
