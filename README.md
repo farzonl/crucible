@@ -9,10 +9,11 @@
 [![macOS Benchmarks](https://github.com/farzonl/crucible/actions/workflows/macos-benchmark.yml/badge.svg)](https://github.com/farzonl/crucible/actions/workflows/macos-benchmark.yml)
 [![DXIL to Metal Pass Rate](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ffarzonl.github.io%2Fcrucible%2Fdata%2Flatest.json&query=%24.passRate&suffix=%25&label=DXIL%20%E2%86%92%20Metal&color=brightgreen)](https://farzonl.github.io/crucible/?track=dxil-to-metal)
 [![DXIL to SPIR-V Pass Rate](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ffarzonl.github.io%2Fcrucible%2Fdata%2Fdxil-to-spirv%2Flatest.json&query=%24.passRate&suffix=%25&label=DXIL%20%E2%86%92%20SPIR-V&color=blue)](https://farzonl.github.io/crucible/?track=dxil-to-spirv)
+[![SPIR-V to Metal Pass Rate](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ffarzonl.github.io%2Fcrucible%2Fdata%2Fspirv-to-metal%2Flatest.json&query=%24.passRate&suffix=%25&label=SPIR-V%20%E2%86%92%20Metal&color=purple)](https://farzonl.github.io/crucible/?track=spirv-to-metal)
 [![Platforms](https://img.shields.io/badge/Platforms-macOS_%7C_Linux-success)](#building)
 [![License](https://img.shields.io/badge/License-Apache--2.0%20WITH%20LLVM--exception-blue)](LICENSE)
 
-[**Live Compliance Dashboard**](https://farzonl.github.io/crucible/) · [**DXIL → Metal Track**](https://farzonl.github.io/crucible/?track=dxil-to-metal) · [**DXIL → SPIR-V Track**](https://farzonl.github.io/crucible/?track=dxil-to-spirv) · [**Live Benchmark Dashboard**](https://farzonl.github.io/crucible/bench.html)
+[**Live Compliance Dashboard**](https://farzonl.github.io/crucible/) · [**DXIL → Metal Track**](https://farzonl.github.io/crucible/?track=dxil-to-metal) · [**DXIL → SPIR-V Track**](https://farzonl.github.io/crucible/?track=dxil-to-spirv) · [**SPIR-V → Metal Track**](https://farzonl.github.io/crucible/?track=spirv-to-metal) · [**Live Benchmark Dashboard**](https://farzonl.github.io/crucible/bench.html)
 
 </div>
 
@@ -24,7 +25,7 @@
 
 - **Metal backend (`--target=msl`)**: Emits clean, human-readable **Metal Shading Language** with zero-overhead direct `[[buffer(n)]]` bindings and JSON reflection, compiled via Apple's native `xcrun metal` / `metallib` toolchain.
 - **Vulkan SPIR-V backend (`--target=spirv`)**: Lowers DXIL directly to **Vulkan 1.3 SPIR-V** via LLVM's built-in SPIR-V backend (`spirv1.6-unknown-vulkan1.3-*`), supporting compute, VS/PS graphics, textures/samplers, bindless descriptor heaps, inline `RayQuery`, and DXC-compatible `--vk-*-shift` register shifts.
-- **Multi-frontend ingestion**: Accepts **DXIL** (`.dxil` DXContainer or bare LLVM 3.7 bitcode) and **SPIR-V** (`.spv`, lowered via MLIR's `spirv` dialect).
+- **Multi-frontend ingestion**: Auto-detects and accepts **DXIL** (`.dxil` DXContainer or bare LLVM 3.7 bitcode), **SPIR-V** (`.spv`, lowered via MLIR's `spirv` dialect), and standalone **Layer 0+1 MLIR** (`.mlir`, PTX/compute-IR compatible `func` + `scf` + `llvm` + `gpu` + `math`).
 
 ### Supported Translation Paths
 
@@ -32,7 +33,8 @@
 | :--- | :--- | :--- | :--- |
 | **DXIL** (`.dxil` / DXContainer) | **Metal MSL** (`--target=msl`) | Compute, VS/PS Graphics, Wave/Quad, Atomics, Bindless | macOS Apple Silicon (`dxil-to-metal`) |
 | **DXIL** (`.dxil` / DXContainer) | **Vulkan SPIR-V** (`--target=spirv`) | Compute, VS/PS Graphics, Textures, Bindless, Inline RT | Linux Lavapipe & macOS MoltenVK (`dxil-to-spirv`) |
-| **SPIR-V** (`.spv`) | **Metal MSL** (`--target=msl`) | Compute, VS/PS Graphics, Textures/Samplers, Typed Buffers, Wave/Subgroup | macOS Apple Silicon (`spirv-to-metal`, in progress) |
+| **SPIR-V** (`.spv`) | **Metal MSL** (`--target=msl`) | Compute, VS/PS Graphics, Textures/Samplers, Typed Buffers, Wave/Subgroup | macOS Apple Silicon (`spirv-to-metal`) |
+| **Layer 0+1 MLIR** (`.mlir`) | **Metal MSL** (`--target=msl`) | `addrspace(1)` pointer kernels, `gpu.*`, `math.*`, `scf.*` (PTX-ready) | FileCheck (`mlir_layer01_ptx_ready`) |
 
 ---
 
@@ -43,11 +45,12 @@ flowchart LR
     subgraph Frontends["Frontends (lib/Frontend)"]
         DXIL["DXIL / DXContainer\nContainerLoader + DXILUpgrader"]
         SPVIn["SPIR-V (.spv)\nSPIRVLoader (MLIR spirv)"]
+        MLIRIn["Layer 0+1 MLIR (.mlir)\nMLIRLoader (PTX-ready)"]
     end
 
     subgraph Transforms["Middle-End (lib/Transforms)"]
         Res["ResourceLowering\nDirect bindings & --vk-*-shift"]
-        CFG["CFGStructurizer\nMLIR LiftControlFlowToSCF"]
+        L1["DXILToLayer1 + CFGStructurizer\nMLIR gpu.* / math.* + LiftControlFlowToSCF"]
     end
 
     subgraph Backends["Backends (lib/Backend)"]
@@ -62,7 +65,8 @@ flowchart LR
 
     DXIL --> Res
     SPVIn --> Res
-    Res --> CFG --> MSL --> Metal
+    MLIRIn --> L1
+    Res --> L1 --> MSL --> Metal
     Res --> SPVOut --> Vulkan
 ```
 
@@ -101,6 +105,7 @@ xychart-beta
 `tools/crucible-offload` builds upstream `offloader` and `api-query` against a unified multi-runtime device provider (`MetalDevice` + `VulkanDevice`). Crucible advertises itself as a `DirectX` implementation with the `Crucible` driver tag so tests are held to the full D3D12 contract:
 
 - **macOS (`dxil-to-metal`)**: `CRUCIBLE_OFFLOAD_RUNTIME=metal` (default on macOS) compiles DXIL → MSL and dispatches on Metal.
+- **macOS (`spirv-to-metal`)**: `check-crucible-offload-spirv` (`lit -Dspirv_frontend=1`) compiles HLSL via `dxc -spirv -fspv-target-env=vulkan1.1`, lowers SPIR-V → MLIR → MSL, and dispatches on Metal.
 - **Linux Lavapipe / macOS MoltenVK (`dxil-to-spirv`)**: `CRUCIBLE_OFFLOAD_RUNTIME=vulkan` (default on Linux) compiles DXIL → SPIR-V and dispatches on Vulkan.
 
 ---
@@ -112,8 +117,9 @@ Requirements: **CMake ≥ 3.24**, **Ninja**, **LLVM + MLIR ≥ 16** (with the SP
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ninja -C build check-crucible          # FileCheck + Metal/Vulkan GPU E2E tests
-ninja -C build check-crucible-offload  # llvm/offload-test-suite (optional)
+ninja -C build check-crucible                # FileCheck + Metal/Vulkan GPU E2E tests
+ninja -C build check-crucible-offload        # llvm/offload-test-suite (DXIL -> Metal / Vulkan)
+ninja -C build check-crucible-offload-spirv  # llvm/offload-test-suite (SPIR-V -> Metal)
 ```
 
 Useful CMake flags: `-DLLVM_DIR=...`, `-DDXC_EXECUTABLE=...`, `-DLLVM_EXTERNAL_LIT=...`, `-DCRUCIBLE_OFFLOAD_SUITE_DIR=...`.
@@ -130,8 +136,9 @@ cruciblec shader.dxil -o out.metal --reflect out.json --metallib out.metallib
 cruciblec shader.dxil --target=spirv -o out.spv --reflect out.json
 cruciblec shader.dxil --target=spirv --spv-asm --vk-u-shift=10 -o out.spvasm
 
-# SPIR-V -> Metal MSL
+# SPIR-V -> Metal MSL (or inspect converged Layer 1 MLIR with --dump-mlir)
 cruciblec shader.spv -o out.metal --reflect out.json
+cruciblec kernel.mlir -o out.metal --dump-mlir
 
 # Run GPU E2E dispatches directly
 crucible-run --lib out.metallib --entry main0 --threads 64,1,1 --groups 1,1,1 --buffer 0:f32:64:iota
@@ -140,7 +147,7 @@ crucible-vk-run --spv out.spv --reflect out.json --groups 1,1,1 --buffer 0:f32:6
 
 | Tool | Purpose |
 | :--- | :--- |
-| `tools/cruciblec` | Multi-frontend, multi-backend compiler CLI (`--target=msl\|spirv`, `--reflect`, `--metallib`, `--vk-*-shift`, `--stage-as-compute`). |
+| `tools/cruciblec` | Multi-frontend, multi-backend compiler CLI (`--target=msl\|spirv`, `--reflect`, `--metallib`, `--vk-*-shift`, `--stage-as-compute`, `--dump-mlir`). |
 | `tools/crucible-run` | Native Metal compute runner and GPU-timestamp benchmark harness (`--bench-json`). |
 | `tools/crucible-vk-run` | Vulkan / MoltenVK / Lavapipe compute runner for SPIR-V GPU E2E verification. |
 | `tools/crucible-offload` | Multi-runtime `llvm/offload-test-suite` device provider (`MetalDevice` + `VulkanDevice` via `CRUCIBLE_OFFLOAD_RUNTIME`). |
