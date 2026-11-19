@@ -1,7 +1,7 @@
 # RUN: %dxc -T cs_6_0 -Fo %t.dxil %S/../Inputs/constant_palette.hlsl
 # RUN: %cruciblec %t.dxil -o %t.metal
 # RUN: FileCheck %s < %t.metal
-# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air
+# RUN: %if metal-tools %{ xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air %}
 
 # CHECK: constant float [[PALETTE:crucible_const_[0-9]+]][4] = {0.0f, 0.25f, 0.5f, 1.0f};
 # CHECK: kernel void main0(

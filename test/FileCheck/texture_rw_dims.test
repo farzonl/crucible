@@ -3,7 +3,7 @@
 # RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/texture_rw_dims.hlsl
 # RUN: %cruciblec %t.dxil -o %t.metal
 # RUN: FileCheck %s --input-file=%t.metal
-# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air
+# RUN: %if metal-tools %{ xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air %}
 
 # CHECK: #include <metal_stdlib>
 # CHECK: using namespace metal;
