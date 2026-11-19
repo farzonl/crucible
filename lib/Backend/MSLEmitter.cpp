@@ -27,6 +27,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -2372,6 +2373,18 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
   if (mlir::isa<mlir::LLVM::GEPOp, mlir::LLVM::AddressOfOp>(Op))
     return true;
 
+  // Trivial GPU builtin reads (Layer 1): always re-spell at each use.
+  if (mlir::isa<mlir::gpu::GlobalIdOp, mlir::gpu::BlockIdOp,
+                mlir::gpu::ThreadIdOp>(Op))
+    return true;
+  if (mlir::isa<mlir::arith::IndexCastOp, mlir::arith::IndexCastUIOp>(Op)) {
+    if (auto *SrcOp = Op->getOperand(0).getDefiningOp()) {
+      if (mlir::isa<mlir::gpu::GlobalIdOp, mlir::gpu::BlockIdOp,
+                    mlir::gpu::ThreadIdOp>(SrcOp))
+        return true;
+    }
+  }
+
   // Side-effecting or aggregate-producing ops are materialized as statements.
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
                 mlir::LLVM::AtomicCmpXchgOp, mlir::LLVM::AllocaOp>(Op))
@@ -2873,6 +2886,8 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     if (!DstTy)
       return DstTy.takeError();
     mlir::Type T = Op->getOperand(0).getType();
+    if (T.isIndex() && *DstTy == "uint")
+      return Src;
     if (!T.isIndex() && mlir::isa<mlir::arith::IndexCastOp>(Op))
       Src->Text = signedView(T, Src->Text);
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
@@ -2978,6 +2993,34 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
 
   if (auto EV = mlir::dyn_cast<ExtractValueOp>(Op))
     return bufferElementExpr(EV);
+
+  // Layer 1 GPU compute IDs.
+  auto gpuDimSwizzle = [](mlir::gpu::Dimension D) -> char {
+    switch (D) {
+    case mlir::gpu::Dimension::x:
+      return 'x';
+    case mlir::gpu::Dimension::y:
+      return 'y';
+    case mlir::gpu::Dimension::z:
+      return 'z';
+    }
+    return 'x';
+  };
+  if (auto G = mlir::dyn_cast<mlir::gpu::GlobalIdOp>(Op)) {
+    UsesDTid = true;
+    return Expr{std::string("dtid.") + gpuDimSwizzle(G.getDimension()),
+                PrecPrimary};
+  }
+  if (auto B = mlir::dyn_cast<mlir::gpu::BlockIdOp>(Op)) {
+    UsesGid = true;
+    return Expr{std::string("gid.") + gpuDimSwizzle(B.getDimension()),
+                PrecPrimary};
+  }
+  if (auto T = mlir::dyn_cast<mlir::gpu::ThreadIdOp>(Op)) {
+    UsesGTid = true;
+    return Expr{std::string("gtid.") + gpuDimSwizzle(T.getDimension()),
+                PrecPrimary};
+  }
 
   if (auto Call = mlir::dyn_cast<CallOp>(Op)) {
     auto DXOp = dxOpcode(Call);

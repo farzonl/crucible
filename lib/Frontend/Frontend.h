@@ -12,6 +12,9 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBufferRef.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 
 #include <memory>
 
@@ -24,6 +27,13 @@ struct LoadedShader {
   Reflection Reflect;
 };
 
+/// Result of loading a shader directly into MLIR (e.g. from SPIR-V) ready for
+/// CFG structurization and MSL emission.
+struct LoadedMLIRShader {
+  mlir::OwningOpRef<mlir::ModuleOp> Module;
+  Reflection Reflect;
+};
+
 /// Extract the raw DXIL bitcode slice from a DXContainer binary. Buffers that
 /// are already bare LLVM bitcode ('BC\xC0\xDE') are returned unchanged.
 llvm::Expected<llvm::StringRef> extractDXILBitcode(llvm::MemoryBufferRef Buf);
@@ -33,6 +43,15 @@ llvm::Expected<llvm::StringRef> extractDXILBitcode(llvm::MemoryBufferRef Buf);
 llvm::Expected<LoadedShader> loadDXIL(llvm::MemoryBufferRef Buf,
                                       llvm::LLVMContext &Ctx,
                                       llvm::StringRef EntryOverride = {});
+
+/// Returns true when Buf begins with the SPIR-V binary magic (0x07230203).
+bool isSPIRVBinary(llvm::MemoryBufferRef Buf);
+
+/// Deserialize a SPIR-V binary into MLIR, extract reflection metadata, and
+/// lower shader-ABI ops into Crucible's layered MLIR representation.
+llvm::Expected<LoadedMLIRShader> loadSPIRV(llvm::MemoryBufferRef Buf,
+                                           mlir::MLIRContext &Ctx,
+                                           llvm::StringRef EntryOverride = {});
 
 } // namespace crucible
 

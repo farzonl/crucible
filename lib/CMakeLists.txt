@@ -3,6 +3,7 @@ add_library(crucible STATIC
   Reflection.cpp
   Frontend/ContainerLoader.cpp
   Frontend/DXILUpgrader.cpp
+  Frontend/SPIRVLoader.cpp
   Transforms/ResourceLowering.cpp
   Transforms/CFGStructurizer.cpp
   Backend/IntrinsicMap.cpp

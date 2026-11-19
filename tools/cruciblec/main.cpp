@@ -23,7 +23,7 @@ using namespace llvm;
 static cl::OptionCategory CrucibleCat("cruciblec options");
 
 static cl::opt<std::string> InputFile(cl::Positional, cl::Required,
-                                      cl::desc("<input .dxil>"),
+                                      cl::desc("<input .dxil or .spv>"),
                                       cl::cat(CrucibleCat));
 static cl::opt<std::string> OutputFile("o", cl::desc("Output .metal file (defaults to stdout)"),
                                        cl::value_desc("path"),
@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
   Opts.EmulateF64 = EmulateF64;
 
   auto Result =
-      crucible::compileDXILToMSL((*BufOrErr)->getMemBufferRef(), Opts);
+      crucible::compileToMSL((*BufOrErr)->getMemBufferRef(), Opts);
   if (!Result)
     return reportError(Result.takeError());
 

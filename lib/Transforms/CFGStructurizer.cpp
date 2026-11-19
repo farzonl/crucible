@@ -117,36 +117,19 @@ static Error convertEntryToCF(mlir::ModuleOp Mod, StringRef EntryName) {
   return Error::success();
 }
 
-Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
-                                            mlir::MLIRContext &Ctx) {
-  // The MLIR importer rejects DXIL's named metadata; reflection was already
-  // captured by the frontend, so drop it.
-  llvm::Module &M = *Shader.M;
-  SmallVector<llvm::NamedMDNode *, 8> Named;
-  for (llvm::NamedMDNode &N : M.named_metadata())
-    Named.push_back(&N);
-  for (auto *N : Named)
-    N->eraseFromParent();
-
-  mlir::DialectRegistry Registry;
-  Registry.insert<mlir::LLVM::LLVMDialect, mlir::DLTIDialect,
-                  mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
-                  mlir::scf::SCFDialect, mlir::arith::ArithDialect>();
-  mlir::registerLLVMDialectImport(Registry);
-  Ctx.appendDialectRegistry(Registry);
-
-  std::string EntryName = Shader.Reflect.EntryName;
-  auto Mod = mlir::translateLLVMIRToModule(std::move(Shader.M), &Ctx);
-  if (!Mod)
-    return makeError("MLIR import of the DXIL module failed");
+Expected<StructurizedShader>
+structurizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp> Mod,
+                      const Reflection &Reflect) {
+  mlir::MLIRContext &Ctx = *Mod->getContext();
+  std::string EntryName = Reflect.EntryName;
 
   if (Error E = convertEntryToCF(*Mod, EntryName))
     return std::move(E);
-  if (Shader.Reflect.Hull) {
-    if (Error E = convertEntryToCF(*Mod, Shader.Reflect.Hull->PatchConstantFuncName))
+  if (Reflect.Hull) {
+    if (Error E = convertEntryToCF(*Mod, Reflect.Hull->PatchConstantFuncName))
       return std::move(E);
   }
-  for (const RTShaderInfo &RT : Shader.Reflect.RTShaders) {
+  for (const RTShaderInfo &RT : Reflect.RTShaders) {
     if (Error E = convertEntryToCF(*Mod, RT.SymbolName))
       return std::move(E);
   }
@@ -170,6 +153,31 @@ Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
   if (!Out.Entry)
     return makeError("entry '{0}' lost during structurization", EntryName);
   return std::move(Out);
+}
+
+Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
+                                            mlir::MLIRContext &Ctx) {
+  // The MLIR importer rejects DXIL's named metadata; reflection was already
+  // captured by the frontend, so drop it.
+  llvm::Module &M = *Shader.M;
+  SmallVector<llvm::NamedMDNode *, 8> Named;
+  for (llvm::NamedMDNode &N : M.named_metadata())
+    Named.push_back(&N);
+  for (auto *N : Named)
+    N->eraseFromParent();
+
+  mlir::DialectRegistry Registry;
+  Registry.insert<mlir::LLVM::LLVMDialect, mlir::DLTIDialect,
+                  mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
+                  mlir::scf::SCFDialect, mlir::arith::ArithDialect>();
+  mlir::registerLLVMDialectImport(Registry);
+  Ctx.appendDialectRegistry(Registry);
+
+  auto Mod = mlir::translateLLVMIRToModule(std::move(Shader.M), &Ctx);
+  if (!Mod)
+    return makeError("MLIR import of the DXIL module failed");
+
+  return structurizeMLIRModule(std::move(Mod), Shader.Reflect);
 }
 
 } // namespace crucible
