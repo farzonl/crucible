@@ -37,6 +37,18 @@ static cl::opt<bool> EmitSPIRVAsm("spv-asm",
 static cl::opt<std::string> VulkanVersion("vulkan-version",
                                           cl::desc("Vulkan target environment for SPIR-V backend (default vulkan1.3)"),
                                           cl::init("vulkan1.3"), cl::cat(CrucibleCat));
+static cl::list<std::string> VkBShifts("vk-b-shift",
+                                       cl::desc("Vulkan CBV register shift: <shift> or <shift>,<space>"),
+                                       cl::cat(CrucibleCat));
+static cl::list<std::string> VkTShifts("vk-t-shift",
+                                       cl::desc("Vulkan SRV register shift: <shift> or <shift>,<space>"),
+                                       cl::cat(CrucibleCat));
+static cl::list<std::string> VkUShifts("vk-u-shift",
+                                       cl::desc("Vulkan UAV register shift: <shift> or <shift>,<space>"),
+                                       cl::cat(CrucibleCat));
+static cl::list<std::string> VkSShifts("vk-s-shift",
+                                       cl::desc("Vulkan Sampler register shift: <shift> or <shift>,<space>"),
+                                       cl::cat(CrucibleCat));
 static cl::opt<std::string> ReflectFile("reflect",
                                         cl::desc("Write binding reflection JSON"),
                                         cl::value_desc("path"),
@@ -129,6 +141,41 @@ int main(int argc, char **argv) {
 
   if (TargetOpt == "spirv") {
     Opts.Target = crucible::TargetBackend::SPIRV;
+    auto parseShifts = [&](const cl::list<std::string> &List,
+                           crucible::ResourceClass RC) -> Error {
+      for (const std::string &Spec : List) {
+        StringRef S(Spec);
+        auto [ShiftStr, SpaceStr] = S.split(',');
+        uint32_t ShiftVal = 0;
+        if (ShiftStr.getAsInteger(10, ShiftVal))
+          return createStringError(inconvertibleErrorCode(),
+                                   "invalid shift value '%s'", Spec.c_str());
+        crucible::VulkanRegisterShift Entry;
+        Entry.Class = RC;
+        Entry.Shift = ShiftVal;
+        if (!SpaceStr.empty()) {
+          uint32_t SpaceVal = 0;
+          if (SpaceStr.getAsInteger(10, SpaceVal))
+            return createStringError(inconvertibleErrorCode(),
+                                     "invalid space value in '%s'", Spec.c_str());
+          Entry.Space = SpaceVal;
+          Entry.AllSpaces = false;
+        } else {
+          Entry.AllSpaces = true;
+        }
+        Opts.VulkanRegisterShifts.push_back(Entry);
+      }
+      return Error::success();
+    };
+    if (Error E = parseShifts(VkBShifts, crucible::ResourceClass::CBV))
+      return reportError(std::move(E));
+    if (Error E = parseShifts(VkTShifts, crucible::ResourceClass::SRV))
+      return reportError(std::move(E));
+    if (Error E = parseShifts(VkUShifts, crucible::ResourceClass::UAV))
+      return reportError(std::move(E));
+    if (Error E = parseShifts(VkSShifts, crucible::ResourceClass::Sampler))
+      return reportError(std::move(E));
+
     if (!MetallibFile.empty())
       return reportError("--metallib cannot be used with --target=spirv");
 

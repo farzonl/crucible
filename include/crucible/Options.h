@@ -40,6 +40,16 @@ struct ArraySizeOverride {
   uint32_t Size = 1;
 };
 
+/// DXC-style Vulkan register shift override (-fvk-b/t/u/s-shift).
+struct VulkanRegisterShift {
+  ResourceClass Class = ResourceClass::CBV;
+  uint32_t Shift = 0;
+  uint32_t Space = 0;
+  /// When true, applies to all descriptor spaces unless overridden by an
+  /// exact-space entry.
+  bool AllSpaces = true;
+};
+
 struct Options {
   TargetBackend Target = TargetBackend::MSL;
   BindingMode Binding = BindingMode::Direct;
@@ -53,6 +63,9 @@ struct Options {
 
   /// Vulkan target environment for the LLVM SPIR-V backend (e.g. "vulkan1.3").
   std::string VulkanVersion = "vulkan1.3";
+
+  /// Optional DXC-style Vulkan register shifts (--vk-b/t/u/s-shift).
+  std::vector<VulkanRegisterShift> VulkanRegisterShifts;
 
   /// Entry point to compile when the container exports multiple (libraries).
   /// Empty selects the sole entry point.
