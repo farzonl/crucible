@@ -1,0 +1,17 @@
+# DXIL -> SPIR-V test for DXC-style Vulkan register shift overrides.
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/cbuffer_params.hlsl
+# RUN: %cruciblec --target=spirv --vk-b-shift=10 --vk-u-shift=20,0 %t.dxil -o %t.spv --reflect %t.json
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+# RUN: not %cruciblec --target=spirv --vk-b-shift=5 --vk-u-shift=5 %t.dxil -o %t.bad.spv 2>&1 | FileCheck %s --check-prefix=COLLISION
+
+# CHECK-DAG: OpDecorate {{%[A-Za-z0-9_]+}} Binding 10
+# CHECK-DAG: OpDecorate {{%[A-Za-z0-9_]+}} Binding 20
+
+# REFLECT-DAG: "spirvBinding": 10
+# REFLECT-DAG: "spirvBinding": 20
+
+# COLLISION: SPIR-V binding collision at set 0, binding 5

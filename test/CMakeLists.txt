@@ -17,6 +17,11 @@ if(NOT FILECHECK_EXECUTABLE)
   message(WARNING "FileCheck not found; lit tests will fail")
 endif()
 
+find_program(SPIRV_VAL_EXECUTABLE spirv-val
+  HINTS /opt/homebrew/bin /usr/local/bin)
+find_program(SPIRV_DIS_EXECUTABLE spirv-dis
+  HINTS /opt/homebrew/bin /usr/local/bin)
+
 # lit can come from pip (`pip install lit`), from an LLVM build tree, or be
 # pointed at explicitly with -DLLVM_EXTERNAL_LIT=/path/to/lit[.py].
 if(NOT LLVM_EXTERNAL_LIT)

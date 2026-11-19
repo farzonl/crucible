@@ -28,6 +28,12 @@ if config.crucible_offload:
     config.substitutions.append(("%api_query", f'"{config.crucible_api_query}"'))
     config.available_features.add("offload-runner")
 
+if getattr(config, "spirv_val", "") and os.path.exists(config.spirv_val):
+    config.substitutions.append(("%spirv-val", config.spirv_val))
+    if getattr(config, "spirv_dis", "") and os.path.exists(config.spirv_dis):
+        config.substitutions.append(("%spirv-dis", config.spirv_dis))
+        config.available_features.add("spirv-tools")
+
 # Feature flags:
 #   metal-tools -- Apple's `xcrun metal` toolchain is available, so emitted
 #                  MSL can be compiled with -Werror.

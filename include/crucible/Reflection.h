@@ -94,6 +94,12 @@ struct ResourceBinding {
   uint32_t MetalIndex = 0;
   /// Assigned Metal [[buffer(n)]] slot for UAV atomic counter (when HasCounter).
   uint32_t CounterMetalIndex = 0;
+
+  /// Assigned Vulkan descriptor set and binding (SPIR-V backend).
+  uint32_t SPIRVSet = 0;
+  uint32_t SPIRVBinding = 0;
+  /// Assigned Vulkan binding for UAV atomic counter (when HasCounter).
+  uint32_t CounterSPIRVBinding = 0;
 };
 
 struct StageParameter {
@@ -201,10 +207,14 @@ struct Reflection {
   uint32_t InstanceContributionMetalIndex = UINT32_MAX;
   bool HasResourceHeap = false;
   uint32_t ResourceHeapMetalIndex = UINT32_MAX;
+  uint32_t ResourceHeapSPIRVSet = 0;
+  uint32_t ResourceHeapSPIRVBinding = UINT32_MAX;
   bool HasCounterHeap = false;
   uint32_t CounterHeapMetalIndex = UINT32_MAX;
   bool HasSamplerHeap = false;
   uint32_t SamplerHeapMetalIndex = UINT32_MAX;
+  uint32_t SamplerHeapSPIRVSet = 0;
+  uint32_t SamplerHeapSPIRVBinding = UINT32_MAX;
   std::vector<RTShaderInfo> RTShaders;
 
   /// Serialize the (space, register, kind) -> metal_index mapping as JSON.

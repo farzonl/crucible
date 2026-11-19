@@ -67,6 +67,8 @@ std::string Reflection::toJSON() const {
         {"rangeSize", static_cast<int64_t>(RB.RangeSize)},
         {"elementStride", static_cast<int64_t>(RB.ElementStride)},
         {"metalIndex", static_cast<int64_t>(RB.MetalIndex)},
+        {"spirvSet", static_cast<int64_t>(RB.SPIRVSet)},
+        {"spirvBinding", static_cast<int64_t>(RB.SPIRVBinding)},
         {"requiresTextureAtomics", RB.RequiresTextureAtomics},
     });
   }
@@ -82,6 +84,18 @@ std::string Reflection::toJSON() const {
                                  static_cast<int64_t>(NumThreads[2])}},
       {"bindings", std::move(Bindings)},
   };
+  if (HasResourceHeap && ResourceHeapSPIRVBinding != UINT32_MAX) {
+    Root["spirvResourceHeap"] = json::Object{
+        {"set", static_cast<int64_t>(ResourceHeapSPIRVSet)},
+        {"binding", static_cast<int64_t>(ResourceHeapSPIRVBinding)},
+    };
+  }
+  if (HasSamplerHeap && SamplerHeapSPIRVBinding != UINT32_MAX) {
+    Root["spirvSamplerHeap"] = json::Object{
+        {"set", static_cast<int64_t>(SamplerHeapSPIRVSet)},
+        {"binding", static_cast<int64_t>(SamplerHeapSPIRVBinding)},
+    };
+  }
 
   std::string Out;
   raw_string_ostream OS(Out);

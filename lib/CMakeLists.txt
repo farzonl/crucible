@@ -8,6 +8,7 @@ add_library(crucible STATIC
   Transforms/CFGStructurizer.cpp
   Backend/IntrinsicMap.cpp
   Backend/MSLEmitter.cpp
+  Backend/SPIRVEmitter.cpp
 )
 
 target_include_directories(crucible PUBLIC

@@ -14,6 +14,9 @@
 #include "crucible/Diagnostic.h"
 
 #include <algorithm>
+#include <map>
+#include <optional>
+#include <set>
 
 namespace crucible {
 
@@ -116,6 +119,164 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
     R.BufferSizesMetalIndex = NextBuffer++;
   if (R.HasInstanceContribution)
     R.InstanceContributionMetalIndex = NextBuffer++;
+  return llvm::Error::success();
+}
+
+llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
+  std::vector<ResourceBinding *> Order;
+  Order.reserve(R.Resources.size());
+  for (ResourceBinding &RB : R.Resources)
+    Order.push_back(&RB);
+  std::stable_sort(Order.begin(), Order.end(),
+                   [](const ResourceBinding *A, const ResourceBinding *B) {
+                     auto Key = [](const ResourceBinding *RB) {
+                       return std::tuple(RB->Space,
+                                         static_cast<unsigned>(RB->Class),
+                                         RB->LowerBound);
+                     };
+                     return Key(A) < Key(B);
+                   });
+
+  auto findShift = [&](ResourceClass RC, uint32_t Space) -> std::optional<uint32_t> {
+    std::optional<uint32_t> Wildcard;
+    for (const VulkanRegisterShift &S : Opts.VulkanRegisterShifts) {
+      if (S.Class != RC)
+        continue;
+      if (!S.AllSpaces && S.Space == Space)
+        return S.Shift;
+      if (S.AllSpaces)
+        Wildcard = S.Shift;
+    }
+    return Wildcard;
+  };
+
+  if (Opts.VulkanRegisterShifts.empty()) {
+    uint32_t CurrentSpace = UINT32_MAX;
+    uint32_t NextBinding = 0;
+    for (ResourceBinding *RB : Order) {
+      if (RB->RangeSize == 0xFFFFFFFFu) {
+        for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
+          if (O.Class == RB->Class && O.Space == RB->Space &&
+              O.Register == RB->LowerBound && O.Size > 0) {
+            RB->RangeSize = O.Size;
+            break;
+          }
+        }
+      }
+      if (RB->RangeSize == 0)
+        return makeError("resource '{0}': zero-sized descriptor array is invalid",
+                         RB->Name);
+      if (RB->Space != CurrentSpace) {
+        CurrentSpace = RB->Space;
+        NextBinding = 0;
+      }
+      RB->SPIRVSet = RB->Space;
+      RB->SPIRVBinding = NextBinding;
+      uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+      NextBinding += SlotStep;
+      if (RB->HasCounter) {
+        RB->CounterSPIRVBinding = NextBinding;
+        NextBinding += SlotStep;
+      }
+    }
+    uint32_t MaxSet = 0;
+    for (const ResourceBinding &RB : R.Resources)
+      MaxSet = std::max(MaxSet, RB.SPIRVSet + 1u);
+    if (R.HasResourceHeap) {
+      R.ResourceHeapSPIRVSet = MaxSet++;
+      R.ResourceHeapSPIRVBinding = 0;
+    }
+    if (R.HasSamplerHeap) {
+      R.SamplerHeapSPIRVSet = MaxSet++;
+      R.SamplerHeapSPIRVBinding = 0;
+    }
+    return llvm::Error::success();
+  }
+
+  // Shift-override mode: apply explicit shifts first, then place unshifted
+  // resources and counters in the lowest non-colliding binding per set.
+  std::map<uint32_t, std::set<uint32_t>> UsedBindings;
+  auto reserveRange = [&](uint32_t Set, uint32_t Start, uint32_t Count,
+                          const std::string &Name) -> llvm::Error {
+    auto &Used = UsedBindings[Set];
+    for (uint32_t I = 0; I < Count; ++I) {
+      if (!Used.insert(Start + I).second)
+        return makeError("SPIR-V binding collision at set {0}, binding {1} "
+                         "for resource '{2}'",
+                         Set, Start + I, Name);
+    }
+    return llvm::Error::success();
+  };
+
+  std::vector<ResourceBinding *> Unshifted;
+  for (ResourceBinding *RB : Order) {
+    if (RB->RangeSize == 0xFFFFFFFFu) {
+      for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
+        if (O.Class == RB->Class && O.Space == RB->Space &&
+            O.Register == RB->LowerBound && O.Size > 0) {
+          RB->RangeSize = O.Size;
+          break;
+        }
+      }
+    }
+    if (RB->RangeSize == 0)
+      return makeError("resource '{0}': zero-sized descriptor array is invalid",
+                       RB->Name);
+    RB->SPIRVSet = RB->Space;
+    uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+    if (auto Shift = findShift(RB->Class, RB->Space)) {
+      RB->SPIRVBinding = RB->LowerBound + *Shift;
+      if (llvm::Error E =
+              reserveRange(RB->SPIRVSet, RB->SPIRVBinding, SlotStep, RB->Name))
+        return E;
+    } else {
+      Unshifted.push_back(RB);
+    }
+  }
+
+  auto allocFreeRange = [&](uint32_t Set, uint32_t Count) -> uint32_t {
+    auto &Used = UsedBindings[Set];
+    uint32_t Cand = 0;
+    while (true) {
+      bool Free = true;
+      for (uint32_t I = 0; I < Count; ++I) {
+        if (Used.count(Cand + I)) {
+          Free = false;
+          Cand = Cand + I + 1;
+          break;
+        }
+      }
+      if (Free) {
+        for (uint32_t I = 0; I < Count; ++I)
+          Used.insert(Cand + I);
+        return Cand;
+      }
+    }
+  };
+
+  for (ResourceBinding *RB : Unshifted) {
+    uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+    RB->SPIRVBinding = allocFreeRange(RB->SPIRVSet, SlotStep);
+  }
+
+  for (ResourceBinding *RB : Order) {
+    if (RB->HasCounter) {
+      uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+      RB->CounterSPIRVBinding = allocFreeRange(RB->SPIRVSet, SlotStep);
+    }
+  }
+
+  uint32_t MaxSet = 0;
+  for (const ResourceBinding &RB : R.Resources)
+    MaxSet = std::max(MaxSet, RB.SPIRVSet + 1u);
+  if (R.HasResourceHeap) {
+    R.ResourceHeapSPIRVSet = MaxSet++;
+    R.ResourceHeapSPIRVBinding = 0;
+  }
+  if (R.HasSamplerHeap) {
+    R.SamplerHeapSPIRVSet = MaxSet++;
+    R.SamplerHeapSPIRVBinding = 0;
+  }
   return llvm::Error::success();
 }
 

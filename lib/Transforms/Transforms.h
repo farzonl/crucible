@@ -26,6 +26,12 @@ namespace crucible {
 /// reflection JSON and the MSL emitter always agree.
 llvm::Error assignMetalBindings(Reflection &R, const Options &Opts);
 
+/// Assign deterministic Vulkan (DescriptorSet, Binding) slots to every DXIL
+/// resource range. DescriptorSet matches DXIL Space; bindings within each set
+/// are assigned sequentially ordered by (class: SRV, UAV, CBV, Sampler; then
+/// register).
+llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts);
+
 /// A shader whose CFG has been lifted into structured MLIR scf.if / scf.while
 /// regions ready for source emission.
 struct StructurizedShader {

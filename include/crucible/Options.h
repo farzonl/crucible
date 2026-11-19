@@ -16,6 +16,14 @@
 
 namespace crucible {
 
+/// Output backend target.
+enum class TargetBackend : uint8_t {
+  /// Metal Shading Language (MSL) source via MLIR SCF structurization.
+  MSL,
+  /// Vulkan SPIR-V binary or assembly via LLVM's SPIR-V backend.
+  SPIRV,
+};
+
 /// How resources are bound in the emitted MSL.
 enum class BindingMode : uint8_t {
   /// Zero-overhead direct slots: each DXIL resource maps deterministically to
@@ -32,11 +40,32 @@ struct ArraySizeOverride {
   uint32_t Size = 1;
 };
 
+/// DXC-style Vulkan register shift override (-fvk-b/t/u/s-shift).
+struct VulkanRegisterShift {
+  ResourceClass Class = ResourceClass::CBV;
+  uint32_t Shift = 0;
+  uint32_t Space = 0;
+  /// When true, applies to all descriptor spaces unless overridden by an
+  /// exact-space entry.
+  bool AllSpaces = true;
+};
+
 struct Options {
+  TargetBackend Target = TargetBackend::MSL;
   BindingMode Binding = BindingMode::Direct;
 
   /// MSL language version passed to the Apple toolchain (e.g. "metal3.1").
   std::string MSLStd = "metal3.1";
+
+  /// When targeting SPIR-V, emit human-readable SPIR-V assembly text instead
+  /// of binary SPIR-V words.
+  bool EmitSPIRVAsm = false;
+
+  /// Vulkan target environment for the LLVM SPIR-V backend (e.g. "vulkan1.3").
+  std::string VulkanVersion = "vulkan1.3";
+
+  /// Optional DXC-style Vulkan register shifts (--vk-b/t/u/s-shift).
+  std::vector<VulkanRegisterShift> VulkanRegisterShifts;
 
   /// Entry point to compile when the container exports multiple (libraries).
   /// Empty selects the sole entry point.
