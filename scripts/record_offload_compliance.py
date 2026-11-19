@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Parse llvm-lit JSON results and update GitHub Pages compliance history."""
+"""Parse llvm-lit JSON results and update multi-track GitHub Pages compliance history."""
 
 import argparse
 import json
-import os
 import shutil
 import urllib.request
 from collections import defaultdict
@@ -12,7 +11,6 @@ from pathlib import Path
 
 
 def category_for_test(test_name: str) -> str:
-    # Example: "OffloadTest-d3d12 :: Feature/HLSLLib/mad.fp64.test"
     rel = test_name.split("::", 1)[-1].strip()
     parts = rel.split("/")
     if len(parts) >= 2 and parts[0] in ("Feature", "Basic", "Tools"):
@@ -26,7 +24,9 @@ def parse_lit_json(path: Path) -> dict:
 
     tests = data.get("tests", [])
     counts = {"PASS": 0, "FAIL": 0, "XFAIL": 0, "XPASS": 0, "UNSUPPORTED": 0}
-    categories = defaultdict(lambda: {"passed": 0, "failed": 0, "xfail": 0, "unsupported": 0})
+    categories = defaultdict(
+        lambda: {"passed": 0, "failed": 0, "xfail": 0, "unsupported": 0}
+    )
     failures = []
 
     for t in tests:
@@ -84,7 +84,24 @@ def parse_lit_json(path: Path) -> dict:
     }
 
 
-def load_existing_history(pages_url: str | None, cache_file: Path | None) -> list:
+def fetch_json_list(url: str) -> list | None:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Crucible-Compliance-CI"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            loaded = json.loads(resp.read().decode("utf-8"))
+            if isinstance(loaded, list):
+                return loaded
+    except Exception as exc:
+        print(f"Info: no prior history fetched from {url} ({exc}).")
+    return None
+
+
+def load_existing_history(
+    pages_url: str | None,
+    cache_file: Path | None,
+    track_id: str,
+    allow_legacy_fallback: bool,
+) -> list:
     if cache_file and cache_file.exists():
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
@@ -95,22 +112,33 @@ def load_existing_history(pages_url: str | None, cache_file: Path | None) -> lis
             print(f"Warning: failed to read cached history {cache_file}: {exc}")
 
     if pages_url:
-        url = pages_url.rstrip("/") + "/data/history.json"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Crucible-Compliance-CI"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                loaded = json.loads(resp.read().decode("utf-8"))
-                if isinstance(loaded, list):
-                    return loaded
-        except Exception as exc:
-            print(f"Info: no prior history fetched from {url} ({exc}); starting fresh.")
+        base = pages_url.rstrip("/")
+        loaded = fetch_json_list(f"{base}/data/{track_id}/history.json")
+        if loaded is not None:
+            return loaded
+        if allow_legacy_fallback:
+            loaded = fetch_json_list(f"{base}/data/history.json")
+            if loaded is not None:
+                return loaded
 
     return []
 
 
+def parse_track_spec(spec: str) -> tuple[str, str, Path]:
+    parts = spec.split("=", 2)
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"invalid --track-lit '{spec}' (expected id=label=path)"
+        )
+    return parts[0].strip(), parts[1].strip(), Path(parts[2].strip())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lit-json", required=True, type=Path)
+    parser.add_argument("--lit-json", type=Path, default=None,
+                        help="Legacy single-track lit JSON (recorded as dxil-to-metal)")
+    parser.add_argument("--track-lit", action="append", default=[],
+                        help="Multi-track input: <track_id>=<label>=<lit_json_path>")
     parser.add_argument("--site-src", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--sha", required=True)
@@ -119,40 +147,21 @@ def main() -> None:
     parser.add_argument("--timestamp", default="")
     parser.add_argument("--run-url", default="")
     parser.add_argument("--pages-url", default="")
-    parser.add_argument("--history-cache", type=Path, default=None)
+    parser.add_argument("--history-cache", type=Path, default=None,
+                        help="Legacy single-track history cache file")
+    parser.add_argument("--history-cache-dir", type=Path, default=None,
+                        help="Directory for per-track <track_id>.json history caches")
     args = parser.parse_args()
 
-    summary = parse_lit_json(args.lit_json)
+    tracks_in: list[tuple[str, str, Path]] = []
+    for raw in args.track_lit:
+        tracks_in.append(parse_track_spec(raw))
+    if args.lit_json:
+        tracks_in.append(("dxil-to-metal", "DXIL -> Metal (macOS)", args.lit_json))
+    if not tracks_in:
+        parser.error("at least one of --lit-json or --track-lit is required")
+
     ts = args.timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    entry = {
-        "sha": args.sha,
-        "shortSha": args.sha[:7],
-        "message": args.message.splitlines()[0][:120] if args.message else "",
-        "author": args.author,
-        "timestamp": ts,
-        "runUrl": args.run_url,
-        "total": summary["total"],
-        "executed": summary["executed"],
-        "passed": summary["passed"],
-        "failed": summary["failed"],
-        "xfail": summary["xfail"],
-        "unsupported": summary["unsupported"],
-        "passRate": summary["passRate"],
-        "elapsed": summary["elapsed"],
-        "categories": summary["categories"],
-    }
-
-    history = load_existing_history(args.pages_url, args.history_cache)
-    # Replace if same SHA already exists, otherwise append
-    history = [h for h in history if h.get("sha") != args.sha]
-    history.append(entry)
-    history.sort(key=lambda h: h.get("timestamp", ""))
-
-    if args.history_cache:
-        args.history_cache.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.history_cache, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for item in args.site_src.iterdir():
@@ -164,45 +173,104 @@ def main() -> None:
 
     data_dir = args.out_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
-    with open(data_dir / "history.json", "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
-    with open(data_dir / "latest.json", "w", encoding="utf-8") as f:
-        json.dump({**entry, "failures": summary["failures"]}, f, indent=2)
-    with open(data_dir / "badge.json", "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "schemaVersion": 1,
-                "label": "Offload Metal Suite",
-                "message": f"{entry['passed']} Passed ({entry['passRate']}%)",
-                "color": "brightgreen" if entry["passRate"] >= 85.0 else "green",
-            },
-            f,
-            indent=2,
+
+    tracks_manifest = []
+    for idx, (track_id, label, lit_path) in enumerate(tracks_in):
+        if not lit_path.exists():
+            print(f"Warning: skipping track '{track_id}'; missing {lit_path}")
+            continue
+        summary = parse_lit_json(lit_path)
+        entry = {
+            "sha": args.sha,
+            "shortSha": args.sha[:7],
+            "message": args.message.splitlines()[0][:120] if args.message else "",
+            "author": args.author,
+            "timestamp": ts,
+            "runUrl": args.run_url,
+            "track": track_id,
+            "trackLabel": label,
+            "total": summary["total"],
+            "executed": summary["executed"],
+            "passed": summary["passed"],
+            "failed": summary["failed"],
+            "xfail": summary["xfail"],
+            "unsupported": summary["unsupported"],
+            "passRate": summary["passRate"],
+            "elapsed": summary["elapsed"],
+            "categories": summary["categories"],
+        }
+
+        cache_file = None
+        if args.history_cache_dir:
+            cache_file = args.history_cache_dir / f"{track_id}.json"
+        elif args.history_cache and (track_id == "dxil-to-metal" or idx == 0):
+            cache_file = args.history_cache
+
+        history = load_existing_history(
+            args.pages_url,
+            cache_file,
+            track_id,
+            allow_legacy_fallback=(track_id == "dxil-to-metal"),
+        )
+        history = [h for h in history if h.get("sha") != args.sha]
+        history.append(entry)
+        history.sort(key=lambda h: h.get("timestamp", ""))
+
+        if cache_file:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+
+        track_dir = data_dir / track_id
+        track_dir.mkdir(parents=True, exist_ok=True)
+        with open(track_dir / "history.json", "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+        with open(track_dir / "latest.json", "w", encoding="utf-8") as f:
+            json.dump({**entry, "failures": summary["failures"]}, f, indent=2)
+        badge_obj = {
+            "schemaVersion": 1,
+            "label": label,
+            "message": f"{entry['passed']} Passed ({entry['passRate']}%)",
+            "color": "brightgreen" if entry["passRate"] >= 85.0 else "green",
+        }
+        with open(track_dir / "badge.json", "w", encoding="utf-8") as f:
+            json.dump(badge_obj, f, indent=2)
+
+        if track_id == "dxil-to-metal" or (idx == 0 and not (data_dir / "history.json").exists()):
+            with open(data_dir / "history.json", "w", encoding="utf-8") as f:
+                json.dump(history, f, indent=2)
+            with open(data_dir / "latest.json", "w", encoding="utf-8") as f:
+                json.dump({**entry, "failures": summary["failures"]}, f, indent=2)
+            with open(data_dir / "badge.json", "w", encoding="utf-8") as f:
+                json.dump(badge_obj, f, indent=2)
+
+        tracks_manifest.append({
+            "id": track_id,
+            "label": label,
+            "passed": entry["passed"],
+            "total": entry["total"],
+            "passRate": entry["passRate"],
+            "historyUrl": f"data/{track_id}/history.json",
+            "latestUrl": f"data/{track_id}/latest.json",
+        })
+        print(
+            f"[{track_id}] Recorded {entry['shortSha']}: {entry['passed']}/{entry['total']} passed "
+            f"({entry['passRate']}%, {entry['executed']} executed), {entry['failed']} failed, "
+            f"{entry['xfail']} xfail, {entry['unsupported']} unsupported. History length: {len(history)}"
         )
 
-    # Preserve Windows and macOS benchmark histories if already deployed on Pages
+    with open(data_dir / "tracks.json", "w", encoding="utf-8") as f:
+        json.dump(tracks_manifest, f, indent=2)
+
+    # Preserve benchmark histories if already deployed on Pages
     if args.pages_url:
         for fname in ("bench-history.json", "bench-history-macos.json"):
             if (data_dir / fname).exists():
                 continue
-            try:
-                req = urllib.request.Request(
-                    args.pages_url.rstrip("/") + f"/data/{fname}",
-                    headers={"User-Agent": "Crucible-Compliance-CI"},
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    bench_hist = json.loads(resp.read().decode("utf-8"))
-                    if isinstance(bench_hist, list):
-                        with open(data_dir / fname, "w", encoding="utf-8") as f:
-                            json.dump(bench_hist, f, indent=2)
-            except Exception:
-                pass
-
-    print(
-        f"Recorded {entry['shortSha']}: {entry['passed']}/{entry['total']} passed "
-        f"({entry['passRate']}%, {entry['executed']} executed), {entry['failed']} failed, "
-        f"{entry['xfail']} xfail, {entry['unsupported']} unsupported. History length: {len(history)}"
-    )
+            loaded = fetch_json_list(args.pages_url.rstrip("/") + f"/data/{fname}")
+            if loaded is not None:
+                with open(data_dir / fname, "w", encoding="utf-8") as f:
+                    json.dump(loaded, f, indent=2)
 
 
 if __name__ == "__main__":
