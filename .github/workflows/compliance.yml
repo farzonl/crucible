@@ -1,6 +1,7 @@
 # Runs llvm/offload-test-suite across multiple Crucible tracks:
-#   - dxil-to-metal (macOS Metal via MetalDevice)
-#   - dxil-to-spirv (Linux Vulkan Lavapipe via VulkanDevice)
+#   - dxil-to-metal  (macOS Metal via MetalDevice)
+#   - dxil-to-spirv  (Linux Vulkan Lavapipe via VulkanDevice)
+#   - spirv-to-metal (macOS Metal via SPIRVLoader -> MSLEmitter -> MetalDevice)
 # and publishes the unified multi-track pass-rate dashboard (pages/index.html)
 # to GitHub Pages.
 
@@ -96,6 +97,82 @@ jobs:
           path: offload-results-dxil-to-metal.json
           if-no-files-found: error
 
+  compliance-spirv-to-metal:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout llvm/offload-test-suite
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-test-suite
+          path: third_party/offload-test-suite
+
+      - name: Checkout llvm/offload-golden-images
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-golden-images
+          path: third_party/offload-golden-images
+
+      - name: Restore DXC SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+
+      - name: Install DXC (from Vulkan SDK)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/lib
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
+          unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
+          INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
+          INSTALLER_BIN="${INSTALLER_APP}/Contents/MacOS/$(basename "${INSTALLER_APP}" .app)"
+          "${INSTALLER_BIN}" --root "/tmp/vulkansdk" --accept-licenses --default-answer --confirm-command install com.lunarg.vulkan.core
+          cp -a /tmp/vulkansdk/macOS/bin/dxc* .sdk/bin/
+          cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
+          rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
+
+      - name: Save DXC SDK cache
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+
+      - name: Install build dependencies
+        run: |
+          brew install llvm ninja libpng
+          pip3 install --break-system-packages lit psutil pyyaml
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DLLVM_EXTERNAL_LIT="$(which lit)"
+          cmake --build build --parallel
+
+      - name: Run offload-test-suite (spirv-to-metal)
+        env:
+          DYLD_LIBRARY_PATH: ${{ github.workspace }}/.sdk/lib
+          CRUCIBLE_OFFLOAD_RUNTIME: metal
+        run: |
+          lit -v --timeout=60 -Dspirv_frontend=1 \
+            --output=offload-results-spirv-to-metal.json \
+            build/test-offload || true
+          test -s offload-results-spirv-to-metal.json
+
+      - name: Upload spirv-to-metal results
+        uses: actions/upload-artifact@v4
+        with:
+          name: offload-results-spirv-to-metal
+          path: offload-results-spirv-to-metal.json
+          if-no-files-found: error
+
   compliance-dxil-to-spirv:
     runs-on: ubuntu-latest
     steps:
@@ -179,8 +256,8 @@ jobs:
 
   publish:
     runs-on: ubuntu-latest
-    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv]
-    if: always() && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success')
+    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv, compliance-spirv-to-metal]
+    if: always() && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success')
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -213,6 +290,9 @@ jobs:
           fi
           if [ -f artifacts/offload-results-dxil-to-spirv.json ]; then
             TRACK_ARGS+=(--track-lit "dxil-to-spirv=DXIL -> SPIR-V (Linux Vulkan)=artifacts/offload-results-dxil-to-spirv.json")
+          fi
+          if [ -f artifacts/offload-results-spirv-to-metal.json ]; then
+            TRACK_ARGS+=(--track-lit "spirv-to-metal=SPIR-V -> Metal (macOS)=artifacts/offload-results-spirv-to-metal.json")
           fi
           python3 scripts/record_offload_compliance.py \
             "${TRACK_ARGS[@]}" \
