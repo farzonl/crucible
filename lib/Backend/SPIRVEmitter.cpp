@@ -136,6 +136,12 @@ private:
   Error lowerBufferStore(CallInst *CI);
   Error lowerCBufferLoadLegacy(CallInst *CI);
   Error lowerBufferUpdateCounter(CallInst *CI);
+  Error lowerTextureLoad(CallInst *CI);
+  Error lowerTextureStore(CallInst *CI);
+  Error lowerTextureSample(CallInst *CI, DXILOp Op);
+  Error lowerTextureGather(CallInst *CI, DXILOp Op);
+  Error lowerCalculateLOD(CallInst *CI);
+  Error lowerGetDimensions(CallInst *CI);
   Error lowerAtomicBinOp(CallInst *CI);
   Error lowerAtomicCompareExchange(CallInst *CI);
   Error lowerBarrier(CallInst *CI, DXILOp Op);
@@ -758,6 +764,474 @@ Error SPIRVLowerer::lowerBufferUpdateCounter(CallInst *CI) {
   return Error::success();
 }
 
+static unsigned textureCoordDims(ResourceKind K) {
+  switch (K) {
+  case ResourceKind::Texture1D:
+  case ResourceKind::TypedBuffer:
+    return 1;
+  case ResourceKind::Texture1DArray:
+  case ResourceKind::Texture2D:
+  case ResourceKind::Texture2DMS:
+    return 2;
+  case ResourceKind::Texture2DArray:
+  case ResourceKind::Texture2DMSArray:
+  case ResourceKind::Texture3D:
+  case ResourceKind::TextureCube:
+    return 3;
+  case ResourceKind::TextureCubeArray:
+    return 4;
+  default:
+    return 2;
+  }
+}
+
+static unsigned textureOffsetDims(ResourceKind K) {
+  switch (K) {
+  case ResourceKind::Texture1D:
+  case ResourceKind::Texture1DArray:
+    return 1;
+  case ResourceKind::Texture2D:
+  case ResourceKind::Texture2DArray:
+  case ResourceKind::Texture2DMS:
+  case ResourceKind::Texture2DMSArray:
+    return 2;
+  case ResourceKind::Texture3D:
+    return 3;
+  default:
+    return 0;
+  }
+}
+
+static Value *packVector(IRBuilder<> &B, Type *ElemTy,
+                         ArrayRef<Value *> Elems) {
+  if (Elems.size() == 1)
+    return Elems[0];
+  Type *VecTy = FixedVectorType::get(ElemTy, Elems.size());
+  Value *Vec = PoisonValue::get(VecTy);
+  for (unsigned I = 0; I < Elems.size(); ++I) {
+    Value *V = Elems[I];
+    if (isa<UndefValue>(V) || isa<PoisonValue>(V))
+      V = Constant::getNullValue(ElemTy);
+    Vec = B.CreateInsertElement(Vec, V, B.getInt32(I));
+  }
+  return Vec;
+}
+
+static Value *packConstOffset(IRBuilder<> &B, unsigned Dims, CallInst *CI,
+                              unsigned StartArg) {
+  SmallVector<Constant *, 3> Vals;
+  for (unsigned I = 0; I < Dims; ++I) {
+    Value *Arg = CI->getArgOperand(StartArg + I);
+    if (auto *C = dyn_cast<ConstantInt>(Arg))
+      Vals.push_back(C);
+    else
+      Vals.push_back(B.getInt32(0));
+  }
+  if (Dims == 1)
+    return Vals[0];
+  return ConstantVector::get(Vals);
+}
+
+static Value *packResRet(IRBuilder<> &B, StructType *RetStructTy,
+                         Value *Vec4) {
+  Type *ElemTy = RetStructTy->getElementType(0);
+  Value *Res = PoisonValue::get(RetStructTy);
+  for (unsigned C = 0; C < 4; ++C) {
+    Value *E = B.CreateExtractElement(Vec4, B.getInt32(C));
+    if (E->getType() != ElemTy) {
+      if (E->getType()->isFloatTy() && ElemTy->isHalfTy())
+        E = B.CreateFPTrunc(E, ElemTy);
+      else if (E->getType()->isIntegerTy() && ElemTy->isIntegerTy())
+        E = B.CreateTruncOrBitCast(E, ElemTy);
+      else
+        E = B.CreateBitCast(E, ElemTy);
+    }
+    Res = B.CreateInsertValue(Res, E, {C});
+  }
+  Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
+  return Res;
+}
+
+Error SPIRVLowerer::lowerTextureLoad(CallInst *CI) {
+  auto RHOrErr = resolveHandle(CI->getArgOperand(1));
+  if (!RHOrErr)
+    return RHOrErr.takeError();
+  const ResolvedHandle &RH = *RHOrErr;
+
+  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
+  if (!RetStructTy || RetStructTy->getNumElements() < 5)
+    return makeError("SPIR-V backend: unexpected TextureLoad return type");
+
+  IRBuilder<> B(CI);
+  unsigned Coords = textureCoordDims(RH.RB->Kind);
+  SmallVector<Value *, 4> CoordVals;
+  for (unsigned I = 0; I < Coords; ++I)
+    CoordVals.push_back(CI->getArgOperand(3 + I));
+  Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
+
+  Type *SampledTy = getComponentLLVMType(RH.RB->ElementType);
+  if (SampledTy->isHalfTy())
+    SampledTy = Type::getFloatTy(Ctx);
+  else if (SampledTy->isIntegerTy(16))
+    SampledTy = Type::getInt32Ty(Ctx);
+  Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
+
+  Value *Vec = nullptr;
+  if (RH.RB->Class == ResourceClass::UAV) {
+    Type *PtrTy = PointerType::get(Ctx, 11);
+    Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_getpointer,
+        {PtrTy, RH.SpvHandleTy, Coord->getType()});
+    Value *Ptr = B.CreateCall(GetPtrFn, {RH.SpvHandle, Coord});
+    Vec = B.CreateAlignedLoad(Vec4Ty, Ptr, Align(16));
+  } else {
+    Value *Mip = CI->getArgOperand(2);
+    if (isa<UndefValue>(Mip) || isa<PoisonValue>(Mip))
+      Mip = B.getInt32(0);
+    unsigned OffDims = textureOffsetDims(RH.RB->Kind);
+    Value *Offset = packConstOffset(B, OffDims ? OffDims : Coords, CI, 6);
+    Function *LoadFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_load_level,
+        {Vec4Ty, RH.SpvHandleTy, Coord->getType(), Mip->getType(),
+         Offset->getType()});
+    Vec = B.CreateCall(LoadFn, {RH.SpvHandle, Coord, Mip, Offset});
+  }
+
+  CI->replaceAllUsesWith(packResRet(B, RetStructTy, Vec));
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerTextureStore(CallInst *CI) {
+  auto RHOrErr = resolveHandle(CI->getArgOperand(1));
+  if (!RHOrErr)
+    return RHOrErr.takeError();
+  const ResolvedHandle &RH = *RHOrErr;
+
+  IRBuilder<> B(CI);
+  unsigned Coords = textureCoordDims(RH.RB->Kind);
+  SmallVector<Value *, 4> CoordVals;
+  for (unsigned I = 0; I < Coords; ++I)
+    CoordVals.push_back(CI->getArgOperand(2 + I));
+  Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
+
+  Type *SampledTy = getComponentLLVMType(RH.RB->ElementType);
+  if (SampledTy->isHalfTy())
+    SampledTy = Type::getFloatTy(Ctx);
+  else if (SampledTy->isIntegerTy(16))
+    SampledTy = Type::getInt32Ty(Ctx);
+  Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
+
+  Value *Vec = PoisonValue::get(Vec4Ty);
+  for (unsigned C = 0; C < 4; ++C) {
+    Value *V = CI->getArgOperand(5 + C);
+    if (isa<UndefValue>(V) || isa<PoisonValue>(V))
+      V = Constant::getNullValue(SampledTy);
+    else if (V->getType() != SampledTy) {
+      if (V->getType()->isHalfTy() && SampledTy->isFloatTy())
+        V = B.CreateFPExt(V, SampledTy);
+      else if (V->getType()->isIntegerTy() && SampledTy->isIntegerTy())
+        V = B.CreateZExtOrTrunc(V, SampledTy);
+      else
+        V = B.CreateBitCast(V, SampledTy);
+    }
+    Vec = B.CreateInsertElement(Vec, V, B.getInt32(C));
+  }
+
+  Type *PtrTy = PointerType::get(Ctx, 11);
+  Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_resource_getpointer,
+      {PtrTy, RH.SpvHandleTy, Coord->getType()});
+  Value *Ptr = B.CreateCall(GetPtrFn, {RH.SpvHandle, Coord});
+  B.CreateAlignedStore(Vec, Ptr, Align(16));
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
+  auto TexRH = resolveHandle(CI->getArgOperand(1));
+  if (!TexRH)
+    return TexRH.takeError();
+  auto SampRH = resolveHandle(CI->getArgOperand(2));
+  if (!SampRH)
+    return SampRH.takeError();
+
+  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
+  if (!RetStructTy || RetStructTy->getNumElements() < 5)
+    return makeError("SPIR-V backend: unexpected Sample return type");
+
+  IRBuilder<> B(CI);
+  unsigned Coords = textureCoordDims(TexRH->RB->Kind);
+  SmallVector<Value *, 4> CoordVals;
+  for (unsigned I = 0; I < Coords; ++I)
+    CoordVals.push_back(CI->getArgOperand(3 + I));
+  Value *Coord = packVector(B, B.getFloatTy(), CoordVals);
+
+  unsigned OffDims = textureOffsetDims(TexRH->RB->Kind);
+  Value *Offset = OffDims ? packConstOffset(B, OffDims, CI, 7)
+                          : ConstantVector::getSplat(ElementCount::getFixed(2),
+                                                     B.getInt32(0));
+
+  Type *SampledTy = getComponentLLVMType(TexRH->RB->ElementType);
+  if (SampledTy->isHalfTy())
+    SampledTy = Type::getFloatTy(Ctx);
+  Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
+
+  Value *ResVec = nullptr;
+  switch (Op) {
+  case DXILOp::Sample: {
+    Value *Clamp = CI->getArgOperand(10);
+    if (!isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp)) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_sample_clamp,
+          {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+           Clamp->getType(), Offset->getType()});
+      ResVec = B.CreateCall(
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Clamp, Offset});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_sample,
+          {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+           Offset->getType()});
+      ResVec =
+          B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Offset});
+    }
+    break;
+  }
+  case DXILOp::SampleLevel: {
+    Value *Lod = CI->getArgOperand(10);
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_samplelevel,
+        {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+         Offset->getType()});
+    ResVec = B.CreateCall(
+        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Lod, Offset});
+    break;
+  }
+  case DXILOp::SampleBias: {
+    Value *Bias = CI->getArgOperand(10);
+    Value *Clamp = CI->getArgOperand(11);
+    if (!isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp)) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_samplebias_clamp,
+          {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+           Offset->getType()});
+      ResVec = B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord,
+                                 Bias, Clamp, Offset});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_samplebias,
+          {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+           Offset->getType()});
+      ResVec = B.CreateCall(
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Bias, Offset});
+    }
+    break;
+  }
+  case DXILOp::SampleGrad: {
+    unsigned GradDims = (OffDims > 0) ? OffDims : 3u;
+    SmallVector<Value *, 3> DdxVals, DdyVals;
+    for (unsigned I = 0; I < GradDims; ++I) {
+      DdxVals.push_back(CI->getArgOperand(10 + I));
+      DdyVals.push_back(CI->getArgOperand(13 + I));
+    }
+    Value *Ddx = packVector(B, B.getFloatTy(), DdxVals);
+    Value *Ddy = packVector(B, B.getFloatTy(), DdyVals);
+    Value *Clamp = CI->getArgOperand(16);
+    if (!isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp)) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_samplegrad_clamp,
+          {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+           Ddx->getType(), Ddy->getType(), Clamp->getType(),
+           Offset->getType()});
+      ResVec = B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord,
+                                 Ddx, Ddy, Clamp, Offset});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_samplegrad,
+          {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+           Ddx->getType(), Ddy->getType(), Offset->getType()});
+      ResVec = B.CreateCall(
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Ddx, Ddy, Offset});
+    }
+    break;
+  }
+  case DXILOp::SampleCmp:
+  case DXILOp::SampleCmpLevelZero: {
+    Value *CmpVal = CI->getArgOperand(10);
+    Intrinsic::ID ID = (Op == DXILOp::SampleCmpLevelZero)
+                           ? Intrinsic::spv_resource_samplecmplevelzero
+                           : Intrinsic::spv_resource_samplecmp;
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, ID,
+        {B.getFloatTy(), TexRH->SpvHandleTy, SampRH->SpvHandleTy,
+         Coord->getType(), CmpVal->getType(), Offset->getType()});
+    Value *Scalar = B.CreateCall(
+        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
+    Value *Res = PoisonValue::get(RetStructTy);
+    Res = B.CreateInsertValue(Res, Scalar, {0});
+    Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
+    CI->replaceAllUsesWith(Res);
+    return Error::success();
+  }
+  default:
+    return makeError("SPIR-V backend: unsupported sample op {0}",
+                     static_cast<unsigned>(Op));
+  }
+
+  CI->replaceAllUsesWith(packResRet(B, RetStructTy, ResVec));
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
+  auto TexRH = resolveHandle(CI->getArgOperand(1));
+  if (!TexRH)
+    return TexRH.takeError();
+  auto SampRH = resolveHandle(CI->getArgOperand(2));
+  if (!SampRH)
+    return SampRH.takeError();
+
+  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
+  if (!RetStructTy || RetStructTy->getNumElements() < 5)
+    return makeError("SPIR-V backend: unexpected TextureGather return type");
+
+  IRBuilder<> B(CI);
+  unsigned Coords = textureCoordDims(TexRH->RB->Kind);
+  SmallVector<Value *, 4> CoordVals;
+  for (unsigned I = 0; I < Coords; ++I)
+    CoordVals.push_back(CI->getArgOperand(3 + I));
+  Value *Coord = packVector(B, B.getFloatTy(), CoordVals);
+
+  Value *Offset = packConstOffset(B, 2, CI, 7);
+  Type *SampledTy = getComponentLLVMType(TexRH->RB->ElementType);
+  if (SampledTy->isHalfTy())
+    SampledTy = Type::getFloatTy(Ctx);
+  Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
+
+  Value *ResVec = nullptr;
+  if (Op == DXILOp::TextureGatherCmp) {
+    Value *CmpVal = CI->getArgOperand(10);
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_gather_cmp,
+        {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+         CmpVal->getType(), Offset->getType()});
+    ResVec = B.CreateCall(
+        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
+  } else {
+    Value *Channel = CI->getArgOperand(9);
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_gather,
+        {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
+         Channel->getType(), Offset->getType()});
+    ResVec = B.CreateCall(
+        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Channel, Offset});
+  }
+
+  CI->replaceAllUsesWith(packResRet(B, RetStructTy, ResVec));
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerCalculateLOD(CallInst *CI) {
+  auto TexRH = resolveHandle(CI->getArgOperand(1));
+  if (!TexRH)
+    return TexRH.takeError();
+  auto SampRH = resolveHandle(CI->getArgOperand(2));
+  if (!SampRH)
+    return SampRH.takeError();
+
+  IRBuilder<> B(CI);
+  unsigned Coords = textureCoordDims(TexRH->RB->Kind);
+  SmallVector<Value *, 4> CoordVals;
+  for (unsigned I = 0; I < Coords; ++I)
+    CoordVals.push_back(CI->getArgOperand(3 + I));
+  Value *Coord = packVector(B, B.getFloatTy(), CoordVals);
+
+  bool Clamped = true;
+  if (auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(6)))
+    Clamped = !C->isZero();
+
+  Intrinsic::ID ID = Clamped ? Intrinsic::spv_resource_calculate_lod
+                             : Intrinsic::spv_resource_calculate_lod_unclamped;
+  Function *Fn = Intrinsic::getOrInsertDeclaration(
+      &M, ID,
+      {B.getFloatTy(), TexRH->SpvHandleTy, SampRH->SpvHandleTy,
+       Coord->getType()});
+  Value *Lod = B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord});
+  CI->replaceAllUsesWith(Lod);
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
+  auto RHOrErr = resolveHandle(CI->getArgOperand(1));
+  if (!RHOrErr)
+    return RHOrErr.takeError();
+  const ResolvedHandle &RH = *RHOrErr;
+
+  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
+  if (!RetStructTy || RetStructTy->getNumElements() < 4)
+    return makeError("SPIR-V backend: unexpected GetDimensions return type");
+
+  IRBuilder<> B(CI);
+  Value *Res = PoisonValue::get(RetStructTy);
+  bool IsUAV = (RH.RB->Class == ResourceClass::UAV);
+  bool IsMS = isMSResource(RH.RB->Kind);
+  unsigned Coords = textureCoordDims(RH.RB->Kind);
+
+  if (IsMS) {
+    Intrinsic::ID ID = (Coords == 3) ? Intrinsic::spv_resource_getdimensions_ms_xyz
+                                     : Intrinsic::spv_resource_getdimensions_ms_xy;
+    unsigned RetElems = Coords + 1;
+    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {RH.SpvHandleTy});
+    Value *Dims = B.CreateCall(Fn, {RH.SpvHandle});
+    for (unsigned I = 0; I < RetElems; ++I)
+      Res = B.CreateInsertValue(Res, B.CreateExtractElement(Dims, B.getInt32(I)),
+                                {I});
+    for (unsigned I = RetElems; I < 4; ++I)
+      Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+  } else if (IsUAV || RH.RB->Kind == ResourceKind::TypedBuffer) {
+    if (Coords == 1) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_getdimensions_x, {RH.SpvHandleTy});
+      Value *W = B.CreateCall(Fn, {RH.SpvHandle});
+      Res = B.CreateInsertValue(Res, W, {0});
+      for (unsigned I = 1; I < 4; ++I)
+        Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+    } else {
+      Intrinsic::ID ID = (Coords >= 3)
+                             ? Intrinsic::spv_resource_getdimensions_xyz
+                             : Intrinsic::spv_resource_getdimensions_xy;
+      unsigned RetElems = (Coords >= 3) ? 3u : 2u;
+      Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {RH.SpvHandleTy});
+      Value *Dims = B.CreateCall(Fn, {RH.SpvHandle});
+      for (unsigned I = 0; I < RetElems; ++I)
+        Res = B.CreateInsertValue(
+            Res, B.CreateExtractElement(Dims, B.getInt32(I)), {I});
+      for (unsigned I = RetElems; I < 4; ++I)
+        Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+    }
+  } else {
+    Value *Mip = CI->getArgOperand(2);
+    if (isa<UndefValue>(Mip) || isa<PoisonValue>(Mip))
+      Mip = B.getInt32(0);
+    unsigned DimCount = (Coords >= 3) ? 3u : Coords;
+    Intrinsic::ID ID = Intrinsic::spv_resource_getdimensions_levels_xy;
+    if (DimCount == 1)
+      ID = Intrinsic::spv_resource_getdimensions_levels_x;
+    else if (DimCount == 3)
+      ID = Intrinsic::spv_resource_getdimensions_levels_xyz;
+    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {RH.SpvHandleTy});
+    Value *Dims = B.CreateCall(Fn, {RH.SpvHandle, Mip});
+    for (unsigned I = 0; I < DimCount; ++I)
+      Res = B.CreateInsertValue(
+          Res, B.CreateExtractElement(Dims, B.getInt32(I)), {I});
+    for (unsigned I = DimCount; I < 3; ++I)
+      Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+    Res = B.CreateInsertValue(
+        Res, B.CreateExtractElement(Dims, B.getInt32(DimCount)), {3});
+  }
+
+  CI->replaceAllUsesWith(Res);
+  return Error::success();
+}
+
 Error SPIRVLowerer::lowerAtomicBinOp(CallInst *CI) {
   auto RHOrErr = resolveHandle(CI->getArgOperand(1));
   if (!RHOrErr)
@@ -1375,6 +1849,24 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
     return lowerCBufferLoadLegacy(CI);
   case DXILOp::BufferUpdateCounter:
     return lowerBufferUpdateCounter(CI);
+  case DXILOp::TextureLoad:
+    return lowerTextureLoad(CI);
+  case DXILOp::TextureStore:
+    return lowerTextureStore(CI);
+  case DXILOp::Sample:
+  case DXILOp::SampleBias:
+  case DXILOp::SampleLevel:
+  case DXILOp::SampleGrad:
+  case DXILOp::SampleCmp:
+  case DXILOp::SampleCmpLevelZero:
+    return lowerTextureSample(CI, Op);
+  case DXILOp::TextureGather:
+  case DXILOp::TextureGatherCmp:
+    return lowerTextureGather(CI, Op);
+  case DXILOp::CalculateLOD:
+    return lowerCalculateLOD(CI);
+  case DXILOp::GetDimensions:
+    return lowerGetDimensions(CI);
   case DXILOp::AtomicBinOp:
     return lowerAtomicBinOp(CI);
   case DXILOp::AtomicCompareExchange:
