@@ -45,8 +45,17 @@ struct Options {
   /// Flush f32 denormals to signed zero around math builtins (D3D12 FTZ).
   bool FlushDenormsF32 = false;
 
+  /// Bounds-check StructuredBuffer/RawBuffer/TypedBuffer loads and stores
+  /// using the crucible_buf_dims buffer (D3D12 out-of-bounds contract).
+  bool BoundsCheckBuffers = false;
+
   /// Explicit array sizes for unbounded DXIL resource arrays (rangeSize == -1).
   std::vector<ArraySizeOverride> ArraySizeOverrides;
+
+  /// Ordered SBT Miss shader names and HitGroup ClosestHit shader names
+  /// for lib_6_x raytracing pipelines.
+  std::vector<std::string> MissShaders;
+  std::vector<std::string> HitGroupClosestHits;
 };
 
 } // namespace crucible

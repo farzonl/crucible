@@ -153,6 +153,20 @@ StringRef helperSource(StringRef Name) {
            "             ? as_type<float>(as_type<uint>(x) & 0x80000000u)\n"
            "             : x;\n"
            "}\n";
+  if (Name == "crucible_ray_params")
+    return "static inline intersection_params crucible_ray_params(uint flags) {\n"
+           "  intersection_params p;\n"
+           "  if (flags & 0x01u) p.force_opacity(forced_opacity::opaque);\n"
+           "  if (flags & 0x02u) p.force_opacity(forced_opacity::non_opaque);\n"
+           "  if (flags & 0x04u) p.accept_any_intersection(true);\n"
+           "  if (flags & 0x10u) p.set_triangle_cull_mode(triangle_cull_mode::back);\n"
+           "  if (flags & 0x20u) p.set_triangle_cull_mode(triangle_cull_mode::front);\n"
+           "  if (flags & 0x40u) p.set_opacity_cull_mode(opacity_cull_mode::opaque);\n"
+           "  if (flags & 0x80u) p.set_opacity_cull_mode(opacity_cull_mode::non_opaque);\n"
+           "  if (flags & 0x100u) p.set_geometry_cull_mode(geometry_cull_mode::triangle);\n"
+           "  if (flags & 0x200u) p.set_geometry_cull_mode(geometry_cull_mode::bounding_box);\n"
+           "  return p;\n"
+           "}\n";
   if (Name == "crucible_wave_ballot")
     return "static inline uint4 crucible_wave_ballot(bool b) {\n"
            "  simd_vote v = simd_ballot(b);\n"
@@ -190,6 +204,56 @@ static inline T crucible_wave_wide(T v, uint lane) {
            "  T sum = simd_prefix_exclusive_sum(v);\n"
            "  return simd_is_first() ? T(0) : sum;\n"
            "}\n";
+  if (Name == "crucible_wave_multi_prefix")
+    return R"MSL(template <typename T>
+static inline T crucible_mp_shuffle(T v, ushort lane) {
+  return simd_shuffle(v, lane);
+}
+__attribute__((unused)) static inline ulong crucible_mp_shuffle(
+    ulong v, ushort lane) {
+  return as_type<ulong>(simd_shuffle(as_type<uint2>(v), lane));
+}
+template <typename T, uint Op>
+static inline T crucible_wave_multi_prefix_arith(T v, uint mask0, uint mask1,
+                                                 uint lane) {
+  ulong active = ulong((simd_vote::vote_t)simd_ballot(true));
+  T acc = Op == 4u ? T(1) : T(0);
+  // Keep simd_shuffle converged on all active lanes.
+  while (active != 0ul) {
+    uint lo = uint(active);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(active >> 32));
+    T x = crucible_mp_shuffle(v, ushort(src));
+    uint m = src < 32u ? mask0 : mask1;
+    if (src < lane && ((m >> (src & 31u)) & 1u) != 0u) {
+      if (Op == 0u) acc += x;
+      if (Op == 4u) acc *= x;
+    }
+    active &= active - 1ul;
+  }
+  return acc;
+}
+template <typename T, uint Op>
+static inline T crucible_wave_multi_prefix_bit(T v, uint mask0, uint mask1,
+                                               uint lane) {
+  ulong active = ulong((simd_vote::vote_t)simd_ballot(true));
+  T acc = Op == 1u ? ~T(0) : T(0);
+  while (active != 0ul) {
+    uint lo = uint(active);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(active >> 32));
+    T x = crucible_mp_shuffle(v, ushort(src));
+    uint m = src < 32u ? mask0 : mask1;
+    if (src < lane && ((m >> (src & 31u)) & 1u) != 0u) {
+      if (Op == 1u) acc &= x;
+      if (Op == 2u) acc |= x;
+      if (Op == 3u) acc ^= x;
+    }
+    active &= active - 1ul;
+  }
+  return acc;
+}
+)MSL";
+  if (Name == "crucible_wave_multi_prefix_bitcount")
+    return "";
   if (Name == "crucible_atomic_cmpxchg_texture2d")
     return R"MSL(template <typename T>
 static inline T crucible_atomic_cmpxchg_texture2d(
@@ -340,10 +404,23 @@ private:
   unsigned NextTemp = 0;
   bool UsesDTid = false, UsesGTid = false, UsesGid = false, UsesGidx = false;
   bool UsesLane = false, UsesLaneCount = false;
+  bool UsesRaytracing = false;
+  bool UsesGridSize = false;
   // MSL helper functions required by the emitted code, in emission order.
   std::vector<std::string> HelperOrder;
   llvm::StringSet<> HelperSet;
   std::string GroupsharedDecls; // threadgroup declarations (kernel prologue)
+  std::string ConstantGlobalDecls;
+  std::string StructDecls;
+  std::string RTFuncsDecl;
+  DenseMap<mlir::Type, std::string> StructNames;
+  struct EmittedRTFunc {
+    std::string MSLName;
+    mlir::Type PayloadTy;
+    mlir::Type AttrTy;
+    uint32_t Kind = 0;
+  };
+  llvm::StringMap<EmittedRTFunc> RTFuncMap;
 
   void requireHelper(StringRef Name) {
     if (HelperSet.insert(Name).second)
@@ -360,6 +437,7 @@ private:
   std::string freshName() { return "v" + std::to_string(NextTemp++); }
 
   // --- types & constants ---
+  Expected<std::string> ensureStruct(mlir::LLVM::LLVMStructType ST);
   Expected<std::string> mslType(mlir::Type T);
   Expected<Expr> constant(mlir::Operation *Def);
 
@@ -380,6 +458,8 @@ private:
   Expected<Expr> bufferElementExpr(mlir::LLVM::ExtractValueOp EV);
   Expected<std::string> bufferIndexExpr(ResState &RS, mlir::Value Coord0,
                                         mlir::Value Coord1, unsigned Comp);
+  Expected<std::string> bufferDimExpr(ResState &RS, mlir::Value Handle);
+  Expected<std::string> bufferBoundExpr(ResState &RS, mlir::Value Handle);
   /// Byte size of one scalar element of an MSL type name.
   static unsigned elemByteSize(StringRef MSLTy) {
     if (MSLTy == "half" || MSLTy == "ushort")
@@ -392,6 +472,8 @@ private:
 
   // --- pointers (groupshared / local arrays) ---
   Error collectGroupshared();
+  Error collectConstantGlobals();
+  Expected<Expr> scalarConstant(mlir::Attribute ValAttr);
   /// Render a pointer-typed SSA value as an MSL lvalue (e.g. "gs[idx]").
   /// When the pointer is a bare array base and DecayArray is set, the first
   /// element is addressed (C array-to-pointer decay in reverse).
@@ -621,7 +703,43 @@ Expected<Expr> Emitter::domainLoad(mlir::LLVM::CallOp Call, bool IsConstant) {
 // Types and constants
 //===----------------------------------------------------------------------===//
 
+Expected<std::string> Emitter::ensureStruct(mlir::LLVM::LLVMStructType ST) {
+  auto It = StructNames.find(ST);
+  if (It != StructNames.end())
+    return It->second;
+  std::string SName = "CrucibleStruct" + std::to_string(StructNames.size());
+  StructNames[ST] = SName;
+  std::string Decl = "struct " + SName + " {\n";
+  auto BodyTys = ST.getBody();
+  for (size_t I = 0; I < BodyTys.size(); ++I) {
+    mlir::Type FTy = BodyTys[I];
+    std::string ArraySuffix;
+    if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(FTy)) {
+      ArraySuffix = "[" + std::to_string(Arr.getNumElements()) + "]";
+      FTy = Arr.getElementType();
+    }
+    auto MTy = mslType(FTy);
+    if (!MTy)
+      return MTy.takeError();
+    Decl += "  " + *MTy + " f" + std::to_string(I) + ArraySuffix + ";\n";
+  }
+  Decl += "};\n";
+  StructDecls += Decl;
+  return SName;
+}
+
 Expected<std::string> Emitter::mslType(mlir::Type T) {
+  if (auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(T))
+    return ensureStruct(ST);
+  if (auto VT = mlir::dyn_cast<mlir::VectorType>(T)) {
+    if (VT.getRank() == 1 && VT.getNumElements() >= 2 &&
+        VT.getNumElements() <= 4) {
+      auto Elem = mslType(VT.getElementType());
+      if (!Elem)
+        return Elem.takeError();
+      return *Elem + std::to_string(VT.getNumElements());
+    }
+  }
   if (T.isIndex())
     return std::string("long");
   if (T.isF32())
@@ -663,6 +781,10 @@ Expected<Expr> Emitter::constant(mlir::Operation *Def) {
     return makeError("unsupported constant-like op '{0}'",
                      Def->getName().getStringRef());
 
+  return scalarConstant(ValAttr);
+}
+
+Expected<Expr> Emitter::scalarConstant(mlir::Attribute ValAttr) {
   if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(ValAttr)) {
     if (IA.getType().isInteger(1))
       return Expr{IA.getValue().isZero() ? "false" : "true", PrecPrimary};
@@ -675,6 +797,28 @@ Expected<Expr> Emitter::constant(mlir::Operation *Def) {
   if (auto FA = mlir::dyn_cast<mlir::FloatAttr>(ValAttr))
     return Expr{formatFloatLiteral(FA.getValue(), FA.getType().isF16()),
                 PrecPrimary};
+  if (auto DA = mlir::dyn_cast<mlir::DenseElementsAttr>(ValAttr)) {
+    if (auto VT = mlir::dyn_cast<mlir::VectorType>(DA.getType());
+        VT && VT.getRank() == 1 && VT.getNumElements() >= 2 &&
+        VT.getNumElements() <= 4) {
+      auto Ty = mslType(VT);
+      if (!Ty)
+        return Ty.takeError();
+      std::string S = *Ty + "(";
+      bool First = true;
+      for (mlir::Attribute Elem : DA.getValues<mlir::Attribute>()) {
+        auto E = scalarConstant(Elem);
+        if (!E)
+          return E.takeError();
+        if (!First)
+          S += ", ";
+        First = false;
+        S += E->Text;
+      }
+      S += ")";
+      return Expr{S, PrecPrimary};
+    }
+  }
   return makeError("unsupported constant attribute");
 }
 
@@ -928,19 +1072,28 @@ Error Emitter::inferElementTypes() {
         Record(Args[1], Args[5].getType());
       break;
     }
+    case DXILOp::Sample:
     case DXILOp::SampleLevel:
     case DXILOp::SampleGrad:
+    case DXILOp::SampleCmp:
+    case DXILOp::SampleCmpLevelZero:
     case DXILOp::TextureGather:
-    case DXILOp::TextureGatherCmp: {
+    case DXILOp::TextureGatherCmp:
+    case DXILOp::CalculateLOD: {
       ResState *RS = stateFor(Args[1]);
       if (RS) {
         RS->IsSampled = true;
-        if (*Op == DXILOp::TextureGatherCmp)
+        if (*Op == DXILOp::TextureGatherCmp || *Op == DXILOp::SampleCmp ||
+            *Op == DXILOp::SampleCmpLevelZero)
           RS->IsDepthSampled = true;
         if (RS->ElemType.empty()) {
-          auto Ret = mlir::cast<mlir::LLVM::LLVMStructType>(
-              Call.getResult().getType());
-          Record(Args[1], Ret.getBody()[0]);
+          if (*Op == DXILOp::CalculateLOD) {
+            Record(Args[1], Call.getResult().getType());
+          } else {
+            auto Ret = mlir::cast<mlir::LLVM::LLVMStructType>(
+                Call.getResult().getType());
+            Record(Args[1], Ret.getBody()[0]);
+          }
         }
       }
       break;
@@ -1001,8 +1154,62 @@ Error Emitter::inferElementTypes() {
 }
 
 //===----------------------------------------------------------------------===//
-// Groupshared memory, local arrays, and pointer lvalues
+// Globals, local arrays, and pointer lvalues
 //===----------------------------------------------------------------------===//
+
+Error Emitter::collectConstantGlobals() {
+  auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+  Error Err = Error::success();
+  Entry.walk([&](mlir::LLVM::AddressOfOp AO) {
+    auto G = Mod.lookupSymbol<mlir::LLVM::GlobalOp>(AO.getGlobalNameAttr());
+    if (!G || G.getAddrSpace() != 0 || !G.getConstant() ||
+        GlobalNames.contains(G))
+      return mlir::WalkResult::advance();
+
+    auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(G.getGlobalType());
+    auto Init = mlir::dyn_cast_if_present<mlir::DenseElementsAttr>(
+        G.getValueAttr());
+    if (!Arr || !Init || Init.getType().getRank() != 1 ||
+        Init.getElementType() != Arr.getElementType() ||
+        static_cast<uint64_t>(Init.getNumElements()) != Arr.getNumElements()) {
+      Err = makeError("unsupported initializer for constant global '{0}'",
+                      G.getSymName());
+      return mlir::WalkResult::interrupt();
+    }
+
+    auto Elem = mslType(Arr.getElementType());
+    if (!Elem) {
+      Err = Elem.takeError();
+      return mlir::WalkResult::interrupt();
+    }
+    std::string Name = "crucible_const_" + std::to_string(GlobalNames.size());
+    while (Name == R.MSLEntryName ||
+           llvm::any_of(GlobalNames, [&](const auto &KV) {
+             return KV.second == Name;
+           }))
+      Name += "_";
+
+    raw_string_ostream OS(ConstantGlobalDecls);
+    OS << "constant " << *Elem << " " << Name << "[" << Arr.getNumElements()
+       << "] = {";
+    bool First = true;
+    for (auto Attr : Init.getValues<mlir::Attribute>()) {
+      auto Value = scalarConstant(Attr);
+      if (!Value) {
+        Err = Value.takeError();
+        return mlir::WalkResult::interrupt();
+      }
+      if (!First)
+        OS << ", ";
+      First = false;
+      OS << Value->Text;
+    }
+    OS << "};\n";
+    GlobalNames[G] = std::move(Name);
+    return mlir::WalkResult::advance();
+  });
+  return Err;
+}
 
 Error Emitter::collectGroupshared() {
   auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
@@ -1052,8 +1259,12 @@ Expected<std::string> Emitter::addrSpaceOf(mlir::Value Ptr) {
 
 Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
   mlir::Operation *Def = Ptr.getDefiningOp();
-  if (!Def)
+  if (!Def) {
+    auto It = ValueNames.find(Ptr);
+    if (It != ValueNames.end())
+      return Expr{It->second, PrecPrimary};
     return makeError("pointer block arguments are not supported");
+  }
 
   if (auto AO = mlir::dyn_cast<mlir::LLVM::AddressOfOp>(Def)) {
     auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
@@ -1093,15 +1304,18 @@ Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
         return Expr{Text + "[" + std::to_string(IA.getInt()) + "]",
                     PrecPrimary};
     }
+    mlir::Type CurTy = GEP.getElemType();
     for (unsigned I = 0; I < Indices.size(); ++I) {
       std::string IdxText;
+      std::optional<uint64_t> ConstIdx;
       if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(Indices[I])) {
+        ConstIdx = IA.getValue().getZExtValue();
         if (I == 0) {
-          if (IA.getValue().getZExtValue() != 0)
+          if (*ConstIdx != 0)
             return makeError("pointer-arithmetic GEPs are not supported");
           continue; // leading zero: address of the aggregate itself
         }
-        IdxText = std::to_string(IA.getValue().getZExtValue()) + "u";
+        IdxText = std::to_string(*ConstIdx) + "u";
       } else {
         auto V = mlir::cast<mlir::Value>(Indices[I]);
         auto E = exprFor(V, PrecUnknown);
@@ -1111,7 +1325,18 @@ Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
           return makeError("pointer-arithmetic GEPs are not supported");
         IdxText = E->Text;
       }
-      Text += "[" + IdxText + "]";
+      if (auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(CurTy)) {
+        if (!ConstIdx || *ConstIdx >= ST.getBody().size())
+          return makeError("non-constant or out-of-bounds struct GEP");
+        Text += ".f" + std::to_string(*ConstIdx);
+        CurTy = ST.getBody()[*ConstIdx];
+      } else {
+        Text += "[" + IdxText + "]";
+        if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(CurTy))
+          CurTy = Arr.getElementType();
+        else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(CurTy))
+          CurTy = Vec.getElementType();
+      }
     }
     return Expr{Text, PrecPrimary};
   }
@@ -1607,6 +1832,14 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   if (auto Load = mlir::dyn_cast<LoadOp>(Op))
     return lvalueFor(Load.getAddr());
 
+  if (auto EE = mlir::dyn_cast<ExtractElementOp>(Op)) {
+    auto Vec = exprFor(EE.getVector(), PrecPrimary);
+    auto Idx = exprFor(EE.getPosition(), PrecUnknown);
+    if (!Vec || !Idx)
+      return makeError("invalid extractelement operand");
+    return Expr{Vec->Text + "[" + Idx->Text + "]", PrecPrimary};
+  }
+
   if (auto EV = mlir::dyn_cast<ExtractValueOp>(Op))
     return bufferElementExpr(EV);
 
@@ -1882,6 +2115,143 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
   switch (Op) {
   case DXILOp::WaveIsFirstLane:
     return Expr{"simd_prefix_exclusive_sum(1u) == 0u", PrecEq};
+  case DXILOp::RayQuery_CommittedStatus: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{"uint(" + Q->Text + ".get_committed_intersection_type())",
+                PrecPrimary};
+  }
+  case DXILOp::RayQuery_CandidateType: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{"(" + Q->Text +
+                    ".get_candidate_intersection_type() == "
+                    "intersection_type::bounding_box ? 1u : 0u)",
+                PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedTriangleFrontFace: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".is_committed_triangle_front_facing()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedTriangleBarycentrics: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    auto Comp = exprFor(Args[2], PrecUnknown);
+    if (!Q || !Comp)
+      return makeError("invalid rayQuery barycentrics operand");
+    return Expr{Q->Text + ".get_committed_triangle_barycentric_coord()[" +
+                    Comp->Text + "]",
+                PrecPrimary};
+  }
+  case DXILOp::RayQuery_RayFlags: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + "_flags", PrecPrimary};
+  }
+  case DXILOp::RayQuery_WorldRayOrigin: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    auto Comp = exprFor(Args[2], PrecUnknown);
+    if (!Q || !Comp)
+      return makeError("invalid rayQuery worldRayOrigin operand");
+    return Expr{Q->Text + ".get_world_space_ray_origin()[" + Comp->Text + "]",
+                PrecPrimary};
+  }
+  case DXILOp::RayQuery_WorldRayDirection: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    auto Comp = exprFor(Args[2], PrecUnknown);
+    if (!Q || !Comp)
+      return makeError("invalid rayQuery worldRayDirection operand");
+    return Expr{
+        Q->Text + ".get_world_space_ray_direction()[" + Comp->Text + "]",
+        PrecPrimary};
+  }
+  case DXILOp::RayQuery_RayTMin: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".get_ray_min_distance()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedRayT: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".get_committed_distance()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedInstanceIndex: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".get_committed_instance_id()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedInstanceID: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".get_committed_user_instance_id()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedGeometryIndex: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".get_committed_geometry_id()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedPrimitiveIndex: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{Q->Text + ".get_committed_primitive_id()", PrecPrimary};
+  }
+  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex: {
+    auto Q = exprFor(Args[1], PrecUnknown);
+    if (!Q)
+      return Q.takeError();
+    return Expr{"crucible_inst_contrib[" + Q->Text +
+                ".get_committed_instance_id()]",
+                PrecPrimary};
+  }
+  case DXILOp::DispatchRaysIndex: {
+    auto Axis = constInt(Args[1]);
+    if (!Axis || *Axis > 2)
+      return makeError("invalid DispatchRaysIndex axis");
+    UsesDTid = true;
+    static const char *const Axes[] = {"dtid.x", "dtid.y", "dtid.z"};
+    return Expr{Axes[*Axis], PrecPrimary};
+  }
+  case DXILOp::DispatchRaysDimensions: {
+    auto Axis = constInt(Args[1]);
+    if (!Axis || *Axis > 2)
+      return makeError("invalid DispatchRaysDimensions axis");
+    UsesGridSize = true;
+    static const char *const Axes[] = {"grid_size.x", "grid_size.y",
+                                       "grid_size.z"};
+    return Expr{Axes[*Axis], PrecPrimary};
+  }
+  case DXILOp::WorldRayOrigin: {
+    auto Axis = constInt(Args[1]);
+    if (!Axis || *Axis > 2)
+      return makeError("invalid WorldRayOrigin axis");
+    static const char *const Axes[] = {"crucible_ray_state.world_origin.x",
+                                       "crucible_ray_state.world_origin.y",
+                                       "crucible_ray_state.world_origin.z"};
+    return Expr{Axes[*Axis], PrecPrimary};
+  }
+  case DXILOp::WorldRayDirection: {
+    auto Axis = constInt(Args[1]);
+    if (!Axis || *Axis > 2)
+      return makeError("invalid WorldRayDirection axis");
+    static const char *const Axes[] = {"crucible_ray_state.world_dir.x",
+                                       "crucible_ray_state.world_dir.y",
+                                       "crucible_ray_state.world_dir.z"};
+    return Expr{Axes[*Axis], PrecPrimary};
+  }
+  case DXILOp::RayTCurrent:
+    return Expr{"crucible_ray_state.t_current", PrecPrimary};
+  case DXILOp::PrimitiveIndex:
+    return Expr{"crucible_ray_state.primitive_index", PrecPrimary};
   case DXILOp::WaveGetLaneIndex:
     UsesLane = true;
     return Expr{"lane", PrecPrimary};
@@ -2056,6 +2426,59 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
                   PrecPrimary};
     return Expr{Fn.str() + "(" + V->Text + ")", PrecPrimary};
   }
+  case DXILOp::WaveMultiPrefixBitCount: {
+    auto V = exprFor(Args[1], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    auto M0 = exprFor(Args[2], PrecUnknown);
+    if (!M0)
+      return M0.takeError();
+    auto M1 = exprFor(Args[3], PrecUnknown);
+    if (!M1)
+      return M1.takeError();
+    requireHelper("crucible_wave_multi_prefix");
+    UsesLane = true;
+    return Expr{"crucible_wave_multi_prefix_arith<uint, 0>(uint(" + V->Text +
+                    "), " + M0->Text + ", " + M1->Text + ", lane)",
+                PrecPrimary};
+  }
+  case DXILOp::WaveMultiPrefixOp: {
+    auto Kind = constInt(Args[6]);
+    if (!Kind || *Kind > 4)
+      return makeError("unsupported wave multi-prefix op kind");
+    auto OpKind = static_cast<DXILWaveMultiPrefixOpKind>(*Kind);
+    bool IsBitwise = OpKind == DXILWaveMultiPrefixOpKind::And ||
+                     OpKind == DXILWaveMultiPrefixOpKind::Or ||
+                     OpKind == DXILWaveMultiPrefixOpKind::Xor;
+    mlir::Type T = Call.getResult().getType();
+    if (IsBitwise && !mlir::isa<mlir::IntegerType>(T))
+      return makeError("bitwise wave multi-prefix op requires integer type");
+    auto V = exprFor(Args[1], PrecUnknown);
+    if (!V)
+      return V.takeError();
+    auto M0 = exprFor(Args[2], PrecUnknown);
+    if (!M0)
+      return M0.takeError();
+    auto M1 = exprFor(Args[3], PrecUnknown);
+    if (!M1)
+      return M1.takeError();
+    requireHelper("crucible_wave_multi_prefix");
+    UsesLane = true;
+    if (T.isF16())
+      return Expr{"half(crucible_wave_multi_prefix_arith<float, " +
+                      std::to_string(*Kind) + ">(float(" + V->Text + "), " +
+                      M0->Text + ", " + M1->Text + ", lane))",
+                  PrecPrimary};
+    auto Ty = mslType(T);
+    if (!Ty)
+      return Ty.takeError();
+    StringRef Helper = IsBitwise ? "crucible_wave_multi_prefix_bit"
+                                 : "crucible_wave_multi_prefix_arith";
+    return Expr{Helper.str() + "<" + *Ty + ", " + std::to_string(*Kind) +
+                    ">(" + V->Text + ", " + M0->Text + ", " + M1->Text +
+                    ", lane)",
+                PrecPrimary};
+  }
   default:
     break;
   }
@@ -2128,6 +2551,50 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
   return Index;
 }
 
+Expected<std::string> Emitter::bufferDimExpr(ResState &RS,
+                                             mlir::Value Handle) {
+  auto It = HandleMap.find(Handle.getDefiningOp());
+  if (It == HandleMap.end())
+    return makeError("unresolved resource handle");
+  std::string Slot = std::to_string(RS.RB->MetalIndex) + "u";
+  if (RS.RB->RangeSize > 1) {
+    if (auto C = constInt(It->second.RegIdx)) {
+      uint32_t Offset = static_cast<uint32_t>(*C) - RS.RB->LowerBound;
+      Slot = std::to_string(RS.RB->MetalIndex + Offset) + "u";
+    } else {
+      auto E = exprFor(It->second.RegIdx, PrecAdd);
+      if (!E)
+        return E.takeError();
+      Slot = std::to_string(RS.RB->MetalIndex) + "u + (" + E->Text + " - " +
+             std::to_string(RS.RB->LowerBound) + "u)";
+    }
+  }
+  return "crucible_buf_dims[" + Slot + "]";
+}
+
+Expected<std::string> Emitter::bufferBoundExpr(ResState &RS,
+                                               mlir::Value Handle) {
+  auto Dim = bufferDimExpr(RS, Handle);
+  if (!Dim)
+    return Dim.takeError();
+  const unsigned EB = elemByteSize(RS.ElemType);
+  const unsigned Shift = EB == 2 ? 1 : EB == 8 ? 3 : 2;
+  switch (RS.RB->Kind) {
+  case ResourceKind::StructuredBuffer: {
+    uint32_t K = RS.RB->ElementStride / EB;
+    return K > 1 ? "(" + *Dim + " * " + std::to_string(K) + "u)" : *Dim;
+  }
+  case ResourceKind::RawBuffer:
+    return "(" + *Dim + " >> " + std::to_string(Shift) + "u)";
+  case ResourceKind::TypedBuffer: {
+    unsigned Width = RS.RB->TypedComponents;
+    return Width > 1 ? "(" + *Dim + " * " + std::to_string(Width) + "u)" : *Dim;
+  }
+  default:
+    return makeError("unsupported buffer kind for '{0}'", RS.ParamName);
+  }
+}
+
 Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
   mlir::Operation *Producer = EV.getContainer().getDefiningOp();
   auto Pos = EV.getPosition();
@@ -2164,9 +2631,10 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
   }
 
   // TextureLoad / Sample / Gather aggregates were materialized as vec4 temps.
-  if (*Op == DXILOp::TextureLoad || *Op == DXILOp::SampleLevel ||
-      *Op == DXILOp::SampleGrad || *Op == DXILOp::TextureGather ||
-      *Op == DXILOp::TextureGatherCmp) {
+  if (*Op == DXILOp::TextureLoad || *Op == DXILOp::Sample ||
+      *Op == DXILOp::SampleLevel || *Op == DXILOp::SampleGrad ||
+      *Op == DXILOp::SampleCmp || *Op == DXILOp::SampleCmpLevelZero ||
+      *Op == DXILOp::TextureGather || *Op == DXILOp::TextureGatherCmp) {
     if (Comp > 3)
       return makeError("texture status queries are not supported yet");
     auto It = ValueNames.find(Call.getResult());
@@ -2183,23 +2651,10 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     if (!isTextureKind(RS->RB->Kind)) {
       if (Comp != 0)
         return makeError("buffer getDimensions only supports component 0");
-      auto It = HandleMap.find(Args[1].getDefiningOp());
-      if (It == HandleMap.end())
-        return makeError("unresolved resource handle");
-      std::string Slot = std::to_string(RS->RB->MetalIndex) + "u";
-      if (RS->RB->RangeSize > 1) {
-        if (auto C = constInt(It->second.RegIdx)) {
-          uint32_t Offset = static_cast<uint32_t>(*C) - RS->RB->LowerBound;
-          Slot = std::to_string(RS->RB->MetalIndex + Offset) + "u";
-        } else {
-          auto E = exprFor(It->second.RegIdx, PrecAdd);
-          if (!E)
-            return E.takeError();
-          Slot = std::to_string(RS->RB->MetalIndex) + "u + (" + E->Text +
-                 " - " + std::to_string(RS->RB->LowerBound) + "u)";
-        }
-      }
-      return Expr{"crucible_buf_dims[" + Slot + "]", PrecPrimary};
+      auto Dim = bufferDimExpr(*RS, Args[1]);
+      if (!Dim)
+        return Dim.takeError();
+      return Expr{*Dim, PrecPrimary};
     }
     auto RName = resourceExpr(Args[1]);
     if (!RName)
@@ -2260,6 +2715,13 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     if (!Index)
       return Index.takeError();
     std::string Element = *RName + "[" + *Index + "]";
+    if (Opts.BoundsCheckBuffers && R.BufferSizesMetalIndex != UINT32_MAX) {
+      auto Bound = bufferBoundExpr(*RS, Args[1]);
+      if (!Bound)
+        return Bound.takeError();
+      Element = "(uint(" + *Index + ") < " + *Bound + " ? " + Element +
+                " : " + RS->ElemType + "(0))";
+    }
     // Reinterpret when this load's type differs from the canonical element
     // type (same-size mixed-type access).
     auto Ret =
@@ -2396,7 +2858,15 @@ Error Emitter::emitBufferStore(mlir::LLVM::CallOp Call, unsigned Ind) {
       return StoreTy.takeError();
     if (*StoreTy != RS->ElemType)
       Value = "as_type<" + RS->ElemType + ">(" + Value + ")";
-    line(Ind, *RName + "[" + *Index + "] = " + Value + ";");
+    if (Opts.BoundsCheckBuffers && R.BufferSizesMetalIndex != UINT32_MAX) {
+      auto Bound = bufferBoundExpr(*RS, Args[1]);
+      if (!Bound)
+        return Bound.takeError();
+      line(Ind, "if (uint(" + *Index + ") < " + *Bound + ") " + *RName + "[" +
+                    *Index + "] = " + Value + ";");
+    } else {
+      line(Ind, *RName + "[" + *Index + "] = " + Value + ";");
+    }
   }
   return Error::success();
 }
@@ -2733,7 +3203,9 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
                     K == ResourceKind::Texture2DArray ||
                     K == ResourceKind::Texture3D) &&
                    !IsZeroOrUndef(Args[8]);
-    bool HasOff2 = (Op == DXILOp::SampleLevel || Op == DXILOp::SampleGrad) &&
+    bool HasOff2 = (Op == DXILOp::Sample || Op == DXILOp::SampleLevel ||
+                    Op == DXILOp::SampleGrad || Op == DXILOp::SampleCmp ||
+                    Op == DXILOp::SampleCmpLevelZero) &&
                    K == ResourceKind::Texture3D && !IsZeroOrUndef(Args[9]);
     if (HasOff0 || HasOff1 || HasOff2) {
       auto O0 = IntStr(Args[7]);
@@ -2765,7 +3237,20 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
     return SName.takeError();
 
   std::string CallExpr = *RName + ".";
-  if (Op == DXILOp::SampleLevel) {
+  if (Op == DXILOp::Sample) {
+    CallExpr += "sample(" + *SName + ", " + Coord;
+    if (!Slice.empty())
+      CallExpr += ", " + Slice;
+    if (!isUndefLike(Args[10])) {
+      auto Clamp = exprFor(Args[10], PrecUnknown);
+      if (!Clamp)
+        return Clamp.takeError();
+      CallExpr += ", min_lod_clamp(" + Clamp->Text + ")";
+    }
+    if (!Offset.empty())
+      CallExpr += ", " + Offset;
+    CallExpr += ")";
+  } else if (Op == DXILOp::SampleLevel) {
     auto Lod = exprFor(Args[10], PrecUnknown);
     if (!Lod)
       return Lod.takeError();
@@ -2835,6 +3320,25 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
              K != ResourceKind::TextureCubeArray)
       CallExpr += ", int2(0)";
     CallExpr += std::string(", ") + Comps[*Chan] + ")";
+  } else if (Op == DXILOp::SampleCmp || Op == DXILOp::SampleCmpLevelZero) {
+    auto Cmp = exprFor(Args[10], PrecUnknown);
+    if (!Cmp)
+      return Cmp.takeError();
+    CallExpr = "float4(" + *RName + ".sample_compare(" + *SName + ", " + Coord;
+    if (!Slice.empty())
+      CallExpr += ", " + Slice;
+    CallExpr += ", " + Cmp->Text;
+    if (Op == DXILOp::SampleCmpLevelZero) {
+      CallExpr += ", level(0)";
+    } else if (!isUndefLike(Args[11])) {
+      auto Clamp = exprFor(Args[11], PrecUnknown);
+      if (!Clamp)
+        return Clamp.takeError();
+      CallExpr += ", min_lod_clamp(" + Clamp->Text + ")";
+    }
+    if (!Offset.empty())
+      CallExpr += ", " + Offset;
+    CallExpr += "), 0.0f, 0.0f, 0.0f)";
   } else if (Op == DXILOp::TextureGatherCmp) {
     auto Cmp = exprFor(Args[10], PrecUnknown);
     if (!Cmp)
@@ -3299,11 +3803,54 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
       return emitTextureLoad(Call, Ind);
     case DXILOp::TextureStore:
       return emitTextureStore(Call, Ind);
+    case DXILOp::Sample:
     case DXILOp::SampleLevel:
     case DXILOp::SampleGrad:
+    case DXILOp::SampleCmp:
+    case DXILOp::SampleCmpLevelZero:
     case DXILOp::TextureGather:
     case DXILOp::TextureGatherCmp:
       return emitTextureSample(Call, *DXOp, Ind);
+    case DXILOp::CalculateLOD: {
+      auto Args = Call.getArgOperands();
+      ResState *RS = stateFor(Args[1]);
+      if (!RS)
+        return makeError("calculateLOD through unresolved texture handle");
+      auto RName = resourceExpr(Args[1]);
+      auto SName = resourceExpr(Args[2]);
+      if (!RName || !SName)
+        return makeError("calculateLOD through unresolved handle");
+      auto Clamped = constInt(Args[6]);
+      if (!Clamped)
+        return makeError("dynamic calculateLOD clamped flag is not supported");
+      auto C0 = exprFor(Args[3], PrecUnknown);
+      if (!C0)
+        return C0.takeError();
+      std::string Coord;
+      ResourceKind K = RS->RB->Kind;
+      if (K == ResourceKind::Texture1D || K == ResourceKind::Texture1DArray) {
+        Coord = "float2(" + C0->Text + ", 0.5f)";
+      } else if (K == ResourceKind::Texture2D ||
+                 K == ResourceKind::Texture2DArray) {
+        auto C1 = exprFor(Args[4], PrecUnknown);
+        if (!C1)
+          return C1.takeError();
+        Coord = "float2(" + C0->Text + ", " + C1->Text + ")";
+      } else {
+        auto C1 = exprFor(Args[4], PrecUnknown);
+        auto C2 = exprFor(Args[5], PrecUnknown);
+        if (!C1 || !C2)
+          return makeError("invalid calculateLOD coordinate");
+        Coord = "float3(" + C0->Text + ", " + C1->Text + ", " + C2->Text + ")";
+      }
+      std::string Fn =
+          *Clamped ? "calculate_clamped_lod" : "calculate_unclamped_lod";
+      std::string Name = freshName();
+      line(Ind, "float " + Name + " = " + *RName + "." + Fn + "(" + *SName +
+                    ", " + Coord + ");");
+      ValueNames[Call.getResult()] = Name;
+      return Error::success();
+    }
     case DXILOp::Barrier:
       return emitBarrier(Call, Ind);
     case DXILOp::AtomicBinOp:
@@ -3360,7 +3907,196 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
       ValueNames[Call.getResult()] = Name;
       return Error::success();
     }
-    case DXILOp::BufferLoad:
+    case DXILOp::AllocateRayQuery: {
+      UsesRaytracing = true;
+      auto Flags = exprFor(Call.getArgOperands()[1], PrecUnknown);
+      if (!Flags)
+        return Flags.takeError();
+      std::string Name = "rq" + std::to_string(NextTemp++);
+      line(Ind, "intersection_query<triangle_data, instancing> " + Name + ";");
+      line(Ind, "uint " + Name + "_flags = " + Flags->Text + ";");
+      ValueNames[Call.getResult()] = Name;
+      return Error::success();
+    }
+    case DXILOp::RayQuery_TraceRayInline: {
+      UsesRaytracing = true;
+      requireHelper("crucible_ray_params");
+      auto Args = Call.getArgOperands();
+      auto Q = exprFor(Args[1], PrecUnknown);
+      auto AS = resourceExpr(Args[2]);
+      auto Flags = exprFor(Args[3], PrecUnknown);
+      auto Mask = exprFor(Args[4], PrecUnknown);
+      auto OX = exprFor(Args[5], PrecUnknown);
+      auto OY = exprFor(Args[6], PrecUnknown);
+      auto OZ = exprFor(Args[7], PrecUnknown);
+      auto TMin = exprFor(Args[8], PrecUnknown);
+      auto DX = exprFor(Args[9], PrecUnknown);
+      auto DY = exprFor(Args[10], PrecUnknown);
+      auto DZ = exprFor(Args[11], PrecUnknown);
+      auto TMax = exprFor(Args[12], PrecUnknown);
+      if (!Q || !AS || !Flags || !Mask || !OX || !OY || !OZ || !TMin ||
+          !DX || !DY || !DZ || !TMax)
+        return makeError("invalid traceRayInline operand");
+      line(Ind, Q->Text + "_flags = " + Q->Text + "_flags | " + Flags->Text + ";");
+      line(Ind, Q->Text + ".reset(ray(float3(" + OX->Text + ", " + OY->Text +
+                    ", " + OZ->Text + "), float3(" + DX->Text + ", " +
+                    DY->Text + ", " + DZ->Text + "), " + TMin->Text + ", " +
+                    TMax->Text + "), " + *AS + ", " + Mask->Text +
+                    ", crucible_ray_params(" + Q->Text + "_flags));");
+      return Error::success();
+    }
+    case DXILOp::RayQuery_Proceed: {
+      auto Q = exprFor(Call.getArgOperands()[1], PrecUnknown);
+      if (!Q)
+        return Q.takeError();
+      if (Call.getResult().use_empty()) {
+        line(Ind, Q->Text + ".next();");
+      } else {
+        std::string Name = freshName();
+        line(Ind, "bool " + Name + " = " + Q->Text + ".next();");
+        ValueNames[Call.getResult()] = Name;
+      }
+      return Error::success();
+    }
+    case DXILOp::RayQuery_Abort: {
+      auto Q = exprFor(Call.getArgOperands()[1], PrecUnknown);
+      if (!Q)
+        return Q.takeError();
+      line(Ind, Q->Text + ".abort();");
+      return Error::success();
+    }
+    case DXILOp::RayQuery_CommitNonOpaqueTriangleHit: {
+      auto Q = exprFor(Call.getArgOperands()[1], PrecUnknown);
+      if (!Q)
+        return Q.takeError();
+      line(Ind, Q->Text + ".commit_triangle_intersection();");
+      return Error::success();
+    }
+    case DXILOp::RayQuery_CommitProceduralPrimitiveHit: {
+      auto Q = exprFor(Call.getArgOperands()[1], PrecUnknown);
+      auto T = exprFor(Call.getArgOperands()[2], PrecUnknown);
+      if (!Q || !T)
+        return makeError("invalid commitProceduralPrimitiveHit operand");
+      line(Ind, Q->Text + ".commit_bounding_box_intersection(" + T->Text + ");");
+      return Error::success();
+    }
+    case DXILOp::TraceRay: {
+      UsesRaytracing = true;
+      requireHelper("crucible_ray_params");
+      auto Args = Call.getArgOperands();
+      auto AS = resourceExpr(Args[1]);
+      auto Flags = exprFor(Args[2], PrecUnknown);
+      auto Mask = exprFor(Args[3], PrecUnknown);
+      auto RayContrib = exprFor(Args[4], PrecUnknown);
+      auto GeomMult = exprFor(Args[5], PrecUnknown);
+      auto MissIdx = exprFor(Args[6], PrecUnknown);
+      auto OX = exprFor(Args[7], PrecUnknown);
+      auto OY = exprFor(Args[8], PrecUnknown);
+      auto OZ = exprFor(Args[9], PrecUnknown);
+      auto TMin = exprFor(Args[10], PrecUnknown);
+      auto DX = exprFor(Args[11], PrecUnknown);
+      auto DY = exprFor(Args[12], PrecUnknown);
+      auto DZ = exprFor(Args[13], PrecUnknown);
+      auto TMax = exprFor(Args[14], PrecUnknown);
+      auto PayloadLV = lvalueFor(Args[15], /*DecayArray=*/false);
+      if (!AS || !Flags || !Mask || !RayContrib || !GeomMult || !MissIdx ||
+          !OX || !OY || !OZ || !TMin || !DX || !DY || !DZ || !TMax ||
+          !PayloadLV)
+        return makeError("invalid TraceRay operand");
+      std::string ID = std::to_string(NextTemp++);
+      std::string RQ = "rq_" + ID;
+      std::string RS = "rs_" + ID;
+      line(Ind, "{");
+      line(Ind + 1, "intersection_query<triangle_data, instancing> " + RQ + ";");
+      line(Ind + 1, RQ + ".reset(ray(float3(" + OX->Text + ", " + OY->Text +
+                        ", " + OZ->Text + "), float3(" + DX->Text + ", " +
+                        DY->Text + ", " + DZ->Text + "), " + TMin->Text + ", " +
+                        TMax->Text + "), " + *AS + ", " + Mask->Text +
+                        ", crucible_ray_params(" + Flags->Text + "));");
+      line(Ind + 1, RQ + ".next();");
+      line(Ind + 1, "CrucibleRayState " + RS + ";");
+      line(Ind + 1, RS + ".world_origin = float3(" + OX->Text + ", " + OY->Text +
+                        ", " + OZ->Text + ");");
+      line(Ind + 1, RS + ".world_dir = float3(" + DX->Text + ", " + DY->Text +
+                        ", " + DZ->Text + ");");
+      line(Ind + 1, "if (" + RQ + ".get_committed_intersection_type() != "
+                        "intersection_type::none) {");
+      line(Ind + 2, RS + ".t_current = " + RQ + ".get_committed_distance();");
+      line(Ind + 2,
+           RS + ".primitive_index = " + RQ + ".get_committed_primitive_id();");
+      line(Ind + 2, RS + ".barycentrics = " + RQ +
+                        ".get_committed_triangle_barycentric_coord();");
+      std::vector<std::string> CHOrder = Opts.HitGroupClosestHits;
+      if (CHOrder.empty()) {
+        for (const RTShaderInfo &RT : R.RTShaders)
+          if (RT.Kind == 10)
+            CHOrder.push_back(RT.Name);
+      }
+      if (!CHOrder.empty()) {
+        line(Ind + 2, "uint hg_" + ID + " = " + RayContrib->Text + " + " +
+                          GeomMult->Text + " * " + RQ +
+                          ".get_committed_geometry_id();");
+        line(Ind + 2, "switch (hg_" + ID + ") {");
+        for (size_t H = 0; H < CHOrder.size(); ++H) {
+          auto It = RTFuncMap.find(CHOrder[H]);
+          if (It == RTFuncMap.end())
+            continue;
+          const EmittedRTFunc &FInfo = It->second;
+          line(Ind + 3, "case " + std::to_string(H) + "u: {");
+          if (FInfo.AttrTy) {
+            auto ATy = mslType(FInfo.AttrTy);
+            if (!ATy)
+              return ATy.takeError();
+            std::string AttrVar = "attr_" + ID + "_" + std::to_string(H);
+            line(Ind + 4, *ATy + " " + AttrVar + ";");
+            if (auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(FInfo.AttrTy)) {
+              if (ST.getBody().size() == 1 &&
+                  mlir::isa<mlir::VectorType>(ST.getBody()[0])) {
+                line(Ind + 4, AttrVar + ".f0 = " + RS + ".barycentrics;");
+              } else if (ST.getBody().size() >= 2) {
+                line(Ind + 4, AttrVar + ".f0 = " + RS + ".barycentrics.x;");
+                line(Ind + 4, AttrVar + ".f1 = " + RS + ".barycentrics.y;");
+              }
+            }
+            line(Ind + 4, FInfo.MSLName + "(" + PayloadLV->Text + ", " +
+                              AttrVar + ", " + RS + ");");
+          } else {
+            line(Ind + 4,
+                 FInfo.MSLName + "(" + PayloadLV->Text + ", " + RS + ");");
+          }
+          line(Ind + 4, "break;");
+          line(Ind + 3, "}");
+        }
+        line(Ind + 2, "}");
+      }
+      line(Ind + 1, "} else {");
+      line(Ind + 2, RS + ".t_current = " + TMax->Text + ";");
+      line(Ind + 2, RS + ".primitive_index = 0u;");
+      line(Ind + 2, RS + ".barycentrics = float2(0.0f);");
+      std::vector<std::string> MissOrder = Opts.MissShaders;
+      if (MissOrder.empty()) {
+        for (const RTShaderInfo &RT : R.RTShaders)
+          if (RT.Kind == 11)
+            MissOrder.push_back(RT.Name);
+      }
+      if (!MissOrder.empty()) {
+        line(Ind + 2, "switch (" + MissIdx->Text + ") {");
+        for (size_t M = 0; M < MissOrder.size(); ++M) {
+          auto It = RTFuncMap.find(MissOrder[M]);
+          if (It == RTFuncMap.end())
+            continue;
+          line(Ind + 3, "case " + std::to_string(M) + "u: {");
+          line(Ind + 4,
+               It->second.MSLName + "(" + PayloadLV->Text + ", " + RS + ");");
+          line(Ind + 4, "break;");
+          line(Ind + 3, "}");
+        }
+        line(Ind + 2, "}");
+      }
+      line(Ind + 1, "}");
+      line(Ind, "}");
+      return Error::success();
+    }
     case DXILOp::RawBufferLoad:
     case DXILOp::CBufferLoadLegacy:
     case DXILOp::GetDimensions:
@@ -3536,7 +4272,7 @@ Error Emitter::emitBlock(mlir::Block &B, unsigned Ind) {
 Expected<std::string> Emitter::kernelSignature() {
   std::string Sig;
   raw_string_ostream OS(Sig);
-  if (R.Stage == ShaderStage::Compute)
+  if (R.Stage == ShaderStage::Compute || R.Stage == ShaderStage::RayGeneration)
     OS << "kernel void ";
   else {
     if (R.Domain)
@@ -3684,6 +4420,21 @@ Expected<std::string> Emitter::kernelSignature() {
            << ")]]";
       continue;
     }
+    if (RB.Kind == ResourceKind::RTAccelerationStructure) {
+      UsesRaytracing = true;
+      if (RB.RangeSize == 1) {
+        OS << "    instance_acceleration_structure " << RS->ParamName
+           << " [[buffer(" << RB.MetalIndex << ")]]";
+      } else {
+        for (uint32_t I = 0; I < RB.RangeSize; ++I) {
+          if (I)
+            OS << ",\n";
+          OS << "    instance_acceleration_structure " << RS->ParamName << "_"
+             << I << " [[buffer(" << (RB.MetalIndex + I) << ")]]";
+        }
+      }
+      continue;
+    }
     const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
                             : RB.Class == ResourceClass::UAV ? "device "
                                                              : "constant ";
@@ -3711,10 +4462,15 @@ Expected<std::string> Emitter::kernelSignature() {
       }
     }
   }
-  if (R.HasBufferDimensions) {
+  if (R.BufferSizesMetalIndex != UINT32_MAX) {
     Sep();
     OS << "    constant uint* crucible_buf_dims [[buffer("
        << R.BufferSizesMetalIndex << ")]]";
+  }
+  if (R.InstanceContributionMetalIndex != UINT32_MAX) {
+    Sep();
+    OS << "    constant uint* crucible_inst_contrib [[buffer("
+       << R.InstanceContributionMetalIndex << ")]]";
   }
 
   if (UsesDTid) {
@@ -3741,6 +4497,10 @@ Expected<std::string> Emitter::kernelSignature() {
     Sep();
     OS << "    uint lanecount [[threads_per_simdgroup]]";
   }
+  if (UsesGridSize) {
+    Sep();
+    OS << "    uint3 grid_size [[threads_per_grid]]";
+  }
   OS << ")";
   return Sig;
 }
@@ -3752,8 +4512,9 @@ Expected<std::string> Emitter::kernelSignature() {
 Expected<std::string> Emitter::run() {
   bool Graphics = R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel ||
                   R.Domain.has_value();
-  if (!Graphics && R.Stage != ShaderStage::Compute)
-    return makeError("unsupported shader stage (expected compute, vertex, pixel or domain)");
+  if (!Graphics && R.Stage != ShaderStage::Compute &&
+      R.Stage != ShaderStage::RayGeneration)
+    return makeError("unsupported shader stage (expected compute, vertex, pixel, domain or raygeneration)");
   if (R.Domain && (!R.Resources.empty() || R.HasBufferDimensions))
     return makeError("domain shaders with descriptor resources are not supported");
   std::string Input, Output;
@@ -3779,6 +4540,72 @@ Expected<std::string> Emitter::run() {
     return std::move(E);
   if (Error E = collectGroupshared())
     return std::move(E);
+  if (Error E = collectConstantGlobals())
+    return std::move(E);
+
+  if (R.Stage == ShaderStage::RayGeneration) {
+    StructDecls += "struct CrucibleRayState {\n"
+                   "  float3 world_origin;\n"
+                   "  float3 world_dir;\n"
+                   "  float t_current;\n"
+                   "  uint primitive_index;\n"
+                   "  float2 barycentrics;\n"
+                   "};\n\n";
+    auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+    for (const RTShaderInfo &RT : R.RTShaders) {
+      auto RTFn = Mod.lookupSymbol<mlir::func::FuncOp>(RT.SymbolName);
+      if (!RTFn)
+        continue;
+      auto FindPtrElemTy = [](mlir::Value Arg) -> mlir::Type {
+        for (mlir::Operation *U : Arg.getUsers()) {
+          if (auto GEP = mlir::dyn_cast<mlir::LLVM::GEPOp>(U))
+            return GEP.getElemType();
+        }
+        return nullptr;
+      };
+      if (RTFn.getNumArguments() < 1)
+        continue;
+      mlir::Type PayloadTy = FindPtrElemTy(RTFn.getArgument(0));
+      if (!PayloadTy)
+        continue;
+      auto PayloadMTy = mslType(PayloadTy);
+      if (!PayloadMTy)
+        return PayloadMTy.takeError();
+      mlir::Type AttrTy;
+      std::string AttrMTy;
+      if (RTFn.getNumArguments() >= 2) {
+        AttrTy = FindPtrElemTy(RTFn.getArgument(1));
+        if (AttrTy) {
+          auto AM = mslType(AttrTy);
+          if (!AM)
+            return AM.takeError();
+          AttrMTy = *AM;
+        }
+      }
+      std::string SavedBody = std::move(Body);
+      auto SavedNames = std::move(ValueNames);
+      Body.clear();
+      ValueNames.clear();
+      ValueNames[RTFn.getArgument(0)] = "rt_arg0";
+      if (RTFn.getNumArguments() >= 2)
+        ValueNames[RTFn.getArgument(1)] = "rt_arg1";
+      if (Error E = emitBlock(RTFn.getBody().front(), 1))
+        return std::move(E);
+      std::string MSLName =
+          "crucible_rt_" + sanitizeIdentifier(RT.Name, "rt_fn");
+      RTFuncsDecl += "static inline void " + MSLName + "(thread " +
+                     *PayloadMTy + "& rt_arg0";
+      if (AttrTy)
+        RTFuncsDecl += ", thread " + AttrMTy + "& rt_arg1";
+      RTFuncsDecl +=
+          ", thread const CrucibleRayState& crucible_ray_state) {\n" + Body +
+          "}\n\n";
+      RTFuncMap[RT.Name] = {MSLName, PayloadTy, AttrTy, RT.Kind};
+      Body = std::move(SavedBody);
+      ValueNames = std::move(SavedNames);
+    }
+  }
+
   if (Error E = emitBlock(Entry.getBody().front(), 1))
     return std::move(E);
 
@@ -3794,15 +4621,31 @@ Expected<std::string> Emitter::run() {
          R.Stage == ShaderStage::Domain ? "ds_" : "cs_")
      << R.ShaderModelMajor << "_" << R.ShaderModelMinor << ")\n"
      << "#include <metal_stdlib>\n"
-     << "using namespace metal;\n\n";
+     << "using namespace metal;\n"
+     << (UsesRaytracing ? "using namespace metal::raytracing;\n\n" : "\n");
   for (const std::string &H : HelperOrder)
     OS << helperSource(H) << "\n";
+  if (!StructDecls.empty())
+    OS << StructDecls << "\n";
+  if (!RTFuncsDecl.empty())
+    OS << RTFuncsDecl;
   std::string ArrayDecls;
   for (const ResState &RS : ResStates) {
     const ResourceBinding &RB = *RS.RB;
     if (RB.RangeSize <= 1 || isTextureKind(RB.Kind) ||
         RB.Class == ResourceClass::Sampler)
       continue;
+    if (RB.Kind == ResourceKind::RTAccelerationStructure) {
+      ArrayDecls += "  instance_acceleration_structure " + RS.ParamName + "[" +
+                    std::to_string(RB.RangeSize) + "] = {";
+      for (uint32_t I = 0; I < RB.RangeSize; ++I) {
+        if (I)
+          ArrayDecls += ", ";
+        ArrayDecls += RS.ParamName + "_" + std::to_string(I);
+      }
+      ArrayDecls += "};\n";
+      continue;
+    }
     const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
                             : RB.Class == ResourceClass::UAV ? "device "
                                                              : "constant ";
@@ -3826,7 +4669,8 @@ Expected<std::string> Emitter::run() {
     }
   }
 
-  OS << Input << Output << *Sig << " {\n" << ArrayDecls << GroupsharedDecls;
+  OS << ConstantGlobalDecls << Input << Output << *Sig << " {\n"
+     << ArrayDecls << GroupsharedDecls;
   if (Graphics)
     OS << "  CrucibleStageOut stageOut = {};\n";
   OS << Body;

@@ -1,8 +1,10 @@
 @LIT_SITE_CFG_IN_HEADER@
 
 config.offload_suite_dir = "@CRUCIBLE_OFFLOAD_SUITE_DIR@"
+config.goldenimage_dir = "@CRUCIBLE_GOLDENIMAGE_DIR@"
 config.crucible_offload = "@CRUCIBLE_OFFLOAD_PATH@"
 config.crucible_api_query = "@CRUCIBLE_API_QUERY_PATH@"
+config.crucible_imgdiff = "@CRUCIBLE_IMGDIFF_PATH@"
 config.crucible_offload_exec_root = "@CMAKE_BINARY_DIR@/test-offload"
 config.dxc = "@DXC_EXECUTABLE@"
 config.llvm_tools_dir = "@LLVM_TOOLS_BINARY_DIR@"

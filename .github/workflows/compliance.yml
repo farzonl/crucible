@@ -34,6 +34,12 @@ jobs:
           repository: llvm/offload-test-suite
           path: third_party/offload-test-suite
 
+      - name: Checkout llvm/offload-golden-images
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-golden-images
+          path: third_party/offload-golden-images
+
       - name: Restore DXC SDK cache
         id: cache-sdk
         uses: actions/cache/restore@v4
@@ -64,7 +70,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install llvm ninja
+          brew install llvm ninja libpng
           pip3 install --break-system-packages lit psutil pyyaml
 
       - name: Configure and build

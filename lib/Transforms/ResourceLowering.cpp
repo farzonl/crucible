@@ -24,6 +24,7 @@ static bool isBufferLike(const ResourceBinding &RB) {
   case ResourceKind::StructuredBuffer:
   case ResourceKind::CBuffer:
   case ResourceKind::TBuffer:
+  case ResourceKind::RTAccelerationStructure:
     return true;
   default:
     return false;
@@ -100,8 +101,21 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
                        RB->Name, static_cast<unsigned>(RB->Kind));
     }
   }
-  if (R.HasBufferDimensions)
+  bool NeedsBufferSizes = R.HasBufferDimensions;
+  if (!NeedsBufferSizes && Opts.BoundsCheckBuffers) {
+    for (const ResourceBinding &RB : R.Resources) {
+      if (RB.Kind == ResourceKind::StructuredBuffer ||
+          RB.Kind == ResourceKind::RawBuffer ||
+          RB.Kind == ResourceKind::TypedBuffer) {
+        NeedsBufferSizes = true;
+        break;
+      }
+    }
+  }
+  if (NeedsBufferSizes)
     R.BufferSizesMetalIndex = NextBuffer++;
+  if (R.HasInstanceContribution)
+    R.InstanceContributionMetalIndex = NextBuffer++;
   return llvm::Error::success();
 }
 

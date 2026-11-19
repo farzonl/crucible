@@ -24,7 +24,8 @@ if config.crucible_run:
     config.substitutions.append(("%crucible-run", config.crucible_run))
 
 if config.crucible_offload:
-    config.substitutions.append(("%crucible-offload", config.crucible_offload))
+    config.substitutions.append(("%offloader", f'"{config.crucible_offload}" -api=dx'))
+    config.substitutions.append(("%api_query", f'"{config.crucible_api_query}"'))
     config.available_features.add("offload-runner")
 
 # Feature flags:

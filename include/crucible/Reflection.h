@@ -24,6 +24,7 @@ enum class ShaderStage : uint8_t {
   Domain = 4,
   Compute = 5,
   Library = 6,
+  RayGeneration = 7,
   Mesh = 13,
   Amplification = 14,
   Unknown = 255,
@@ -49,6 +50,7 @@ enum class ResourceKind : uint8_t {
   CBuffer = 13,
   Sampler = 14,
   TBuffer = 15,
+  RTAccelerationStructure = 16,
 };
 
 /// DXIL element component type (matches hlsl::DXIL::ComponentType).
@@ -117,6 +119,12 @@ struct DomainInterface {
   static constexpr uint32_t DataMetalIndex = 30;
 };
 
+struct RTShaderInfo {
+  std::string Name;       ///< Unmangled HLSL name.
+  std::string SymbolName; ///< DXIL function symbol name.
+  uint32_t Kind = 0;      ///< DXIL ShaderKind (10=ClosestHit, 11=Miss).
+};
+
 /// Full reflection for one compiled entry point.
 struct Reflection {
   ShaderStage Stage = ShaderStage::Unknown;
@@ -132,6 +140,9 @@ struct Reflection {
   std::optional<DomainInterface> Domain;
   bool HasBufferDimensions = false;
   uint32_t BufferSizesMetalIndex = UINT32_MAX;
+  bool HasInstanceContribution = false;
+  uint32_t InstanceContributionMetalIndex = UINT32_MAX;
+  std::vector<RTShaderInfo> RTShaders;
 
   /// Serialize the (space, register, kind) -> metal_index mapping as JSON.
   std::string toJSON() const;

@@ -1,0 +1,22 @@
+# RUN: %dxc -T ds_6_0 -Fo %t.tri.dxil %S/../Inputs/domain_system_values.hlsl
+# RUN: %dxc -T ds_6_0 -DQUAD -Fo %t.quad.dxil %S/../Inputs/domain_system_values.hlsl
+# RUN: %cruciblec %t.tri.dxil -o %t.tri.metal
+# RUN: %cruciblec %t.quad.dxil -o %t.quad.metal
+# RUN: FileCheck %s --check-prefixes=TRI,COMMON < %t.tri.metal
+# RUN: FileCheck %s --check-prefixes=QUAD,COMMON < %t.quad.metal
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.tri.metal -o %t.tri.air
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.quad.metal -o %t.quad.air
+
+# TRI: {{\[\[patch\(triangle, 3\)\]\]}}
+# QUAD: {{\[\[patch\(quad, 4\)\]\]}}
+# COMMON-NEXT: vertex CrucibleStageOut main0(
+# TRI-NEXT: float3 crucible_domain_location {{\[\[position_in_patch\]\]}}
+# QUAD-NEXT: float2 crucible_domain_location {{\[\[position_in_patch\]\]}}
+# COMMON-NEXT: uint crucible_patch_id {{\[\[patch_id\]\]}}
+# COMMON-NEXT: const device uint* crucible_patch_data {{\[\[buffer\(30\)\]\]}}
+# TRI-DAG: as_type<float>(crucible_patch_data[crucible_patch_id * 17u + 1u * 4u])
+# TRI-DAG: as_type<float>(crucible_patch_data[crucible_patch_id * 17u + 15u])
+# TRI-DAG: crucible_patch_data[crucible_patch_id * 17u + 16u]
+# QUAD-DAG: as_type<float>(crucible_patch_data[crucible_patch_id * 23u + 1u * 4u])
+# QUAD-DAG: as_type<float>(crucible_patch_data[crucible_patch_id * 23u + 21u])
+# QUAD-DAG: crucible_patch_data[crucible_patch_id * 23u + 22u]

@@ -1,0 +1,14 @@
+# REQUIRES: metal-tools
+# RUN: %dxc -T cs_6_5 -E main -Fo %t.dxil %S/../Inputs/inline_rt.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s < %t.metal
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air
+
+# CHECK: using namespace metal::raytracing;
+# CHECK: instance_acceleration_structure srv0 {{\[\[buffer\(0\)\]\]}}
+# CHECK: intersection_query<triangle_data, instancing>
+# CHECK: .reset(ray(
+# CHECK: .next()
+# CHECK: .get_committed_intersection_type()
+# CHECK: .get_committed_primitive_id()
+# CHECK-SAME: .get_committed_user_instance_id()

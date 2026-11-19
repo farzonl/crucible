@@ -81,9 +81,8 @@ if(APPLE)
   add_subdirectory(tools/crucible-run)
 endif()
 
-# llvm/offload-test-suite integration: builds crucible-offload (an
-# offloader-compatible runner that compiles DXIL with crucible and executes
-# on Metal with direct bindings) plus a check-crucible-offload lit target
+# llvm/offload-test-suite integration: builds the upstream CLI tools with
+# Crucible's Metal execution provider, plus a check-crucible-offload lit target.
 # over the suite's test tree.
 set(CRUCIBLE_OFFLOAD_SUITE_DIR "" CACHE PATH
     "Path to an llvm/offload-test-suite checkout")
@@ -100,6 +99,20 @@ endif()
 if(APPLE AND CRUCIBLE_OFFLOAD_SUITE_DIR)
   message(STATUS "offload-test-suite: ${CRUCIBLE_OFFLOAD_SUITE_DIR}")
   add_subdirectory(tools/crucible-offload)
+endif()
+
+set(CRUCIBLE_GOLDENIMAGE_DIR "" CACHE PATH
+    "Path to an llvm/offload-golden-images checkout")
+if(NOT CRUCIBLE_GOLDENIMAGE_DIR)
+  foreach(candidate
+      "${CMAKE_SOURCE_DIR}/third_party/offload-golden-images"
+      "${CMAKE_SOURCE_DIR}/../offload-golden-images"
+      "${CMAKE_BINARY_DIR}/golden-images")
+    if(EXISTS "${candidate}")
+      set(CRUCIBLE_GOLDENIMAGE_DIR "${candidate}")
+      break()
+    endif()
+  endforeach()
 endif()
 
 if(CRUCIBLE_ENABLE_TESTS)

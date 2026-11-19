@@ -142,6 +142,10 @@ Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
 
   if (Error E = convertEntryToCF(*Mod, EntryName))
     return std::move(E);
+  for (const RTShaderInfo &RT : Shader.Reflect.RTShaders) {
+    if (Error E = convertEntryToCF(*Mod, RT.SymbolName))
+      return std::move(E);
+  }
 
   mlir::PassManager PM(&Ctx);
   PM.addPass(mlir::createLiftControlFlowToSCFPass());
