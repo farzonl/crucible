@@ -96,6 +96,12 @@ struct StageVar {
   bool Referenced = false;
 };
 
+struct PendingHeapHandle {
+  Value *Index = nullptr;
+  bool IsSamplerHeap = false;
+  bool NonUniform = false;
+};
+
 class SPIRVLowerer {
 public:
   SPIRVLowerer(Module &M, Function *Entry, Reflection &Reflect,
@@ -112,6 +118,8 @@ private:
   const Options &Opts;
 
   DenseMap<const Value *, ResolvedHandle> HandleMap;
+  DenseMap<const Value *, PendingHeapHandle> PendingHeapHandles;
+  std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
   DenseMap<uint32_t, StageVar> OutputVars;
@@ -140,6 +148,7 @@ private:
   Error lowerDXILCall(CallInst *CI);
   Error lowerCreateHandle(CallInst *CI);
   Error lowerCreateHandleFromBinding(CallInst *CI);
+  Error lowerCreateHandleFromHeap(CallInst *CI);
   Error lowerAnnotateHandle(CallInst *CI);
   Error lowerRawBufferLoad(CallInst *CI);
   Error lowerRawBufferStore(CallInst *CI);
@@ -464,6 +473,12 @@ Error SPIRVLowerer::lowerCreateHandle(CallInst *CI) {
   Value *ArrIdx = (RB->LowerBound == 0)
                       ? RegIdx
                       : B.CreateSub(RegIdx, B.getInt32(RB->LowerBound));
+  if (auto *NUI = dyn_cast<ConstantInt>(CI->getArgOperand(4));
+      NUI && !NUI->isZero()) {
+    Function *NuiFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_nonuniformindex);
+    ArrIdx = B.CreateCall(NuiFn, {ArrIdx});
+  }
 
   GlobalVariable *NameGV = getOrCreateResourceName(*RB);
   Function *HandleFn = Intrinsic::getOrInsertDeclaration(
@@ -505,6 +520,12 @@ Error SPIRVLowerer::lowerCreateHandleFromBinding(CallInst *CI) {
   Value *ArrIdx = (RB->LowerBound == 0)
                       ? RegIdx
                       : B.CreateSub(RegIdx, B.getInt32(RB->LowerBound));
+  if (auto *NUI = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+      NUI && !NUI->isZero()) {
+    Function *NuiFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_nonuniformindex);
+    ArrIdx = B.CreateCall(NuiFn, {ArrIdx});
+  }
 
   GlobalVariable *NameGV = getOrCreateResourceName(*RB);
   Function *HandleFn = Intrinsic::getOrInsertDeclaration(
@@ -517,8 +538,120 @@ Error SPIRVLowerer::lowerCreateHandleFromBinding(CallInst *CI) {
   return Error::success();
 }
 
+Error SPIRVLowerer::lowerCreateHandleFromHeap(CallInst *CI) {
+  PendingHeapHandle PH;
+  PH.Index = CI->getArgOperand(1);
+  if (auto *SC = dyn_cast<ConstantInt>(CI->getArgOperand(2)))
+    PH.IsSamplerHeap = !SC->isZero();
+  if (auto *NC = dyn_cast<ConstantInt>(CI->getArgOperand(3)))
+    PH.NonUniform = !NC->isZero();
+
+  auto nextFreeSet = [&]() -> uint32_t {
+    uint32_t MaxSet = 0;
+    for (const ResourceBinding &RB : Reflect.Resources)
+      MaxSet = std::max(MaxSet, RB.SPIRVSet + 1u);
+    if (Reflect.HasResourceHeap &&
+        Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
+      MaxSet = std::max(MaxSet, Reflect.ResourceHeapSPIRVSet + 1u);
+    if (Reflect.HasSamplerHeap &&
+        Reflect.SamplerHeapSPIRVBinding != UINT32_MAX)
+      MaxSet = std::max(MaxSet, Reflect.SamplerHeapSPIRVSet + 1u);
+    return MaxSet;
+  };
+
+  if (PH.IsSamplerHeap) {
+    if (Reflect.SamplerHeapSPIRVBinding == UINT32_MAX) {
+      Reflect.SamplerHeapSPIRVSet = nextFreeSet();
+      Reflect.SamplerHeapSPIRVBinding = 0;
+    }
+    Reflect.HasSamplerHeap = true;
+  } else {
+    if (Reflect.ResourceHeapSPIRVBinding == UINT32_MAX) {
+      Reflect.ResourceHeapSPIRVSet = nextFreeSet();
+      Reflect.ResourceHeapSPIRVBinding = 0;
+    }
+    Reflect.HasResourceHeap = true;
+  }
+
+  PendingHeapHandles[CI] = PH;
+  return Error::success();
+}
+
 Error SPIRVLowerer::lowerAnnotateHandle(CallInst *CI) {
-  auto RH = resolveHandle(CI->getArgOperand(1));
+  Value *Base = CI->getArgOperand(1);
+  auto PendingIt = PendingHeapHandles.find(Base);
+  if (PendingIt != PendingHeapHandles.end()) {
+    const PendingHeapHandle &PH = PendingIt->second;
+    auto *PropsC = dyn_cast<ConstantStruct>(CI->getArgOperand(2));
+    if (!PropsC || PropsC->getNumOperands() < 2)
+      return makeError(
+          "SPIR-V backend: non-constant ResourceProperties in annotateHandle");
+
+    uint32_t Prop0 = static_cast<uint32_t>(
+        cast<ConstantInt>(PropsC->getOperand(0))->getZExtValue());
+    uint32_t Prop1 = static_cast<uint32_t>(
+        cast<ConstantInt>(PropsC->getOperand(1))->getZExtValue());
+
+    auto RB = std::make_unique<ResourceBinding>();
+    RB->Kind = static_cast<ResourceKind>(Prop0 & 0xFFu);
+    bool IsUAV = ((Prop0 >> 12) & 1u) != 0;
+    if (PH.IsSamplerHeap || RB->Kind == ResourceKind::Sampler) {
+      RB->Class = ResourceClass::Sampler;
+      RB->Kind = ResourceKind::Sampler;
+      RB->SPIRVSet = Reflect.SamplerHeapSPIRVSet;
+      RB->SPIRVBinding = (Reflect.SamplerHeapSPIRVBinding != UINT32_MAX)
+                             ? Reflect.SamplerHeapSPIRVBinding
+                             : 0u;
+      RB->Name = "sampler_heap";
+    } else if (RB->Kind == ResourceKind::CBuffer) {
+      RB->Class = ResourceClass::CBV;
+      RB->ElementStride = Prop1;
+      RB->SPIRVSet = Reflect.ResourceHeapSPIRVSet;
+      RB->SPIRVBinding = (Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
+                             ? Reflect.ResourceHeapSPIRVBinding
+                             : 0u;
+      RB->Name = "resource_heap_cbv";
+    } else {
+      RB->Class = IsUAV ? ResourceClass::UAV : ResourceClass::SRV;
+      if (RB->Kind == ResourceKind::StructuredBuffer)
+        RB->ElementStride = Prop1;
+      else
+        RB->ElementType = static_cast<ComponentType>(Prop1 & 0xFFu);
+      RB->SPIRVSet = Reflect.ResourceHeapSPIRVSet;
+      RB->SPIRVBinding = (Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
+                             ? Reflect.ResourceHeapSPIRVBinding
+                             : 0u;
+      RB->Name = IsUAV ? "resource_heap_uav" : "resource_heap_srv";
+    }
+    RB->RangeSize = 0xFFFFFFFFu;
+
+    Type *ResTy = getSPIRVResourceType(*RB);
+    if (!ResTy)
+      return makeError(
+          "SPIR-V backend: unsupported dynamic heap resource kind {0}",
+          static_cast<unsigned>(RB->Kind));
+
+    IRBuilder<> B(CI);
+    Value *Idx = PH.Index;
+    if (PH.NonUniform) {
+      Function *NuiFn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_nonuniformindex);
+      Idx = B.CreateCall(NuiFn, {Idx});
+    }
+    const ResourceBinding *RBPtr = RB.get();
+    SyntheticBindings.push_back(std::move(RB));
+    GlobalVariable *NameGV = getOrCreateResourceName(*RBPtr);
+    Function *HandleFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
+    Value *SpvHandle =
+        B.CreateCall(HandleFn, {B.getInt32(RBPtr->SPIRVSet),
+                                B.getInt32(RBPtr->SPIRVBinding),
+                                B.getInt32(0xFFFFFFFFu), Idx, NameGV});
+    HandleMap[CI] = ResolvedHandle{RBPtr, SpvHandle, ResTy};
+    return Error::success();
+  }
+
+  auto RH = resolveHandle(Base);
   if (!RH)
     return RH.takeError();
   HandleMap[CI] = *RH;
@@ -1850,6 +1983,8 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
     return lowerCreateHandle(CI);
   case DXILOp::CreateHandleFromBinding:
     return lowerCreateHandleFromBinding(CI);
+  case DXILOp::CreateHandleFromHeap:
+    return lowerCreateHandleFromHeap(CI);
   case DXILOp::AnnotateHandle:
     return lowerAnnotateHandle(CI);
   case DXILOp::RawBufferLoad:
