@@ -58,6 +58,11 @@ endif()
 set(CRUCIBLE_MLIR_LIBS
   MLIRTargetLLVMIRImport
   MLIRLLVMIRToLLVMTranslation
+  MLIRSPIRVDeserialization
+  MLIRSPIRVToLLVM
+  MLIRSPIRVDialect
+  MLIRGPUDialect
+  MLIRMathDialect
   MLIRControlFlowToSCF
   MLIRSCFDialect
   MLIRControlFlowDialect

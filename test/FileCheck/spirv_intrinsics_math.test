@@ -1,11 +1,10 @@
-# DXIL -> SPIR-V test for math and bitwise intrinsics.
-# REQUIRES: spirv-tools
+# SPIR-V -> MSL test: GLSL.std.450 math intrinsics (fabs, sqrt, fmax, fmin) + select.
 
-# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/intrinsics_math.hlsl
-# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
-# RUN: %spirv-val --target-env vulkan1.3 %t.spv
-# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/intrinsics_math.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
 
-# CHECK: OpExtInstImport "GLSL.std.450"
-# CHECK: OpEntryPoint GLCompute %main "main"
-# CHECK: OpExtInst
+# CHECK: kernel void main0(
+# CHECK-NEXT: device float* Data {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: fmin(fmax(sqrt(fabs({{.*}})), 0.5f) * float(dtid.x + 1u), {{.*}} < 2.0f ? 1e+09f : 10.0f)

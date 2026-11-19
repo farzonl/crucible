@@ -1,11 +1,13 @@
-# DXIL -> SPIR-V test for wave / subgroup operations.
-# REQUIRES: spirv-tools
+# SPIR-V -> MSL test: wave/subgroup sum, broadcast_first, prefix_exclusive_sum via gpu.* dialect.
 
-# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/wave_ops.hlsl
-# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
-# RUN: %spirv-val --target-env vulkan1.3 %t.spv
-# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.1 -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/wave_ops.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
 
-# CHECK: OpCapability GroupNonUniform
-# CHECK: OpEntryPoint GLCompute %main "main"
-# CHECK: OpGroupNonUniform
+# CHECK: kernel void main0(
+# CHECK-NEXT: device uint* Out {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: simd_sum(dtid.x)
+# CHECK: simd_broadcast_first(dtid.x)
+# CHECK: simd_prefix_exclusive_sum(1u)
+# CHECK: Out[dtid.x] =

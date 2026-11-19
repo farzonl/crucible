@@ -1,10 +1,15 @@
-# DXIL -> SPIR-V test for structured if/else control flow.
-# REQUIRES: spirv-tools
+# SPIR-V -> MSL test: structured if/else + fmin (LLVM intrinsic).
 
-# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/control_flow_if.hlsl
-# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
-# RUN: %spirv-val --target-env vulkan1.3 %t.spv
-# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/control_flow_if.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
 
-# CHECK: OpEntryPoint GLCompute %main "main"
-# CHECK: OpSelect
+# CHECK: kernel void main0(
+# CHECK-NEXT: device float* Data {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: if ({{.*}} < 2.0f) {
+# CHECK: * 3.0f
+# CHECK: } else {
+# CHECK: fmin({{.*}}, 10.0f)
+# CHECK: }
+# CHECK: Data[dtid.x] =

@@ -1,0 +1,27 @@
+# DXIL -> SPIR-V test for simple compute shader (StorageBuffer + ThreadId).
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv --reflect %t.json
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: %cruciblec --target=spirv --spv-asm %t.dxil | FileCheck %s --check-prefix=ASM
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+
+# CHECK: OpCapability Shader
+# CHECK: OpMemoryModel Logical GLSL450
+# CHECK: OpEntryPoint GLCompute %main "main"
+# CHECK: OpExecutionMode %main LocalSize 64 1 1
+# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} DescriptorSet 0
+# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} Binding 0
+# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} BuiltIn GlobalInvocationId
+# CHECK: OpFMul %float
+# CHECK: OpFAdd %float
+
+# ASM: OpCapability Shader
+# ASM: OpEntryPoint GLCompute
+# ASM: OpExecutionMode {{%[0-9]+}} LocalSize 64 1 1
+
+# REFLECT: "class": "uav"
+# REFLECT: "spirvBinding": 0
+# REFLECT: "spirvSet": 0

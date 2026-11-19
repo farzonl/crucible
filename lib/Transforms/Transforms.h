@@ -46,6 +46,11 @@ struct StructurizedShader {
 llvm::Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
                                                   mlir::MLIRContext &Ctx);
 
+/// Structurize an already-built MLIR module (e.g. from loadSPIRV).
+llvm::Expected<StructurizedShader>
+structurizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp> Mod,
+                      const Reflection &Reflect);
+
 } // namespace crucible
 
 #endif // CRUCIBLE_LIB_TRANSFORMS_TRANSFORMS_H
