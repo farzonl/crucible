@@ -1,0 +1,7 @@
+# End-to-end DXIL -> SPIR-V -> Vulkan/MoltenVK traditional raster (VS + PS) test.
+# REQUIRES: vulkan-gpu, offload-runner
+# RUN: %dxc -T vs_6_0 -E vs -Fo %t.vs %S/../Inputs/graphics_varyings.hlsl
+# RUN: %dxc -T ps_6_0 -E ps -Fo %t.ps %S/../Inputs/graphics_varyings.hlsl
+# RUN: env CRUCIBLE_OFFLOAD_RUNTIME=vulkan %offloader %S/../Inputs/graphics_varyings.yaml %t.vs %t.ps | FileCheck %s
+
+# CHECK: Name: Output

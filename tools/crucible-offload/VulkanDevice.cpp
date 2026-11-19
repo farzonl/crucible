@@ -154,6 +154,7 @@ struct VkContext {
   VkDevice Device = VK_NULL_HANDLE;
   VkQueue Queue = VK_NULL_HANDLE;
   uint32_t ComputeQF = UINT32_MAX;
+  uint32_t GraphicsQF = UINT32_MAX;
   std::string DeviceName;
   uint32_t VendorID = 0;
   uint32_t DeviceID = 0;
@@ -755,6 +756,438 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
   return Error::success();
 }
 
+VkFormat vkFormatForAttr(DataFormat Fmt, unsigned Ch) {
+  CPUBuffer Tmp;
+  Tmp.Format = Fmt;
+  Tmp.Channels = Ch;
+  return vkFormatForBuffer(Tmp);
+}
+
+Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
+  auto Fail = [](const char *Msg) {
+    return createStringError(inconvertibleErrorCode(), "%s", Msg);
+  };
+  if (VK.GraphicsQF == UINT32_MAX)
+    return Fail("no Vulkan graphics queue family available");
+  if (!P.isTraditionalRaster() || P.Shaders.size() < 2)
+    return Fail("raster execution requires one vertex and one pixel shader");
+
+  const Shader *VS = nullptr, *PS = nullptr;
+  for (const Shader &S : P.Shaders) {
+    if (S.Stage == Stages::Vertex)
+      VS = &S;
+    else if (S.Stage == Stages::Pixel)
+      PS = &S;
+    else
+      return Fail("Vulkan raster currently supports VS + PS pipelines only");
+  }
+  if (!VS || !PS)
+    return Fail("raster execution requires one vertex and one pixel shader");
+
+  auto &B = P.Bindings;
+  CPUBuffer *Output = B.RTargetBufferPtr;
+  if (!Output || Output->OutputProps.Width < 1 ||
+      Output->OutputProps.Height < 1 || Output->OutputProps.Depth > 1 ||
+      Output->OutputProps.ArraySlices > 1 || Output->OutputProps.MipLevels > 1)
+    return Fail("raster execution requires a single 2D color target");
+
+  uint32_t Width = static_cast<uint32_t>(Output->OutputProps.Width);
+  uint32_t Height = static_cast<uint32_t>(Output->OutputProps.Height);
+  size_t PixelSize = Output->getSingleElementSize() * Output->Channels;
+  if (!PixelSize || Width > Output->Size / PixelSize / Height)
+    return Fail("color target exceeds its backing storage");
+  VkDeviceSize ReadbackBytes = static_cast<VkDeviceSize>(Width) * Height * PixelSize;
+  VkFormat ColorFmt = vkFormatForBuffer(*Output);
+
+  crucible::Options VSOpts;
+  VSOpts.Target = crucible::TargetBackend::SPIRV;
+  VSOpts.EntryPoint = VS->Entry;
+  auto VSCompiled =
+      crucible::compileDXILToSPIRV(VS->Shader->getMemBufferRef(), VSOpts);
+  if (!VSCompiled)
+    return VSCompiled.takeError();
+
+  crucible::Options PSOpts;
+  PSOpts.Target = crucible::TargetBackend::SPIRV;
+  PSOpts.EntryPoint = PS->Entry;
+  auto PSCompiled =
+      crucible::compileDXILToSPIRV(PS->Shader->getMemBufferRef(), PSOpts);
+  if (!PSCompiled)
+    return PSCompiled.takeError();
+
+  VkShaderModule VSMod = VK_NULL_HANDLE, PSMod = VK_NULL_HANDLE;
+  auto createMod = [&](const std::string &Bytes,
+                       VkShaderModule &Out) -> Error {
+    VkShaderModuleCreateInfo CI{};
+    CI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    CI.codeSize = Bytes.size();
+    CI.pCode = reinterpret_cast<const uint32_t *>(Bytes.data());
+    if (VkResult R = vkCreateShaderModule(VK.Device, &CI, nullptr, &Out))
+      return vkErr(R, "vkCreateShaderModule");
+    return Error::success();
+  };
+  if (Error E = createMod(VSCompiled->Output, VSMod))
+    return E;
+  if (Error E = createMod(PSCompiled->Output, PSMod)) {
+    vkDestroyShaderModule(VK.Device, VSMod, nullptr);
+    return E;
+  }
+
+  // Offscreen color attachment image + view.
+  VkImage ColorImg = VK_NULL_HANDLE;
+  VkDeviceMemory ColorMem = VK_NULL_HANDLE;
+  VkImageView ColorView = VK_NULL_HANDLE;
+  VkBuffer ReadbackBuf = VK_NULL_HANDLE;
+  VkDeviceMemory ReadbackMem = VK_NULL_HANDLE;
+  VkBuffer VertBuf = VK_NULL_HANDLE;
+  VkDeviceMemory VertMem = VK_NULL_HANDLE;
+  VkRenderPass RenderPass = VK_NULL_HANDLE;
+  VkFramebuffer FB = VK_NULL_HANDLE;
+  VkPipelineLayout PipeLayout = VK_NULL_HANDLE;
+  VkPipeline Pipe = VK_NULL_HANDLE;
+  VkCommandPool CmdPool = VK_NULL_HANDLE;
+
+  auto cleanup = [&]() {
+    if (CmdPool) vkDestroyCommandPool(VK.Device, CmdPool, nullptr);
+    if (Pipe) vkDestroyPipeline(VK.Device, Pipe, nullptr);
+    if (PipeLayout) vkDestroyPipelineLayout(VK.Device, PipeLayout, nullptr);
+    if (FB) vkDestroyFramebuffer(VK.Device, FB, nullptr);
+    if (RenderPass) vkDestroyRenderPass(VK.Device, RenderPass, nullptr);
+    if (VertBuf) vkDestroyBuffer(VK.Device, VertBuf, nullptr);
+    if (VertMem) vkFreeMemory(VK.Device, VertMem, nullptr);
+    if (ReadbackBuf) vkDestroyBuffer(VK.Device, ReadbackBuf, nullptr);
+    if (ReadbackMem) vkFreeMemory(VK.Device, ReadbackMem, nullptr);
+    if (ColorView) vkDestroyImageView(VK.Device, ColorView, nullptr);
+    if (ColorImg) vkDestroyImage(VK.Device, ColorImg, nullptr);
+    if (ColorMem) vkFreeMemory(VK.Device, ColorMem, nullptr);
+    if (PSMod) vkDestroyShaderModule(VK.Device, PSMod, nullptr);
+    if (VSMod) vkDestroyShaderModule(VK.Device, VSMod, nullptr);
+  };
+
+  VkImageCreateInfo ICI{};
+  ICI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  ICI.imageType = VK_IMAGE_TYPE_2D;
+  ICI.format = ColorFmt;
+  ICI.extent = {Width, Height, 1};
+  ICI.mipLevels = 1;
+  ICI.arrayLayers = 1;
+  ICI.samples = VK_SAMPLE_COUNT_1_BIT;
+  ICI.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ICI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  ICI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ICI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (VkResult R = vkCreateImage(VK.Device, &ICI, nullptr, &ColorImg)) {
+    cleanup();
+    return vkErr(R, "vkCreateImage");
+  }
+  VkMemoryRequirements IMR{};
+  vkGetImageMemoryRequirements(VK.Device, ColorImg, &IMR);
+  auto ImgMemType = VK.findMemoryType(IMR.memoryTypeBits,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (!ImgMemType) {
+    cleanup();
+    return ImgMemType.takeError();
+  }
+  VkMemoryAllocateInfo IMAI{};
+  IMAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  IMAI.allocationSize = IMR.size;
+  IMAI.memoryTypeIndex = *ImgMemType;
+  if (VkResult R = vkAllocateMemory(VK.Device, &IMAI, nullptr, &ColorMem)) {
+    cleanup();
+    return vkErr(R, "vkAllocateMemory (color image)");
+  }
+  if (VkResult R = vkBindImageMemory(VK.Device, ColorImg, ColorMem, 0)) {
+    cleanup();
+    return vkErr(R, "vkBindImageMemory");
+  }
+
+  VkImageViewCreateInfo IVCI{};
+  IVCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  IVCI.image = ColorImg;
+  IVCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  IVCI.format = ColorFmt;
+  IVCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  if (VkResult R = vkCreateImageView(VK.Device, &IVCI, nullptr, &ColorView)) {
+    cleanup();
+    return vkErr(R, "vkCreateImageView");
+  }
+
+  // Host-visible staging buffer for color target readback.
+  auto allocHostBuf = [&](VkDeviceSize Size, VkBufferUsageFlags Usage,
+                          const void *InitData, VkBuffer &BufOut,
+                          VkDeviceMemory &MemOut) -> Error {
+    VkBufferCreateInfo BCI{};
+    BCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    BCI.size = std::max<VkDeviceSize>(Size, 16);
+    BCI.usage = Usage;
+    BCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (VkResult R = vkCreateBuffer(VK.Device, &BCI, nullptr, &BufOut))
+      return vkErr(R, "vkCreateBuffer");
+    VkMemoryRequirements MR{};
+    vkGetBufferMemoryRequirements(VK.Device, BufOut, &MR);
+    auto MT = VK.findMemoryType(MR.memoryTypeBits,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!MT)
+      return MT.takeError();
+    VkMemoryAllocateInfo MAI{};
+    MAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    MAI.allocationSize = MR.size;
+    MAI.memoryTypeIndex = *MT;
+    if (VkResult R = vkAllocateMemory(VK.Device, &MAI, nullptr, &MemOut))
+      return vkErr(R, "vkAllocateMemory");
+    if (VkResult R = vkBindBufferMemory(VK.Device, BufOut, MemOut, 0))
+      return vkErr(R, "vkBindBufferMemory");
+    if (InitData) {
+      void *Mapped = nullptr;
+      if (VkResult R = vkMapMemory(VK.Device, MemOut, 0, Size, 0, &Mapped))
+        return vkErr(R, "vkMapMemory");
+      memcpy(Mapped, InitData, Size);
+      vkUnmapMemory(VK.Device, MemOut);
+    }
+    return Error::success();
+  };
+
+  if (Error E = allocHostBuf(ReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             nullptr, ReadbackBuf, ReadbackMem)) {
+    cleanup();
+    return E;
+  }
+
+  uint32_t Stride = B.VertexBufferPtr ? static_cast<uint32_t>(B.VertexBufferPtr->Stride) : 0;
+  if (!Stride)
+    Stride = static_cast<uint32_t>(B.getVertexStride());
+  uint32_t VertexCount = 3;
+  if (B.VertexBufferPtr) {
+    if (Stride > 0)
+      VertexCount = static_cast<uint32_t>(B.VertexBufferPtr->Size / Stride);
+    if (Error E = allocHostBuf(B.VertexBufferPtr->Size,
+                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                               B.VertexBufferPtr->Data[0].get(), VertBuf,
+                               VertMem)) {
+      cleanup();
+      return E;
+    }
+  }
+
+  // RenderPass & Framebuffer.
+  VkAttachmentDescription ColorAtt{};
+  ColorAtt.format = ColorFmt;
+  ColorAtt.samples = VK_SAMPLE_COUNT_1_BIT;
+  ColorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  ColorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  ColorAtt.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  ColorAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  ColorAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  ColorAtt.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+  VkAttachmentReference ColorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription Subpass{};
+  Subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  Subpass.colorAttachmentCount = 1;
+  Subpass.pColorAttachments = &ColorRef;
+
+  VkRenderPassCreateInfo RPCI{};
+  RPCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+  RPCI.attachmentCount = 1;
+  RPCI.pAttachments = &ColorAtt;
+  RPCI.subpassCount = 1;
+  RPCI.pSubpasses = &Subpass;
+  if (VkResult R = vkCreateRenderPass(VK.Device, &RPCI, nullptr, &RenderPass)) {
+    cleanup();
+    return vkErr(R, "vkCreateRenderPass");
+  }
+
+  VkFramebufferCreateInfo FBCI{};
+  FBCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+  FBCI.renderPass = RenderPass;
+  FBCI.attachmentCount = 1;
+  FBCI.pAttachments = &ColorView;
+  FBCI.width = Width;
+  FBCI.height = Height;
+  FBCI.layers = 1;
+  if (VkResult R = vkCreateFramebuffer(VK.Device, &FBCI, nullptr, &FB)) {
+    cleanup();
+    return vkErr(R, "vkCreateFramebuffer");
+  }
+
+  // Vertex input state matching SPIR-V VS input locations.
+  std::vector<VkVertexInputBindingDescription> VBindings;
+  std::vector<VkVertexInputAttributeDescription> VAttrs;
+  if (B.VertexBufferPtr && Stride > 0) {
+    VBindings.push_back({0, Stride, VK_VERTEX_INPUT_RATE_VERTEX});
+    uint32_t NextLoc = 0;
+    for (const auto &Input : VSCompiled->Reflect.Inputs) {
+      if (Input.Kind != 0)
+        continue;
+      std::string Indexed = Input.Semantic + std::to_string(Input.SemanticIndex);
+      auto It = llvm::find_if(B.VertexAttributes, [&](const VertexAttribute &A) {
+        return StringRef(A.Name).equals_insensitive(Input.Semantic) ||
+               StringRef(A.Name).equals_insensitive(Indexed);
+      });
+      if (It != B.VertexAttributes.end()) {
+        VAttrs.push_back({NextLoc, 0,
+                          vkFormatForAttr(It->Format, It->Channels),
+                          static_cast<uint32_t>(It->Offset)});
+      }
+      NextLoc += std::max(1u, Input.Rows);
+    }
+  }
+
+  VkPipelineLayoutCreateInfo PLCI{};
+  PLCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  if (VkResult R = vkCreatePipelineLayout(VK.Device, &PLCI, nullptr, &PipeLayout)) {
+    cleanup();
+    return vkErr(R, "vkCreatePipelineLayout");
+  }
+
+  VkPipelineShaderStageCreateInfo StagesCI[2]{};
+  StagesCI[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  StagesCI[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  StagesCI[0].module = VSMod;
+  StagesCI[0].pName =
+      VSCompiled->Reflect.EntryName.empty() ? "main" : VSCompiled->Reflect.EntryName.c_str();
+  StagesCI[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  StagesCI[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  StagesCI[1].module = PSMod;
+  StagesCI[1].pName =
+      PSCompiled->Reflect.EntryName.empty() ? "main" : PSCompiled->Reflect.EntryName.c_str();
+
+  VkPipelineVertexInputStateCreateInfo VISCI{};
+  VISCI.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+  VISCI.vertexBindingDescriptionCount = static_cast<uint32_t>(VBindings.size());
+  VISCI.pVertexBindingDescriptions = VBindings.data();
+  VISCI.vertexAttributeDescriptionCount = static_cast<uint32_t>(VAttrs.size());
+  VISCI.pVertexAttributeDescriptions = VAttrs.data();
+
+  VkPipelineInputAssemblyStateCreateInfo IASCI{};
+  IASCI.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+  IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+  // Flip Vulkan viewport Y to match DirectX top-left clip-space convention.
+  VkViewport VP{0.0f, static_cast<float>(Height), static_cast<float>(Width),
+                -static_cast<float>(Height), 0.0f, 1.0f};
+  VkRect2D Scissor{{0, 0}, {Width, Height}};
+  VkPipelineViewportStateCreateInfo VPSCI{};
+  VPSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+  VPSCI.viewportCount = 1;
+  VPSCI.pViewports = &VP;
+  VPSCI.scissorCount = 1;
+  VPSCI.pScissors = &Scissor;
+
+  VkPipelineRasterizationStateCreateInfo RSCI{};
+  RSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+  RSCI.polygonMode = VK_POLYGON_MODE_FILL;
+  RSCI.cullMode = VK_CULL_MODE_NONE;
+  RSCI.frontFace = VK_FRONT_FACE_CLOCKWISE;
+  RSCI.lineWidth = 1.0f;
+
+  VkPipelineMultisampleStateCreateInfo MSSCI{};
+  MSSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+  MSSCI.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+  VkPipelineColorBlendAttachmentState CBAtt{};
+  CBAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo CBSCI{};
+  CBSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+  CBSCI.attachmentCount = 1;
+  CBSCI.pAttachments = &CBAtt;
+
+  VkGraphicsPipelineCreateInfo GPCI{};
+  GPCI.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+  GPCI.stageCount = 2;
+  GPCI.pStages = StagesCI;
+  GPCI.pVertexInputState = &VISCI;
+  GPCI.pInputAssemblyState = &IASCI;
+  GPCI.pViewportState = &VPSCI;
+  GPCI.pRasterizationState = &RSCI;
+  GPCI.pMultisampleState = &MSSCI;
+  GPCI.pColorBlendState = &CBSCI;
+  GPCI.layout = PipeLayout;
+  GPCI.renderPass = RenderPass;
+  GPCI.subpass = 0;
+
+  if (VkResult R = vkCreateGraphicsPipelines(VK.Device, VK_NULL_HANDLE, 1,
+                                             &GPCI, nullptr, &Pipe)) {
+    cleanup();
+    return vkErr(R, "vkCreateGraphicsPipelines");
+  }
+
+  VkCommandPoolCreateInfo PoolCI{};
+  PoolCI.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  PoolCI.queueFamilyIndex = VK.GraphicsQF;
+  if (VkResult R = vkCreateCommandPool(VK.Device, &PoolCI, nullptr, &CmdPool)) {
+    cleanup();
+    return vkErr(R, "vkCreateCommandPool");
+  }
+
+  VkCommandBufferAllocateInfo CBAI{};
+  CBAI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  CBAI.commandPool = CmdPool;
+  CBAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  CBAI.commandBufferCount = 1;
+  VkCommandBuffer CB = VK_NULL_HANDLE;
+  if (VkResult R = vkAllocateCommandBuffers(VK.Device, &CBAI, &CB)) {
+    cleanup();
+    return vkErr(R, "vkAllocateCommandBuffers");
+  }
+
+  VkCommandBufferBeginInfo CBBI{};
+  CBBI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  CBBI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(CB, &CBBI);
+
+  VkClearValue ClearVal{};
+  VkRenderPassBeginInfo RPBI{};
+  RPBI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+  RPBI.renderPass = RenderPass;
+  RPBI.framebuffer = FB;
+  RPBI.renderArea = {{0, 0}, {Width, Height}};
+  RPBI.clearValueCount = 1;
+  RPBI.pClearValues = &ClearVal;
+  vkCmdBeginRenderPass(CB, &RPBI, VK_SUBPASS_CONTENTS_INLINE);
+  vkCmdBindPipeline(CB, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipe);
+  if (VertBuf) {
+    VkDeviceSize Off = 0;
+    vkCmdBindVertexBuffers(CB, 0, 1, &VertBuf, &Off);
+  }
+  vkCmdDraw(CB, VertexCount, 1, 0, 0);
+  vkCmdEndRenderPass(CB);
+
+  VkBufferImageCopy CopyRegion{};
+  CopyRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  CopyRegion.imageExtent = {Width, Height, 1};
+  vkCmdCopyImageToBuffer(CB, ColorImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         ReadbackBuf, 1, &CopyRegion);
+  vkEndCommandBuffer(CB);
+
+  VkSubmitInfo SI{};
+  SI.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  SI.commandBufferCount = 1;
+  SI.pCommandBuffers = &CB;
+  if (VkResult R = vkQueueSubmit(VK.Queue, 1, &SI, VK_NULL_HANDLE)) {
+    cleanup();
+    return vkErr(R, "vkQueueSubmit (raster)");
+  }
+  if (VkResult R = vkQueueWaitIdle(VK.Queue)) {
+    cleanup();
+    return vkErr(R, "vkQueueWaitIdle (raster)");
+  }
+
+  void *Mapped = nullptr;
+  if (VkResult R =
+          vkMapMemory(VK.Device, ReadbackMem, 0, ReadbackBytes, 0, &Mapped)) {
+    cleanup();
+    return vkErr(R, "vkMapMemory (raster readback)");
+  }
+  memcpy(Output->Data[0].get(), Mapped, ReadbackBytes);
+  vkUnmapMemory(VK.Device, ReadbackMem);
+
+  cleanup();
+  return Error::success();
+}
+
 class CrucibleVulkanDevice final : public offloadtest::Device {
   std::unique_ptr<VkContext> VK;
   Capabilities Caps;
@@ -823,7 +1256,8 @@ public:
   Error executeProgram(Pipeline &P) override {
     if (auto Err = validateRootParameters(P))
       return Err;
-    return executeVulkanCompute(P, *VK);
+    return P.isTraditionalRaster() ? executeVulkanRaster(P, *VK)
+                                   : executeVulkanCompute(P, *VK);
   }
 
   Queue &getGraphicsQueue() override {
@@ -970,9 +1404,19 @@ createVulkanDevices(const DeviceConfig &Config) {
   std::vector<VkQueueFamilyProperties> QFs(QFCount);
   vkGetPhysicalDeviceQueueFamilyProperties(VK->PhysDev, &QFCount, QFs.data());
   for (uint32_t I = 0; I < QFCount; ++I) {
-    if (QFs[I].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+    if ((QFs[I].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+        (QFs[I].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
       VK->ComputeQF = I;
+      VK->GraphicsQF = I;
       break;
+    }
+  }
+  if (VK->ComputeQF == UINT32_MAX) {
+    for (uint32_t I = 0; I < QFCount; ++I) {
+      if (QFs[I].queueFlags & VK_QUEUE_COMPUTE_BIT)
+        VK->ComputeQF = I;
+      if (QFs[I].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+        VK->GraphicsQF = I;
     }
   }
   if (VK->ComputeQF == UINT32_MAX)
