@@ -2375,7 +2375,11 @@ public:
                      makeCapability("ResourceBindingTier", uint32_t(3)));
     Caps.try_emplace("TiledResourcesTier",
                      makeCapability("TiledResourcesTier", uint32_t(2)));
-    Caps.try_emplace("MeshShaderTier", MakeStr("MeshShaderTier", "Tier1"));
+    Caps.try_emplace("MeshShaderTier",
+                     MakeStr("MeshShaderTier",
+                             this->Metal->supportsFamily(MTL::GPUFamilyMetal3)
+                                 ? "Tier1"
+                                 : "NotSupported"));
     Caps.try_emplace("BarycentricsSupported",
                      makeCapability("BarycentricsSupported", false));
     Caps.try_emplace("PSSpecifiedStencilRefSupported",
