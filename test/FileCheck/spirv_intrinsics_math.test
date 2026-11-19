@@ -1,0 +1,10 @@
+# SPIR-V -> MSL test: GLSL.std.450 math intrinsics (fabs, sqrt, fmax, fmin) + select.
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/intrinsics_math.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK-NEXT: device float* Data {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: fmin(fmax(sqrt(fabs({{.*}})), 0.5f) * float(dtid.x + 1u), {{.*}} < 2.0f ? 1e+09f : 10.0f)

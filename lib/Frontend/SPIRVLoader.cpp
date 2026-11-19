@@ -60,6 +60,70 @@ struct BoundBufferInfo {
   uint32_t ElemStride = 4;
 };
 
+struct BoundCBufferInfo {
+  size_t ReflectIndex = 0;
+  mlir::spirv::StructType StructTy;
+};
+
+struct WorkgroupGlobalInfo {
+  std::string Name;
+  mlir::Type LLVMType;
+};
+
+mlir::Type convertSpirvDataType(mlir::Type T, mlir::OpBuilder &B) {
+  if (auto IT = mlir::dyn_cast<mlir::IntegerType>(T))
+    return B.getIntegerType(IT.getWidth());
+  if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T))
+    return mlir::VectorType::get(Vec.getShape(),
+                                 convertSpirvDataType(Vec.getElementType(), B));
+  if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(T))
+    return mlir::LLVM::LLVMArrayType::get(
+        convertSpirvDataType(Arr.getElementType(), B), Arr.getNumElements());
+  if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(T)) {
+    SmallVector<mlir::Type, 4> Elems;
+    for (unsigned I = 0; I < ST.getNumElements(); ++I)
+      Elems.push_back(convertSpirvDataType(ST.getElementType(I), B));
+    return mlir::LLVM::LLVMStructType::getLiteral(B.getContext(), Elems);
+  }
+  return T;
+}
+
+uint32_t scalarTypeBytes(mlir::Type T) {
+  if (T.isF16() || T.isInteger(16))
+    return 2;
+  if (T.isF64() || T.isInteger(64))
+    return 8;
+  return 4;
+}
+
+uint32_t spirvTypeBytes(mlir::Type T) {
+  if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T))
+    return static_cast<uint32_t>(Vec.getNumElements()) *
+           scalarTypeBytes(Vec.getElementType());
+  if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(T)) {
+    uint32_t Stride = Arr.getArrayStride();
+    if (Stride == 0)
+      Stride = spirvTypeBytes(Arr.getElementType());
+    return Arr.getNumElements() * Stride;
+  }
+  if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(T)) {
+    unsigned N = ST.getNumElements();
+    if (N == 0)
+      return 0;
+    uint32_t LastOff = ST.getMemberOffset(N - 1);
+    return LastOff + spirvTypeBytes(ST.getElementType(N - 1));
+  }
+  return scalarTypeBytes(T);
+}
+
+std::optional<int64_t> getConstSpirvInt(mlir::Value V) {
+  if (auto C = V.getDefiningOp<mlir::spirv::ConstantOp>()) {
+    if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(C.getValue()))
+      return IA.getInt();
+  }
+  return std::nullopt;
+}
+
 ComponentType toComponentType(mlir::Type T) {
   if (T.isF32())
     return ComponentType::F32;
@@ -122,6 +186,15 @@ mlir::LLVM::LLVMStructType getOrInitResRetType(mlir::MLIRContext *Ctx,
     auto I32 = mlir::IntegerType::get(Ctx, 32);
     (void)ST.setBody({ElemTy, ElemTy, ElemTy, ElemTy, I32}, /*isPacked=*/false);
   }
+  return ST;
+}
+
+mlir::LLVM::LLVMStructType getOrInitCBufRetType(mlir::MLIRContext *Ctx,
+                                                mlir::Type ElemTy) {
+  std::string Name = "dx.types.CBufRet." + typeSuffix(ElemTy);
+  auto ST = mlir::LLVM::LLVMStructType::getIdentified(Ctx, Name);
+  if (!ST.isInitialized())
+    (void)ST.setBody({ElemTy, ElemTy, ElemTy, ElemTy}, /*isPacked=*/false);
   return ST;
 }
 
@@ -242,11 +315,14 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     }
   }
 
-  // 2. Inspect spirv.GlobalVariables for built-ins and descriptor bindings.
+  // 2. Inspect spirv.GlobalVariables for built-ins, workgroup memory, and
+  // descriptor bindings.
   StringMap<mlir::spirv::BuiltIn> BuiltInGlobals;
   StringMap<BoundBufferInfo> BufferGlobals;
+  StringMap<BoundCBufferInfo> CBufferGlobals;
+  StringMap<WorkgroupGlobalInfo> WorkgroupGlobals;
   SmallVector<mlir::spirv::GlobalVariableOp, 8> GlobalsToErase;
-  uint32_t NextSRVId = 0, NextUAVId = 0;
+  uint32_t NextSRVId = 0, NextUAVId = 0, NextCBVId = 0;
 
   for (auto GV : SpvModule.getOps<mlir::spirv::GlobalVariableOp>()) {
     if (auto BIName = GV.getBuiltIn()) {
@@ -258,15 +334,25 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       continue;
     }
 
-    auto DS = GV.getDescriptorSet();
-    auto Binding = GV.getBinding();
-    if (!DS || !Binding)
-      continue;
-
     auto PtrTy = mlir::dyn_cast<mlir::spirv::PointerType>(GV.getType());
     if (!PtrTy)
       continue;
     auto SC = PtrTy.getStorageClass();
+
+    if (SC == mlir::spirv::StorageClass::Workgroup) {
+      mlir::OpBuilder B(&Ctx);
+      WorkgroupGlobalInfo Info;
+      Info.Name = GV.getSymName().str();
+      Info.LLVMType = convertSpirvDataType(PtrTy.getPointeeType(), B);
+      WorkgroupGlobals[GV.getSymName()] = std::move(Info);
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+
+    auto DS = GV.getDescriptorSet();
+    auto Binding = GV.getBinding();
+    if (!DS || !Binding)
+      continue;
     if (SC != mlir::spirv::StorageClass::Uniform &&
         SC != mlir::spirv::StorageClass::StorageBuffer)
       continue;
@@ -276,42 +362,67 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     if (!StructTy || StructTy.getNumElements() == 0)
       continue;
 
-    auto RTArr =
-        mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(StructTy.getElementType(0));
-    if (!RTArr)
+    if (auto RTArr = mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(
+            StructTy.getElementType(0))) {
+      mlir::Type ElemTy = RTArr.getElementType();
+      uint32_t Stride = RTArr.getArrayStride();
+      if (Stride == 0)
+        Stride = 4;
+
+      bool IsReadOnly = false;
+      SmallVector<mlir::spirv::StructType::MemberDecorationInfo> MemDecs;
+      StructTy.getMemberDecorations(0, MemDecs);
+      for (const auto &D : MemDecs) {
+        if (D.decoration == mlir::spirv::Decoration::NonWritable)
+          IsReadOnly = true;
+      }
+
+      ResourceBinding RB;
+      RB.Class = IsReadOnly ? ResourceClass::SRV : ResourceClass::UAV;
+      RB.Kind = ResourceKind::StructuredBuffer;
+      RB.ElementType = toComponentType(ElemTy);
+      RB.RecordID = IsReadOnly ? NextSRVId++ : NextUAVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = *DS;
+      RB.LowerBound = *Binding;
+      RB.RangeSize = 1;
+      RB.ElementStride = Stride;
+
+      BoundBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.ElemType = ElemTy;
+      Info.ElemStride = Stride;
+      BufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
       continue;
-
-    mlir::Type ElemTy = RTArr.getElementType();
-    uint32_t Stride = RTArr.getArrayStride();
-    if (Stride == 0)
-      Stride = 4;
-
-    bool IsReadOnly = false;
-    SmallVector<mlir::spirv::StructType::MemberDecorationInfo> MemDecs;
-    StructTy.getMemberDecorations(0, MemDecs);
-    for (const auto &D : MemDecs) {
-      if (D.decoration == mlir::spirv::Decoration::NonWritable)
-        IsReadOnly = true;
     }
 
-    ResourceBinding RB;
-    RB.Class = IsReadOnly ? ResourceClass::SRV : ResourceClass::UAV;
-    RB.Kind = ResourceKind::StructuredBuffer;
-    RB.ElementType = toComponentType(ElemTy);
-    RB.RecordID = IsReadOnly ? NextSRVId++ : NextUAVId++;
-    RB.Name = GV.getSymName().str();
-    RB.Space = *DS;
-    RB.LowerBound = *Binding;
-    RB.RangeSize = 1;
-    RB.ElementStride = Stride;
+    // Uniform Block struct without RuntimeArray -> Constant Buffer (CBV).
+    if (SC == mlir::spirv::StorageClass::Uniform) {
+      uint32_t RawBytes = spirvTypeBytes(StructTy);
+      uint32_t PaddedBytes = ((RawBytes + 15u) / 16u) * 16u;
+      if (PaddedBytes == 0)
+        PaddedBytes = 16;
 
-    BoundBufferInfo Info;
-    Info.ReflectIndex = Reflect.Resources.size();
-    Info.ElemType = ElemTy;
-    Info.ElemStride = Stride;
-    BufferGlobals[GV.getSymName()] = Info;
-    Reflect.Resources.push_back(std::move(RB));
-    GlobalsToErase.push_back(GV);
+      ResourceBinding RB;
+      RB.Class = ResourceClass::CBV;
+      RB.Kind = ResourceKind::CBuffer;
+      RB.RecordID = NextCBVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = *DS;
+      RB.LowerBound = *Binding;
+      RB.RangeSize = 1;
+      RB.ElementStride = PaddedBytes;
+
+      BoundCBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.StructTy = StructTy;
+      CBufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
   }
 
   auto EntryFn = SpvModule.lookupSymbol<mlir::spirv::FuncOp>(Reflect.EntryName);
@@ -329,13 +440,13 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
   auto VoidTy = mlir::LLVM::LLVMVoidType::get(&Ctx);
 
   DenseMap<size_t, mlir::Value> HandleCache;
-  auto getHandleFor = [&](const BoundBufferInfo &Info) -> mlir::Value {
-    auto It = HandleCache.find(Info.ReflectIndex);
+  auto getHandleForIndex = [&](size_t ReflectIndex) -> mlir::Value {
+    auto It = HandleCache.find(ReflectIndex);
     if (It != HandleCache.end())
       return It->second;
 
     EntryBuilder.setInsertionPointToStart(&EntryFn.getBody().front());
-    const ResourceBinding &RB = Reflect.Resources[Info.ReflectIndex];
+    const ResourceBinding &RB = Reflect.Resources[ReflectIndex];
     auto FnTy = mlir::LLVM::LLVMFunctionType::get(
         HandleTy, {I32Ty, I8Ty, I32Ty, I32Ty, I1Ty});
     getOrCreateDecl(SpvModule, "dx.op.createHandle", FnTy);
@@ -354,7 +465,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     auto Call = mlir::LLVM::CallOp::create(
         EntryBuilder, FnLoc, mlir::TypeRange{HandleTy}, "dx.op.createHandle",
         mlir::ValueRange{OpC, ClassC, IdC, IdxC, NonUnifC});
-    HandleCache[Info.ReflectIndex] = Call.getResult();
+    HandleCache[ReflectIndex] = Call.getResult();
     return Call.getResult();
   };
 
@@ -364,7 +475,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
   for (auto AO : AddrOps) {
     StringRef Sym = AO.getVariable();
 
-    // 3a. Built-in globals (e.g. GlobalInvocationId -> gpu.global_id).
+    // 3a. Built-in globals (vector IDs -> gpu.*, LocalInvocationIndex -> gidx).
     auto BIIt = BuiltInGlobals.find(Sym);
     if (BIIt != BuiltInGlobals.end()) {
       mlir::spirv::BuiltIn BI = BIIt->second;
@@ -374,6 +485,21 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(U);
         if (!Load)
           return makeError("unsupported user of built-in global '{0}'", Sym);
+        if (BI == mlir::spirv::BuiltIn::LocalInvocationIndex) {
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          auto FnTy = mlir::LLVM::LLVMFunctionType::get(I32Ty, {I32Ty});
+          getOrCreateDecl(SpvModule, "dx.op.flattenedThreadIdInGroup.i32", FnTy);
+          auto OpC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty,
+              static_cast<int32_t>(DXILOp::FlattenedThreadIdInGroup));
+          auto Call = mlir::LLVM::CallOp::create(
+              B, Loc, mlir::TypeRange{I32Ty},
+              "dx.op.flattenedThreadIdInGroup.i32", mlir::ValueRange{OpC});
+          Load.replaceAllUsesWith(Call.getResult());
+          Load.erase();
+          continue;
+        }
         SmallVector<mlir::Operation *, 4> Extracts(Load->getUsers().begin(),
                                                    Load->getUsers().end());
         for (mlir::Operation *EU : Extracts) {
@@ -402,7 +528,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     auto BufIt = BufferGlobals.find(Sym);
     if (BufIt != BufferGlobals.end()) {
       const BoundBufferInfo &Info = BufIt->second;
-      mlir::Value Handle = getHandleFor(Info);
+      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
 
       SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
                                                    AO->getUsers().end());
@@ -466,7 +592,64 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                  Undef, Undef, MaskC, AlignC});
             Store.erase();
           } else {
-            return makeError("unsupported memory op on buffer '{0}'", Sym);
+            // Structured buffer atomics -> dx.op.atomicBinOp.
+            std::optional<DXILAtomicBinOp> ABinOp;
+            mlir::Value AVal;
+            if (auto A = mlir::dyn_cast<mlir::spirv::AtomicIAddOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Add;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicAndOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::And;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicOrOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Or;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicXorOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Xor;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicSMinOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::IMin;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicSMaxOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::IMax;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicUMinOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::UMin;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicUMaxOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::UMax;
+              AVal = A.getValue();
+            } else if (auto A =
+                           mlir::dyn_cast<mlir::spirv::AtomicExchangeOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Exchange;
+              AVal = A.getValue();
+            }
+            if (!ABinOp)
+              return makeError("unsupported memory op '{0}' on buffer '{1}'",
+                               MU->getName().getStringRef(), Sym);
+
+            mlir::OpBuilder B(MU);
+            mlir::Location Loc = MU->getLoc();
+            mlir::Type ValTy = makeSignless(AVal.getType(), B);
+            std::string Callee = "dx.op.atomicBinOp." + typeSuffix(ValTy);
+            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+                ValTy,
+                {I32Ty, HandleTy, I32Ty, I32Ty, I32Ty, I32Ty, ValTy});
+            getOrCreateDecl(SpvModule, Callee, FnTy);
+
+            auto OpC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::AtomicBinOp));
+            auto BinC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(*ABinOp));
+            auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+            auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
+
+            auto Call = mlir::LLVM::CallOp::create(
+                B, Loc, mlir::TypeRange{ValTy}, Callee,
+                mlir::ValueRange{OpC, Handle, BinC, ElemIdx, ZeroC, UndefI32,
+                                 AVal});
+            MU->getResult(0).replaceAllUsesWith(Call.getResult());
+            MU->erase();
           }
         }
         Chain.erase();
@@ -474,12 +657,248 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       AO.erase();
       continue;
     }
+
+    // 3c. Constant buffers (Uniform Block) -> dx.op.cbufferLoadLegacy.
+    auto CBIt = CBufferGlobals.find(Sym);
+    if (CBIt != CBufferGlobals.end()) {
+      const BoundCBufferInfo &Info = CBIt->second;
+      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
+
+      SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
+                                                   AO->getUsers().end());
+      for (mlir::Operation *CU : ChainUsers) {
+        auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(CU);
+        if (!Chain || Chain.getIndices().empty())
+          return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
+
+        // Compute static byte offset through nested structs/arrays.
+        mlir::Type CurTy = Info.StructTy;
+        uint32_t ByteOffset = 0;
+        for (mlir::Value IdxV : Chain.getIndices()) {
+          auto ConstIdx = getConstSpirvInt(IdxV);
+          if (!ConstIdx)
+            return makeError("dynamic indexing into cbuffer '{0}' not yet supported",
+                             Sym);
+          uint32_t I = static_cast<uint32_t>(*ConstIdx);
+          if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
+            ByteOffset += ST.getMemberOffset(I);
+            CurTy = ST.getElementType(I);
+          } else if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(CurTy)) {
+            uint32_t Stride = Arr.getArrayStride();
+            if (Stride == 0)
+              Stride = spirvTypeBytes(Arr.getElementType());
+            ByteOffset += I * Stride;
+            CurTy = Arr.getElementType();
+          } else {
+            return makeError("unsupported cbuffer index step on '{0}'", Sym);
+          }
+        }
+
+        uint32_t Row = ByteOffset / 16u;
+        uint32_t Comp = (ByteOffset % 16u) / 4u;
+
+        SmallVector<mlir::Operation *, 4> MemUsers(Chain->getUsers().begin(),
+                                                   Chain->getUsers().end());
+        for (mlir::Operation *MU : MemUsers) {
+          auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU);
+          if (!Load)
+            return makeError("unsupported non-load user of cbuffer '{0}'", Sym);
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          mlir::Type ValTy = makeSignless(Load.getType(), B);
+          auto RetTy = getOrInitCBufRetType(&Ctx, ValTy);
+          std::string Callee = "dx.op.cbufferLoadLegacy." + typeSuffix(ValTy);
+          auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+              RetTy, {I32Ty, HandleTy, I32Ty});
+          getOrCreateDecl(SpvModule, Callee, FnTy);
+
+          auto OpC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty, static_cast<int32_t>(DXILOp::CBufferLoadLegacy));
+          auto RowC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty, static_cast<int32_t>(Row));
+          auto Call = mlir::LLVM::CallOp::create(
+              B, Loc, mlir::TypeRange{RetTy}, Callee,
+              mlir::ValueRange{OpC, Handle, RowC});
+          auto Val = mlir::LLVM::ExtractValueOp::create(
+              B, Loc, Call.getResult(), ArrayRef<int64_t>{Comp});
+          Load.replaceAllUsesWith(Val.getResult());
+          Load.erase();
+        }
+        Chain.erase();
+      }
+      AO.erase();
+      continue;
+    }
+
+    // 3c2. Workgroup (groupshared) globals -> addrspace(3) LLVM ops.
+    auto WGIt = WorkgroupGlobals.find(Sym);
+    if (WGIt != WorkgroupGlobals.end()) {
+      const WorkgroupGlobalInfo &Info = WGIt->second;
+      mlir::OpBuilder AOB(AO);
+      auto Ptr3Ty = mlir::LLVM::LLVMPointerType::get(&Ctx, 3);
+      auto LLVMAddr = mlir::LLVM::AddressOfOp::create(
+          AOB, AO.getLoc(), Ptr3Ty,
+          mlir::FlatSymbolRefAttr::get(&Ctx, Info.Name));
+
+      auto rewritePtrUsers = [&](mlir::Value OldPtr, mlir::Value NewPtr) -> Error {
+        SmallVector<mlir::Operation *, 8> Users(OldPtr.getUsers().begin(),
+                                                OldPtr.getUsers().end());
+        for (mlir::Operation *MU : Users) {
+          if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
+            mlir::OpBuilder B(Load);
+            mlir::Type ValTy = makeSignless(Load.getType(), B);
+            auto LLVMLoad = mlir::LLVM::LoadOp::create(
+                B, Load.getLoc(), ValTy, NewPtr);
+            Load.replaceAllUsesWith(LLVMLoad.getResult());
+            Load.erase();
+          } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(MU)) {
+            mlir::OpBuilder B(Store);
+            mlir::LLVM::StoreOp::create(
+                B, Store.getLoc(), Store.getValue(), NewPtr);
+            Store.erase();
+          } else if (auto AAdd = mlir::dyn_cast<mlir::spirv::AtomicIAddOp>(MU)) {
+            mlir::OpBuilder B(AAdd);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AAdd.getLoc(), mlir::LLVM::AtomicBinOp::add, NewPtr,
+                AAdd.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AAdd.replaceAllUsesWith(RMW.getResult());
+            AAdd.erase();
+          } else if (auto ASub = mlir::dyn_cast<mlir::spirv::AtomicISubOp>(MU)) {
+            mlir::OpBuilder B(ASub);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, ASub.getLoc(), mlir::LLVM::AtomicBinOp::sub, NewPtr,
+                ASub.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            ASub.replaceAllUsesWith(RMW.getResult());
+            ASub.erase();
+          } else if (auto AAnd = mlir::dyn_cast<mlir::spirv::AtomicAndOp>(MU)) {
+            mlir::OpBuilder B(AAnd);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AAnd.getLoc(), mlir::LLVM::AtomicBinOp::_and, NewPtr,
+                AAnd.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AAnd.replaceAllUsesWith(RMW.getResult());
+            AAnd.erase();
+          } else if (auto AOr = mlir::dyn_cast<mlir::spirv::AtomicOrOp>(MU)) {
+            mlir::OpBuilder B(AOr);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AOr.getLoc(), mlir::LLVM::AtomicBinOp::_or, NewPtr,
+                AOr.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AOr.replaceAllUsesWith(RMW.getResult());
+            AOr.erase();
+          } else if (auto AXor = mlir::dyn_cast<mlir::spirv::AtomicXorOp>(MU)) {
+            mlir::OpBuilder B(AXor);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AXor.getLoc(), mlir::LLVM::AtomicBinOp::_xor, NewPtr,
+                AXor.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AXor.replaceAllUsesWith(RMW.getResult());
+            AXor.erase();
+          } else if (auto ASMin = mlir::dyn_cast<mlir::spirv::AtomicSMinOp>(MU)) {
+            mlir::OpBuilder B(ASMin);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, ASMin.getLoc(), mlir::LLVM::AtomicBinOp::min, NewPtr,
+                ASMin.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            ASMin.replaceAllUsesWith(RMW.getResult());
+            ASMin.erase();
+          } else if (auto ASMax = mlir::dyn_cast<mlir::spirv::AtomicSMaxOp>(MU)) {
+            mlir::OpBuilder B(ASMax);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, ASMax.getLoc(), mlir::LLVM::AtomicBinOp::max, NewPtr,
+                ASMax.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            ASMax.replaceAllUsesWith(RMW.getResult());
+            ASMax.erase();
+          } else if (auto AUMin = mlir::dyn_cast<mlir::spirv::AtomicUMinOp>(MU)) {
+            mlir::OpBuilder B(AUMin);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AUMin.getLoc(), mlir::LLVM::AtomicBinOp::umin, NewPtr,
+                AUMin.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AUMin.replaceAllUsesWith(RMW.getResult());
+            AUMin.erase();
+          } else if (auto AUMax = mlir::dyn_cast<mlir::spirv::AtomicUMaxOp>(MU)) {
+            mlir::OpBuilder B(AUMax);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AUMax.getLoc(), mlir::LLVM::AtomicBinOp::umax, NewPtr,
+                AUMax.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AUMax.replaceAllUsesWith(RMW.getResult());
+            AUMax.erase();
+          } else if (auto AXchg =
+                         mlir::dyn_cast<mlir::spirv::AtomicExchangeOp>(MU)) {
+            mlir::OpBuilder B(AXchg);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AXchg.getLoc(), mlir::LLVM::AtomicBinOp::xchg, NewPtr,
+                AXchg.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AXchg.replaceAllUsesWith(RMW.getResult());
+            AXchg.erase();
+          } else {
+            return makeError("unsupported op '{0}' on workgroup global '{1}'",
+                             MU->getName().getStringRef(), Sym);
+          }
+        }
+        return Error::success();
+      };
+
+      SmallVector<mlir::Operation *, 8> AOUsers(AO->getUsers().begin(),
+                                                AO->getUsers().end());
+      for (mlir::Operation *U : AOUsers) {
+        if (auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
+          mlir::OpBuilder B(Chain);
+          SmallVector<mlir::LLVM::GEPArg, 4> GEPArgs;
+          GEPArgs.push_back(int32_t(0));
+          for (mlir::Value IdxV : Chain.getIndices()) {
+            if (auto C = getConstSpirvInt(IdxV))
+              GEPArgs.push_back(static_cast<int32_t>(*C));
+            else
+              GEPArgs.push_back(IdxV);
+          }
+          auto GEP = mlir::LLVM::GEPOp::create(
+              B, Chain.getLoc(), Ptr3Ty, Info.LLVMType, LLVMAddr.getResult(),
+              GEPArgs);
+          if (Error E = rewritePtrUsers(Chain.getResult(), GEP.getResult()))
+            return std::move(E);
+          Chain.erase();
+        } else {
+          if (Error E = rewritePtrUsers(AO.getResult(), LLVMAddr.getResult()))
+            return std::move(E);
+          break;
+        }
+      }
+      AO.erase();
+      continue;
+    }
+  }
+
+  // 3d. Lower spirv.ControlBarrier -> Layer 1 gpu.barrier.
+  SmallVector<mlir::spirv::ControlBarrierOp, 4> Barriers;
+  EntryFn.walk(
+      [&](mlir::spirv::ControlBarrierOp CB) { Barriers.push_back(CB); });
+  for (auto CB : Barriers) {
+    mlir::OpBuilder B(CB);
+    auto GPU = mlir::gpu::BarrierOp::create(B, CB.getLoc());
+    auto Sem = CB.getMemorySemantics();
+    if (mlir::spirv::bitEnumContainsAny(
+            Sem, mlir::spirv::MemorySemantics::UniformMemory |
+                     mlir::spirv::MemorySemantics::ImageMemory)) {
+      GPU->setAttr("crucible.device_fence", B.getUnitAttr());
+    }
+    CB.erase();
   }
 
   // Erase rewritten shader-ABI globals and entry/execution-mode ops before
   // running ConvertSPIRVToLLVM.
   for (auto GV : GlobalsToErase)
     GV.erase();
+
+  // Emit addrspace(3) LLVM globals for Workgroup variables now that the
+  // original spirv.GlobalVariable symbols have been erased.
+  {
+    mlir::OpBuilder GB =
+        mlir::OpBuilder::atBlockBegin(&SpvModule.getBodyRegion().front());
+    for (const auto &KV : WorkgroupGlobals) {
+      const WorkgroupGlobalInfo &Info = KV.second;
+      mlir::LLVM::GlobalOp::create(
+          GB, SpvModule.getLoc(), Info.LLVMType, /*isConstant=*/false,
+          mlir::LLVM::Linkage::Internal, Info.Name, /*value=*/mlir::Attribute(),
+          /*alignment=*/0, /*addrSpace=*/3);
+    }
+  }
   SmallVector<mlir::Operation *, 4> MetaOps;
   for (auto EP : SpvModule.getOps<mlir::spirv::EntryPointOp>())
     MetaOps.push_back(EP);
