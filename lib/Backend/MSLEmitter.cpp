@@ -199,48 +199,6 @@ static inline T crucible_wave_wide(T v, uint lane) {
   return acc;
 }
 )MSL";
-  if (Name == "crucible_wave_wide_f64")
-    return R"MSL(template <uint Op, bool Prefix>
-static inline ulong crucible_wave_wide_f64(ulong v, uint lane) {
-  ulong bits = ulong((simd_vote::vote_t)simd_ballot(true));
-  ulong acc = Op == 1u ? 0x3ff0000000000000ul : 0ul;
-  bool first = true;
-  while (bits != 0ul) {
-    uint lo = uint(bits);
-    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(bits >> 32));
-    ulong x = as_type<ulong>(simd_shuffle(as_type<uint2>(v), ushort(src)));
-    if (!Prefix || src < lane) {
-      if (Op == 0u) acc = first ? x : crucible_f64_add(acc, x);
-      if (Op == 1u) acc = first ? x : crucible_f64_mul(acc, x);
-      if (Op == 2u) acc = first ? x : crucible_f64_min(acc, x);
-      if (Op == 3u) acc = first ? x : crucible_f64_max(acc, x);
-      first = false;
-    }
-    bits &= bits - 1ul;
-  }
-  return acc;
-}
-)MSL";
-  if (Name == "crucible_wave_multi_prefix_f64")
-    return R"MSL(template <uint Op>
-static inline ulong crucible_wave_multi_prefix_f64(ulong v, uint mask0,
-                                                   uint mask1, uint lane) {
-  ulong active = ulong((simd_vote::vote_t)simd_ballot(true));
-  ulong acc = Op == 4u ? 0x3ff0000000000000ul : 0ul;
-  while (active != 0ul) {
-    uint lo = uint(active);
-    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(active >> 32));
-    ulong x = as_type<ulong>(simd_shuffle(as_type<uint2>(v), ushort(src)));
-    uint m = src < 32u ? mask0 : mask1;
-    if (src < lane && ((m >> (src & 31u)) & 1u) != 0u) {
-      if (Op == 0u) acc = crucible_f64_add(acc, x);
-      if (Op == 4u) acc = crucible_f64_mul(acc, x);
-    }
-    active &= active - 1ul;
-  }
-  return acc;
-}
-)MSL";
   if (Name == "crucible_wave_prefix_sum")
     return "template <typename T> static inline T crucible_wave_prefix_sum(T v) {\n"
            "  T sum = simd_prefix_exclusive_sum(v);\n"
@@ -332,16 +290,16 @@ static inline T crucible_atomic_cmpxchg_texture2d(
            "  return expected;\n"
            "}\n";
   if (Name == "crucible_f64")
-    return R"MSL(static inline bool crucible_f64_isnan(ulong a) {
+    return R"MSL(__attribute__((unused)) static inline bool crucible_f64_isnan(ulong a) {
   return (a & 0x7ffffffffffffffful) > 0x7ff0000000000000ul;
 }
-static inline bool crucible_f64_isinf(ulong a) {
+__attribute__((unused)) static inline bool crucible_f64_isinf(ulong a) {
   return (a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul;
 }
-static inline bool crucible_f64_isfinite(ulong a) {
+__attribute__((unused)) static inline bool crucible_f64_isfinite(ulong a) {
   return (a & 0x7ff0000000000000ul) != 0x7ff0000000000000ul;
 }
-static inline ulong crucible_f64_norm_round_pack(bool sign, int exp, ulong sig) {
+__attribute__((unused)) static inline ulong crucible_f64_norm_round_pack(bool sign, int exp, ulong sig) {
   if (sig == 0ul) return sign ? 0x8000000000000000ul : 0ul;
   int lz = int(clz(sig));
   if (lz == 0) {
@@ -377,7 +335,7 @@ static inline ulong crucible_f64_norm_round_pack(bool sign, int exp, ulong sig) 
   }
   return sbit | mant;
 }
-static inline ulong crucible_f64_add_mags(ulong a, ulong b, bool sign) {
+__attribute__((unused)) static inline ulong crucible_f64_add_mags(ulong a, ulong b, bool sign) {
   int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
   ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
   if (ea == 0x7ff) {
@@ -409,7 +367,7 @@ static inline ulong crucible_f64_add_mags(ulong a, ulong b, bool sign) {
   if (fa == 0ul && fb == 0ul) return sign ? 0x8000000000000000ul : 0ul;
   return crucible_f64_norm_round_pack(sign, ea, fa + fb);
 }
-static inline ulong crucible_f64_sub_mags(ulong a, ulong b, bool sign) {
+__attribute__((unused)) static inline ulong crucible_f64_sub_mags(ulong a, ulong b, bool sign) {
   int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
   ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
   if (ea == 0x7ff) {
@@ -445,15 +403,15 @@ static inline ulong crucible_f64_sub_mags(ulong a, ulong b, bool sign) {
   if (fa == fb) return 0ul;
   return crucible_f64_norm_round_pack(sign, ea, fa - fb);
 }
-static inline ulong crucible_f64_add(ulong a, ulong b) {
+__attribute__((unused)) static inline ulong crucible_f64_add(ulong a, ulong b) {
   bool sa = (a >> 63) != 0ul, sb = (b >> 63) != 0ul;
   return sa == sb ? crucible_f64_add_mags(a, b, sa)
                   : crucible_f64_sub_mags(a, b, sa);
 }
-static inline ulong crucible_f64_sub(ulong a, ulong b) {
+__attribute__((unused)) static inline ulong crucible_f64_sub(ulong a, ulong b) {
   return crucible_f64_add(a, b ^ 0x8000000000000000ul);
 }
-static inline ulong crucible_f64_mul(ulong a, ulong b) {
+__attribute__((unused)) static inline ulong crucible_f64_mul(ulong a, ulong b) {
   bool sign = ((a ^ b) >> 63) != 0ul;
   int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
   ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
@@ -491,7 +449,7 @@ static inline ulong crucible_f64_mul(ulong a, ulong b) {
   return crucible_f64_norm_round_pack(sign, ea + eb - 1022,
                                       hi | (lo != 0ul ? 1ul : 0ul));
 }
-static inline ulong crucible_f64_fma(ulong a, ulong b, ulong c) {
+__attribute__((unused)) static inline ulong crucible_f64_fma(ulong a, ulong b, ulong c) {
   bool sp = ((a ^ b) >> 63) != 0ul, sc = (c >> 63) != 0ul;
   int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful),
       ec = int((c >> 52) & 0x7fful);
@@ -583,7 +541,7 @@ static inline ulong crucible_f64_fma(ulong a, ulong b, ulong c) {
   return crucible_f64_norm_round_pack(sign, p_exp,
                                       r_hi | (r_lo != 0ul ? 1ul : 0ul));
 }
-static inline ulong crucible_f64_div(ulong a, ulong b) {
+__attribute__((unused)) static inline ulong crucible_f64_div(ulong a, ulong b) {
   bool sign = ((a ^ b) >> 63) != 0ul;
   int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
   ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
@@ -622,7 +580,7 @@ static inline ulong crucible_f64_div(ulong a, ulong b) {
   }
   return crucible_f64_norm_round_pack(sign, exp, (q << 8) | (fa != 0ul ? 1ul : 0ul));
 }
-static inline ulong crucible_f64_sqrt(ulong a) {
+__attribute__((unused)) static inline ulong crucible_f64_sqrt(ulong a) {
   int ea = int((a >> 52) & 0x7fful);
   ulong fa = a & 0x000ffffffffffffful;
   if (ea == 0x7ff && fa != 0ul) return a | 0x0008000000000000ul;
@@ -658,35 +616,35 @@ static inline ulong crucible_f64_sqrt(ulong a) {
   return crucible_f64_norm_round_pack(false, eh + 1023,
                                       (q << 8) | ((rem_hi != 0ul || rem_lo != 0ul) ? 1ul : 0ul));
 }
-static inline bool crucible_f64_cmp_eq(ulong a, ulong b) {
+__attribute__((unused)) static inline bool crucible_f64_cmp_eq(ulong a, ulong b) {
   if (crucible_f64_isnan(a) || crucible_f64_isnan(b)) return false;
   if (((a | b) & 0x7ffffffffffffffful) == 0ul) return true;
   return a == b;
 }
-static inline bool crucible_f64_cmp_lt(ulong a, ulong b) {
+__attribute__((unused)) static inline bool crucible_f64_cmp_lt(ulong a, ulong b) {
   if (crucible_f64_isnan(a) || crucible_f64_isnan(b)) return false;
   if (((a | b) & 0x7ffffffffffffffful) == 0ul) return false;
   bool sa = (a >> 63) != 0ul, sb = (b >> 63) != 0ul;
   if (sa != sb) return sa;
   return sa ? (a > b) : (a < b);
 }
-static inline bool crucible_f64_cmp_le(ulong a, ulong b) {
+__attribute__((unused)) static inline bool crucible_f64_cmp_le(ulong a, ulong b) {
   if (crucible_f64_isnan(a) || crucible_f64_isnan(b)) return false;
   return crucible_f64_cmp_lt(a, b) || crucible_f64_cmp_eq(a, b);
 }
-static inline ulong crucible_f64_min(ulong a, ulong b) {
+__attribute__((unused)) static inline ulong crucible_f64_min(ulong a, ulong b) {
   if (crucible_f64_isnan(a)) return b;
   if (crucible_f64_isnan(b)) return a;
   if (((a | b) & 0x7ffffffffffffffful) == 0ul) return a | b;
   return crucible_f64_cmp_lt(a, b) ? a : b;
 }
-static inline ulong crucible_f64_max(ulong a, ulong b) {
+__attribute__((unused)) static inline ulong crucible_f64_max(ulong a, ulong b) {
   if (crucible_f64_isnan(a)) return b;
   if (crucible_f64_isnan(b)) return a;
   if (((a | b) & 0x7ffffffffffffffful) == 0ul) return a & b;
   return crucible_f64_cmp_lt(a, b) ? b : a;
 }
-static inline ulong crucible_f64_round(ulong a, int mode) {
+__attribute__((unused)) static inline ulong crucible_f64_round(ulong a, int mode) {
   int ea = int((a >> 52) & 0x7fful);
   if (ea >= 1075) return a;
   ulong sbit = a & 0x8000000000000000ul;
@@ -713,7 +671,7 @@ static inline ulong crucible_f64_round(ulong a, int mode) {
   }
   return res;
 }
-static inline ulong crucible_f32_to_f64(float f) {
+__attribute__((unused)) static inline ulong crucible_f32_to_f64(float f) {
   uint u = as_type<uint>(f);
   ulong sbit = ulong(u & 0x80000000u) << 32;
   uint e = (u >> 23) & 0xffu;
@@ -730,7 +688,7 @@ static inline ulong crucible_f32_to_f64(float f) {
   }
   return sbit | (ulong(e - 127u + 1023u) << 52) | (ulong(frac) << 29);
 }
-static inline float crucible_f64_to_f32(ulong a) {
+__attribute__((unused)) static inline float crucible_f64_to_f32(ulong a) {
   uint sbit = uint((a >> 32) & 0x80000000ul);
   int ea = int((a >> 52) & 0x7fful);
   ulong fa = a & 0x000ffffffffffffful;
@@ -762,7 +720,7 @@ static inline float crucible_f64_to_f32(ulong a) {
   }
   return as_type<float>(sbit | mant);
 }
-static inline ulong crucible_u64_to_f64(ulong u) {
+__attribute__((unused)) static inline ulong crucible_u64_to_f64(ulong u) {
   if (u == 0ul) return 0ul;
   int lz = int(clz(u));
   int exp = 1023 + 63 - lz;
@@ -770,7 +728,7 @@ static inline ulong crucible_u64_to_f64(ulong u) {
   if (lz == 0) exp = 1023 + 63; // bit 62 corresponds to 2^63 when shifted right 1
   return crucible_f64_norm_round_pack(false, exp, sig);
 }
-static inline ulong crucible_i64_to_f64(long s) {
+__attribute__((unused)) static inline ulong crucible_i64_to_f64(long s) {
   if (s == 0l) return 0ul;
   bool sign = s < 0l;
   ulong u = sign ? ulong(-s) : ulong(s);
@@ -779,7 +737,7 @@ static inline ulong crucible_i64_to_f64(long s) {
   ulong sig = (lz == 0) ? ((u >> 1) | (u & 1ul)) : (u << (lz - 1));
   return crucible_f64_norm_round_pack(sign, exp, sig);
 }
-static inline ulong crucible_f64_to_u64(ulong a) {
+__attribute__((unused)) static inline ulong crucible_f64_to_u64(ulong a) {
   if ((a >> 63) != 0ul) return 0ul;
   int ea = int((a >> 52) & 0x7fful);
   if (ea < 1023) return 0ul;
@@ -788,7 +746,7 @@ static inline ulong crucible_f64_to_u64(ulong a) {
   int shift = ea - 1023 - 52;
   return shift >= 0 ? (fa << shift) : (fa >> (-shift));
 }
-static inline long crucible_f64_to_i64(ulong a) {
+__attribute__((unused)) static inline long crucible_f64_to_i64(ulong a) {
   bool sign = (a >> 63) != 0ul;
   int ea = int((a >> 52) & 0x7fful);
   if (ea < 1023) return 0l;
@@ -3280,14 +3238,6 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     if (Args[1].getType().isInteger(1))
       return Expr{"(simd_all(" + A->Text + ") || !simd_any(" + A->Text + "))",
                   PrecPrimary};
-    if (Args[1].getType().isF64()) {
-      requireHelper("crucible_f64");
-      First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
-              A->Text + ")))";
-      return Expr{"simd_all(crucible_f64_cmp_eq(" + A->Text + ", " + First +
-                      "))",
-                  PrecPrimary};
-    }
     if (Args[1].getType().isInteger(64)) {
       First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
               A->Text + ")))";
@@ -3325,7 +3275,7 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
       return Expr{"bool(" + Fn.str() + "(uint(" + V->Text + ")" + LaneArg +
                       "))",
                   PrecPrimary};
-    if (T.isInteger(64) || T.isF64())
+    if (T.isInteger(64))
       return Expr{"as_type<ulong>(" + Fn.str() + "(as_type<uint2>(" +
                       V->Text + ")" + LaneArg + "))",
                   PrecPrimary};
@@ -3365,15 +3315,6 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     // Signed min/max (and ordering-sensitive prefix ops) need signed views;
     // sums/products are bit-identical for signed and unsigned.
     bool SignedOrder = IsSigned && (Fn == "simd_min" || Fn == "simd_max");
-    if (T.isF64()) {
-      requireHelper("crucible_f64");
-      requireHelper("crucible_wave_wide_f64");
-      UsesLane |= Prefix;
-      return Expr{"crucible_wave_wide_f64<" + std::to_string(*Kind) + ", " +
-                      (Prefix ? "true" : "false") + ">(" + V->Text + ", " +
-                      (Prefix ? "lane" : "0u") + ")",
-                  PrecPrimary};
-    }
     if (T.isInteger(64)) {
       requireHelper("crucible_wave_wide");
       UsesLane |= Prefix;
@@ -3475,14 +3416,6 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
       return M1.takeError();
     requireHelper("crucible_wave_multi_prefix");
     UsesLane = true;
-    if (T.isF64()) {
-      requireHelper("crucible_f64");
-      requireHelper("crucible_wave_multi_prefix_f64");
-      return Expr{"crucible_wave_multi_prefix_f64<" + std::to_string(*Kind) +
-                      ">(" + V->Text + ", " + M0->Text + ", " + M1->Text +
-                      ", lane)",
-                  PrecPrimary};
-    }
     if (T.isF16())
       return Expr{"half(crucible_wave_multi_prefix_arith<float, " +
                       std::to_string(*Kind) + ">(float(" + V->Text + "), " +
