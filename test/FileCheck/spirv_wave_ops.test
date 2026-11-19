@@ -1,0 +1,13 @@
+# SPIR-V -> MSL test: wave/subgroup sum, broadcast_first, prefix_exclusive_sum via gpu.* dialect.
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.1 -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/wave_ops.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK-NEXT: device uint* Out {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: simd_sum(dtid.x)
+# CHECK: simd_broadcast_first(dtid.x)
+# CHECK: simd_prefix_exclusive_sum(1u)
+# CHECK: Out[dtid.x] =

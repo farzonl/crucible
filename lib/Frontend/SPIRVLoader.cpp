@@ -193,8 +193,16 @@ mlir::LLVM::LLVMStructType getOrInitCBufRetType(mlir::MLIRContext *Ctx,
                                                 mlir::Type ElemTy) {
   std::string Name = "dx.types.CBufRet." + typeSuffix(ElemTy);
   auto ST = mlir::LLVM::LLVMStructType::getIdentified(Ctx, Name);
-  if (!ST.isInitialized())
-    (void)ST.setBody({ElemTy, ElemTy, ElemTy, ElemTy}, /*isPacked=*/false);
+  if (!ST.isInitialized()) {
+    if (ElemTy.isF16() || ElemTy.isInteger(16))
+      (void)ST.setBody(
+          {ElemTy, ElemTy, ElemTy, ElemTy, ElemTy, ElemTy, ElemTy, ElemTy},
+          /*isPacked=*/false);
+    else if (ElemTy.isF64() || ElemTy.isInteger(64))
+      (void)ST.setBody({ElemTy, ElemTy}, /*isPacked=*/false);
+    else
+      (void)ST.setBody({ElemTy, ElemTy, ElemTy, ElemTy}, /*isPacked=*/false);
+  }
   return ST;
 }
 
@@ -485,6 +493,21 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(U);
         if (!Load)
           return makeError("unsupported user of built-in global '{0}'", Sym);
+        if (BI == mlir::spirv::BuiltIn::SubgroupLocalInvocationId ||
+            BI == mlir::spirv::BuiltIn::SubgroupSize) {
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          mlir::Value IdxVal =
+              BI == mlir::spirv::BuiltIn::SubgroupLocalInvocationId
+                  ? mlir::Value(mlir::gpu::LaneIdOp::create(B, Loc, /*upper_bound=*/nullptr))
+                  : mlir::Value(mlir::gpu::SubgroupSizeOp::create(B, Loc, /*upper_bound=*/nullptr));
+          mlir::Type DstTy = makeSignless(Load.getType(), B);
+          auto Cast =
+              mlir::arith::IndexCastUIOp::create(B, Loc, DstTy, IdxVal);
+          Load.replaceAllUsesWith(Cast.getResult());
+          Load.erase();
+          continue;
+        }
         if (BI == mlir::spirv::BuiltIn::LocalInvocationIndex) {
           mlir::OpBuilder B(Load);
           mlir::Location Loc = Load.getLoc();
@@ -695,7 +718,6 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         }
 
         uint32_t Row = ByteOffset / 16u;
-        uint32_t Comp = (ByteOffset % 16u) / 4u;
 
         SmallVector<mlir::Operation *, 4> MemUsers(Chain->getUsers().begin(),
                                                    Chain->getUsers().end());
@@ -706,6 +728,8 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           mlir::OpBuilder B(Load);
           mlir::Location Loc = Load.getLoc();
           mlir::Type ValTy = makeSignless(Load.getType(), B);
+          uint32_t ElemBytes = scalarTypeBytes(ValTy);
+          uint32_t Comp = (ByteOffset % 16u) / ElemBytes;
           auto RetTy = getOrInitCBufRetType(&Ctx, ValTy);
           std::string Callee = "dx.op.cbufferLoadLegacy." + typeSuffix(ValTy);
           auto FnTy = mlir::LLVM::LLVMFunctionType::get(
@@ -880,6 +904,186 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     }
     CB.erase();
   }
+
+  // 3e. Lower spirv.GroupNonUniform* subgroup ops -> Layer 1 gpu.* ops.
+  auto lowerGroupOp = [&](mlir::Operation *Op) {
+    mlir::OpBuilder B(Op);
+    mlir::Location Loc = Op->getLoc();
+
+    auto emitReduce = [&](mlir::Value Val,
+                          mlir::gpu::AllReduceOperation ReduceOp,
+                          mlir::spirv::GroupOperation GroupOp) {
+      auto Red = mlir::gpu::SubgroupReduceOp::create(B, Loc, Val, ReduceOp,
+                                                     /*uniform=*/false);
+      if (GroupOp == mlir::spirv::GroupOperation::ExclusiveScan)
+        Red->setAttr("crucible.scan_kind", B.getStringAttr("exclusive"));
+      else if (GroupOp == mlir::spirv::GroupOperation::InclusiveScan)
+        Red->setAttr("crucible.scan_kind", B.getStringAttr("inclusive"));
+      Op->getResult(0).replaceAllUsesWith(Red.getResult());
+      Op->erase();
+    };
+
+    if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformIAddOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::ADD,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFAddOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::ADD,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformIMulOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MUL,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFMulOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MUL,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformSMinOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINSI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformUMinOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINUI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFMinOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINNUMF,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformSMaxOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXSI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformUMaxOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXUI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFMaxOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXNUMF,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseAndOp>(
+                   Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::AND,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseOrOp>(
+                   Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::OR,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseXorOp>(
+                   Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::XOR,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<
+                   mlir::spirv::GroupNonUniformBroadcastFirstOp>(Op)) {
+      auto BC = mlir::gpu::SubgroupBroadcastOp::create(
+          B, Loc, G.getValue(), /*subgroupId=*/nullptr,
+          mlir::gpu::BroadcastType::first_active_lane);
+      G.replaceAllUsesWith(BC.getResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformBroadcastOp>(Op)) {
+      auto BC = mlir::gpu::SubgroupBroadcastOp::create(
+          B, Loc, G.getValue(), G.getId(),
+          mlir::gpu::BroadcastType::specific_lane);
+      G.replaceAllUsesWith(BC.getResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleOp>(Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(
+          B, Loc, G.getValue(), G.getId(), Width, mlir::gpu::ShuffleMode::IDX);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleXorOp>(
+                   Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(
+          B, Loc, G.getValue(), G.getMask(), Width, mlir::gpu::ShuffleMode::XOR);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleUpOp>(
+                   Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(
+          B, Loc, G.getValue(), G.getDelta(), Width, mlir::gpu::ShuffleMode::UP);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleDownOp>(
+                       Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(B, Loc, G.getValue(),
+                                               G.getDelta(), Width,
+                                               mlir::gpu::ShuffleMode::DOWN);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformElectOp>(Op)) {
+      auto One = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 1);
+      auto Zero = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+      auto Scan = mlir::gpu::SubgroupReduceOp::create(
+          B, Loc, One.getResult(), mlir::gpu::AllReduceOperation::ADD, false);
+      Scan->setAttr("crucible.scan_kind", B.getStringAttr("exclusive"));
+      auto Cmp = mlir::LLVM::ICmpOp::create(
+          B, Loc, mlir::LLVM::ICmpPredicate::eq, Scan.getResult(),
+          Zero.getResult());
+      G.replaceAllUsesWith(Cmp.getResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformBallotOp>(Op)) {
+      auto Bal = mlir::gpu::BallotOp::create(B, Loc, I32Ty, G.getPredicate());
+      SmallVector<mlir::Operation *, 4> Users(G->getUsers().begin(),
+                                              G->getUsers().end());
+      for (mlir::Operation *U : Users) {
+        if (auto Ext = mlir::dyn_cast<mlir::spirv::CompositeExtractOp>(U)) {
+          if (Ext.getIndices().size() == 1) {
+            int64_t Idx =
+                mlir::cast<mlir::IntegerAttr>(Ext.getIndices()[0]).getInt();
+            mlir::OpBuilder EB(Ext);
+            mlir::Value Rep =
+                Idx == 0
+                    ? Bal.getResult()
+                    : mlir::LLVM::ConstantOp::create(EB, Ext.getLoc(), I32Ty, 0)
+                          .getResult();
+            Ext.replaceAllUsesWith(Rep);
+            Ext.erase();
+          }
+        } else if (auto BC = mlir::dyn_cast<
+                       mlir::spirv::GroupNonUniformBallotBitCountOp>(U)) {
+          mlir::OpBuilder BCB(BC);
+          mlir::Location BLoc = BC.getLoc();
+          mlir::Value Masked = Bal.getResult();
+          if (BC.getGroupOperation() ==
+              mlir::spirv::GroupOperation::ExclusiveScan) {
+            auto LaneIdx =
+                mlir::gpu::LaneIdOp::create(BCB, BLoc, /*upper_bound=*/nullptr);
+            auto Lane =
+                mlir::arith::IndexCastUIOp::create(BCB, BLoc, I32Ty, LaneIdx);
+            auto One = mlir::LLVM::ConstantOp::create(BCB, BLoc, I32Ty, 1);
+            auto Shl = mlir::LLVM::ShlOp::create(BCB, BLoc, One, Lane);
+            auto Mask = mlir::LLVM::SubOp::create(BCB, BLoc, Shl, One);
+            Masked = mlir::LLVM::AndOp::create(BCB, BLoc, Masked, Mask);
+          }
+          auto Pop = mlir::math::CtPopOp::create(BCB, BLoc, Masked);
+          BC.replaceAllUsesWith(Pop.getResult());
+          BC.erase();
+        }
+      }
+      if (G->use_empty())
+        G.erase();
+    }
+  };
+
+  SmallVector<mlir::Operation *, 16> SubgroupOps;
+  EntryFn.walk([&](mlir::Operation *Op) {
+    StringRef Name = Op->getName().getStringRef();
+    if (Name.starts_with("spirv.GroupNonUniform") &&
+        Name != "spirv.GroupNonUniformBallotBitCount")
+      SubgroupOps.push_back(Op);
+  });
+  for (mlir::Operation *Op : SubgroupOps)
+    lowerGroupOp(Op);
 
   // Erase rewritten shader-ABI globals and entry/execution-mode ops before
   // running ConvertSPIRVToLLVM.
