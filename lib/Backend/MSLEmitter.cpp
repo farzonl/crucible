@@ -199,6 +199,48 @@ static inline T crucible_wave_wide(T v, uint lane) {
   return acc;
 }
 )MSL";
+  if (Name == "crucible_wave_wide_f64")
+    return R"MSL(template <uint Op, bool Prefix>
+static inline ulong crucible_wave_wide_f64(ulong v, uint lane) {
+  ulong bits = ulong((simd_vote::vote_t)simd_ballot(true));
+  ulong acc = Op == 1u ? 0x3ff0000000000000ul : 0ul;
+  bool first = true;
+  while (bits != 0ul) {
+    uint lo = uint(bits);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(bits >> 32));
+    ulong x = as_type<ulong>(simd_shuffle(as_type<uint2>(v), ushort(src)));
+    if (!Prefix || src < lane) {
+      if (Op == 0u) acc = first ? x : crucible_f64_add(acc, x);
+      if (Op == 1u) acc = first ? x : crucible_f64_mul(acc, x);
+      if (Op == 2u) acc = first ? x : crucible_f64_min(acc, x);
+      if (Op == 3u) acc = first ? x : crucible_f64_max(acc, x);
+      first = false;
+    }
+    bits &= bits - 1ul;
+  }
+  return acc;
+}
+)MSL";
+  if (Name == "crucible_wave_multi_prefix_f64")
+    return R"MSL(template <uint Op>
+static inline ulong crucible_wave_multi_prefix_f64(ulong v, uint mask0,
+                                                   uint mask1, uint lane) {
+  ulong active = ulong((simd_vote::vote_t)simd_ballot(true));
+  ulong acc = Op == 4u ? 0x3ff0000000000000ul : 0ul;
+  while (active != 0ul) {
+    uint lo = uint(active);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(active >> 32));
+    ulong x = as_type<ulong>(simd_shuffle(as_type<uint2>(v), ushort(src)));
+    uint m = src < 32u ? mask0 : mask1;
+    if (src < lane && ((m >> (src & 31u)) & 1u) != 0u) {
+      if (Op == 0u) acc = crucible_f64_add(acc, x);
+      if (Op == 4u) acc = crucible_f64_mul(acc, x);
+    }
+    active &= active - 1ul;
+  }
+  return acc;
+}
+)MSL";
   if (Name == "crucible_wave_prefix_sum")
     return "template <typename T> static inline T crucible_wave_prefix_sum(T v) {\n"
            "  T sum = simd_prefix_exclusive_sum(v);\n"
@@ -289,6 +331,475 @@ static inline T crucible_atomic_cmpxchg_texture2d(
            "  }\n"
            "  return expected;\n"
            "}\n";
+  if (Name == "crucible_f64")
+    return R"MSL(static inline bool crucible_f64_isnan(ulong a) {
+  return (a & 0x7ffffffffffffffful) > 0x7ff0000000000000ul;
+}
+static inline bool crucible_f64_isinf(ulong a) {
+  return (a & 0x7ffffffffffffffful) == 0x7ff0000000000000ul;
+}
+static inline bool crucible_f64_isfinite(ulong a) {
+  return (a & 0x7ff0000000000000ul) != 0x7ff0000000000000ul;
+}
+static inline ulong crucible_f64_norm_round_pack(bool sign, int exp, ulong sig) {
+  if (sig == 0ul) return sign ? 0x8000000000000000ul : 0ul;
+  int lz = int(clz(sig));
+  if (lz == 0) {
+    sig = (sig >> 1) | (sig & 1ul);
+    exp += 1;
+  } else if (lz > 1) {
+    int shift = lz - 1;
+    sig <<= shift;
+    exp -= shift;
+  }
+  if (exp <= 0) {
+    int shift = 1 - exp;
+    if (shift >= 64) {
+      sig = 1ul;
+    } else {
+      ulong sticky = (sig & ((1ul << shift) - 1ul)) != 0ul ? 1ul : 0ul;
+      sig = (sig >> shift) | sticky;
+    }
+    exp = 0;
+  }
+  ulong round_bits = sig & 0x3fful;
+  ulong mant = sig >> 10;
+  if (round_bits > 0x200ul || (round_bits == 0x200ul && (mant & 1ul) != 0ul))
+    mant += 1ul;
+  ulong sbit = sign ? 0x8000000000000000ul : 0ul;
+  if (exp > 0) {
+    if (mant >= 0x0020000000000000ul) {
+      mant >>= 1;
+      exp += 1;
+    }
+    if (exp >= 0x7ff) return sbit | 0x7ff0000000000000ul;
+    return sbit | (ulong(exp) << 52) | (mant & 0x000ffffffffffffful);
+  }
+  return sbit | mant;
+}
+static inline ulong crucible_f64_add_mags(ulong a, ulong b, bool sign) {
+  int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
+  if (ea == 0x7ff) {
+    if (fa != 0ul) return a | 0x0008000000000000ul;
+    if (eb == 0x7ff && fb != 0ul) return b | 0x0008000000000000ul;
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (eb == 0x7ff) {
+    if (fb != 0ul) return b | 0x0008000000000000ul;
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (ea != 0) fa |= 0x0010000000000000ul; else ea = 1;
+  if (eb != 0) fb |= 0x0010000000000000ul; else eb = 1;
+  fa <<= 10;
+  fb <<= 10;
+  if (ea < eb) {
+    int te = ea; ea = eb; eb = te;
+    ulong tf = fa; fa = fb; fb = tf;
+  }
+  int diff = ea - eb;
+  if (diff > 0) {
+    if (diff >= 64) {
+      fb = fb != 0ul ? 1ul : 0ul;
+    } else {
+      ulong sticky = (fb & ((1ul << diff) - 1ul)) != 0ul ? 1ul : 0ul;
+      fb = (fb >> diff) | sticky;
+    }
+  }
+  if (fa == 0ul && fb == 0ul) return sign ? 0x8000000000000000ul : 0ul;
+  return crucible_f64_norm_round_pack(sign, ea, fa + fb);
+}
+static inline ulong crucible_f64_sub_mags(ulong a, ulong b, bool sign) {
+  int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
+  if (ea == 0x7ff) {
+    if (fa != 0ul) return a | 0x0008000000000000ul;
+    if (eb == 0x7ff) {
+      if (fb != 0ul) return b | 0x0008000000000000ul;
+      return 0x7ff8000000000000ul;
+    }
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (eb == 0x7ff) {
+    if (fb != 0ul) return b | 0x0008000000000000ul;
+    return (!sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (ea != 0) fa |= 0x0010000000000000ul; else ea = 1;
+  if (eb != 0) fb |= 0x0010000000000000ul; else eb = 1;
+  fa <<= 10;
+  fb <<= 10;
+  if (ea < eb || (ea == eb && fa < fb)) {
+    int te = ea; ea = eb; eb = te;
+    ulong tf = fa; fa = fb; fb = tf;
+    sign = !sign;
+  }
+  int diff = ea - eb;
+  if (diff > 0) {
+    if (diff >= 64) {
+      fb = fb != 0ul ? 1ul : 0ul;
+    } else {
+      ulong sticky = (fb & ((1ul << diff) - 1ul)) != 0ul ? 1ul : 0ul;
+      fb = (fb >> diff) | sticky;
+    }
+  }
+  if (fa == fb) return 0ul;
+  return crucible_f64_norm_round_pack(sign, ea, fa - fb);
+}
+static inline ulong crucible_f64_add(ulong a, ulong b) {
+  bool sa = (a >> 63) != 0ul, sb = (b >> 63) != 0ul;
+  return sa == sb ? crucible_f64_add_mags(a, b, sa)
+                  : crucible_f64_sub_mags(a, b, sa);
+}
+static inline ulong crucible_f64_sub(ulong a, ulong b) {
+  return crucible_f64_add(a, b ^ 0x8000000000000000ul);
+}
+static inline ulong crucible_f64_mul(ulong a, ulong b) {
+  bool sign = ((a ^ b) >> 63) != 0ul;
+  int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
+  if (ea == 0x7ff) {
+    if (fa != 0ul) return a | 0x0008000000000000ul;
+    if (eb == 0x7ff && fb != 0ul) return b | 0x0008000000000000ul;
+    if ((b & 0x7ffffffffffffffful) == 0ul) return 0x7ff8000000000000ul;
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (eb == 0x7ff) {
+    if (fb != 0ul) return b | 0x0008000000000000ul;
+    if ((a & 0x7ffffffffffffffful) == 0ul) return 0x7ff8000000000000ul;
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if ((a & 0x7ffffffffffffffful) == 0ul || (b & 0x7ffffffffffffffful) == 0ul)
+    return sign ? 0x8000000000000000ul : 0ul;
+  if (ea == 0) {
+    int lz = int(clz(fa)) - 11;
+    fa <<= lz;
+    ea = 1 - lz;
+  } else {
+    fa |= 0x0010000000000000ul;
+  }
+  if (eb == 0) {
+    int lz = int(clz(fb)) - 11;
+    fb <<= lz;
+    eb = 1 - lz;
+  } else {
+    fb |= 0x0010000000000000ul;
+  }
+  fa <<= 10;
+  fb <<= 11;
+  ulong hi = mulhi(fa, fb);
+  ulong lo = fa * fb;
+  return crucible_f64_norm_round_pack(sign, ea + eb - 1022,
+                                      hi | (lo != 0ul ? 1ul : 0ul));
+}
+static inline ulong crucible_f64_fma(ulong a, ulong b, ulong c) {
+  bool sp = ((a ^ b) >> 63) != 0ul, sc = (c >> 63) != 0ul;
+  int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful),
+      ec = int((c >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful,
+        fc = c & 0x000ffffffffffffful;
+  if (ea == 0x7ff && fa != 0ul) return a | 0x0008000000000000ul;
+  if (eb == 0x7ff && fb != 0ul) return b | 0x0008000000000000ul;
+  if (ec == 0x7ff && fc != 0ul) return c | 0x0008000000000000ul;
+  if (ea == 0x7ff || eb == 0x7ff) {
+    if ((a & 0x7ffffffffffffffful) == 0ul || (b & 0x7ffffffffffffffful) == 0ul)
+      return 0x7ff8000000000000ul;
+    if (ec == 0x7ff && sp != sc) return 0x7ff8000000000000ul;
+    return (sp ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (ec == 0x7ff) return c;
+  if ((a & 0x7ffffffffffffffful) == 0ul || (b & 0x7ffffffffffffffful) == 0ul) {
+    if ((c & 0x7ffffffffffffffful) == 0ul)
+      return (sp && sc) ? 0x8000000000000000ul : 0ul;
+    return c;
+  }
+  if (ea == 0) {
+    int lz = int(clz(fa)) - 11; fa <<= lz; ea = 1 - lz;
+  } else { fa |= 0x0010000000000000ul; }
+  if (eb == 0) {
+    int lz = int(clz(fb)) - 11; fb <<= lz; eb = 1 - lz;
+  } else { fb |= 0x0010000000000000ul; }
+  fa <<= 10;
+  fb <<= 11;
+  ulong p_hi = mulhi(fa, fb);
+  ulong p_lo = fa * fb;
+  int p_exp = ea + eb - 1022;
+  if ((p_hi & 0x4000000000000000ul) == 0ul) {
+    p_hi = (p_hi << 1) | (p_lo >> 63);
+    p_lo <<= 1;
+    p_exp -= 1;
+  }
+  if ((c & 0x7ffffffffffffffful) == 0ul)
+    return crucible_f64_norm_round_pack(sp, p_exp,
+                                        p_hi | (p_lo != 0ul ? 1ul : 0ul));
+  if (ec == 0) {
+    int lz = int(clz(fc)) - 11; fc <<= lz; ec = 1 - lz;
+  } else { fc |= 0x0010000000000000ul; }
+  ulong c_hi = fc << 10;
+  ulong c_lo = 0ul;
+  int c_exp = ec;
+  bool sign = sp;
+  if (sp != sc && p_exp == c_exp && p_hi == c_hi && p_lo == c_lo)
+    return 0ul;
+  if (p_exp < c_exp ||
+      (p_exp == c_exp && (p_hi < c_hi || (p_hi == c_hi && p_lo < c_lo)))) {
+    int te = p_exp; p_exp = c_exp; c_exp = te;
+    ulong th = p_hi; p_hi = c_hi; c_hi = th;
+    ulong tl = p_lo; p_lo = c_lo; c_lo = tl;
+    sign = sc;
+  }
+  int diff = p_exp - c_exp;
+  if (diff > 0) {
+    if (diff >= 128) {
+      c_lo = (c_hi != 0ul || c_lo != 0ul) ? 1ul : 0ul;
+      c_hi = 0ul;
+    } else if (diff >= 64) {
+      int s = diff - 64;
+      ulong sticky = (c_lo != 0ul || (s > 0 && (c_hi & ((1ul << s) - 1ul)) != 0ul)) ? 1ul : 0ul;
+      c_lo = (c_hi >> s) | sticky;
+      c_hi = 0ul;
+    } else {
+      ulong sticky = (c_lo & ((1ul << diff) - 1ul)) != 0ul ? 1ul : 0ul;
+      c_lo = (c_hi << (64 - diff)) | (c_lo >> diff) | sticky;
+      c_hi >>= diff;
+    }
+  }
+  ulong r_hi, r_lo;
+  if (sp == sc) {
+    r_lo = p_lo + c_lo;
+    r_hi = p_hi + c_hi + (r_lo < p_lo ? 1ul : 0ul);
+  } else {
+    r_lo = p_lo - c_lo;
+    r_hi = p_hi - c_hi - (p_lo < c_lo ? 1ul : 0ul);
+  }
+  if (r_hi == 0ul && r_lo == 0ul) return 0ul;
+  if (r_hi == 0ul) {
+    int lz = int(clz(r_lo));
+    r_hi = r_lo << lz;
+    r_lo = 0ul;
+    p_exp -= 64 + lz - 1;
+    // Place leading 1 at bit 62
+    r_hi = (r_hi >> 1);
+  }
+  return crucible_f64_norm_round_pack(sign, p_exp,
+                                      r_hi | (r_lo != 0ul ? 1ul : 0ul));
+}
+static inline ulong crucible_f64_div(ulong a, ulong b) {
+  bool sign = ((a ^ b) >> 63) != 0ul;
+  int ea = int((a >> 52) & 0x7fful), eb = int((b >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful, fb = b & 0x000ffffffffffffful;
+  if (ea == 0x7ff && fa != 0ul) return a | 0x0008000000000000ul;
+  if (eb == 0x7ff && fb != 0ul) return b | 0x0008000000000000ul;
+  if (ea == 0x7ff) {
+    if (eb == 0x7ff) return 0x7ff8000000000000ul;
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if (eb == 0x7ff) return sign ? 0x8000000000000000ul : 0ul;
+  if ((b & 0x7ffffffffffffffful) == 0ul) {
+    if ((a & 0x7ffffffffffffffful) == 0ul) return 0x7ff8000000000000ul;
+    return (sign ? 0x8000000000000000ul : 0ul) | 0x7ff0000000000000ul;
+  }
+  if ((a & 0x7ffffffffffffffful) == 0ul)
+    return sign ? 0x8000000000000000ul : 0ul;
+  if (ea == 0) {
+    int lz = int(clz(fa)) - 11; fa <<= lz; ea = 1 - lz;
+  } else { fa |= 0x0010000000000000ul; }
+  if (eb == 0) {
+    int lz = int(clz(fb)) - 11; fb <<= lz; eb = 1 - lz;
+  } else { fb |= 0x0010000000000000ul; }
+  int exp = ea - eb + 1023;
+  if (fa < fb) {
+    fa <<= 1;
+    exp -= 1;
+  }
+  ulong q = 0ul;
+  for (int i = 0; i < 55; ++i) {
+    q <<= 1;
+    if (fa >= fb) {
+      fa -= fb;
+      q |= 1ul;
+    }
+    fa <<= 1;
+  }
+  return crucible_f64_norm_round_pack(sign, exp, (q << 8) | (fa != 0ul ? 1ul : 0ul));
+}
+static inline ulong crucible_f64_sqrt(ulong a) {
+  int ea = int((a >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful;
+  if (ea == 0x7ff && fa != 0ul) return a | 0x0008000000000000ul;
+  if ((a & 0x7ffffffffffffffful) == 0ul) return a;
+  if ((a >> 63) != 0ul) return 0x7ff8000000000000ul;
+  if (ea == 0x7ff) return a;
+  if (ea == 0) {
+    int lz = int(clz(fa)) - 11;
+    fa <<= lz;
+    ea = 1 - lz;
+  } else {
+    fa |= 0x0010000000000000ul;
+  }
+  int eu = ea - 1023;
+  int er = eu & 1;
+  int eh = (eu - er) / 2;
+  if (er != 0) fa <<= 1;
+  ulong r_hi = fa << 10;
+  ulong rem_hi = 0ul, rem_lo = 0ul, q = 0ul;
+  for (int i = 0; i < 55; ++i) {
+    rem_hi = (rem_hi << 2) | (rem_lo >> 62);
+    rem_lo = (rem_lo << 2) | (r_hi >> 62);
+    r_hi <<= 2;
+    ulong trial = (q << 2) | 1ul;
+    if (rem_hi > 0ul || rem_lo >= trial) {
+      if (rem_lo < trial) rem_hi -= 1ul;
+      rem_lo -= trial;
+      q = (q << 1) | 1ul;
+    } else {
+      q <<= 1;
+    }
+  }
+  return crucible_f64_norm_round_pack(false, eh + 1023,
+                                      (q << 8) | ((rem_hi != 0ul || rem_lo != 0ul) ? 1ul : 0ul));
+}
+static inline bool crucible_f64_cmp_eq(ulong a, ulong b) {
+  if (crucible_f64_isnan(a) || crucible_f64_isnan(b)) return false;
+  if (((a | b) & 0x7ffffffffffffffful) == 0ul) return true;
+  return a == b;
+}
+static inline bool crucible_f64_cmp_lt(ulong a, ulong b) {
+  if (crucible_f64_isnan(a) || crucible_f64_isnan(b)) return false;
+  if (((a | b) & 0x7ffffffffffffffful) == 0ul) return false;
+  bool sa = (a >> 63) != 0ul, sb = (b >> 63) != 0ul;
+  if (sa != sb) return sa;
+  return sa ? (a > b) : (a < b);
+}
+static inline bool crucible_f64_cmp_le(ulong a, ulong b) {
+  if (crucible_f64_isnan(a) || crucible_f64_isnan(b)) return false;
+  return crucible_f64_cmp_lt(a, b) || crucible_f64_cmp_eq(a, b);
+}
+static inline ulong crucible_f64_min(ulong a, ulong b) {
+  if (crucible_f64_isnan(a)) return b;
+  if (crucible_f64_isnan(b)) return a;
+  if (((a | b) & 0x7ffffffffffffffful) == 0ul) return a | b;
+  return crucible_f64_cmp_lt(a, b) ? a : b;
+}
+static inline ulong crucible_f64_max(ulong a, ulong b) {
+  if (crucible_f64_isnan(a)) return b;
+  if (crucible_f64_isnan(b)) return a;
+  if (((a | b) & 0x7ffffffffffffffful) == 0ul) return a & b;
+  return crucible_f64_cmp_lt(a, b) ? b : a;
+}
+static inline ulong crucible_f64_round(ulong a, int mode) {
+  int ea = int((a >> 52) & 0x7fful);
+  if (ea >= 1075) return a;
+  ulong sbit = a & 0x8000000000000000ul;
+  bool sign = sbit != 0ul;
+  if (ea < 1023) {
+    if ((a & 0x7ffffffffffffffful) == 0ul) return a;
+    if (mode == 0) return sbit;
+    if (mode == 1) return sign ? 0xbff0000000000000ul : 0ul;
+    if (mode == 2) return sign ? 0x8000000000000000ul : 0x3ff0000000000000ul;
+    ulong mag = a & 0x7ffffffffffffffful;
+    return mag > 0x3fe0000000000000ul ? (sbit | 0x3ff0000000000000ul) : sbit;
+  }
+  int fbits = 52 - (ea - 1023);
+  ulong mask = (1ul << fbits) - 1ul;
+  ulong frac = a & mask;
+  if (frac == 0ul) return a;
+  ulong res = a & ~mask;
+  ulong inc = 1ul << fbits;
+  if ((mode == 1 && sign) || (mode == 2 && !sign)) {
+    res += inc;
+  } else if (mode == 3) {
+    ulong half_bit = 1ul << (fbits - 1);
+    if (frac > half_bit || (frac == half_bit && (res & inc) != 0ul)) res += inc;
+  }
+  return res;
+}
+static inline ulong crucible_f32_to_f64(float f) {
+  uint u = as_type<uint>(f);
+  ulong sbit = ulong(u & 0x80000000u) << 32;
+  uint e = (u >> 23) & 0xffu;
+  uint frac = u & 0x7fffffu;
+  if (e == 0xffu) {
+    if (frac != 0u) return sbit | 0x7ff8000000000000ul | (ulong(frac) << 29);
+    return sbit | 0x7ff0000000000000ul;
+  }
+  if (e == 0u) {
+    if (frac == 0u) return sbit;
+    int lz = int(clz(frac)) - 8;
+    frac <<= lz;
+    return sbit | (ulong(1023 - 126 - lz) << 52) | (ulong(frac & 0x7fffffu) << 29);
+  }
+  return sbit | (ulong(e - 127u + 1023u) << 52) | (ulong(frac) << 29);
+}
+static inline float crucible_f64_to_f32(ulong a) {
+  uint sbit = uint((a >> 32) & 0x80000000ul);
+  int ea = int((a >> 52) & 0x7fful);
+  ulong fa = a & 0x000ffffffffffffful;
+  if (ea == 0x7ff) {
+    if (fa != 0ul) return as_type<float>(sbit | 0x7fc00000u | uint(fa >> 29));
+    return as_type<float>(sbit | 0x7f800000u);
+  }
+  if ((a & 0x7ffffffffffffffful) == 0ul) return as_type<float>(sbit);
+  if (ea != 0) fa |= 0x0010000000000000ul; else ea = 1;
+  int e32 = ea - 1023 + 127;
+  if (e32 >= 255) return as_type<float>(sbit | 0x7f800000u);
+  // Align bit 52 to bit 30 (7 rounding bits at 0..6, bit 23+7=30)
+  ulong sig = fa >> 22;
+  if ((fa & 0x3ffffful) != 0ul) sig |= 1ul;
+  if (e32 <= 0) {
+    int shift = 1 - e32;
+    if (shift >= 32) return as_type<float>(sbit);
+    ulong sticky = (sig & ((1ul << shift) - 1ul)) != 0ul ? 1ul : 0ul;
+    sig = (sig >> shift) | sticky;
+    e32 = 0;
+  }
+  uint rb = uint(sig & 0x7ful);
+  uint mant = uint(sig >> 7);
+  if (rb > 0x40u || (rb == 0x40u && (mant & 1u) != 0u)) mant += 1u;
+  if (e32 > 0) {
+    if (mant >= 0x01000000u) { mant >>= 1; e32 += 1; }
+    if (e32 >= 255) return as_type<float>(sbit | 0x7f800000u);
+    return as_type<float>(sbit | (uint(e32) << 23) | (mant & 0x7fffffu));
+  }
+  return as_type<float>(sbit | mant);
+}
+static inline ulong crucible_u64_to_f64(ulong u) {
+  if (u == 0ul) return 0ul;
+  int lz = int(clz(u));
+  int exp = 1023 + 63 - lz;
+  ulong sig = (lz == 0) ? ((u >> 1) | (u & 1ul)) : (u << (lz - 1));
+  if (lz == 0) exp = 1023 + 63; // bit 62 corresponds to 2^63 when shifted right 1
+  return crucible_f64_norm_round_pack(false, exp, sig);
+}
+static inline ulong crucible_i64_to_f64(long s) {
+  if (s == 0l) return 0ul;
+  bool sign = s < 0l;
+  ulong u = sign ? ulong(-s) : ulong(s);
+  int lz = int(clz(u));
+  int exp = 1023 + 63 - lz;
+  ulong sig = (lz == 0) ? ((u >> 1) | (u & 1ul)) : (u << (lz - 1));
+  return crucible_f64_norm_round_pack(sign, exp, sig);
+}
+static inline ulong crucible_f64_to_u64(ulong a) {
+  if ((a >> 63) != 0ul) return 0ul;
+  int ea = int((a >> 52) & 0x7fful);
+  if (ea < 1023) return 0ul;
+  if (ea >= 1023 + 64) return 0xfffffffffffffffful;
+  ulong fa = (a & 0x000ffffffffffffful) | 0x0010000000000000ul;
+  int shift = ea - 1023 - 52;
+  return shift >= 0 ? (fa << shift) : (fa >> (-shift));
+}
+static inline long crucible_f64_to_i64(ulong a) {
+  bool sign = (a >> 63) != 0ul;
+  int ea = int((a >> 52) & 0x7fful);
+  if (ea < 1023) return 0l;
+  if (ea >= 1023 + 63)
+    return sign ? long(0x8000000000000000ul) : long(0x7ffffffffffffffful);
+  ulong fa = (a & 0x000ffffffffffffful) | 0x0010000000000000ul;
+  int shift = ea - 1023 - 52;
+  ulong mag = shift >= 0 ? (fa << shift) : (fa >> (-shift));
+  return sign ? -long(mag) : long(mag);
+}
+)MSL";
   return {};
 }
 
@@ -505,6 +1016,10 @@ private:
   Expected<std::string> stageStruct(bool Input);
   Expected<std::string> stageElement(mlir::LLVM::CallOp Call, bool Input);
   Expected<Expr> domainLoad(mlir::LLVM::CallOp Call, bool IsConstant);
+  Expected<Expr> hullLoad(mlir::LLVM::CallOp Call, bool IsOutputCP);
+  Error hullStore(mlir::LLVM::CallOp Call, bool IsPatchConstant, unsigned Ind);
+  Expected<Expr> geometryLoad(mlir::LLVM::CallOp Call);
+  Error geometryEmit(unsigned Ind, bool Emit, bool Cut);
 };
 
 namespace {
@@ -512,6 +1027,7 @@ enum SemanticKind : unsigned {
   UserSemantic = 0, VertexID = 1, InstanceID = 2, Position = 3,
   ClipDistance = 6, PrimitiveID = 10, FrontFace = 13, ColorTarget = 16,
   Depth = 17, DepthLess = 18, DepthGreater = 19,
+  TessFactor = 25, InsideTessFactor = 26,
 };
 
 unsigned clipDistanceOffset(ArrayRef<StageParameter> Params) {
@@ -536,7 +1052,8 @@ std::string signatureField(const StageParameter &P, unsigned Row) {
 } // namespace
 
 Expected<std::string> Emitter::stageStruct(bool Input) {
-  bool Vertex = R.Stage == ShaderStage::Vertex || R.Domain.has_value();
+  bool Vertex = R.Stage == ShaderStage::Vertex || R.Domain.has_value() ||
+                R.Geometry.has_value();
   std::string Text;
   raw_string_ostream OS(Text);
   OS << "struct " << (Input ? "CrucibleStageIn" : "CrucibleStageOut")
@@ -617,7 +1134,7 @@ Expected<std::string> Emitter::stageStruct(bool Input) {
 Expected<std::string> Emitter::stageElement(mlir::LLVM::CallOp Call,
                                              bool Input) {
   if (R.Stage != ShaderStage::Vertex && R.Stage != ShaderStage::Pixel &&
-      !(R.Domain && !Input))
+      !(R.Domain && !Input) && !(R.Geometry && !Input))
     return makeError("graphics signature access outside a graphics stage");
   auto Args = Call.getArgOperands();
   auto ID = constInt(Args[1]);
@@ -699,6 +1216,234 @@ Expected<Expr> Emitter::domainLoad(mlir::LLVM::CallOp Call, bool IsConstant) {
   return makeError("domain signature loads require 32-bit components");
 }
 
+static unsigned hullTessFactorOffset(ArrayRef<StageParameter> PatchConstants,
+                                     const StageParameter &Target,
+                                     unsigned Row) {
+  // Metal tessellation factor buffer layout:
+  //   Triangle: edge[0..2] (3), inside[0] (1) => stride 4
+  //   Quad:     edge[0..3] (4), inside[0..1] (2) => stride 6
+  //   Isoline:  edge[0..1] (2) => stride 2
+  unsigned EdgeCount = 0;
+  for (const auto &P : PatchConstants)
+    if (P.Kind == TessFactor)
+      EdgeCount += P.Rows;
+  if (Target.Kind == TessFactor) {
+    unsigned Off = 0;
+    for (const auto &P : PatchConstants) {
+      if (&P == &Target)
+        return Off + Row;
+      if (P.Kind == TessFactor)
+        Off += P.Rows;
+    }
+  }
+  unsigned Off = EdgeCount;
+  for (const auto &P : PatchConstants) {
+    if (&P == &Target)
+      return Off + Row;
+    if (P.Kind == InsideTessFactor)
+      Off += P.Rows;
+  }
+  return Off + Row;
+}
+
+Expected<Expr> Emitter::hullLoad(mlir::LLVM::CallOp Call, bool IsOutputCP) {
+  auto Args = Call.getArgOperands();
+  if (Args.size() != 5)
+    return makeError("invalid DXIL hull signature load");
+  auto ID = constInt(Args[1]);
+  auto Row = constInt(Args[2]);
+  auto Col = constInt(Args[3]);
+  const auto &Params = IsOutputCP ? R.Outputs : R.Inputs;
+  auto P = llvm::find_if(Params, [&](const StageParameter &S) {
+    return ID && S.ID == *ID;
+  });
+  if (P == Params.end() || !Row || *Row >= P->Rows || !Col || *Col >= P->Columns)
+    return makeError("unsupported DXIL hull signature component access");
+  unsigned Offset = signatureWordCount(ArrayRef(Params).take_front(
+                        std::distance(Params.begin(), P))) +
+                    *Row * P->Columns + *Col;
+  auto CP = exprFor(Args[4], PrecMul);
+  if (!CP)
+    return CP.takeError();
+  std::string Word;
+  if (IsOutputCP) {
+    unsigned CPWords = signatureWordCount(R.Outputs);
+    unsigned PatchWords =
+        CPWords * R.Hull->OutputControlPointCount +
+        signatureWordCount(R.Hull->PatchConstants);
+    Word = "crucible_patch_data[crucible_patch_id * " +
+           std::to_string(PatchWords) + "u + (" + CP->Text + ") * " +
+           std::to_string(CPWords) + "u + " + std::to_string(Offset) + "u]";
+  } else {
+    unsigned InWords = signatureWordCount(R.Inputs);
+    unsigned PatchInWords = InWords * R.Hull->InputControlPointCount;
+    Word = "crucible_hs_in[crucible_patch_id * " +
+           std::to_string(PatchInWords) + "u + (" + CP->Text + ") * " +
+           std::to_string(InWords) + "u + " + std::to_string(Offset) + "u]";
+  }
+  auto T = Call.getResult().getType();
+  if (T.isF32())
+    return Expr{"as_type<float>(" + Word + ")", PrecPrimary};
+  if (T.isInteger(32))
+    return Expr{std::move(Word), PrecPrimary};
+  return makeError("hull signature loads require 32-bit components");
+}
+
+Error Emitter::hullStore(mlir::LLVM::CallOp Call, bool IsPatchConstant,
+                         unsigned Ind) {
+  auto Args = Call.getArgOperands();
+  if (Args.size() != 5)
+    return makeError("invalid DXIL hull signature store");
+  auto ID = constInt(Args[1]);
+  auto Row = constInt(Args[2]);
+  auto Col = constInt(Args[3]);
+  const auto &Params = IsPatchConstant ? R.Hull->PatchConstants : R.Outputs;
+  auto P = llvm::find_if(Params, [&](const StageParameter &S) {
+    return ID && S.ID == *ID;
+  });
+  if (P == Params.end() || !Row || *Row >= P->Rows || !Col || *Col >= P->Columns)
+    return makeError("unsupported DXIL hull signature store");
+  auto Val = exprFor(Args[4], PrecUnknown);
+  if (!Val)
+    return Val.takeError();
+  unsigned CPWords = signatureWordCount(R.Outputs);
+  unsigned ConstantBase = CPWords * R.Hull->OutputControlPointCount;
+  unsigned PatchWords = ConstantBase + signatureWordCount(R.Hull->PatchConstants);
+  unsigned Offset = signatureWordCount(ArrayRef(Params).take_front(
+                        std::distance(Params.begin(), P))) +
+                    *Row * P->Columns + *Col;
+  std::string Index = "crucible_patch_id * " + std::to_string(PatchWords) + "u";
+  if (IsPatchConstant)
+    Index += " + " + std::to_string(ConstantBase + Offset) + "u";
+  else
+    Index += " + crucible_cp_id * " + std::to_string(CPWords) + "u + " +
+             std::to_string(Offset) + "u";
+  std::string Stored = Args[4].getType().isF32()
+                           ? "as_type<uint>(float(" + Val->Text + "))"
+                           : "uint(" + Val->Text + ")";
+  line(Ind, "crucible_patch_data[" + Index + "] = " + Stored + ";");
+  if (IsPatchConstant &&
+      (P->Kind == TessFactor || P->Kind == InsideTessFactor)) {
+    bool UseFloat = R.Hull->Domain == TessellationDomain::Isoline ||
+                    R.Hull->OutputPrimitive == TessellationOutputPrimitive::Point;
+    unsigned TFStride =
+        R.Hull->Domain == TessellationDomain::Triangle ? 4u
+        : R.Hull->Domain == TessellationDomain::Quad   ? 6u
+                                                       : 2u;
+    unsigned TFOff = hullTessFactorOffset(R.Hull->PatchConstants, *P, *Row);
+    line(Ind, "crucible_tess_factors[crucible_patch_id * " +
+                  std::to_string(TFStride) + "u + " + std::to_string(TFOff) +
+                  "u] = " + (UseFloat ? "float(" : "half(") + Val->Text + ");");
+  }
+  return Error::success();
+}
+
+Expected<Expr> Emitter::geometryLoad(mlir::LLVM::CallOp Call) {
+  auto Args = Call.getArgOperands();
+  if (Args.size() != 5)
+    return makeError("invalid DXIL geometry signature load");
+  auto ID = constInt(Args[1]);
+  auto Row = constInt(Args[2]);
+  auto Col = constInt(Args[3]);
+  auto P = llvm::find_if(R.Inputs, [&](const StageParameter &S) {
+    return ID && S.ID == *ID;
+  });
+  if (P == R.Inputs.end() || !Row || *Row >= P->Rows || !Col || *Col >= P->Columns)
+    return makeError("unsupported DXIL geometry signature component access");
+  if (P->Kind == PrimitiveID)
+    return Expr{"crucible_prim_id", PrecPrimary};
+  unsigned InWords = 0;
+  unsigned Offset = 0;
+  bool Found = false;
+  for (const StageParameter &S : R.Inputs) {
+    if (S.Kind == PrimitiveID)
+      continue;
+    if (&S == &*P)
+      Found = true;
+    unsigned W = S.Rows * S.Columns;
+    if (!Found)
+      Offset += W;
+    InWords += W;
+  }
+  Offset += *Row * P->Columns + *Col;
+  unsigned InputVerts =
+      R.Geometry->InputPrimitive == 1 ? 1u
+      : R.Geometry->InputPrimitive == 2 ? 2u
+      : R.Geometry->InputPrimitive == 3 ? 3u
+      : R.Geometry->InputPrimitive == 6 ? 4u : 6u;
+  auto Vtx = exprFor(Args[4], PrecMul);
+  if (!Vtx)
+    return Vtx.takeError();
+  std::string Word = "crucible_gs_in[(crucible_prim_id * " +
+                     std::to_string(InputVerts) + "u + (" + Vtx->Text +
+                     ")) * " + std::to_string(InWords) + "u + " +
+                     std::to_string(Offset) + "u]";
+  auto T = Call.getResult().getType();
+  if (T.isF32())
+    return Expr{"as_type<float>(" + Word + ")", PrecPrimary};
+  if (T.isInteger(32))
+    return Expr{std::move(Word), PrecPrimary};
+  return makeError("geometry signature loads require 32-bit components");
+}
+
+Error Emitter::geometryEmit(unsigned Ind, bool Emit, bool Cut) {
+  if (Emit) {
+    unsigned OutWords = signatureWordCount(R.Outputs);
+    auto EmitVertexTo = [&](const std::string &SrcVar, const std::string &SlotExpr) {
+      unsigned WordOff = 0;
+      for (const StageParameter &P : R.Outputs) {
+        for (uint32_t RIdx = 0; RIdx < P.Rows; ++RIdx) {
+          std::string Field = SrcVar + "." + signatureField(P, RIdx);
+          for (uint32_t CIdx = 0; CIdx < P.Columns; ++CIdx) {
+            std::string Src = P.Columns > 1
+                                  ? Field + "[" + std::to_string(CIdx) + "]"
+                                  : Field;
+            line(Ind, "crucible_gs_out[(" + SlotExpr + ") * " +
+                          std::to_string(OutWords) + "u + " +
+                          std::to_string(WordOff) + "u] = as_type<uint>(" +
+                          Src + ");");
+            ++WordOff;
+          }
+        }
+      }
+    };
+    if (R.Geometry->OutputTopology == 1) {
+      std::string Base = freshName();
+      line(Ind, "uint " + Base + " = atomic_fetch_add_explicit(crucible_gs_counter, 1u, memory_order_relaxed);");
+      EmitVertexTo("stageOut", Base);
+    } else if (R.Geometry->OutputTopology == 3) {
+      line(Ind, "if (crucible_strip_len >= 1u) {");
+      std::string Base = freshName();
+      line(Ind + 1, "uint " + Base + " = atomic_fetch_add_explicit(crucible_gs_counter, 2u, memory_order_relaxed);");
+      EmitVertexTo("crucible_prev[1]", Base);
+      EmitVertexTo("stageOut", Base + " + 1u");
+      line(Ind, "}");
+      line(Ind, "crucible_prev[1] = stageOut;");
+      line(Ind, "++crucible_strip_len;");
+    } else {
+      line(Ind, "if (crucible_strip_len >= 2u) {");
+      std::string Base = freshName();
+      line(Ind + 1, "uint " + Base + " = atomic_fetch_add_explicit(crucible_gs_counter, 3u, memory_order_relaxed);");
+      line(Ind + 1, "if ((crucible_strip_len & 1u) == 0u) {");
+      EmitVertexTo("crucible_prev[0]", Base);
+      EmitVertexTo("crucible_prev[1]", Base + " + 1u");
+      EmitVertexTo("stageOut", Base + " + 2u");
+      line(Ind + 1, "} else {");
+      EmitVertexTo("crucible_prev[1]", Base);
+      EmitVertexTo("crucible_prev[0]", Base + " + 1u");
+      EmitVertexTo("stageOut", Base + " + 2u");
+      line(Ind + 1, "}");
+      line(Ind, "}");
+      line(Ind, "crucible_prev[0] = crucible_prev[1];");
+      line(Ind, "crucible_prev[1] = stageOut;");
+      line(Ind, "++crucible_strip_len;");
+    }
+  }
+  if (Cut)
+    line(Ind, "crucible_strip_len = 0u;");
+  return Error::success();
+}
+
 //===----------------------------------------------------------------------===//
 // Types and constants
 //===----------------------------------------------------------------------===//
@@ -760,8 +1505,11 @@ Expected<std::string> Emitter::mslType(mlir::Type T) {
       break;
     }
   }
-  if (T.isF64())
+  if (T.isF64()) {
+    if (Opts.EmulateF64)
+      return std::string("ulong");
     return makeError("MSL has no double type; use float in the shader");
+  }
   std::string S;
   raw_string_ostream OS(S);
   T.print(OS);
@@ -794,9 +1542,21 @@ Expected<Expr> Emitter::scalarConstant(mlir::Attribute ValAttr) {
       S = "ushort(" + S + ")";
     return Expr{S, PrecPrimary};
   }
-  if (auto FA = mlir::dyn_cast<mlir::FloatAttr>(ValAttr))
+  if (auto FA = mlir::dyn_cast<mlir::FloatAttr>(ValAttr)) {
+    if (FA.getType().isF64()) {
+      if (!Opts.EmulateF64)
+        return makeError("MSL has no double type; use float in the shader");
+      uint64_t Bits = FA.getValue().bitcastToAPInt().getZExtValue();
+      SmallString<24> Hex;
+      raw_svector_ostream OS(Hex);
+      OS << "0x";
+      OS.write_hex(Bits);
+      OS << "ul";
+      return Expr{std::string(Hex.str()), PrecPrimary};
+    }
     return Expr{formatFloatLiteral(FA.getValue(), FA.getType().isF16()),
                 PrecPrimary};
+  }
   if (auto DA = mlir::dyn_cast<mlir::DenseElementsAttr>(ValAttr)) {
     if (auto VT = mlir::dyn_cast<mlir::VectorType>(DA.getType());
         VT && VT.getRank() == 1 && VT.getNumElements() >= 2 &&
@@ -1123,7 +1883,8 @@ Error Emitter::inferElementTypes() {
       if (Elem.isF32())
         Row = "float4";
       else if (Elem.isInteger(16) || Elem.isInteger(32) ||
-               Elem.isInteger(64) || Elem.isF16())
+               Elem.isInteger(64) || Elem.isF16() ||
+               (Opts.EmulateF64 && Elem.isF64()))
         Row = "uint4";
       else {
         FirstError = "cbuffer '" + RS->ParamName +
@@ -1399,6 +2160,7 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
     case DXILOp::BufferLoad:
     case DXILOp::RawBufferLoad:
     case DXILOp::CBufferLoadLegacy:
+    case DXILOp::SplitDouble:
       // Never materialized directly; consumed via handles/extractvalue.
       return true;
     case DXILOp::AtomicBinOp:
@@ -1531,6 +2293,28 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
                                           : signedView(T, R2->Text))),
                   PrecPrimary};
     }
+    if (Opts.EmulateF64 && T.isF64()) {
+      requireHelper("crucible_f64");
+      const char *Fn = nullptr;
+      if (mlir::isa<FAddOp>(Op))
+        Fn = "crucible_f64_add";
+      else if (mlir::isa<FSubOp>(Op))
+        Fn = "crucible_f64_sub";
+      else if (mlir::isa<FMulOp>(Op))
+        Fn = "crucible_f64_mul";
+      else if (mlir::isa<FDivOp>(Op))
+        Fn = "crucible_f64_div";
+      else
+        return makeError("unsupported f64 binary op");
+      auto L64 = exprFor(Op->getOperand(0), PrecUnknown);
+      if (!L64)
+        return L64.takeError();
+      auto R64 = exprFor(Op->getOperand(1), PrecUnknown);
+      if (!R64)
+        return R64.takeError();
+      return Expr{std::string(Fn) + "(" + L64->Text + ", " + R64->Text + ")",
+                  PrecPrimary};
+    }
     if (T.isInteger(16))
       return Expr{"ushort(uint(" + L->Text + ") " + Info->Spelling +
                       " uint(" + R2->Text + "))",
@@ -1552,6 +2336,12 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   }
 
   if (auto FNeg = mlir::dyn_cast<FNegOp>(Op)) {
+    if (Opts.EmulateF64 && FNeg.getType().isF64()) {
+      auto A = exprFor(FNeg.getOperand(), PrecXor);
+      if (!A)
+        return A.takeError();
+      return Expr{A->Text + " ^ 0x8000000000000000ul", PrecXor};
+    }
     auto A = exprFor(FNeg.getOperand(), PrecUnary);
     if (!A)
       return A.takeError();
@@ -1613,6 +2403,62 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   }
 
   if (auto Cmp = mlir::dyn_cast<FCmpOp>(Op)) {
+    if (Opts.EmulateF64 && Cmp.getLhs().getType().isF64()) {
+      requireHelper("crucible_f64");
+      auto L = exprFor(Cmp.getLhs(), PrecUnknown);
+      if (!L)
+        return L.takeError();
+      auto R2 = exprFor(Cmp.getRhs(), PrecUnknown);
+      if (!R2)
+        return R2.takeError();
+      std::string A = L->Text, B = R2->Text;
+      std::string NanCheck =
+          "(crucible_f64_isnan(" + A + ") || crucible_f64_isnan(" + B + "))";
+      switch (Cmp.getPredicate()) {
+      case FCmpPredicate::oeq:
+        return Expr{"crucible_f64_cmp_eq(" + A + ", " + B + ")", PrecPrimary};
+      case FCmpPredicate::ueq:
+        return Expr{"(" + NanCheck + " || crucible_f64_cmp_eq(" + A + ", " + B +
+                        "))",
+                    PrecPrimary};
+      case FCmpPredicate::one:
+        return Expr{"(!" + NanCheck + " && !crucible_f64_cmp_eq(" + A + ", " +
+                        B + "))",
+                    PrecPrimary};
+      case FCmpPredicate::une:
+        return Expr{"!crucible_f64_cmp_eq(" + A + ", " + B + ")", PrecUnary};
+      case FCmpPredicate::olt:
+        return Expr{"crucible_f64_cmp_lt(" + A + ", " + B + ")", PrecPrimary};
+      case FCmpPredicate::ult:
+        return Expr{"(" + NanCheck + " || crucible_f64_cmp_lt(" + A + ", " + B +
+                        "))",
+                    PrecPrimary};
+      case FCmpPredicate::ole:
+        return Expr{"crucible_f64_cmp_le(" + A + ", " + B + ")", PrecPrimary};
+      case FCmpPredicate::ule:
+        return Expr{"(" + NanCheck + " || crucible_f64_cmp_le(" + A + ", " + B +
+                        "))",
+                    PrecPrimary};
+      case FCmpPredicate::ogt:
+        return Expr{"crucible_f64_cmp_lt(" + B + ", " + A + ")", PrecPrimary};
+      case FCmpPredicate::ugt:
+        return Expr{"(" + NanCheck + " || crucible_f64_cmp_lt(" + B + ", " + A +
+                        "))",
+                    PrecPrimary};
+      case FCmpPredicate::oge:
+        return Expr{"crucible_f64_cmp_le(" + B + ", " + A + ")", PrecPrimary};
+      case FCmpPredicate::uge:
+        return Expr{"(" + NanCheck + " || crucible_f64_cmp_le(" + B + ", " + A +
+                        "))",
+                    PrecPrimary};
+      case FCmpPredicate::ord:
+        return Expr{"!" + NanCheck, PrecUnary};
+      case FCmpPredicate::uno:
+        return Expr{NanCheck, PrecPrimary};
+      default:
+        return makeError("unsupported f64 fcmp predicate");
+      }
+    }
     const char *Sp = nullptr;
     switch (Cmp.getPredicate()) {
     case FCmpPredicate::oeq:
@@ -1789,11 +2635,35 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
-    auto DstTy = mslType(Op->getResult(0).getType());
+    mlir::Type SrcTy = Op->getOperand(0).getType();
+    mlir::Type DstMlirTy = Op->getResult(0).getType();
+    if (Opts.EmulateF64 && (SrcTy.isF64() || DstMlirTy.isF64())) {
+      requireHelper("crucible_f64");
+      if (mlir::isa<FPExtOp>(Op) && DstMlirTy.isF64()) {
+        std::string F32 = SrcTy.isF32() ? Src->Text : "float(" + Src->Text + ")";
+        return Expr{"crucible_f32_to_f64(" + F32 + ")", PrecPrimary};
+      }
+      if (mlir::isa<FPTruncOp>(Op) && SrcTy.isF64()) {
+        std::string F32 = "crucible_f64_to_f32(" + Src->Text + ")";
+        return Expr{DstMlirTy.isF16() ? "half(" + F32 + ")" : F32, PrecPrimary};
+      }
+      if (mlir::isa<UIToFPOp>(Op) && DstMlirTy.isF64())
+        return Expr{"crucible_u64_to_f64(ulong(" + Src->Text + "))",
+                    PrecPrimary};
+      if (mlir::isa<FPToUIOp>(Op) && SrcTy.isF64()) {
+        auto DstTy = mslType(DstMlirTy);
+        if (!DstTy)
+          return DstTy.takeError();
+        std::string U64 = "crucible_f64_to_u64(" + Src->Text + ")";
+        return Expr{DstMlirTy.isInteger(64) ? U64 : *DstTy + "(" + U64 + ")",
+                    PrecPrimary};
+      }
+    }
+    auto DstTy = mslType(DstMlirTy);
     if (!DstTy)
       return DstTy.takeError();
     if (mlir::isa<TruncOp, mlir::arith::TruncIOp>(Op) &&
-        Op->getResult(0).getType().isInteger(1))
+        DstMlirTy.isInteger(1))
       return Expr{"bool((" + Src->Text + ") & 1u)", PrecPrimary};
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
   }
@@ -1801,6 +2671,12 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
+    if (Opts.EmulateF64 && Op->getResult(0).getType().isF64()) {
+      requireHelper("crucible_f64");
+      return Expr{"crucible_i64_to_f64(long(" +
+                      signedView(Op->getOperand(0).getType(), Src->Text) + "))",
+                  PrecPrimary};
+    }
     auto DstTy = mslType(Op->getResult(0).getType());
     if (!DstTy)
       return DstTy.takeError();
@@ -1813,6 +2689,14 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     if (!Src)
       return Src.takeError();
     mlir::Type T = Op->getResult(0).getType();
+    if (Opts.EmulateF64 && Op->getOperand(0).getType().isF64()) {
+      requireHelper("crucible_f64");
+      std::string I64 = "crucible_f64_to_i64(" + Src->Text + ")";
+      if (T.isInteger(64))
+        return Expr{unsignedView(T, I64), PrecPrimary};
+      StringRef Ty = T.isInteger(16) ? "short" : "int";
+      return Expr{unsignedView(T, (Ty + "(" + I64 + ")").str()), PrecPrimary};
+    }
     StringRef Ty = T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
     return Expr{unsignedView(T, (Ty + "(" + Src->Text + ")").str()),
                 PrecPrimary};
@@ -1821,9 +2705,14 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
+    auto SrcTy = mslType(Op->getOperand(0).getType());
+    if (!SrcTy)
+      return SrcTy.takeError();
     auto DstTy = mslType(Op->getResult(0).getType());
     if (!DstTy)
       return DstTy.takeError();
+    if (*SrcTy == *DstTy)
+      return Src;
     return Expr{"as_type<" + *DstTy + ">(" + Src->Text + ")", PrecPrimary};
   }
   if (auto Freeze = mlir::dyn_cast<FreezeOp>(Op))
@@ -1857,6 +2746,22 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
 
 Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
   auto Args = Call.getArgOperands();
+  if (R.Geometry) {
+    if (Op == DXILOp::LoadInput)
+      return geometryLoad(Call);
+    if (Op == DXILOp::PrimitiveID)
+      return Expr{"crucible_prim_id", PrecPrimary};
+  }
+  if (R.Hull) {
+    if (Op == DXILOp::LoadInput)
+      return hullLoad(Call, false);
+    if (Op == DXILOp::LoadOutputControlPoint)
+      return hullLoad(Call, true);
+    if (Op == DXILOp::OutputControlPointID)
+      return Expr{"crucible_cp_id", PrecPrimary};
+    if (Op == DXILOp::PrimitiveID)
+      return Expr{"crucible_patch_id", PrecPrimary};
+  }
   if (R.Domain) {
     if (Op == DXILOp::LoadInput || Op == DXILOp::LoadPatchConstant)
       return domainLoad(Call, Op == DXILOp::LoadPatchConstant);
@@ -1924,9 +2829,31 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
   bool IsFloat = Call.getNumResults() == 1 &&
                  mlir::isa<mlir::FloatType>(Call.getResult().getType());
 
+  if (Op == DXILOp::MakeDouble) {
+    if (!Opts.EmulateF64)
+      return makeError("MSL has no double type; use float in the shader");
+    auto Lo = exprFor(Args[1], PrecUnknown);
+    if (!Lo)
+      return Lo.takeError();
+    auto Hi = exprFor(Args[2], PrecUnknown);
+    if (!Hi)
+      return Hi.takeError();
+    return Expr{"((ulong(" + Hi->Text + ") << 32ul) | ulong(" + Lo->Text + "))",
+                PrecPrimary};
+  }
+
   // DXIL Frc must propagate NaN for infinite inputs (metal::fract clamps),
   // so spell it as x - floor(x).
   if (Op == DXILOp::Frc) {
+    if (Opts.EmulateF64 && Call.getResult().getType().isF64()) {
+      requireHelper("crucible_f64");
+      auto A = exprFor(Args[1], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      return Expr{"crucible_f64_sub(" + A->Text + ", crucible_f64_round(" +
+                      A->Text + ", 1))",
+                  PrecPrimary};
+    }
     auto A = exprFor(Args[1], PrecAdd);
     if (!A)
       return A.takeError();
@@ -1934,6 +2861,73 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     if (!AF)
       return AF.takeError();
     return Expr{A->Text + " - floor(" + AF->Text + ")", PrecAdd};
+  }
+
+  if (Opts.EmulateF64 &&
+      ((Call.getNumResults() == 1 && Call.getResult().getType().isF64()) ||
+       (Args.size() > 1 && Args[1].getType().isF64()))) {
+    if (Op == DXILOp::FAbs) {
+      auto A = exprFor(Args[1], PrecAnd);
+      if (!A)
+        return A.takeError();
+      return Expr{A->Text + " & 0x7ffffffffffffffful", PrecAnd};
+    }
+    if (Op == DXILOp::IsNaN || Op == DXILOp::IsInf || Op == DXILOp::IsFinite ||
+        Op == DXILOp::Sqrt || Op == DXILOp::RoundZ || Op == DXILOp::RoundNI ||
+        Op == DXILOp::RoundPI || Op == DXILOp::RoundNE) {
+      requireHelper("crucible_f64");
+      auto A = exprFor(Args[1], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      switch (Op) {
+      case DXILOp::IsNaN:
+        return Expr{"crucible_f64_isnan(" + A->Text + ")", PrecPrimary};
+      case DXILOp::IsInf:
+        return Expr{"crucible_f64_isinf(" + A->Text + ")", PrecPrimary};
+      case DXILOp::IsFinite:
+        return Expr{"crucible_f64_isfinite(" + A->Text + ")", PrecPrimary};
+      case DXILOp::Sqrt:
+        return Expr{"crucible_f64_sqrt(" + A->Text + ")", PrecPrimary};
+      case DXILOp::RoundZ:
+        return Expr{"crucible_f64_round(" + A->Text + ", 0)", PrecPrimary};
+      case DXILOp::RoundNI:
+        return Expr{"crucible_f64_round(" + A->Text + ", 1)", PrecPrimary};
+      case DXILOp::RoundPI:
+        return Expr{"crucible_f64_round(" + A->Text + ", 2)", PrecPrimary};
+      case DXILOp::RoundNE:
+        return Expr{"crucible_f64_round(" + A->Text + ", 3)", PrecPrimary};
+      default:
+        break;
+      }
+    }
+    if (Op == DXILOp::FMin || Op == DXILOp::FMax) {
+      requireHelper("crucible_f64");
+      auto A = exprFor(Args[1], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      auto B = exprFor(Args[2], PrecUnknown);
+      if (!B)
+        return B.takeError();
+      return Expr{std::string(Op == DXILOp::FMin ? "crucible_f64_min("
+                                                 : "crucible_f64_max(") +
+                      A->Text + ", " + B->Text + ")",
+                  PrecPrimary};
+    }
+    if (Op == DXILOp::FMad || Op == DXILOp::Fma) {
+      requireHelper("crucible_f64");
+      auto A = exprFor(Args[1], PrecUnknown);
+      if (!A)
+        return A.takeError();
+      auto B = exprFor(Args[2], PrecUnknown);
+      if (!B)
+        return B.takeError();
+      auto C = exprFor(Args[3], PrecUnknown);
+      if (!C)
+        return C.takeError();
+      return Expr{"crucible_f64_fma(" + A->Text + ", " + B->Text + ", " +
+                      C->Text + ")",
+                  PrecPrimary};
+    }
   }
 
   if (StringRef Fn = mslUnaryFunction(Op, IsFloat); !Fn.empty()) {
@@ -2286,6 +3280,14 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     if (Args[1].getType().isInteger(1))
       return Expr{"(simd_all(" + A->Text + ") || !simd_any(" + A->Text + "))",
                   PrecPrimary};
+    if (Args[1].getType().isF64()) {
+      requireHelper("crucible_f64");
+      First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
+              A->Text + ")))";
+      return Expr{"simd_all(crucible_f64_cmp_eq(" + A->Text + ", " + First +
+                      "))",
+                  PrecPrimary};
+    }
     if (Args[1].getType().isInteger(64)) {
       First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
               A->Text + ")))";
@@ -2323,7 +3325,7 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
       return Expr{"bool(" + Fn.str() + "(uint(" + V->Text + ")" + LaneArg +
                       "))",
                   PrecPrimary};
-    if (T.isInteger(64))
+    if (T.isInteger(64) || T.isF64())
       return Expr{"as_type<ulong>(" + Fn.str() + "(as_type<uint2>(" +
                       V->Text + ")" + LaneArg + "))",
                   PrecPrimary};
@@ -2363,6 +3365,15 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     // Signed min/max (and ordering-sensitive prefix ops) need signed views;
     // sums/products are bit-identical for signed and unsigned.
     bool SignedOrder = IsSigned && (Fn == "simd_min" || Fn == "simd_max");
+    if (T.isF64()) {
+      requireHelper("crucible_f64");
+      requireHelper("crucible_wave_wide_f64");
+      UsesLane |= Prefix;
+      return Expr{"crucible_wave_wide_f64<" + std::to_string(*Kind) + ", " +
+                      (Prefix ? "true" : "false") + ">(" + V->Text + ", " +
+                      (Prefix ? "lane" : "0u") + ")",
+                  PrecPrimary};
+    }
     if (T.isInteger(64)) {
       requireHelper("crucible_wave_wide");
       UsesLane |= Prefix;
@@ -2464,6 +3475,14 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
       return M1.takeError();
     requireHelper("crucible_wave_multi_prefix");
     UsesLane = true;
+    if (T.isF64()) {
+      requireHelper("crucible_f64");
+      requireHelper("crucible_wave_multi_prefix_f64");
+      return Expr{"crucible_wave_multi_prefix_f64<" + std::to_string(*Kind) +
+                      ">(" + V->Text + ", " + M0->Text + ", " + M1->Text +
+                      ", lane)",
+                  PrecPrimary};
+    }
     if (T.isF16())
       return Expr{"half(crucible_wave_multi_prefix_arith<float, " +
                       std::to_string(*Kind) + ">(float(" + V->Text + "), " +
@@ -2693,6 +3712,19 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     }
   }
 
+  if (*Op == DXILOp::SplitDouble) {
+    if (!Opts.EmulateF64)
+      return makeError("MSL has no double type; use float in the shader");
+    auto V = exprFor(Args[1], PrecShift);
+    if (!V)
+      return V.takeError();
+    if (Comp == 0)
+      return Expr{"uint(" + V->Text + ")", PrecPrimary};
+    if (Comp == 1)
+      return Expr{"uint((" + V->Text + ") >> 32ul)", PrecPrimary};
+    return makeError("splitDouble component out of range");
+  }
+
   // Ballot and Unpack4x8 aggregates were materialized as vec4 temporaries.
   if (*Op == DXILOp::WaveActiveBallot || *Op == DXILOp::Unpack4x8) {
     auto It = ValueNames.find(Call.getResult());
@@ -2753,7 +3785,7 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     bool RowIsFloat = RS->ElemType == "float4";
     if (Comp >= Ret.getBody().size())
       return makeError("cbuffer component out of range");
-    if (T.isInteger(64))
+    if (T.isInteger(64) || (Opts.EmulateF64 && T.isF64()))
       return Expr{"as_type<ulong2>(" + RowText + ")[" +
                       std::to_string(Comp) + "]",
                   PrecPrimary};
@@ -3738,6 +4770,16 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return Error::success();
 
   if (auto Call = mlir::dyn_cast<mlir::LLVM::CallOp>(Op)) {
+    if (R.Geometry && dxOpcode(Call) == DXILOp::EmitStream)
+      return geometryEmit(Ind, true, false);
+    if (R.Geometry && dxOpcode(Call) == DXILOp::CutStream)
+      return geometryEmit(Ind, false, true);
+    if (R.Geometry && dxOpcode(Call) == DXILOp::EmitThenCutStream)
+      return geometryEmit(Ind, true, true);
+    if (R.Hull && dxOpcode(Call) == DXILOp::StoreOutput)
+      return hullStore(Call, false, Ind);
+    if (R.Hull && dxOpcode(Call) == DXILOp::StorePatchConstant)
+      return hullStore(Call, true, Ind);
     if (dxOpcode(Call) == DXILOp::StoreOutput) {
       auto Access = stageElement(Call, false);
       if (!Access)
@@ -4272,7 +5314,13 @@ Error Emitter::emitBlock(mlir::Block &B, unsigned Ind) {
 Expected<std::string> Emitter::kernelSignature() {
   std::string Sig;
   raw_string_ostream OS(Sig);
-  if (R.Stage == ShaderStage::Compute || R.Stage == ShaderStage::RayGeneration)
+  bool IsComputeKernel = R.Stage == ShaderStage::Compute ||
+                         R.Stage == ShaderStage::RayGeneration ||
+                         R.Stage == ShaderStage::Hull ||
+                         R.Stage == ShaderStage::Geometry ||
+                         (Opts.StageAsCompute &&
+                          (R.Stage == ShaderStage::Vertex || R.Domain));
+  if (IsComputeKernel)
     OS << "kernel void ";
   else {
     if (R.Domain)
@@ -4300,7 +5348,45 @@ Expected<std::string> Emitter::kernelSignature() {
   };
 
   bool HasInput = false;
-  if (R.Domain) {
+  if (R.Geometry) {
+    Sep();
+    OS << "    uint crucible_prim_id [[thread_position_in_grid]]";
+    Sep();
+    OS << "    const device uint* crucible_gs_in [[buffer("
+       << GeometryInterface::InputDataMetalIndex << ")]]";
+    Sep();
+    OS << "    device atomic_uint* crucible_gs_counter [[buffer("
+       << GeometryInterface::CounterMetalIndex << ")]]";
+    Sep();
+    OS << "    device uint* crucible_gs_out [[buffer("
+       << GeometryInterface::OutputDataMetalIndex << ")]]";
+  } else if (R.Hull) {
+    bool UseFloatTF =
+        R.Hull->Domain == TessellationDomain::Isoline ||
+        R.Hull->OutputPrimitive == TessellationOutputPrimitive::Point;
+    Sep();
+    OS << "    uint crucible_patch_id [[thread_position_in_grid]]";
+    Sep();
+    OS << "    const device uint* crucible_hs_in [[buffer("
+       << HullInterface::InputDataMetalIndex << ")]]";
+    Sep();
+    OS << "    device " << (UseFloatTF ? "float" : "half")
+       << "* crucible_tess_factors [[buffer("
+       << HullInterface::TessFactorMetalIndex << ")]]";
+    Sep();
+    OS << "    device uint* crucible_patch_data [[buffer("
+       << HullInterface::PatchDataMetalIndex << ")]]";
+  } else if (R.Domain && Opts.StageAsCompute) {
+    Sep();
+    OS << "    uint crucible_domain_item_id [[thread_position_in_grid]]";
+    Sep();
+    OS << "    device uint* crucible_stage_out [[buffer(28)]]";
+    Sep();
+    OS << "    const device float4* crucible_domain_items [[buffer(29)]]";
+    Sep();
+    OS << "    const device uint* crucible_patch_data [[buffer("
+       << DomainInterface::DataMetalIndex << ")]]";
+  } else if (R.Domain) {
     Sep();
     OS << "    float"
        << (R.Domain->Domain == TessellationDomain::Triangle ? "3" : "2")
@@ -4310,9 +5396,19 @@ Expected<std::string> Emitter::kernelSignature() {
     Sep();
     OS << "    const device uint* crucible_patch_data [[buffer("
        << DomainInterface::DataMetalIndex << ")]]";
+  } else if (R.Stage == ShaderStage::Vertex && Opts.StageAsCompute) {
+    Sep();
+    OS << "    uint crucible_vertex_id [[thread_position_in_grid]]";
+    Sep();
+    OS << "    const device uchar* crucible_stage_in [[buffer(28)]]";
+    Sep();
+    OS << "    device uint* crucible_stage_out [[buffer(30)]]";
   }
-  for (const StageParameter &P : R.Domain ? ArrayRef<StageParameter>()
-                                        : ArrayRef(R.Inputs)) {
+  for (const StageParameter &P :
+       (R.Domain || R.Hull || R.Geometry ||
+        (R.Stage == ShaderStage::Vertex && Opts.StageAsCompute))
+           ? ArrayRef<StageParameter>()
+           : ArrayRef(R.Inputs)) {
     if (R.Stage == ShaderStage::Vertex && P.Kind == VertexID) {
       Sep();
       OS << "    uint crucible_vertex_id [[vertex_id]]";
@@ -4511,15 +5607,13 @@ Expected<std::string> Emitter::kernelSignature() {
 
 Expected<std::string> Emitter::run() {
   bool Graphics = R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel ||
-                  R.Domain.has_value();
+                  R.Domain.has_value() || R.Geometry.has_value();
   if (!Graphics && R.Stage != ShaderStage::Compute &&
-      R.Stage != ShaderStage::RayGeneration)
-    return makeError("unsupported shader stage (expected compute, vertex, pixel, domain or raygeneration)");
-  if (R.Domain && (!R.Resources.empty() || R.HasBufferDimensions))
-    return makeError("domain shaders with descriptor resources are not supported");
+      R.Stage != ShaderStage::RayGeneration && R.Stage != ShaderStage::Hull)
+    return makeError("unsupported shader stage (expected compute, vertex, pixel, hull, geometry, domain or raygeneration)");
   std::string Input, Output;
   if (Graphics) {
-    if (!R.Domain) {
+    if (!R.Domain && !R.Geometry) {
       auto In = stageStruct(true);
       if (!In)
         return In.takeError();
@@ -4606,8 +5700,25 @@ Expected<std::string> Emitter::run() {
     }
   }
 
-  if (Error E = emitBlock(Entry.getBody().front(), 1))
-    return std::move(E);
+  if (R.Hull) {
+    line(1, "for (uint crucible_cp_id = 0u; crucible_cp_id < " +
+                std::to_string(R.Hull->OutputControlPointCount) +
+                "u; ++crucible_cp_id) {");
+    if (Error E = emitBlock(Entry.getBody().front(), 2))
+      return std::move(E);
+    line(1, "}");
+    auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+    auto PCF = Mod.lookupSymbol<mlir::func::FuncOp>(R.Hull->PatchConstantFuncName);
+    if (!PCF)
+      return makeError("missing hull patch-constant function '{0}'",
+                       R.Hull->PatchConstantFuncName);
+    ValueNames.clear();
+    if (Error E = emitBlock(PCF.getBody().front(), 1))
+      return std::move(E);
+  } else {
+    if (Error E = emitBlock(Entry.getBody().front(), 1))
+      return std::move(E);
+  }
 
   auto Sig = kernelSignature();
   if (!Sig)
@@ -4618,6 +5729,8 @@ Expected<std::string> Emitter::run() {
   OS << "// Generated by crucible from DXIL (" << R.EntryName << ", "
      << (R.Stage == ShaderStage::Vertex ? "vs_" :
          R.Stage == ShaderStage::Pixel ? "ps_" :
+         R.Stage == ShaderStage::Hull ? "hs_" :
+         R.Stage == ShaderStage::Geometry ? "gs_" :
          R.Stage == ShaderStage::Domain ? "ds_" : "cs_")
      << R.ShaderModelMajor << "_" << R.ShaderModelMinor << ")\n"
      << "#include <metal_stdlib>\n"
@@ -4671,11 +5784,83 @@ Expected<std::string> Emitter::run() {
 
   OS << ConstantGlobalDecls << Input << Output << *Sig << " {\n"
      << ArrayDecls << GroupsharedDecls;
-  if (Graphics)
+  if (Graphics && Opts.StageAsCompute) {
+    if (R.Stage == ShaderStage::Vertex) {
+      OS << "  CrucibleStageIn stageIn = {};\n";
+      for (const StageParameter &P : R.Inputs) {
+        if (P.Kind == VertexID) {
+          continue;
+        }
+        std::string Indexed = P.Semantic + std::to_string(P.SemanticIndex);
+        auto Attr = llvm::find_if(Opts.VertexInputLayout, [&](const auto &A) {
+          return StringRef(A.Name).equals_insensitive(Indexed) ||
+                 (P.SemanticIndex == 0 &&
+                  StringRef(A.Name).equals_insensitive(P.Semantic));
+        });
+        if (Attr == Opts.VertexInputLayout.end())
+          continue;
+        const char *ElemTy =
+            Attr->Type == Options::VertexInputAttribute::ElementType::Int32
+                ? "int"
+            : Attr->Type == Options::VertexInputAttribute::ElementType::UInt32
+                ? "uint"
+                : "float";
+        std::string Ptr = "((const device " + std::string(ElemTy) +
+                          "*)(crucible_stage_in + crucible_vertex_id * " +
+                          std::to_string(Opts.VertexInputStride) + "u + " +
+                          std::to_string(Attr->Offset) + "u))";
+        for (uint32_t RIdx = 0; RIdx < P.Rows; ++RIdx) {
+          std::string Field = "stageIn." + signatureField(P, RIdx);
+          for (uint32_t CIdx = 0; CIdx < P.Columns; ++CIdx) {
+            uint32_t Linear = RIdx * P.Columns + CIdx;
+            std::string Target = P.Columns > 1
+                                     ? Field + "[" + std::to_string(CIdx) + "]"
+                                     : Field;
+            if (Linear < Attr->Channels)
+              OS << "  " << Target << " = " << Ptr << "[" << Linear << "];\n";
+            else
+              OS << "  " << Target << " = " << (CIdx == 3 ? "1" : "0") << ";\n";
+          }
+        }
+      }
+    } else if (R.Domain) {
+      OS << "  float"
+         << (R.Domain->Domain == TessellationDomain::Triangle ? "3" : "2")
+         << " crucible_domain_location = crucible_domain_items[crucible_domain_item_id]."
+         << (R.Domain->Domain == TessellationDomain::Triangle ? "xyz" : "xy")
+         << ";\n"
+         << "  uint crucible_patch_id = as_type<uint>(crucible_domain_items[crucible_domain_item_id].w);\n";
+    }
     OS << "  CrucibleStageOut stageOut = {};\n";
-  OS << Body;
-  if (Graphics)
-    OS << "  return stageOut;\n";
+    OS << Body;
+    unsigned OutWords = signatureWordCount(R.Outputs);
+    std::string OutId = R.Domain ? "crucible_domain_item_id" : "crucible_vertex_id";
+    unsigned WordOff = 0;
+    for (const StageParameter &P : R.Outputs) {
+      for (uint32_t RIdx = 0; RIdx < P.Rows; ++RIdx) {
+        std::string Field = "stageOut." + signatureField(P, RIdx);
+        for (uint32_t CIdx = 0; CIdx < P.Columns; ++CIdx) {
+          std::string Src = P.Columns > 1
+                                ? Field + "[" + std::to_string(CIdx) + "]"
+                                : Field;
+          OS << "  crucible_stage_out[" << OutId << " * " << OutWords << "u + "
+             << WordOff << "u] = as_type<uint>(" << Src << ");\n";
+          ++WordOff;
+        }
+      }
+    }
+  } else if (Graphics && R.Geometry) {
+    OS << "  CrucibleStageOut stageOut = {};\n"
+       << "  CrucibleStageOut crucible_prev[2] = {};\n"
+       << "  uint crucible_strip_len = 0u;\n";
+    OS << Body;
+  } else {
+    if (Graphics)
+      OS << "  CrucibleStageOut stageOut = {};\n";
+    OS << Body;
+    if (Graphics)
+      OS << "  return stageOut;\n";
+  }
   OS << "}\n";
   return Out;
 }

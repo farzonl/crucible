@@ -108,7 +108,47 @@ struct StageParameter {
   std::vector<uint32_t> RowSemanticIndices;
 };
 
-enum class TessellationDomain : uint8_t { Triangle = 2, Quad = 3 };
+enum class TessellationDomain : uint8_t { Isoline = 1, Triangle = 2, Quad = 3 };
+
+enum class TessellationPartitioning : uint8_t {
+  Integer = 1,
+  Pow2 = 2,
+  FractionalOdd = 3,
+  FractionalEven = 4,
+};
+
+enum class TessellationOutputPrimitive : uint8_t {
+  Point = 1,
+  Line = 2,
+  TriangleCW = 3,
+  TriangleCCW = 4,
+};
+
+struct HullInterface {
+  TessellationDomain Domain = TessellationDomain::Triangle;
+  TessellationPartitioning Partitioning = TessellationPartitioning::Integer;
+  TessellationOutputPrimitive OutputPrimitive =
+      TessellationOutputPrimitive::TriangleCW;
+  uint32_t InputControlPointCount = 3;
+  uint32_t OutputControlPointCount = 3;
+  float MaxTessFactor = 64.0f;
+  std::string PatchConstantFuncName;
+  std::vector<StageParameter> PatchConstants;
+  static constexpr uint32_t InputDataMetalIndex = 28;
+  static constexpr uint32_t TessFactorMetalIndex = 29;
+  static constexpr uint32_t PatchDataMetalIndex = 30;
+};
+
+struct GeometryInterface {
+  uint32_t InputPrimitive = 3;   // 1=point, 2=line, 3=triangle
+  uint32_t MaxVertexCount = 3;
+  uint32_t InstanceCount = 1;
+  uint32_t OutputTopology = 5;   // 1=point, 3=linestrip, 5=trianglestrip
+  uint32_t StreamMask = 1;
+  static constexpr uint32_t InputDataMetalIndex = 28;
+  static constexpr uint32_t CounterMetalIndex = 29;
+  static constexpr uint32_t OutputDataMetalIndex = 30;
+};
 
 struct DomainInterface {
   TessellationDomain Domain;
@@ -138,6 +178,8 @@ struct Reflection {
   std::vector<ResourceBinding> Resources;
   std::vector<StageParameter> Inputs, Outputs;
   std::optional<DomainInterface> Domain;
+  std::optional<HullInterface> Hull;
+  std::optional<GeometryInterface> Geometry;
   bool HasBufferDimensions = false;
   uint32_t BufferSizesMetalIndex = UINT32_MAX;
   bool HasInstanceContribution = false;

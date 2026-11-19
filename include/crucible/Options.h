@@ -49,6 +49,10 @@ struct Options {
   /// using the crucible_buf_dims buffer (D3D12 out-of-bounds contract).
   bool BoundsCheckBuffers = false;
 
+  /// Emulate 64-bit floating-point (double) operations using software
+  /// IEEE-754 binary64 arithmetic on ulong.
+  bool EmulateF64 = false;
+
   /// Explicit array sizes for unbounded DXIL resource arrays (rangeSize == -1).
   std::vector<ArraySizeOverride> ArraySizeOverrides;
 
@@ -56,6 +60,21 @@ struct Options {
   /// for lib_6_x raytracing pipelines.
   std::vector<std::string> MissShaders;
   std::vector<std::string> HitGroupClosestHits;
+
+  /// Compile a Vertex or Domain shader as a compute kernel that writes its
+  /// packed 32-bit signature outputs to [[buffer(30)]] for downstream HS/GS.
+  bool StageAsCompute = false;
+
+  /// Vertex attribute layout used when compiling a Vertex shader with
+  /// StageAsCompute = true (reads raw vertex buffer from [[buffer(28)]]).
+  struct VertexInputAttribute {
+    std::string Name;
+    uint32_t Offset = 0;
+    uint32_t Channels = 0;
+    enum class ElementType : uint8_t { Float32, Int32, UInt32 } Type = ElementType::Float32;
+  };
+  uint32_t VertexInputStride = 0;
+  std::vector<VertexInputAttribute> VertexInputLayout;
 };
 
 } // namespace crucible

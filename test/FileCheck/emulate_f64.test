@@ -1,0 +1,27 @@
+# Double (f64) emulation is disabled by default and enabled with --emulate-f64.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/emulate_f64.hlsl
+# RUN: not %cruciblec %t.dxil -o /dev/null 2>&1 | FileCheck %s --check-prefix=DISABLED
+# DISABLED: MSL has no double type; use float in the shader
+
+# RUN: %cruciblec --emulate-f64 %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: static inline ulong crucible_f64_add(ulong a, ulong b)
+# CHECK: static inline ulong crucible_f64_mul(ulong a, ulong b)
+# CHECK: static inline ulong crucible_f64_fma(ulong a, ulong b, ulong c)
+# CHECK: static inline ulong crucible_f64_div(ulong a, ulong b)
+# CHECK: static inline ulong crucible_f64_sqrt(ulong a)
+# CHECK: kernel void main0(
+# CHECK-DAG: crucible_f64_add(
+# CHECK-DAG: crucible_f64_mul(
+# CHECK-DAG: crucible_f64_fma(
+# CHECK-DAG: crucible_f64_div(
+# CHECK-DAG: crucible_f64_min(
+# CHECK-DAG: crucible_f64_max(
+# CHECK-DAG: crucible_f64_cmp_lt(
+# CHECK-DAG: crucible_f64_to_f32(
+# CHECK-DAG: crucible_f32_to_f64(
+
+# REQUIRES: metal-tools
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air

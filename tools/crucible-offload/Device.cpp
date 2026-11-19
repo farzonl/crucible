@@ -21,6 +21,7 @@
 
 #include "crucible/Compiler.h"
 
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Object/DXContainer.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -405,15 +406,80 @@ void readbackMetalTexture(MTL::Texture *Tex, CPUBuffer *CPU, ResourceKind Kind,
   }
 }
 
+static unsigned signatureWords(ArrayRef<crucible::StageParameter> Params) {
+  unsigned W = 0;
+  for (const auto &P : Params)
+    W += P.Rows * P.Columns;
+  return W;
+}
+
+static std::string buildPassThroughVS(ArrayRef<crucible::StageParameter> Outputs) {
+  std::string Out;
+  raw_string_ostream OS(Out);
+  OS << "#include <metal_stdlib>\nusing namespace metal;\n"
+     << "struct CrucibleStageOut {\n";
+  for (const auto &P : Outputs) {
+    const char *Scalar =
+        P.Type == crucible::ComponentType::I32   ? "int"
+        : P.Type == crucible::ComponentType::U32 ? "uint"
+                                                 : "float";
+    std::string Ty = P.Columns > 1 ? std::string(Scalar) + std::to_string(P.Columns)
+                                   : std::string(Scalar);
+    for (uint32_t RIdx = 0; RIdx < P.Rows; ++RIdx) {
+      std::string Field = "sig" + std::to_string(P.ID) +
+                          (P.Rows > 1 ? "_" + std::to_string(RIdx) : "");
+      OS << "  " << Ty << " " << Field;
+      if (P.Kind == 3) {
+        OS << " [[position]]";
+      } else {
+        std::string Hex = toHex(StringRef(P.Semantic).lower(), true);
+        uint32_t SemIdx = RIdx < P.RowSemanticIndices.size()
+                              ? P.RowSemanticIndices[RIdx]
+                              : RIdx;
+        OS << " [[user(crucible_" << Hex << "_" << SemIdx << ")]]";
+      }
+      OS << ";\n";
+    }
+  }
+  unsigned OutWords = signatureWords(Outputs);
+  OS << "};\nvertex CrucibleStageOut crucible_passthrough_vs(\n"
+     << "    uint vid [[vertex_id]],\n"
+     << "    const device uint* buf [[buffer(30)]]) {\n"
+     << "  CrucibleStageOut out = {};\n"
+     << "  uint base = vid * " << OutWords << "u;\n";
+  unsigned WordOff = 0;
+  for (const auto &P : Outputs) {
+    const char *Scalar =
+        P.Type == crucible::ComponentType::I32   ? "int"
+        : P.Type == crucible::ComponentType::U32 ? "uint"
+                                                 : "float";
+    for (uint32_t RIdx = 0; RIdx < P.Rows; ++RIdx) {
+      std::string Field = "out.sig" + std::to_string(P.ID) +
+                          (P.Rows > 1 ? "_" + std::to_string(RIdx) : "");
+      for (uint32_t CIdx = 0; CIdx < P.Columns; ++CIdx) {
+        std::string Dst = P.Columns > 1 ? Field + "[" + std::to_string(CIdx) + "]"
+                                        : Field;
+        OS << "  " << Dst << " = as_type<" << Scalar << ">(buf[base + "
+           << WordOff << "u]);\n";
+        ++WordOff;
+      }
+    }
+  }
+  OS << "  return out;\n}\n";
+  return Out;
+}
+
 Error executeRaster(Pipeline &P, MTL::Device *Device) {
   auto Fail = [](const char *Message) {
     return createStringError(inconvertibleErrorCode(), "%s", Message);
   };
-  if (!P.isTraditionalRaster() || P.Shaders.size() != 2)
+  if (!P.isTraditionalRaster() || P.Shaders.size() < 2)
     return Fail("raster execution requires one vertex and one pixel shader");
   auto &B = P.Bindings;
-  if (B.SampleCount != 1 || P.Stencil || B.getViewportCount() != 1 ||
-      !P.PushConstants.empty() ||
+  bool HasStencil = P.Stencil && P.Stencil->Enabled;
+  if (B.SampleCount < 1 ||
+      (B.SampleCount > 1 && !Device->supportsTextureSampleCount(B.SampleCount)) ||
+      B.getViewportCount() != 1 || !P.PushConstants.empty() ||
       P.ShadingRate != FragmentShadingRate::Rate1x1)
     return Fail("unsupported raster pipeline state");
 
@@ -441,7 +507,6 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   auto CO = NS::TransferPtr(MTL::CompileOptions::alloc()->init());
   CO->setFastMathEnabled(false);
   bool HasVertex = false, HasPixel = false, UsesVertexBuffer = false;
-  bool WritesDepth = false;
   constexpr unsigned VertexDataSlot = 30;
   std::map<CPUBuffer *, NS::SharedPtr<MTL::Buffer>> RasterBuffers;
   std::map<CPUBuffer *, NS::SharedPtr<MTL::Texture>> RasterTextures;
@@ -454,6 +519,453 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   size_t Stride = B.VertexBufferPtr ? B.VertexBufferPtr->Stride : 0;
   if (!Stride)
     Stride = B.getVertexStride();
+  const Shader *VS = nullptr, *HS = nullptr, *DS = nullptr, *GS = nullptr, *PS = nullptr;
+  for (const Shader &S : P.Shaders) {
+    switch (S.Stage) {
+    case Stages::Vertex: if (VS) return Fail("duplicate vertex shader"); VS = &S; break;
+    case Stages::Hull: if (HS) return Fail("duplicate hull shader"); HS = &S; break;
+    case Stages::Domain: if (DS) return Fail("duplicate domain shader"); DS = &S; break;
+    case Stages::Geometry: if (GS) return Fail("duplicate geometry shader"); GS = &S; break;
+    case Stages::Pixel: if (PS) return Fail("duplicate pixel shader"); PS = &S; break;
+    default: return Fail("unsupported raster shader stage");
+    }
+  }
+  if (!VS || !PS || (HS != nullptr) != (DS != nullptr))
+    return Fail("raster execution requires one vertex and one pixel shader");
+
+  auto CollectResources = [&](const crucible::Reflection &R,
+                              SmallVectorImpl<std::tuple<unsigned, MTL::Buffer *>> &Bufs,
+                              SmallVectorImpl<std::tuple<unsigned, MTL::Texture *>> &Texs,
+                              SmallVectorImpl<std::tuple<unsigned, MTL::SamplerState *>> &Samps) -> Error {
+    for (const auto &RB : R.Resources) {
+      if (RB.RangeSize != 1 || RB.HasCounter)
+        return Fail("unsupported raster shader resource array or counter");
+      if (RB.Class == crucible::ResourceClass::Sampler) {
+        YAMLSampler *Samp = nullptr;
+        for (auto &Set : P.Sets)
+          for (auto &Res : Set.Resources)
+            if (Res.DXBinding && Res.Kind == ResourceKind::Sampler &&
+                !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
+                Res.DXBinding->Register == RB.LowerBound &&
+                Res.getArraySize() == 1)
+              Samp = Res.SamplerPtr;
+        if (!Samp)
+          return Fail("missing sampler for raster shader resource");
+        auto &GPU = RasterSamplers[Samp];
+        if (!GPU)
+          GPU = NS::TransferPtr(createMetalSampler(Device, Samp));
+        if (!GPU)
+          return Fail("cannot allocate raster sampler");
+        Samps.emplace_back(RB.MetalIndex, GPU.get());
+        continue;
+      }
+      if (isCrucibleTextureKind(RB.Kind)) {
+        CPUBuffer *CPU = nullptr;
+        ResourceKind ResKind = ResourceKind::Texture2D;
+        for (auto &Set : P.Sets)
+          for (auto &Res : Set.Resources)
+            if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+                isTextureResource(Res.Kind) && !Res.HasCounter &&
+                !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
+                Res.DXBinding->Register == RB.LowerBound &&
+                Res.getArraySize() == 1) {
+              CPU = Res.BufferPtr;
+              ResKind = Res.Kind;
+            }
+        if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
+            !CPU->Data[0])
+          return Fail("missing backing texture for raster shader resource");
+        RasterTextureKinds[CPU] = ResKind;
+        MTL::TextureUsage Usage = MTL::TextureUsageShaderRead;
+        if (isWritableTexture(ResKind))
+          Usage = static_cast<MTL::TextureUsage>(Usage | MTL::TextureUsageShaderWrite);
+        if (RB.RequiresTextureAtomics)
+          Usage = static_cast<MTL::TextureUsage>(Usage | MTL::TextureUsageShaderAtomic);
+        RasterTextureUsages[CPU] = Usage;
+        auto &GPU = RasterTextures[CPU];
+        if (!GPU) {
+          auto TexOrErr = createMetalTexture(Device, CPU, ResKind, Usage);
+          if (!TexOrErr)
+            return TexOrErr.takeError();
+          GPU = NS::TransferPtr(*TexOrErr);
+        }
+        Texs.emplace_back(RB.MetalIndex, GPU.get());
+        continue;
+      }
+      if (RB.Kind != crucible::ResourceKind::StructuredBuffer &&
+          RB.Kind != crucible::ResourceKind::RawBuffer &&
+          RB.Kind != crucible::ResourceKind::TypedBuffer &&
+          RB.Kind != crucible::ResourceKind::CBuffer)
+        return Fail("unsupported raster shader resource kind");
+      if (RB.MetalIndex >= 28)
+        return Fail("raster buffer binding exceeds the available slots");
+      CPUBuffer *CPU = nullptr;
+      for (auto &Set : P.Sets)
+        for (auto &Res : Set.Resources)
+          if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+              !isTextureResource(Res.Kind) && !Res.HasCounter &&
+              !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
+              Res.DXBinding->Register == RB.LowerBound &&
+              Res.getArraySize() == 1)
+            CPU = Res.BufferPtr;
+      if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
+          !CPU->Data[0])
+        return Fail("missing backing buffer for raster shader resource");
+      auto &GPU = RasterBuffers[CPU];
+      if (!GPU)
+        GPU = NS::TransferPtr(Device->newBuffer(CPU->Data[0].get(), CPU->Size,
+                                               MTL::ResourceStorageModeShared));
+      if (!GPU)
+        return Fail("cannot allocate raster shader buffer");
+      Bufs.emplace_back(RB.MetalIndex, GPU.get());
+    }
+    return Error::success();
+  };
+
+  auto CompileMSL = [&](const crucible::CompileResult &CR) -> Expected<NS::SharedPtr<MTL::Function>> {
+    auto Lib = NS::TransferPtr(Device->newLibrary(
+        NS::String::string(CR.MSL.c_str(), NS::UTF8StringEncoding), CO.get(), &NErr));
+    if (!Lib)
+      return mtlError("MSL compilation failed", NErr);
+    auto Fn = NS::TransferPtr(Lib->newFunction(
+        NS::String::string(CR.Reflect.MSLEntryName.c_str(), NS::UTF8StringEncoding)));
+    if (!Fn)
+      return Fail("compiled raster entry point was not found");
+    return Fn;
+  };
+
+  // --- Tessellation and/or Geometry pipeline (VS -> [HS -> DS ->] [GS ->] PS) ---
+  if ((HS && DS) || GS) {
+    crucible::Options VSOpts;
+    VSOpts.EntryPoint = VS->Entry;
+    VSOpts.StageAsCompute = true;
+    VSOpts.VertexInputStride = static_cast<uint32_t>(Stride);
+    for (const auto &Attr : B.VertexAttributes) {
+      using ET = crucible::Options::VertexInputAttribute::ElementType;
+      ET T = Attr.Format == DataFormat::Int32 ? ET::Int32
+           : Attr.Format == DataFormat::UInt32 ? ET::UInt32
+                                               : ET::Float32;
+      VSOpts.VertexInputLayout.push_back(
+          {Attr.Name, static_cast<uint32_t>(Attr.Offset),
+           static_cast<uint32_t>(Attr.Channels), T});
+    }
+    auto VSComp = crucible::compileDXILToMSL(VS->Shader->getMemBufferRef(), VSOpts);
+    if (!VSComp) return VSComp.takeError();
+    auto VSFn = CompileMSL(*VSComp); if (!VSFn) return VSFn.takeError();
+
+    crucible::Options PSOpts;
+    PSOpts.EntryPoint = PS->Entry;
+    auto PSComp = crucible::compileDXILToMSL(PS->Shader->getMemBufferRef(), PSOpts);
+    if (!PSComp) return PSComp.takeError();
+    auto PSFn = CompileMSL(*PSComp); if (!PSFn) return PSFn.takeError();
+
+    SmallVector<std::tuple<unsigned, MTL::Buffer *>, 4> VSBufs, HSBufs, DSBufs, GSBufs, PSBufs;
+    SmallVector<std::tuple<unsigned, MTL::Texture *>, 4> VSTexs, HSTexs, DSTexs, GSTexs, PSTexs;
+    SmallVector<std::tuple<unsigned, MTL::SamplerState *>, 4> VSSamps, HSSamps, DSSamps, GSSamps, PSSamps;
+    if (Error E = CollectResources(VSComp->Reflect, VSBufs, VSTexs, VSSamps)) return E;
+    if (Error E = CollectResources(PSComp->Reflect, PSBufs, PSTexs, PSSamps)) return E;
+
+    size_t VertexCount = P.DispatchParameters.VertexCount.value_or(0);
+    if (!P.DispatchParameters.VertexCount && B.VertexBufferPtr && Stride &&
+        B.VertexBufferPtr->Size % Stride == 0)
+      VertexCount = B.VertexBufferPtr->Size / Stride;
+    if (!VertexCount || !B.VertexBufferPtr)
+      return Fail("invalid raster vertex count or buffer");
+
+    auto Queue = NS::TransferPtr(Device->newCommandQueue());
+    auto Vertices = NS::TransferPtr(Device->newBuffer(
+        B.VertexBufferPtr->Data[0].get(), B.VertexBufferPtr->Size,
+        MTL::ResourceStorageModeShared));
+    unsigned VSOutWords = signatureWords(VSComp->Reflect.Outputs);
+    auto VSOutBuf = NS::TransferPtr(Device->newBuffer(
+        VertexCount * std::max(1u, VSOutWords) * 4, MTL::ResourceStorageModeShared));
+
+    auto DispatchCompute = [&](MTL::Function *Fn, size_t Count,
+                               ArrayRef<std::tuple<unsigned, MTL::Buffer *>> Bufs,
+                               ArrayRef<std::tuple<unsigned, MTL::Texture *>> Texs,
+                               ArrayRef<std::tuple<unsigned, MTL::SamplerState *>> Samps) -> Error {
+      if (!Count) return Error::success();
+      auto CPSO = NS::TransferPtr(Device->newComputePipelineState(Fn, &NErr));
+      if (!CPSO) return mtlError("compute pipeline creation failed", NErr);
+      auto *Cmd = Queue->commandBuffer();
+      auto *Enc = Cmd->computeCommandEncoder();
+      Enc->setComputePipelineState(CPSO.get());
+      for (auto [Slot, Buf] : Bufs) Enc->setBuffer(Buf, 0, Slot);
+      for (auto [Slot, Tex] : Texs) Enc->setTexture(Tex, Slot);
+      for (auto [Slot, Samp] : Samps) Enc->setSamplerState(Samp, Slot);
+      Enc->dispatchThreads(MTL::Size(Count, 1, 1), MTL::Size(1, 1, 1));
+      Enc->endEncoding();
+      Cmd->commit();
+      Cmd->waitUntilCompleted();
+      if (Cmd->status() == MTL::CommandBufferStatusError)
+        return mtlError("compute dispatch failed", Cmd->error());
+      return Error::success();
+    };
+
+    VSBufs.emplace_back(28, Vertices.get());
+    VSBufs.emplace_back(30, VSOutBuf.get());
+    if (Error E = DispatchCompute(VSFn->get(), VertexCount, VSBufs, VSTexs, VSSamps))
+      return E;
+
+    NS::SharedPtr<MTL::Buffer> StageBuf = VSOutBuf;
+    size_t StageVertCount = VertexCount;
+    bool UseHardwareTess = false;
+    size_t PatchCount = 0;
+    uint32_t DSControlPoints = 0;
+    NS::SharedPtr<MTL::Buffer> TessFactorBuf, PatchDataBuf;
+    NS::SharedPtr<MTL::Function> DSFn;
+    MTL::PrimitiveType DrawPrim = MTL::PrimitiveTypeTriangle;
+
+    if (HS && DS) {
+      crucible::Options HSOpts;
+      HSOpts.EntryPoint = HS->Entry;
+      auto HSComp = crucible::compileDXILToMSL(HS->Shader->getMemBufferRef(), HSOpts);
+      if (!HSComp) return HSComp.takeError();
+      if (!HSComp->Reflect.Hull) return Fail("missing hull reflection");
+      const auto &HI = *HSComp->Reflect.Hull;
+      bool DSAsCompute = (GS != nullptr) ||
+                         HI.Domain == crucible::TessellationDomain::Isoline ||
+                         HI.OutputPrimitive == crucible::TessellationOutputPrimitive::Point;
+      crucible::Options DSOpts;
+      DSOpts.EntryPoint = DS->Entry;
+      DSOpts.StageAsCompute = DSAsCompute;
+      auto DSComp = crucible::compileDXILToMSL(DS->Shader->getMemBufferRef(), DSOpts);
+      if (!DSComp) return DSComp.takeError();
+      auto HSFn = CompileMSL(*HSComp); if (!HSFn) return HSFn.takeError();
+      auto DSFnRes = CompileMSL(*DSComp); if (!DSFnRes) return DSFnRes.takeError();
+      DSFn = *DSFnRes;
+      if (Error E = CollectResources(HSComp->Reflect, HSBufs, HSTexs, HSSamps)) return E;
+      if (Error E = CollectResources(DSComp->Reflect, DSBufs, DSTexs, DSSamps)) return E;
+
+      PatchCount = VertexCount / HI.InputControlPointCount;
+      if (!PatchCount) return Fail("invalid tessellation patch count");
+      unsigned HSCPWords = signatureWords(HSComp->Reflect.Outputs);
+      unsigned PatchWords = HSCPWords * HI.OutputControlPointCount +
+                            signatureWords(HI.PatchConstants);
+      PatchDataBuf = NS::TransferPtr(Device->newBuffer(
+          PatchCount * std::max(1u, PatchWords) * 4, MTL::ResourceStorageModeShared));
+      unsigned TFStride = HI.Domain == crucible::TessellationDomain::Triangle ? 4u
+                        : HI.Domain == crucible::TessellationDomain::Quad ? 6u : 2u;
+      size_t TFElemSize = DSAsCompute ? sizeof(float) : 2;
+      TessFactorBuf = NS::TransferPtr(Device->newBuffer(
+          PatchCount * TFStride * TFElemSize, MTL::ResourceStorageModeShared));
+
+      HSBufs.emplace_back(28, VSOutBuf.get());
+      HSBufs.emplace_back(29, TessFactorBuf.get());
+      HSBufs.emplace_back(30, PatchDataBuf.get());
+      if (Error E = DispatchCompute(HSFn->get(), PatchCount, HSBufs, HSTexs, HSSamps))
+        return E;
+
+      if (DSAsCompute) {
+        const float *TF = static_cast<const float *>(TessFactorBuf->contents());
+        struct DomainItem { float u, v, w; uint32_t patchID; };
+        SmallVector<DomainItem, 64> Items;
+        for (size_t Patch = 0; Patch < PatchCount; ++Patch) {
+          if (HI.Domain == crucible::TessellationDomain::Isoline) {
+            int NumLines = std::max(1, static_cast<int>(std::round(TF[Patch * 2 + 0])));
+            int NumSegs = std::max(1, static_cast<int>(std::round(TF[Patch * 2 + 1])));
+            for (int J = 0; J < NumLines; ++J) {
+              float V = static_cast<float>(J) / static_cast<float>(NumLines);
+              for (int S = 0; S < NumSegs; ++S) {
+                float U0 = static_cast<float>(S) / static_cast<float>(NumSegs);
+                float U1 = static_cast<float>(S + 1) / static_cast<float>(NumSegs);
+                Items.push_back({U0, V, 0.0f, static_cast<uint32_t>(Patch)});
+                Items.push_back({U1, V, 0.0f, static_cast<uint32_t>(Patch)});
+              }
+            }
+            DrawPrim = MTL::PrimitiveTypeLine;
+          } else if (HI.Domain == crucible::TessellationDomain::Quad) {
+            int NU = std::max(1, static_cast<int>(std::round(TF[Patch * 6 + 4])));
+            int NV = std::max(1, static_cast<int>(std::round(TF[Patch * 6 + 5])));
+            for (int J = 0; J <= NV; ++J)
+              for (int I = 0; I <= NU; ++I)
+                Items.push_back({static_cast<float>(I) / NU, static_cast<float>(J) / NV,
+                                 0.0f, static_cast<uint32_t>(Patch)});
+            DrawPrim = MTL::PrimitiveTypePoint;
+          }
+        }
+        StageVertCount = Items.size();
+        auto ItemsBuf = NS::TransferPtr(Device->newBuffer(
+            Items.data(), Items.size() * sizeof(DomainItem), MTL::ResourceStorageModeShared));
+        unsigned DSOutWords = signatureWords(DSComp->Reflect.Outputs);
+        auto DSOutBuf = NS::TransferPtr(Device->newBuffer(
+            std::max<size_t>(1, StageVertCount) * std::max(1u, DSOutWords) * 4,
+            MTL::ResourceStorageModeShared));
+        DSBufs.emplace_back(28, DSOutBuf.get());
+        DSBufs.emplace_back(29, ItemsBuf.get());
+        DSBufs.emplace_back(30, PatchDataBuf.get());
+        if (Error E = DispatchCompute(DSFn.get(), StageVertCount, DSBufs, DSTexs, DSSamps))
+          return E;
+        StageBuf = DSOutBuf;
+        if (!GS) {
+          std::string PTVS = buildPassThroughVS(DSComp->Reflect.Outputs);
+          auto PTLib = NS::TransferPtr(Device->newLibrary(
+              NS::String::string(PTVS.c_str(), NS::UTF8StringEncoding), CO.get(), &NErr));
+          if (!PTLib) return mtlError("passthrough VS compilation failed", NErr);
+          auto PTFn = NS::TransferPtr(PTLib->newFunction(
+              NS::String::string("crucible_passthrough_vs", NS::UTF8StringEncoding)));
+          Desc->setVertexFunction(PTFn.get());
+        }
+      } else {
+        UseHardwareTess = true;
+        DSControlPoints = DSComp->Reflect.Domain->ControlPointCount;
+        Desc->setVertexFunction(DSFn.get());
+        MTL::TessellationPartitionMode PartMode = MTL::TessellationPartitionModeInteger;
+        switch (HI.Partitioning) {
+        case crucible::TessellationPartitioning::Integer: PartMode = MTL::TessellationPartitionModeInteger; break;
+        case crucible::TessellationPartitioning::Pow2: PartMode = MTL::TessellationPartitionModePow2; break;
+        case crucible::TessellationPartitioning::FractionalOdd: PartMode = MTL::TessellationPartitionModeFractionalOdd; break;
+        case crucible::TessellationPartitioning::FractionalEven: PartMode = MTL::TessellationPartitionModeFractionalEven; break;
+        }
+        Desc->setTessellationPartitionMode(PartMode);
+        Desc->setTessellationFactorStepFunction(MTL::TessellationFactorStepFunctionPerPatch);
+        Desc->setTessellationOutputWindingOrder(
+            HI.OutputPrimitive == crucible::TessellationOutputPrimitive::TriangleCCW
+                ? MTL::WindingCounterClockwise
+                : MTL::WindingClockwise);
+        Desc->setMaxTessellationFactor(std::min(64.0f, HI.MaxTessFactor));
+        Desc->setTessellationFactorScaleEnabled(false);
+        Desc->setTessellationControlPointIndexType(MTL::TessellationControlPointIndexTypeNone);
+      }
+    }
+
+    if (GS) {
+      crucible::Options GSOpts;
+      GSOpts.EntryPoint = GS->Entry;
+      auto GSComp = crucible::compileDXILToMSL(GS->Shader->getMemBufferRef(), GSOpts);
+      if (!GSComp) return GSComp.takeError();
+      if (!GSComp->Reflect.Geometry) return Fail("missing geometry reflection");
+      const auto &GI = *GSComp->Reflect.Geometry;
+      auto GSFn = CompileMSL(*GSComp); if (!GSFn) return GSFn.takeError();
+      if (Error E = CollectResources(GSComp->Reflect, GSBufs, GSTexs, GSSamps)) return E;
+
+      unsigned InputVerts = GI.InputPrimitive == 1 ? 1u : GI.InputPrimitive == 2 ? 2u : 3u;
+      size_t PrimCount = StageVertCount / InputVerts;
+      unsigned MaxVertsPerPrim =
+          GI.OutputTopology == 1 ? GI.MaxVertexCount
+          : GI.OutputTopology == 3
+              ? (GI.MaxVertexCount >= 2 ? (GI.MaxVertexCount - 1) * 2 : 0)
+              : (GI.MaxVertexCount >= 3 ? (GI.MaxVertexCount - 2) * 3 : 0);
+      unsigned GSOutWords = signatureWords(GSComp->Reflect.Outputs);
+      uint32_t InitCounter = 0;
+      auto GSCounterBuf = NS::TransferPtr(Device->newBuffer(
+          &InitCounter, sizeof(uint32_t), MTL::ResourceStorageModeShared));
+      auto GSOutBuf = NS::TransferPtr(Device->newBuffer(
+          std::max<size_t>(1, PrimCount * MaxVertsPerPrim) * std::max(1u, GSOutWords) * 4,
+          MTL::ResourceStorageModeShared));
+      GSBufs.emplace_back(28, StageBuf.get());
+      GSBufs.emplace_back(29, GSCounterBuf.get());
+      GSBufs.emplace_back(30, GSOutBuf.get());
+      if (Error E = DispatchCompute(GSFn->get(), PrimCount, GSBufs, GSTexs, GSSamps))
+        return E;
+
+      StageVertCount = *static_cast<const uint32_t *>(GSCounterBuf->contents());
+      StageBuf = GSOutBuf;
+      DrawPrim = GI.OutputTopology == 1 ? MTL::PrimitiveTypePoint
+               : GI.OutputTopology == 3 ? MTL::PrimitiveTypeLine
+                                        : MTL::PrimitiveTypeTriangle;
+      std::string PTVS = buildPassThroughVS(GSComp->Reflect.Outputs);
+      auto PTLib = NS::TransferPtr(Device->newLibrary(
+          NS::String::string(PTVS.c_str(), NS::UTF8StringEncoding), CO.get(), &NErr));
+      if (!PTLib) return mtlError("passthrough VS compilation failed", NErr);
+      auto PTFn = NS::TransferPtr(PTLib->newFunction(
+          NS::String::string("crucible_passthrough_vs", NS::UTF8StringEncoding)));
+      Desc->setVertexFunction(PTFn.get());
+    }
+
+    Desc->setFragmentFunction(PSFn->get());
+    auto *TexDesc = MTL::TextureDescriptor::texture2DDescriptor(*PF, Width, Height, false);
+    TexDesc->setStorageMode(MTL::StorageModeShared);
+    TexDesc->setUsage(MTL::TextureUsageRenderTarget);
+    auto Target = NS::TransferPtr(Device->newTexture(TexDesc));
+    NS::SharedPtr<MTL::Texture> MSAATarget;
+    if (B.SampleCount > 1) {
+      auto *MSAADesc = MTL::TextureDescriptor::texture2DDescriptor(*PF, Width, Height, false);
+      MSAADesc->setTextureType(MTL::TextureType2DMultisample);
+      MSAADesc->setSampleCount(B.SampleCount);
+      MSAADesc->setStorageMode(MTL::StorageModePrivate);
+      MSAADesc->setUsage(MTL::TextureUsageRenderTarget);
+      MSAATarget = NS::TransferPtr(Device->newTexture(MSAADesc));
+    }
+    if (B.SampleCount > 1)
+      Desc->setRasterSampleCount(B.SampleCount);
+    MTL::PixelFormat DepthStencilFormat =
+        HasStencil ? MTL::PixelFormatDepth32Float_Stencil8
+                   : MTL::PixelFormatDepth32Float;
+    Desc->setDepthAttachmentPixelFormat(DepthStencilFormat);
+    if (HasStencil)
+      Desc->setStencilAttachmentPixelFormat(DepthStencilFormat);
+
+    auto PSO = NS::TransferPtr(Device->newRenderPipelineState(Desc.get(), &NErr));
+    if (!PSO) return mtlError("raster render pipeline creation failed", NErr);
+
+    auto VP = B.getViewports().front();
+    auto Sc = B.getScissors().front();
+    auto *Pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+    auto *DSDesc = MTL::TextureDescriptor::texture2DDescriptor(DepthStencilFormat, Width, Height, false);
+    if (B.SampleCount > 1) {
+      DSDesc->setTextureType(MTL::TextureType2DMultisample);
+      DSDesc->setSampleCount(B.SampleCount);
+    }
+    DSDesc->setStorageMode(MTL::StorageModePrivate);
+    DSDesc->setUsage(MTL::TextureUsageRenderTarget);
+    auto DepthStencilTarget = NS::TransferPtr(Device->newTexture(DSDesc));
+    auto DSStateDesc = NS::TransferPtr(MTL::DepthStencilDescriptor::alloc()->init());
+    DSStateDesc->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
+    DSStateDesc->setDepthWriteEnabled(true);
+    auto DepthStencilState = NS::TransferPtr(Device->newDepthStencilState(DSStateDesc.get()));
+    auto *DepthAttachment = Pass->depthAttachment();
+    DepthAttachment->setTexture(DepthStencilTarget.get());
+    DepthAttachment->setLoadAction(MTL::LoadActionClear);
+    DepthAttachment->setClearDepth(1.0);
+    DepthAttachment->setStoreAction(MTL::StoreActionDontCare);
+    auto *Color = Pass->colorAttachments()->object(0);
+    if (MSAATarget) {
+      Color->setTexture(MSAATarget.get());
+      Color->setResolveTexture(Target.get());
+      Color->setStoreAction(MTL::StoreActionMultisampleResolve);
+    } else {
+      Color->setTexture(Target.get());
+      Color->setStoreAction(MTL::StoreActionStore);
+    }
+    Color->setLoadAction(MTL::LoadActionClear);
+    Color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
+
+    auto *Cmd = Queue->commandBuffer();
+    auto *Enc = Cmd->renderCommandEncoder(Pass);
+    Enc->setRenderPipelineState(PSO.get());
+    Enc->setDepthStencilState(DepthStencilState.get());
+    Enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
+    Enc->setViewport({VP.X, VP.Y, VP.Width, VP.Height, VP.MinDepth, VP.MaxDepth});
+    Enc->setScissorRect({static_cast<size_t>(Sc.X), static_cast<size_t>(Sc.Y), Sc.Width, Sc.Height});
+    for (auto [Slot, Buf] : PSBufs) Enc->setFragmentBuffer(Buf, 0, Slot);
+    for (auto [Slot, Tex] : PSTexs) Enc->setFragmentTexture(Tex, Slot);
+    for (auto [Slot, Samp] : PSSamps) Enc->setFragmentSamplerState(Samp, Slot);
+    if (UseHardwareTess) {
+      Enc->setTessellationFactorBuffer(TessFactorBuf.get(), 0, 0);
+      Enc->setVertexBuffer(PatchDataBuf.get(), 0, crucible::DomainInterface::DataMetalIndex);
+      for (auto [Slot, Buf] : DSBufs) Enc->setVertexBuffer(Buf, 0, Slot);
+      for (auto [Slot, Tex] : DSTexs) Enc->setVertexTexture(Tex, Slot);
+      for (auto [Slot, Samp] : DSSamps) Enc->setVertexSamplerState(Samp, Slot);
+      Enc->drawPatches(DSControlPoints, 0, PatchCount, nullptr, 0, 1, 0);
+    } else if (StageVertCount > 0) {
+      Enc->setVertexBuffer(StageBuf.get(), 0, 30);
+      Enc->drawPrimitives(DrawPrim, NS::UInteger{0}, StageVertCount);
+    }
+    Enc->endEncoding();
+    Cmd->commit();
+    Cmd->waitUntilCompleted();
+    if (Cmd->status() == MTL::CommandBufferStatusError)
+      return mtlError("GPU raster rendering failed", Cmd->error());
+    Target->getBytes(Output->Data[0].get(), Pitch, MTL::Region::Make2D(0, 0, Width, Height), 0);
+    for (auto &[CPU, GPU] : RasterBuffers)
+      memcpy(CPU->Data[0].get(), GPU->contents(), CPU->Size);
+    for (auto &[CPU, Tex] : RasterTextures)
+      if (RasterTextureUsages.at(CPU) & MTL::TextureUsageShaderWrite)
+        readbackMetalTexture(Tex.get(), CPU, RasterTextureKinds.at(CPU));
+    return Error::success();
+  }
+
   for (const Shader &S : P.Shaders) {
     bool Vertex = S.Stage == Stages::Vertex;
     if ((!Vertex && S.Stage != Stages::Pixel) ||
@@ -567,9 +1079,6 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
     if (!Fn)
       return Fail("compiled raster entry point was not found");
     if (!Vertex) {
-      WritesDepth = llvm::any_of(R.Outputs, [](const auto &P) {
-        return P.Kind >= 17 && P.Kind <= 19;
-      });
       Desc->setFragmentFunction(Fn.get());
       HasPixel = true;
       continue;
@@ -629,8 +1138,14 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   case PrimitiveTopology::PointList: Primitive = MTL::PrimitiveTypePoint; break;
   default: return Fail("unsupported raster primitive topology");
   }
-  if (WritesDepth)
-    Desc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+  if (B.SampleCount > 1)
+    Desc->setRasterSampleCount(B.SampleCount);
+  MTL::PixelFormat DepthStencilFormat =
+      HasStencil ? MTL::PixelFormatDepth32Float_Stencil8
+                 : MTL::PixelFormatDepth32Float;
+  Desc->setDepthAttachmentPixelFormat(DepthStencilFormat);
+  if (HasStencil)
+    Desc->setStencilAttachmentPixelFormat(DepthStencilFormat);
   auto PSO = NS::TransferPtr(Device->newRenderPipelineState(Desc.get(), &NErr));
   if (!PSO)
     return mtlError("render pipeline state creation failed", NErr);
@@ -638,6 +1153,17 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   TexDesc->setStorageMode(MTL::StorageModeShared);
   TexDesc->setUsage(MTL::TextureUsageRenderTarget);
   auto Target = NS::TransferPtr(Device->newTexture(TexDesc));
+  NS::SharedPtr<MTL::Texture> MSAATarget;
+  if (B.SampleCount > 1) {
+    auto *MSAADesc = MTL::TextureDescriptor::texture2DDescriptor(*PF, Width, Height, false);
+    MSAADesc->setTextureType(MTL::TextureType2DMultisample);
+    MSAADesc->setSampleCount(B.SampleCount);
+    MSAADesc->setStorageMode(MTL::StorageModePrivate);
+    MSAADesc->setUsage(MTL::TextureUsageRenderTarget);
+    MSAATarget = NS::TransferPtr(Device->newTexture(MSAADesc));
+    if (!MSAATarget)
+      return Fail("cannot allocate Metal MSAA render target");
+  }
   auto Queue = NS::TransferPtr(Device->newCommandQueue());
   if (!Target || !Queue)
     return Fail("cannot allocate Metal render target or queue");
@@ -654,31 +1180,59 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
       static_cast<size_t>(Sc.Y) + Sc.Height > Height)
     return Fail("scissor exceeds the render target");
   auto *Pass = MTL::RenderPassDescriptor::renderPassDescriptor();
-  NS::SharedPtr<MTL::Texture> DepthTarget;
-  NS::SharedPtr<MTL::DepthStencilState> DepthState;
-  if (WritesDepth) {
-    auto *DepthDesc = MTL::TextureDescriptor::texture2DDescriptor(
-        MTL::PixelFormatDepth32Float, Width, Height, false);
-    DepthDesc->setStorageMode(MTL::StorageModePrivate);
-    DepthDesc->setUsage(MTL::TextureUsageRenderTarget);
-    DepthTarget = NS::TransferPtr(Device->newTexture(DepthDesc));
+  NS::SharedPtr<MTL::Texture> DepthStencilTarget;
+  NS::SharedPtr<MTL::DepthStencilState> DepthStencilState;
+  {
+    auto *DSDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        DepthStencilFormat, Width, Height, false);
+    if (B.SampleCount > 1) {
+      DSDesc->setTextureType(MTL::TextureType2DMultisample);
+      DSDesc->setSampleCount(B.SampleCount);
+    }
+    DSDesc->setStorageMode(MTL::StorageModePrivate);
+    DSDesc->setUsage(MTL::TextureUsageRenderTarget);
+    DepthStencilTarget = NS::TransferPtr(Device->newTexture(DSDesc));
     auto DS = NS::TransferPtr(MTL::DepthStencilDescriptor::alloc()->init());
-    DS->setDepthCompareFunction(MTL::CompareFunctionLess);
+    DS->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
     DS->setDepthWriteEnabled(true);
-    DepthState = NS::TransferPtr(Device->newDepthStencilState(DS.get()));
-    if (!DepthTarget || !DepthState)
-      return Fail("cannot allocate Metal depth target or state");
-    auto *Attachment = Pass->depthAttachment();
-    Attachment->setTexture(DepthTarget.get());
-    Attachment->setLoadAction(MTL::LoadActionClear);
-    Attachment->setClearDepth(1.0);
-    Attachment->setStoreAction(MTL::StoreActionDontCare);
+    if (HasStencil) {
+      auto StencilDesc = NS::TransferPtr(MTL::StencilDescriptor::alloc()->init());
+      StencilDesc->setStencilCompareFunction(metalCompare(P.Stencil->ComparisonOp));
+      StencilDesc->setStencilFailureOperation(MTL::StencilOperationKeep);
+      StencilDesc->setDepthFailureOperation(MTL::StencilOperationKeep);
+      StencilDesc->setDepthStencilPassOperation(MTL::StencilOperationKeep);
+      StencilDesc->setReadMask(0xff);
+      StencilDesc->setWriteMask(0xff);
+      DS->setFrontFaceStencil(StencilDesc.get());
+      DS->setBackFaceStencil(StencilDesc.get());
+    }
+    DepthStencilState = NS::TransferPtr(Device->newDepthStencilState(DS.get()));
+    if (!DepthStencilTarget || !DepthStencilState)
+      return Fail("cannot allocate Metal depth/stencil target or state");
+    auto *DepthAttachment = Pass->depthAttachment();
+    DepthAttachment->setTexture(DepthStencilTarget.get());
+    DepthAttachment->setLoadAction(MTL::LoadActionClear);
+    DepthAttachment->setClearDepth(1.0);
+    DepthAttachment->setStoreAction(MTL::StoreActionDontCare);
+    if (HasStencil) {
+      auto *StencilAttachment = Pass->stencilAttachment();
+      StencilAttachment->setTexture(DepthStencilTarget.get());
+      StencilAttachment->setLoadAction(MTL::LoadActionClear);
+      StencilAttachment->setClearStencil(P.Stencil->ClearValue);
+      StencilAttachment->setStoreAction(MTL::StoreActionDontCare);
+    }
   }
   auto *Color = Pass->colorAttachments()->object(0);
-  Color->setTexture(Target.get());
+  if (MSAATarget) {
+    Color->setTexture(MSAATarget.get());
+    Color->setResolveTexture(Target.get());
+    Color->setStoreAction(MTL::StoreActionMultisampleResolve);
+  } else {
+    Color->setTexture(Target.get());
+    Color->setStoreAction(MTL::StoreActionStore);
+  }
   Color->setLoadAction(MTL::LoadActionClear);
   Color->setClearColor(MTL::ClearColor(0, 0, 0, 0));
-  Color->setStoreAction(MTL::StoreActionStore);
   auto *Cmd = Queue->commandBuffer();
   if (!Cmd)
     return Fail("cannot allocate Metal render command buffer");
@@ -686,8 +1240,10 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
   if (!Enc)
     return Fail("cannot allocate Metal render command encoder");
   Enc->setRenderPipelineState(PSO.get());
-  if (DepthState)
-    Enc->setDepthStencilState(DepthState.get());
+  if (DepthStencilState)
+    Enc->setDepthStencilState(DepthStencilState.get());
+  if (HasStencil)
+    Enc->setStencilReferenceValue(0);
   Enc->setFrontFacingWinding(MTL::WindingCounterClockwise);
   Enc->setViewport({VP.X, VP.Y, VP.Width, VP.Height, VP.MinDepth, VP.MaxDepth});
   Enc->setScissorRect({static_cast<size_t>(Sc.X), static_cast<size_t>(Sc.Y),
@@ -1074,6 +1630,7 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
     }
     Opts.FlushDenormsF32 = true;
     Opts.BoundsCheckBuffers = true;
+    Opts.EmulateF64 = true;
     for (const DescriptorSet &Set : P.Sets) {
       for (const Resource &Res : Set.Resources) {
         auto Class = classify(Res.Kind);
@@ -1471,7 +2028,7 @@ public:
     for (auto [Name, Enabled] :
          {std::pair<StringRef, bool>{"Native16BitShaderOpsSupported", true},
           {"Int64ShaderOps", true},
-          {"DoublePrecisionFloatShaderOps", false},
+          {"DoublePrecisionFloatShaderOps", true},
           {"AtomicInt64OnGroupSharedSupported", false},
           {"AtomicInt64OnTypedResourceSupported", false},
           {"SM_6_9", true}, {"WaveMultiPrefix", true},
