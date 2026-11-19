@@ -2998,6 +2998,53 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return Expr{Vec->Text + "[" + Idx->Text + "]", PrecPrimary};
   }
 
+  if (auto IE = mlir::dyn_cast<InsertElementOp>(Op)) {
+    auto VecTy = mlir::dyn_cast<mlir::VectorType>(IE.getType());
+    if (!VecTy || VecTy.isScalable() || VecTy.getRank() != 1)
+      return makeError("unsupported insertelement vector type");
+    unsigned N = static_cast<unsigned>(VecTy.getNumElements());
+    SmallVector<mlir::Value, 4> Lanes(N);
+    mlir::Value Cur = IE.getResult();
+    while (auto CurIE = Cur.getDefiningOp<InsertElementOp>()) {
+      auto Pos = constInt(CurIE.getPosition());
+      if (!Pos || *Pos >= N)
+        return makeError("dynamic or out-of-range insertelement index");
+      if (!Lanes[*Pos])
+        Lanes[*Pos] = CurIE.getValue();
+      Cur = CurIE.getVector();
+    }
+    auto VecName = mslType(VecTy);
+    auto ElemName = mslType(VecTy.getElementType());
+    if (!VecName || !ElemName)
+      return makeError("unsupported insertelement element type");
+    bool BaseIsUndef = isUndefLike(Cur) ||
+                       (Cur.getDefiningOp() &&
+                        mlir::isa<mlir::LLVM::ZeroOp>(Cur.getDefiningOp()));
+    std::string BaseText;
+    if (!BaseIsUndef) {
+      auto BE = exprFor(Cur, PrecPrimary);
+      if (!BE)
+        return BE.takeError();
+      BaseText = BE->Text;
+    }
+    std::string ArgsText;
+    for (unsigned I = 0; I < N; ++I) {
+      if (I)
+        ArgsText += ", ";
+      if (Lanes[I]) {
+        auto LE = exprFor(Lanes[I], PrecUnknown);
+        if (!LE)
+          return LE.takeError();
+        ArgsText += LE->Text;
+      } else if (!BaseIsUndef) {
+        ArgsText += BaseText + "[" + std::to_string(I) + "]";
+      } else {
+        ArgsText += *ElemName + "(0)";
+      }
+    }
+    return Expr{*VecName + "(" + ArgsText + ")", PrecPrimary};
+  }
+
   if (auto EV = mlir::dyn_cast<ExtractValueOp>(Op))
     return bufferElementExpr(EV);
 
