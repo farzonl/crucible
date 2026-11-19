@@ -1,0 +1,12 @@
+# DXIL -> SPIR-V test for RWTexture2D read/write and GetDimensions.
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/texture_rw_dims.hlsl
+# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %spirv-dis %t.spv | FileCheck %s
+
+# CHECK: OpEntryPoint GLCompute %main "main"
+# CHECK: OpTypeImage
+# CHECK: OpImageQuerySize
+# CHECK: OpImageWrite
