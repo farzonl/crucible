@@ -466,6 +466,45 @@
       font-size: 0.9rem;
       margin: 0;
     }
+
+    .track-switcher {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-bottom: 1.25rem;
+    }
+
+    .track-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.45rem 0.9rem;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+    }
+
+    .track-pill:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+
+    .track-pill.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .track-pill .track-rate {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      opacity: 0.85;
+    }
   </style>
 </head>
 <body>
@@ -473,7 +512,7 @@
     <header>
       <div class="title-group">
         <h1>Crucible Offload Compliance</h1>
-        <p>macOS Metal (<span style="font-family: var(--font-mono)">offload-test-suite via crucible</span>) pass rate &amp; regression history per commit</p>
+        <p id="track-subtitle">Multi-backend (<span style="font-family: var(--font-mono)">offload-test-suite via crucible</span>) pass rate &amp; regression history per commit</p>
       </div>
       <div style="display: flex; gap: 0.6rem; flex-wrap: wrap; align-items: center;">
         <button id="theme-toggle" class="meta-pill" type="button" aria-label="Toggle color theme">☀ Light</button>
@@ -483,6 +522,7 @@
         </a>
       </div>
     </header>
+    <nav id="track-switcher" class="track-switcher" aria-label="Compliance track" hidden></nav>
 
     <section class="kpi-grid" aria-label="Latest compliance summary">
       <article class="card">
@@ -953,10 +993,15 @@
       });
     }
 
-    async function init() {
-      setupThemeToggle();
+    let availableTracks = [];
+    let currentTrackId = "dxil-to-metal";
+
+    async function loadTrack(trackId) {
+      currentTrackId = trackId;
+      const track = availableTracks.find(t => t.id === trackId);
+      const url = track ? track.historyUrl : "data/history.json";
       try {
-        const resp = await fetch("data/history.json", { cache: "no-store" });
+        const resp = await fetch(url, { cache: "no-store" });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const json = await resp.json();
         historyData = normalizeHistory(Array.isArray(json) && json.length ? json : FALLBACK_HISTORY);
@@ -964,8 +1009,62 @@
         historyData = normalizeHistory(FALLBACK_HISTORY);
       }
 
+      if (track) {
+        const sub = document.getElementById("track-subtitle");
+        if (sub) {
+          sub.innerHTML = `${escapeHtml(track.label)} (<span style="font-family: var(--font-mono)">offload-test-suite via crucible</span>) pass rate &amp; regression history per commit`;
+        }
+      }
+
+      document.querySelectorAll(".track-pill").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.trackId === trackId);
+      });
+
+      try {
+        const u = new URL(window.location.href);
+        u.searchParams.set("track", trackId);
+        window.history.replaceState({}, "", u.toString());
+      } catch {}
+
       selectedIndex = historyData.length - 1;
       selectCommit(selectedIndex);
+    }
+
+    function renderTrackSwitcher() {
+      const nav = document.getElementById("track-switcher");
+      if (!nav || availableTracks.length <= 1) return;
+      nav.hidden = false;
+      nav.innerHTML = availableTracks.map(t => `
+        <button type="button" class="track-pill${t.id === currentTrackId ? " active" : ""}" data-track-id="${escapeHtml(t.id)}">
+          <span>${escapeHtml(t.label)}</span>
+          <span class="track-rate">${Number(t.passRate || 0).toFixed(1)}%</span>
+        </button>
+      `).join("");
+      nav.querySelectorAll(".track-pill").forEach(btn => {
+        btn.addEventListener("click", () => loadTrack(btn.dataset.trackId));
+      });
+    }
+
+    async function init() {
+      setupThemeToggle();
+      try {
+        const tr = await fetch("data/tracks.json", { cache: "no-store" });
+        if (tr.ok) {
+          const parsed = await tr.json();
+          if (Array.isArray(parsed) && parsed.length) availableTracks = parsed;
+        }
+      } catch {}
+
+      const params = new URLSearchParams(window.location.search);
+      const requested = params.get("track");
+      if (requested && availableTracks.some(t => t.id === requested)) {
+        currentTrackId = requested;
+      } else if (availableTracks.length) {
+        currentTrackId = availableTracks[0].id;
+      }
+
+      renderTrackSwitcher();
+      await loadTrack(currentTrackId);
       setupCanvasInteraction();
 
       const ro = new ResizeObserver(() => drawTrendChart());

@@ -1,7 +1,8 @@
-# Runs llvm/offload-test-suite on a Metal GPU through crucible-offload
-# (crucible's DirectX personality: DXIL -> MSL -> Metal, direct bindings)
-# and publishes the pass-rate dashboard (pages/index.html) to GitHub Pages,
-# mirroring Nacelle's offload-compliance pipeline.
+# Runs llvm/offload-test-suite across multiple Crucible tracks:
+#   - dxil-to-metal (macOS Metal via MetalDevice)
+#   - dxil-to-spirv (Linux Vulkan Lavapipe via VulkanDevice)
+# and publishes the unified multi-track pass-rate dashboard (pages/index.html)
+# to GitHub Pages.
 
 name: Compliance
 
@@ -20,11 +21,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  compliance:
+  compliance-dxil-to-metal:
     runs-on: macos-15
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -82,28 +80,140 @@ jobs:
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --parallel
 
-      - name: Run offload-test-suite compliance run
+      - name: Run offload-test-suite (dxil-to-metal)
         env:
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/.sdk/lib
+          CRUCIBLE_OFFLOAD_RUNTIME: metal
         run: |
-          lit -v --timeout=60 --output=offload-results.json \
+          lit -v --timeout=60 --output=offload-results-dxil-to-metal.json \
             build/test-offload || true
+
+      - name: Upload dxil-to-metal results
+        uses: actions/upload-artifact@v4
+        with:
+          name: offload-results-dxil-to-metal
+          path: offload-results-dxil-to-metal.json
+
+  compliance-dxil-to-spirv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout llvm/offload-test-suite
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-test-suite
+          path: third_party/offload-test-suite
+
+      - name: Checkout llvm/offload-golden-images
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-golden-images
+          path: third_party/offload-golden-images
+
+      - name: Install Vulkan (Lavapipe), LLVM/MLIR, and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl gnupg lsb-release software-properties-common \
+            ninja-build cmake libpng-dev libvulkan-dev mesa-vulkan-drivers \
+            vulkan-tools python3-pip
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          CODENAME="$(lsb_release -cs)"
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-22-dev llvm-22-tools libmlir-22-dev mlir-22-tools
+          pip3 install --break-system-packages lit psutil pyyaml
+
+      - name: Restore Linux DXC SDK cache
+        id: cache-linux-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-linux-x86_64-vk1.4.357.0
+
+      - name: Install Linux DXC (from Vulkan SDK)
+        if: steps.cache-linux-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin .sdk/lib
+          VULKAN_VER="1.4.357.0"
+          curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/linux/vulkansdk-linux-x86_64-${VULKAN_VER}.tar.xz" -o /tmp/vulkansdk.tar.xz
+          tar -xf /tmp/vulkansdk.tar.xz -C /tmp
+          cp -a /tmp/${VULKAN_VER}/x86_64/bin/dxc* .sdk/bin/
+          cp -a /tmp/${VULKAN_VER}/x86_64/lib/libdxcompiler* .sdk/lib/
+          rm -rf /tmp/${VULKAN_VER} /tmp/vulkansdk.tar.xz
+
+      - name: Save Linux DXC SDK cache
+        if: steps.cache-linux-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-linux-x86_64-vk1.4.357.0
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir \
+            -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
+            -DLLVM_EXTERNAL_LIT="$(which lit)"
+          cmake --build build --parallel
+
+      - name: Run offload-test-suite (dxil-to-spirv on Lavapipe)
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/.sdk/lib
+          CRUCIBLE_OFFLOAD_RUNTIME: vulkan
+        run: |
+          lit -v --timeout=60 --output=offload-results-dxil-to-spirv.json \
+            build/test-offload || true
+
+      - name: Upload dxil-to-spirv results
+        uses: actions/upload-artifact@v4
+        with:
+          name: offload-results-dxil-to-spirv
+          path: offload-results-dxil-to-spirv.json
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv]
+    if: always() && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success')
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download offload result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
 
       - name: Restore historical compliance data cache
         uses: actions/cache/restore@v4
         with:
           path: .compliance-cache
-          key: offload-history-${{ github.sha }}
+          key: offload-history-v2-${{ github.sha }}
           restore-keys: |
+            offload-history-v2-
             offload-history-
 
-      - name: Record compliance history and build GitHub Pages site
+      - name: Record multi-track compliance history and build GitHub Pages site
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%s)
           COMMIT_AUTHOR=$(git log -1 --pretty=%an)
           COMMIT_TS=$(git log -1 --pretty=%cI)
+          TRACK_ARGS=()
+          if [ -f artifacts/offload-results-dxil-to-metal.json ]; then
+            TRACK_ARGS+=(--track-lit "dxil-to-metal=DXIL -> Metal (macOS)=artifacts/offload-results-dxil-to-metal.json")
+          fi
+          if [ -f artifacts/offload-results-dxil-to-spirv.json ]; then
+            TRACK_ARGS+=(--track-lit "dxil-to-spirv=DXIL -> SPIR-V (Linux Vulkan)=artifacts/offload-results-dxil-to-spirv.json")
+          fi
           python3 scripts/record_offload_compliance.py \
-            --lit-json offload-results.json \
+            "${TRACK_ARGS[@]}" \
             --site-src pages \
             --out-dir _site \
             --sha "${{ github.sha }}" \
@@ -112,7 +222,7 @@ jobs:
             --timestamp "$COMMIT_TS" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --pages-url "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}" \
-            --history-cache .compliance-cache/history.json
+            --history-cache-dir .compliance-cache
 
       - name: Save historical compliance data cache
         if: always()
@@ -120,7 +230,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .compliance-cache
-          key: offload-history-${{ github.sha }}
+          key: offload-history-v2-${{ github.sha }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
