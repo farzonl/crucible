@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Common.h"
 #include "API/Device.h"
 #include "API/FormatConversion.h"
 #include "Support/Pipeline.h"
@@ -53,35 +54,7 @@ Error mtlError(const Twine &Msg, NS::Error *Err) {
 }
 
 std::optional<crucible::ResourceClass> classify(ResourceKind Kind) {
-  switch (Kind) {
-  case ResourceKind::Buffer:
-  case ResourceKind::StructuredBuffer:
-  case ResourceKind::ByteAddressBuffer:
-  case ResourceKind::Texture1D:
-  case ResourceKind::Texture1DArray:
-  case ResourceKind::Texture2D:
-  case ResourceKind::Texture2DArray:
-  case ResourceKind::Texture3D:
-  case ResourceKind::TextureCube:
-  case ResourceKind::TextureCubeArray:
-  case ResourceKind::AccelerationStructure:
-    return crucible::ResourceClass::SRV;
-  case ResourceKind::RWBuffer:
-  case ResourceKind::RWStructuredBuffer:
-  case ResourceKind::RWByteAddressBuffer:
-  case ResourceKind::RWTexture1D:
-  case ResourceKind::RWTexture1DArray:
-  case ResourceKind::RWTexture2D:
-  case ResourceKind::RWTexture2DArray:
-  case ResourceKind::RWTexture3D:
-    return crucible::ResourceClass::UAV;
-  case ResourceKind::ConstantBuffer:
-    return crucible::ResourceClass::CBV;
-  case ResourceKind::Sampler:
-    return crucible::ResourceClass::Sampler;
-  default:
-    return std::nullopt; // accel structures: unsupported
-  }
+  return crucible_offload::classifyResource(Kind);
 }
 
 MTL::SamplerMinMagFilter metalFilter(FilterMode F) {
@@ -2296,36 +2269,10 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
   return Error::success();
 }
 
-Error validateRootParameters(const Pipeline &P) {
-  for (const auto &Param : P.Settings.DX.RootParams) {
-    if (Param.Kind == dx::RootParamKind::Constant) {
-      const auto &RC = std::get<dx::RootConstant>(Param.Data);
-      if (RC.BufferPtr && RC.BufferPtr->ArraySize != 1)
-        return createStringError(
-            std::errc::invalid_argument,
-            "Root constant cannot refer to resource arrays.");
-    } else if (Param.Kind == dx::RootParamKind::RootDescriptor) {
-      const auto &RR = std::get<dx::RootResource>(Param.Data);
-      if (RR.getArraySize() != 1)
-        return createStringError(
-            std::errc::invalid_argument,
-            "Root descriptor cannot refer to resource arrays.");
-    }
-  }
-
-  return Error::success();
-}
-
 // The suite tools use executeProgram; the lower-level device API is not
 // implemented by this provider.
-struct CapabilityValueString
-    : CapabilityValue<CapabilityValueString, std::string> {
-  CapabilityValueString(std::string V)
-      : CapabilityValue<CapabilityValueString, std::string>(std::move(V)) {}
-  static char ID;
-  static std::string valueToString(const std::string &V) { return V; }
-};
-char CapabilityValueString::ID = 0;
+using crucible_offload::CapabilityValueString;
+using crucible_offload::validateRootParameters;
 
 class CrucibleDevice final : public offloadtest::Device {
   NS::SharedPtr<MTL::Device> Metal;
@@ -2490,10 +2437,10 @@ public:
 
 } // namespace
 
-offloadtest::Device::~Device() = default;
+namespace crucible_offload {
 
 Expected<SmallVector<std::unique_ptr<offloadtest::Device>>>
-offloadtest::initializeDevices(const DeviceConfig Config) {
+createMetalDevices(const DeviceConfig &Config) {
   if ((Config.EnableValidationLayer || Config.EnableDebugLayer) &&
       setenv("MTL_DEBUG_LAYER", "1", 1) != 0)
     return errorCodeToError(std::error_code(errno, std::generic_category()));
@@ -2506,3 +2453,5 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
   Devices.push_back(std::make_unique<CrucibleDevice>(std::move(Metal)));
   return Devices;
 }
+
+} // namespace crucible_offload

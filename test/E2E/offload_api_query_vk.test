@@ -1,0 +1,9 @@
+# Verify crucible-offload's Vulkan runtime (DXIL -> SPIR-V -> Vulkan) reports
+# as a DirectX/Crucible device when CRUCIBLE_OFFLOAD_RUNTIME=vulkan is set.
+# REQUIRES: offload-runner, vulkan-gpu
+
+# RUN: env CRUCIBLE_OFFLOAD_RUNTIME=vulkan %api_query | FileCheck %s
+
+# CHECK: API: DirectX
+# CHECK: Driver: Crucible
+# CHECK: Backend: Vulkan
