@@ -3,6 +3,7 @@
 config.cruciblec = "@CRUCIBLE_CRUCIBLEC_PATH@"
 config.crucible_run = "@CRUCIBLE_RUN_PATH@"
 config.crucible_offload = "@CRUCIBLE_OFFLOAD_PATH@"
+config.crucible_api_query = "@CRUCIBLE_API_QUERY_PATH@"
 config.dxc = "@DXC_EXECUTABLE@"
 config.filecheck = "@FILECHECK_EXECUTABLE@"
 config.test_exec_root = "@CMAKE_CURRENT_BINARY_DIR@"

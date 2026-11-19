@@ -1,0 +1,10 @@
+# REQUIRES: gpu, offload-runner
+# RUN: %api_query | FileCheck %s
+
+# CHECK-DAG: API: DirectX
+# CHECK-DAG: Backend: Metal
+# CHECK-DAG: Description: {{.+}}
+# CHECK-DAG: Driver: Crucible
+# CHECK-DAG: DoublePrecisionFloatShaderOps: false
+# CHECK-DAG: RegistryID: {{[1-9][0-9]*}}
+# CHECK-DAG: Architecture: "{{[^"]+}}"

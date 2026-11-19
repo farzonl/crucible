@@ -1,6 +1,4 @@
-# crucible-offload: an offloader-compatible runner for llvm/offload-test-suite
-# that compiles DXIL with crucible and executes on Metal with zero-overhead
-# direct bindings (no metal-shaderconverter, no argument-buffer ABI).
+# Build the suite's unmodified CLI sources with Crucible as their device provider.
 
 # The suite's headers expect a build-generated Config.h; crucible uses none
 # of the suite's device backends, so generate a minimal one.
@@ -14,6 +12,7 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/suite-config/Config.h"
 # The suite's YAML pipeline parser and result-verification rules are reused
 # directly from its sources.
 add_library(offload-suite-support STATIC
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/Capabilities.cpp"
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/Pipeline.cpp"
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/Check.cpp"
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/OffloadMigration.cpp"
@@ -24,23 +23,38 @@ target_include_directories(offload-suite-support PUBLIC
 target_compile_options(offload-suite-support PRIVATE ${CRUCIBLE_COMMON_FLAGS})
 target_link_libraries(offload-suite-support PUBLIC ${CRUCIBLE_LLVM_LIBS})
 
-set(OFFLOAD_HOST_INFO "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/HostInfo.cpp")
-if(EXISTS "${OFFLOAD_HOST_INFO}")
-  add_executable(crucible-api-query api-query.cpp "${OFFLOAD_HOST_INFO}")
-  target_compile_definitions(crucible-api-query PRIVATE OFFLOADTEST_HAVE_SYSCTLBYNAME)
-  target_compile_options(crucible-api-query PRIVATE ${CRUCIBLE_COMMON_FLAGS})
-  target_link_libraries(crucible-api-query PRIVATE offload-suite-support)
-endif()
-
 # Pure C++ via the suite's vendored metal-cpp (LLVM headers are not
 # Objective-C++ clean).
-add_executable(crucible-offload main.cpp)
-target_include_directories(crucible-offload PRIVATE
+add_library(crucible-offload-device STATIC Device.cpp)
+target_include_directories(crucible-offload-device PRIVATE
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/third-party/metal-cpp")
-target_link_libraries(crucible-offload PRIVATE
+target_link_libraries(crucible-offload-device PUBLIC
   crucible
   offload-suite-support
   "-framework Metal"
   "-framework Foundation"
   "-framework QuartzCore"
 )
+
+find_package(PNG REQUIRED)
+add_library(offload-suite-image STATIC
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Image/Color.cpp"
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Image/Image.cpp"
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Image/ImageComparators.cpp"
+)
+target_compile_options(offload-suite-image PRIVATE ${CRUCIBLE_COMMON_FLAGS})
+target_link_libraries(offload-suite-image PUBLIC offload-suite-support PNG::PNG)
+
+add_executable(imgdiff "${CRUCIBLE_OFFLOAD_SUITE_DIR}/tools/imgdiff/imgdiff.cpp")
+target_compile_options(imgdiff PRIVATE ${CRUCIBLE_COMMON_FLAGS})
+target_link_libraries(imgdiff PRIVATE offload-suite-image)
+
+add_executable(offloader "${CRUCIBLE_OFFLOAD_SUITE_DIR}/tools/offloader/offloader.cpp")
+target_link_libraries(offloader PRIVATE crucible-offload-device offload-suite-image)
+add_executable(api-query "${CRUCIBLE_OFFLOAD_SUITE_DIR}/tools/api-query/api-query.cpp"
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/HostInfo.cpp")
+target_compile_definitions(api-query PRIVATE OFFLOADTEST_HAVE_SYSCTLBYNAME)
+target_link_libraries(api-query PRIVATE crucible-offload-device)
+foreach(tool offloader api-query)
+  target_compile_options(${tool} PRIVATE ${CRUCIBLE_COMMON_FLAGS})
+endforeach()

@@ -1,0 +1,16 @@
+# SM 6.5 wave multi-prefix intrinsics -> Metal simdgroup helpers.
+
+# RUN: %dxc -T cs_6_5 -E main -Fo %t.dxil %S/../Inputs/wave_multi_prefix.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK: uint lane {{\[\[thread_index_in_simdgroup\]\]}}
+# CHECK-DAG: crucible_wave_multi_prefix_arith<uint, 0>(
+# CHECK-DAG: crucible_wave_multi_prefix_arith<uint, 4>(
+# CHECK-DAG: crucible_wave_multi_prefix_bit<uint, 1>(
+# CHECK-DAG: crucible_wave_multi_prefix_bit<uint, 2>(
+# CHECK-DAG: crucible_wave_multi_prefix_bit<uint, 3>(
+
+# REQUIRES: metal-tools
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air

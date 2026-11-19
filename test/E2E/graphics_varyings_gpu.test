@@ -1,6 +1,6 @@
 # REQUIRES: gpu, offload-runner
 # RUN: %dxc -T vs_6_0 -E vs -Fo %t.vs %S/../Inputs/graphics_varyings.hlsl
 # RUN: %dxc -T ps_6_0 -E ps -Fo %t.ps %S/../Inputs/graphics_varyings.hlsl
-# RUN: %crucible-offload %S/../Inputs/graphics_varyings.yaml %t.vs %t.ps | FileCheck %s
+# RUN: %offloader %S/../Inputs/graphics_varyings.yaml %t.vs %t.ps | FileCheck %s
 
 # CHECK: Name: Output

@@ -30,6 +30,8 @@ static const char *stageName(ShaderStage S) {
     return "compute";
   case ShaderStage::Library:
     return "library";
+  case ShaderStage::RayGeneration:
+    return "raygeneration";
   case ShaderStage::Mesh:
     return "mesh";
   case ShaderStage::Amplification:

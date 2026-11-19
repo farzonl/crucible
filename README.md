@@ -101,7 +101,8 @@ All testing is lit/FileCheck-driven (`test/FileCheck` for golden MSL +
 ### offload-test-suite integration
 
 Crucible runs [llvm/offload-test-suite](https://github.com/llvm/offload-test-suite)
-natively: `tools/crucible-offload` is a drop-in `offloader` replacement that
+natively: `tools/crucible-offload` builds upstream `offloader` and `api-query`
+from unmodified sources and links them to a Crucible device provider that
 reuses the suite's YAML pipeline parser and ULP/epsilon verification rules,
 but compiles the DXIL with crucible and dispatches on Metal with
 reflection-driven direct bindings.
@@ -118,9 +119,13 @@ cmake -S . -B build -G Ninja \
 ninja -C build check-crucible-offload
 ```
 
-Pass `--validation-layer` to `crucible-offload` to enable Metal API Validation.
-The offload lit harness uses `crucible-api-query` for host information when
-the suite checkout includes its `HostInfo` support code.
+The integration requires `libpng` to build the suite's image tools and
+`PyYAML` for lit device discovery. Run `build/tools/crucible-offload/api-query`
+to report the default Metal adapter as a `DirectX` target with the `Crucible`
+driver tag. The local lit harness selects that record and invokes the linked
+`offloader` with `-api=dx` (required when invoking it manually on macOS).
+Add `--validation-layer` to enable Metal API Validation. The upstream checkout
+and test cases are not modified.
 
 Baseline at Milestone 2: **110 passed / 219 failed / 289 unsupported** of 619
 discovered tests (graphics, RT, wave ops, 16/64-bit types, and textures are
@@ -182,6 +187,8 @@ is the current optimization target.
 - [x] **Milestone 4 (partial)** — offload-test-suite integration
   (`crucible-offload` + `check-crucible-offload`) and public compliance
   dashboard. Scalar `half`, `i16`, and `i64` are enabled in compliance tests.
+  Statically initialized scalar lookup tables can be dynamically indexed
+  from Metal constant memory, as in the upstream Mandelbrot image test.
   Typed buffer loads and stores preserve DXIL's packed 32-bit word layout
   for scalar and two-component 64-bit integers.
   Long-vector integer `abs` and integer/float `dot` use LLVM's Scalarizer
@@ -202,7 +209,11 @@ is the current optimization target.
   pipelines with buffer bindings, fragment discard, and derivatives. It
   uses a transient depth attachment for shaders that write depth.
   Graphics textures and samplers, stencil, multisampling, cull distance,
-  geometry, and tessellation remain unsupported.
+  geometry, and end-to-end tessellation remain unsupported. Standalone
+  triangle and quad domain shaders can lower to Metal post-tessellation
+  vertex functions, with a reflected patch-data layout for control points
+  and patch constants. The runner does not yet produce that data or
+  dispatch a tessellated draw.
 
 ## License
 

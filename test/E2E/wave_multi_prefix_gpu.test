@@ -1,0 +1,9 @@
+# End-to-end GPU test: SM 6.5 wave multi-prefix intrinsics on a 32-lane wave.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_5 -E main -Fo %t.dxil %S/../Inputs/wave_multi_prefix.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 32,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:u32:6:zero | FileCheck %s
+
+# CHECK: buffer0: 256 256 21 25 29 41

@@ -1,0 +1,17 @@
+# REQUIRES: metal-tools
+# RUN: %dxc -T lib_6_5 -Fo %t.dxil %S/../Inputs/rt_pipeline.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s < %t.metal
+# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.metal -o %t.air
+
+# CHECK: using namespace metal::raytracing;
+# CHECK: struct CrucibleRayState
+# CHECK: static inline void crucible_rt_ClosestHitMain(
+# CHECK: static inline void crucible_rt_MissMain(
+# CHECK: kernel void
+# CHECK: instance_acceleration_structure Scene {{\[\[buffer\(0\)\]\]}}
+# CHECK: uint3 dtid {{\[\[thread_position_in_grid\]\]}}
+# CHECK: uint3 grid_size {{\[\[threads_per_grid\]\]}}
+# CHECK: intersection_query<triangle_data, instancing>
+# CHECK: crucible_rt_ClosestHitMain(
+# CHECK: crucible_rt_MissMain(

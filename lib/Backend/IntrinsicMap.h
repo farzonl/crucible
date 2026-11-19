@@ -74,8 +74,11 @@ enum class DXILOp : uint32_t {
   // Resources
   CreateHandle = 57,
   CBufferLoadLegacy = 59,
+  Sample = 60,
   SampleLevel = 62,
   SampleGrad = 63,
+  SampleCmp = 64,
+  SampleCmpLevelZero = 65,
   TextureLoad = 66,
   TextureStore = 67,
   BufferLoad = 68,
@@ -84,6 +87,7 @@ enum class DXILOp : uint32_t {
   GetDimensions = 72,
   TextureGather = 73,
   TextureGatherCmp = 74,
+  CalculateLOD = 81,
   // Atomics
   AtomicBinOp = 78,
   AtomicCompareExchange = 79,
@@ -124,10 +128,43 @@ enum class DXILOp : uint32_t {
   // SM 6.2+ raw/structured buffer access
   RawBufferLoad = 139,
   RawBufferStore = 140,
+  // SM 6.3+ Raytracing Pipeline
+  DispatchRaysIndex = 145,
+  DispatchRaysDimensions = 146,
+  WorldRayOrigin = 147,
+  WorldRayDirection = 148,
+  RayTCurrent = 154,
+  TraceRay = 157,
+  CreateHandleForLib = 160,
+  PrimitiveIndex = 161,
   // SM 6.4 packed dot products
   Dot2AddHalf = 162,
   Dot4AddI8Packed = 163,
   Dot4AddU8Packed = 164,
+  // SM 6.5 RayQuery
+  AllocateRayQuery = 178,
+  RayQuery_TraceRayInline = 179,
+  RayQuery_Proceed = 180,
+  RayQuery_Abort = 181,
+  RayQuery_CommitNonOpaqueTriangleHit = 182,
+  RayQuery_CommitProceduralPrimitiveHit = 183,
+  RayQuery_CommittedStatus = 184,
+  RayQuery_CandidateType = 185,
+  RayQuery_CommittedTriangleFrontFace = 192,
+  RayQuery_CommittedTriangleBarycentrics = 194,
+  RayQuery_RayFlags = 195,
+  RayQuery_WorldRayOrigin = 196,
+  RayQuery_WorldRayDirection = 197,
+  RayQuery_RayTMin = 198,
+  RayQuery_CommittedRayT = 200,
+  RayQuery_CommittedInstanceID = 208,
+  RayQuery_CommittedInstanceIndex = 209,
+  RayQuery_CommittedPrimitiveIndex = 210,
+  RayQuery_CommittedGeometryIndex = 212,
+  RayQuery_CommittedInstanceContributionToHitGroupIndex = 215,
+  // SM 6.5 wave multi-prefix ops
+  WaveMultiPrefixOp = 166,
+  WaveMultiPrefixBitCount = 167,
   // SM 6.6 resource handles & pack/unpack
   AnnotateHandle = 216,
   CreateHandleFromBinding = 217,
@@ -153,6 +190,15 @@ enum class DXILWaveOpKind : uint32_t { Sum = 0, Product = 1, Min = 2, Max = 3 };
 
 /// hlsl::DXIL::WaveBitOpKind (operand 2 of dx.op.waveActiveBit).
 enum class DXILWaveBitOpKind : uint32_t { And = 0, Or = 1, Xor = 2 };
+
+/// hlsl::DXIL::WaveMultiPrefixOpKind (operand 6 of dx.op.waveMultiPrefixOp).
+enum class DXILWaveMultiPrefixOpKind : uint32_t {
+  Sum = 0,
+  And = 1,
+  Or = 2,
+  Xor = 3,
+  Product = 4,
+};
 
 /// Returns the metal_stdlib function implementing a unary DXIL op on the
 /// given operand class, or empty if unmapped.

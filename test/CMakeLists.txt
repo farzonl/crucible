@@ -6,8 +6,9 @@ if(NOT DXC_EXECUTABLE)
   message(WARNING "dxc not found; tests that compile HLSL will fail")
 endif()
 
-if(TARGET crucible-offload)
-  set(CRUCIBLE_OFFLOAD_PATH $<TARGET_FILE:crucible-offload>)
+if(TARGET offloader)
+  set(CRUCIBLE_OFFLOAD_PATH $<TARGET_FILE:offloader>)
+  set(CRUCIBLE_API_QUERY_PATH $<TARGET_FILE:api-query>)
 endif()
 
 find_program(FILECHECK_EXECUTABLE FileCheck
@@ -58,10 +59,10 @@ if(LLVM_EXTERNAL_LIT)
   # llvm/offload-test-suite compliance run (crucible-offload backend).
   # Lives outside this suite's directory so check-crucible doesn't recurse
   # into it.
-  if(TARGET crucible-offload)
-    add_dependencies(check-crucible crucible-offload)
-    if(TARGET crucible-api-query)
-      set(CRUCIBLE_API_QUERY_PATH $<TARGET_FILE:crucible-api-query>)
+  if(TARGET offloader)
+    add_dependencies(check-crucible offloader api-query)
+    if(TARGET imgdiff)
+      set(CRUCIBLE_IMGDIFF_PATH $<TARGET_FILE:imgdiff>)
     endif()
     configure_file(
       "${CMAKE_CURRENT_SOURCE_DIR}/offload/lit.site.cfg.py.in"
@@ -73,11 +74,11 @@ if(LLVM_EXTERNAL_LIT)
     add_custom_target(check-crucible-offload
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv
               "${CMAKE_BINARY_DIR}/test-offload"
-      DEPENDS crucible-offload
+      DEPENDS offloader api-query
       USES_TERMINAL
       COMMENT "Running llvm/offload-test-suite against crucible")
-    if(TARGET crucible-api-query)
-      add_dependencies(check-crucible-offload crucible-api-query)
+    if(TARGET imgdiff)
+      add_dependencies(check-crucible-offload imgdiff)
     endif()
   endif()
 else()
