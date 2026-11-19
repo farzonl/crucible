@@ -7,4 +7,4 @@
 # CHECK: kernel void main0(
 # CHECK-NEXT: device float* Data {{\[\[}}buffer(0){{\]\]}},
 # CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
-# CHECK: fmin(fmax(sqrt(fabs({{.*}})), 0.5f) * float(dtid.x + 1u), {{.*}} < 2.0f ? 1e+09f : 10.0f)
+# CHECK: min(max(sqrt(fabs({{.*}})), 0.5f) * float(dtid.x + 1u), {{.*}} < 2.0f ? 1e+09f : 10.0f)

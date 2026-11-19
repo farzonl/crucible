@@ -10,6 +10,6 @@
 # CHECK: if ({{.*}} < 2.0f) {
 # CHECK: * 3.0f
 # CHECK: } else {
-# CHECK: fmin({{.*}}, 10.0f)
+# CHECK: min({{.*}}, 10.0f)
 # CHECK: }
 # CHECK: Data[dtid.x] =

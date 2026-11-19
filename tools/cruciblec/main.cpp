@@ -73,6 +73,9 @@ static cl::opt<bool> EmulateF64("emulate-f64",
 static cl::opt<bool> StageAsCompute("stage-as-compute",
                                     cl::desc("Lower Geometry/Hull/Domain/Mesh/Amplification stages as compute shaders"),
                                     cl::cat(CrucibleCat));
+static cl::opt<bool> DumpMLIR("dump-mlir",
+                              cl::desc("Dump structurized MLIR to stderr before MSL emission"),
+                              cl::cat(CrucibleCat));
 
 static int reportError(Error E) {
   logAllUnhandledErrors(std::move(E), errs(), "cruciblec: error: ");
@@ -139,6 +142,7 @@ int main(int argc, char **argv) {
   Opts.MSLStd = MSLStd;
   Opts.FlushDenormsF32 = FlushDenormsF32;
   Opts.EmulateF64 = EmulateF64;
+  Opts.DumpMLIR = DumpMLIR;
   Opts.StageAsCompute = StageAsCompute;
   Opts.EmitSPIRVAsm = EmitSPIRVAsm;
   Opts.VulkanVersion = VulkanVersion;

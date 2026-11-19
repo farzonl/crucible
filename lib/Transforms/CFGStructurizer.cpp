@@ -25,7 +25,9 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Pass/PassManager.h"
@@ -169,14 +171,17 @@ Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
   mlir::DialectRegistry Registry;
   Registry.insert<mlir::LLVM::LLVMDialect, mlir::DLTIDialect,
                   mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
-                  mlir::scf::SCFDialect, mlir::arith::ArithDialect>();
+                  mlir::scf::SCFDialect, mlir::arith::ArithDialect,
+                  mlir::gpu::GPUDialect, mlir::math::MathDialect>();
   mlir::registerLLVMDialectImport(Registry);
   Ctx.appendDialectRegistry(Registry);
+  Ctx.loadDialect<mlir::gpu::GPUDialect, mlir::math::MathDialect>();
 
   auto Mod = mlir::translateLLVMIRToModule(std::move(Shader.M), &Ctx);
   if (!Mod)
     return makeError("MLIR import of the DXIL module failed");
 
+  lowerDXILToLayer1(*Mod);
   return structurizeMLIRModule(std::move(Mod), Shader.Reflect);
 }
 
