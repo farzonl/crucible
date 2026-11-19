@@ -24,8 +24,12 @@ struct CompileResult {
   Reflection Reflect;
 };
 
-/// Translate a DXContainer (.dxil) binary -- or bare DXIL bitcode -- into
+/// Translate a shader binary (DXContainer, bare DXIL bitcode, or SPIR-V) into
 /// Metal Shading Language source plus binding reflection.
+llvm::Expected<CompileResult> compileToMSL(llvm::MemoryBufferRef Input,
+                                           const Options &Opts = {});
+
+/// Alias for compileToMSL retained for backwards compatibility.
 llvm::Expected<CompileResult> compileDXILToMSL(llvm::MemoryBufferRef DXIL,
                                                const Options &Opts = {});
 
