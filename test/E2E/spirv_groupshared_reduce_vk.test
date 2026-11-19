@@ -1,0 +1,9 @@
+# End-to-end DXIL -> SPIR-V -> Vulkan/MoltenVK GPU execution with groupshared reduction.
+# REQUIRES: spirv-tools, vulkan-gpu
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/groupshared_reduce.hlsl
+# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %crucible-vk-run --spv %t.spv --entry main --groups 1,1,1 --buffer 0:u32:1:zero | FileCheck %s
+
+# CHECK: buffer0: 2016
