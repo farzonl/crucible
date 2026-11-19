@@ -90,8 +90,15 @@ if(LLVM_EXTERNAL_LIT)
       DEPENDS offloader api-query
       USES_TERMINAL
       COMMENT "Running llvm/offload-test-suite against crucible")
+    add_custom_target(check-crucible-offload-spirv
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
+              "${CMAKE_BINARY_DIR}/test-offload"
+      DEPENDS offloader api-query
+      USES_TERMINAL
+      COMMENT "Running llvm/offload-test-suite against crucible (SPIR-V frontend -> Metal)")
     if(TARGET imgdiff)
       add_dependencies(check-crucible-offload imgdiff)
+      add_dependencies(check-crucible-offload-spirv imgdiff)
     endif()
   endif()
 else()

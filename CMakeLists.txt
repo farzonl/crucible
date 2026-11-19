@@ -73,6 +73,7 @@ set(CRUCIBLE_MLIR_LIBS
   MLIRDLTIDialect
   MLIRTransforms
   MLIRPass
+  MLIRParser
   MLIRIR)
 
 # Match LLVM conventions: no RTTI / no exceptions unless LLVM has them.

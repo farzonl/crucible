@@ -988,6 +988,12 @@ private:
   };
 
   std::vector<ResState> ResStates; // parallel to R.Resources
+  struct KernelPtrArg {
+    std::string Name;
+    std::string ElemType;
+    uint32_t BufferIndex = 0;
+  };
+  std::vector<KernelPtrArg> KernelPtrArgs; // Layer 0 addrspace(1) ptr args
   std::deque<ResourceBinding> HeapBindings;
   std::deque<ResState> HeapStates;
   DenseMap<mlir::Operation *, HandleRef> HandleMap; // handle def -> resource
@@ -2290,6 +2296,22 @@ Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
       if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(Indices[0]))
         return Expr{Text + "[" + std::to_string(IA.getInt()) + "]",
                     PrecPrimary};
+    }
+    // Flat 1D pointer indexing on Layer 0 addrspace(1) kernel pointer args.
+    if (auto BArg = mlir::dyn_cast<mlir::BlockArgument>(GEP.getBase());
+        BArg && Indices.size() == 1) {
+      if (auto PT = mlir::dyn_cast<mlir::LLVM::LLVMPointerType>(BArg.getType());
+          PT && PT.getAddressSpace() == 1) {
+        if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(Indices[0]))
+          return Expr{Text + "[" +
+                          std::to_string(IA.getValue().getZExtValue()) + "u]",
+                      PrecPrimary};
+        auto V = mlir::cast<mlir::Value>(Indices[0]);
+        auto E = exprFor(V, PrecUnknown);
+        if (!E)
+          return E.takeError();
+        return Expr{Text + "[" + E->Text + "]", PrecPrimary};
+      }
     }
     mlir::Type CurTy = GEP.getElemType();
     for (unsigned I = 0; I < Indices.size(); ++I) {
@@ -6375,6 +6397,11 @@ Expected<std::string> Emitter::kernelSignature() {
       }
     }
   }
+  for (const KernelPtrArg &KA : KernelPtrArgs) {
+    Sep();
+    OS << "    device " << KA.ElemType << "* " << KA.Name << " [[buffer("
+       << KA.BufferIndex << ")]]";
+  }
   if (R.BufferSizesMetalIndex != UINT32_MAX) {
     Sep();
     OS << "    constant uint* crucible_buf_dims [[buffer("
@@ -6482,6 +6509,45 @@ Expected<std::string> Emitter::run() {
     return std::move(E);
   if (Error E = collectConstantGlobals())
     return std::move(E);
+
+  // Layer 0 addrspace(1) pointer arguments (PTX / compute IR kernel ABI).
+  if (!Entry.getBody().empty()) {
+    uint32_t NextBuf = 0;
+    for (const ResourceBinding &RB : R.Resources) {
+      if (RB.Class != ResourceClass::Sampler && !isTextureKind(RB.Kind))
+        NextBuf = std::max(NextBuf, RB.MetalIndex + RB.RangeSize);
+    }
+    for (mlir::BlockArgument Arg : Entry.getBody().front().getArguments()) {
+      auto PT = mlir::dyn_cast<mlir::LLVM::LLVMPointerType>(Arg.getType());
+      if (!PT || PT.getAddressSpace() != 1)
+        continue;
+      mlir::Type ElemTy;
+      for (mlir::Operation *U : Arg.getUsers()) {
+        if (auto GEP = mlir::dyn_cast<mlir::LLVM::GEPOp>(U)) {
+          ElemTy = GEP.getElemType();
+          break;
+        }
+        if (auto Ld = mlir::dyn_cast<mlir::LLVM::LoadOp>(U)) {
+          ElemTy = Ld.getType();
+          break;
+        }
+        if (auto St = mlir::dyn_cast<mlir::LLVM::StoreOp>(U)) {
+          ElemTy = St.getValue().getType();
+          break;
+        }
+      }
+      std::string ElemStr = "uint";
+      if (ElemTy) {
+        auto MT = mslType(ElemTy);
+        if (!MT)
+          return MT.takeError();
+        ElemStr = *MT;
+      }
+      std::string Name = "arg" + std::to_string(KernelPtrArgs.size());
+      ValueNames[Arg] = Name;
+      KernelPtrArgs.push_back(KernelPtrArg{Name, ElemStr, NextBuf++});
+    }
+  }
 
   if (MeshStage || AmpStage) {
     mlir::Type PayloadTy;

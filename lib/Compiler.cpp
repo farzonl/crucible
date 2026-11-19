@@ -21,9 +21,11 @@ namespace crucible {
 
 Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
                                        const Options &Opts) {
-  if (isSPIRVBinary(Input)) {
+  if (isSPIRVBinary(Input) || isMLIRText(Input)) {
     mlir::MLIRContext MCtx;
-    auto Loaded = loadSPIRV(Input, MCtx, Opts.EntryPoint);
+    auto Loaded = isSPIRVBinary(Input)
+                      ? loadSPIRV(Input, MCtx, Opts.EntryPoint)
+                      : loadMLIR(Input, MCtx, Opts.EntryPoint);
     if (!Loaded)
       return Loaded.takeError();
 
