@@ -115,15 +115,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl gnupg lsb-release software-properties-common \
-            ninja-build cmake libpng-dev libvulkan-dev mesa-vulkan-drivers \
-            vulkan-tools python3-pip
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          CODENAME="$(lsb_release -cs)"
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-22 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update
+            ca-certificates curl ninja-build cmake libpng-dev libvulkan-dev \
+            mesa-vulkan-drivers vulkan-tools python3-pip
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 23
           sudo apt-get install -y --no-install-recommends \
-            llvm-22-dev llvm-22-tools libmlir-22-dev mlir-22-tools
+            llvm-23-dev llvm-23-tools libmlir-23-dev mlir-23-tools
           pip3 install --break-system-packages lit psutil pyyaml
 
       - name: Restore Linux DXC SDK cache
@@ -155,8 +153,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-22/lib/cmake/mlir \
+            -DLLVM_DIR=/usr/lib/llvm-23/lib/cmake/llvm \
+            -DMLIR_DIR=/usr/lib/llvm-23/lib/cmake/mlir \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --parallel
