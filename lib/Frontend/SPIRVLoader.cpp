@@ -1,0 +1,1145 @@
+//===- SPIRVLoader.cpp - MLIR SPIR-V frontend -------------------*- C++ -*-===//
+//
+// Part of Crucible, an open-source shader-to-MSL compiler.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+// Deserializes SPIR-V binaries into MLIR's spirv dialect, extracts binding and
+// stage reflection, rewrites shader-ABI ops (built-ins, descriptor-bound
+// buffers) into Crucible's layered MLIR representation (gpu.* + llvm.*), and
+// lowers remaining SPIR-V ops via MLIR's ConvertSPIRVToLLVM pass.
+//
+//===----------------------------------------------------------------------===//
+
+#include "Frontend.h"
+#include "../Backend/IntrinsicMap.h"
+#include "crucible/Diagnostic.h"
+
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Endian.h"
+
+#include "mlir/Conversion/SPIRVToLLVM/SPIRVToLLVMPass.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVEnums.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVTypes.h"
+#include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Target/SPIRV/Deserialization.h"
+
+using namespace llvm;
+
+namespace crucible {
+
+static constexpr uint32_t kSPIRVMagic = 0x07230203u;
+
+bool isSPIRVBinary(MemoryBufferRef Buf) {
+  if (Buf.getBufferSize() < 4)
+    return false;
+  uint32_t Magic = support::endian::read32le(Buf.getBufferStart());
+  return Magic == kSPIRVMagic;
+}
+
+namespace {
+
+struct BoundBufferInfo {
+  size_t ReflectIndex = 0;
+  mlir::Type ElemType;
+  uint32_t ElemStride = 4;
+};
+
+struct BoundCBufferInfo {
+  size_t ReflectIndex = 0;
+  mlir::spirv::StructType StructTy;
+};
+
+struct WorkgroupGlobalInfo {
+  std::string Name;
+  mlir::Type LLVMType;
+};
+
+mlir::Type convertSpirvDataType(mlir::Type T, mlir::OpBuilder &B) {
+  if (auto IT = mlir::dyn_cast<mlir::IntegerType>(T))
+    return B.getIntegerType(IT.getWidth());
+  if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T))
+    return mlir::VectorType::get(Vec.getShape(),
+                                 convertSpirvDataType(Vec.getElementType(), B));
+  if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(T))
+    return mlir::LLVM::LLVMArrayType::get(
+        convertSpirvDataType(Arr.getElementType(), B), Arr.getNumElements());
+  if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(T)) {
+    SmallVector<mlir::Type, 4> Elems;
+    for (unsigned I = 0; I < ST.getNumElements(); ++I)
+      Elems.push_back(convertSpirvDataType(ST.getElementType(I), B));
+    return mlir::LLVM::LLVMStructType::getLiteral(B.getContext(), Elems);
+  }
+  return T;
+}
+
+uint32_t scalarTypeBytes(mlir::Type T) {
+  if (T.isF16() || T.isInteger(16))
+    return 2;
+  if (T.isF64() || T.isInteger(64))
+    return 8;
+  return 4;
+}
+
+uint32_t spirvTypeBytes(mlir::Type T) {
+  if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T))
+    return static_cast<uint32_t>(Vec.getNumElements()) *
+           scalarTypeBytes(Vec.getElementType());
+  if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(T)) {
+    uint32_t Stride = Arr.getArrayStride();
+    if (Stride == 0)
+      Stride = spirvTypeBytes(Arr.getElementType());
+    return Arr.getNumElements() * Stride;
+  }
+  if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(T)) {
+    unsigned N = ST.getNumElements();
+    if (N == 0)
+      return 0;
+    uint32_t LastOff = ST.getMemberOffset(N - 1);
+    return LastOff + spirvTypeBytes(ST.getElementType(N - 1));
+  }
+  return scalarTypeBytes(T);
+}
+
+std::optional<int64_t> getConstSpirvInt(mlir::Value V) {
+  if (auto C = V.getDefiningOp<mlir::spirv::ConstantOp>()) {
+    if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(C.getValue()))
+      return IA.getInt();
+  }
+  return std::nullopt;
+}
+
+ComponentType toComponentType(mlir::Type T) {
+  if (T.isF32())
+    return ComponentType::F32;
+  if (T.isF16())
+    return ComponentType::F16;
+  if (T.isF64())
+    return ComponentType::F64;
+  if (auto IT = mlir::dyn_cast<mlir::IntegerType>(T)) {
+    if (IT.getWidth() == 32)
+      return IT.isSigned() ? ComponentType::I32 : ComponentType::U32;
+    if (IT.getWidth() == 16)
+      return IT.isSigned() ? ComponentType::I16 : ComponentType::U16;
+    if (IT.getWidth() == 64)
+      return IT.isSigned() ? ComponentType::I64 : ComponentType::U64;
+    if (IT.getWidth() == 1)
+      return ComponentType::I1;
+  }
+  return ComponentType::Invalid;
+}
+
+std::string typeSuffix(mlir::Type T) {
+  if (T.isF32())
+    return "f32";
+  if (T.isF16())
+    return "f16";
+  if (T.isF64())
+    return "f64";
+  if (auto IT = mlir::dyn_cast<mlir::IntegerType>(T))
+    return "i" + std::to_string(IT.getWidth());
+  return "i32";
+}
+
+mlir::Type makeSignless(mlir::Type T, mlir::OpBuilder &B) {
+  if (auto IT = mlir::dyn_cast<mlir::IntegerType>(T)) {
+    if (!IT.isSignless())
+      return B.getIntegerType(IT.getWidth());
+  }
+  return T;
+}
+
+mlir::LLVM::LLVMStructType getHandleType(mlir::MLIRContext *Ctx) {
+  auto PtrTy = mlir::LLVM::LLVMPointerType::get(Ctx);
+  return mlir::LLVM::LLVMStructType::getIdentified(Ctx, "dx.types.Handle");
+}
+
+mlir::LLVM::LLVMStructType getOrInitHandleType(mlir::MLIRContext *Ctx) {
+  auto ST = getHandleType(Ctx);
+  if (!ST.isInitialized()) {
+    auto PtrTy = mlir::LLVM::LLVMPointerType::get(Ctx);
+    (void)ST.setBody({PtrTy}, /*isPacked=*/false);
+  }
+  return ST;
+}
+
+mlir::LLVM::LLVMStructType getOrInitResRetType(mlir::MLIRContext *Ctx,
+                                               mlir::Type ElemTy) {
+  std::string Name = "dx.types.ResRet." + typeSuffix(ElemTy);
+  auto ST = mlir::LLVM::LLVMStructType::getIdentified(Ctx, Name);
+  if (!ST.isInitialized()) {
+    auto I32 = mlir::IntegerType::get(Ctx, 32);
+    (void)ST.setBody({ElemTy, ElemTy, ElemTy, ElemTy, I32}, /*isPacked=*/false);
+  }
+  return ST;
+}
+
+mlir::LLVM::LLVMStructType getOrInitCBufRetType(mlir::MLIRContext *Ctx,
+                                                mlir::Type ElemTy) {
+  std::string Name = "dx.types.CBufRet." + typeSuffix(ElemTy);
+  auto ST = mlir::LLVM::LLVMStructType::getIdentified(Ctx, Name);
+  if (!ST.isInitialized()) {
+    if (ElemTy.isF16() || ElemTy.isInteger(16))
+      (void)ST.setBody(
+          {ElemTy, ElemTy, ElemTy, ElemTy, ElemTy, ElemTy, ElemTy, ElemTy},
+          /*isPacked=*/false);
+    else if (ElemTy.isF64() || ElemTy.isInteger(64))
+      (void)ST.setBody({ElemTy, ElemTy}, /*isPacked=*/false);
+    else
+      (void)ST.setBody({ElemTy, ElemTy, ElemTy, ElemTy}, /*isPacked=*/false);
+  }
+  return ST;
+}
+
+mlir::LLVM::LLVMFuncOp getOrCreateDecl(mlir::spirv::ModuleOp SpvMod,
+                                       StringRef Name,
+                                       mlir::LLVM::LLVMFunctionType FnTy) {
+  if (auto Existing = SpvMod.lookupSymbol<mlir::LLVM::LLVMFuncOp>(Name))
+    return Existing;
+  mlir::OpBuilder B = mlir::OpBuilder::atBlockBegin(&SpvMod.getBodyRegion().front());
+  return mlir::LLVM::LLVMFuncOp::create(B, SpvMod.getLoc(), Name, FnTy);
+}
+
+mlir::Value emitGPUIdComponent(mlir::OpBuilder &B, mlir::Location Loc,
+                               mlir::spirv::BuiltIn BI, uint32_t Comp,
+                               mlir::Type ResultTy) {
+  mlir::gpu::Dimension Dim = mlir::gpu::Dimension::x;
+  if (Comp == 1)
+    Dim = mlir::gpu::Dimension::y;
+  else if (Comp == 2)
+    Dim = mlir::gpu::Dimension::z;
+
+  mlir::Value IdxVal;
+  switch (BI) {
+  case mlir::spirv::BuiltIn::GlobalInvocationId:
+    IdxVal = mlir::gpu::GlobalIdOp::create(B, Loc, Dim);
+    break;
+  case mlir::spirv::BuiltIn::WorkgroupId:
+    IdxVal = mlir::gpu::BlockIdOp::create(B, Loc, Dim);
+    break;
+  case mlir::spirv::BuiltIn::LocalInvocationId:
+    IdxVal = mlir::gpu::ThreadIdOp::create(B, Loc, Dim);
+    break;
+  default:
+    return nullptr;
+  }
+
+  mlir::Type SignlessTy = makeSignless(ResultTy, B);
+  return mlir::arith::IndexCastUIOp::create(B, Loc, SignlessTy, IdxVal);
+}
+
+} // namespace
+
+Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
+                                     mlir::MLIRContext &Ctx,
+                                     StringRef EntryOverride) {
+  if (!isSPIRVBinary(Buf))
+    return makeError("input buffer is not a valid SPIR-V binary");
+  if (Buf.getBufferSize() % 4 != 0)
+    return makeError("SPIR-V binary size ({0}) is not a multiple of 4",
+                     Buf.getBufferSize());
+
+  mlir::DialectRegistry Registry;
+  Registry.insert<mlir::spirv::SPIRVDialect, mlir::LLVM::LLVMDialect,
+                  mlir::DLTIDialect, mlir::func::FuncDialect,
+                  mlir::cf::ControlFlowDialect, mlir::scf::SCFDialect,
+                  mlir::arith::ArithDialect, mlir::gpu::GPUDialect,
+                  mlir::math::MathDialect, mlir::ub::UBDialect>();
+  Ctx.appendDialectRegistry(Registry);
+  Ctx.loadAllAvailableDialects();
+
+  size_t NumWords = Buf.getBufferSize() / 4;
+  SmallVector<uint32_t> Words(NumWords);
+  const char *Raw = Buf.getBufferStart();
+  for (size_t I = 0; I < NumWords; ++I)
+    Words[I] = support::endian::read32le(Raw + I * 4);
+
+  // Keep CFG as plain spirv.Branch / spirv.BranchConditional so
+  // ConvertSPIRVToLLVM + LiftControlFlowToSCF handle all control flow.
+  mlir::spirv::DeserializationOptions DeserOpts;
+  DeserOpts.enableControlFlowStructurization = false;
+  auto SpvMod = mlir::spirv::deserialize(Words, &Ctx, DeserOpts);
+  if (!SpvMod)
+    return makeError("MLIR SPIR-V deserialization failed");
+
+  // Wrap inside a top-level builtin.module so ConvertSPIRVToLLVM can run on it.
+  mlir::OwningOpRef<mlir::ModuleOp> TopMod =
+      mlir::ModuleOp::create(SpvMod->getLoc());
+  TopMod->getBody()->push_back(SpvMod.release());
+  auto SpvModule = *TopMod->getOps<mlir::spirv::ModuleOp>().begin();
+
+  // 1. Extract entry point & execution mode into Reflection.
+  Reflection Reflect;
+  mlir::spirv::EntryPointOp SelectedEP;
+  for (auto EP : SpvModule.getOps<mlir::spirv::EntryPointOp>()) {
+    if (EntryOverride.empty() || EP.getFn() == EntryOverride) {
+      SelectedEP = EP;
+      break;
+    }
+  }
+  if (!SelectedEP)
+    return makeError("no matching SPIR-V entry point found");
+
+  Reflect.EntryName = SelectedEP.getFn().str();
+  switch (SelectedEP.getExecutionModel()) {
+  case mlir::spirv::ExecutionModel::GLCompute:
+    Reflect.Stage = ShaderStage::Compute;
+    break;
+  case mlir::spirv::ExecutionModel::Vertex:
+    Reflect.Stage = ShaderStage::Vertex;
+    break;
+  case mlir::spirv::ExecutionModel::Fragment:
+    Reflect.Stage = ShaderStage::Pixel;
+    break;
+  default:
+    return makeError("unsupported SPIR-V execution model");
+  }
+
+  for (auto EM : SpvModule.getOps<mlir::spirv::ExecutionModeOp>()) {
+    if (EM.getFn() != Reflect.EntryName)
+      continue;
+    if (EM.getExecutionMode() == mlir::spirv::ExecutionMode::LocalSize) {
+      auto Vals = EM.getValues();
+      if (Vals.size() == 3) {
+        for (unsigned I = 0; I < 3; ++I)
+          Reflect.NumThreads[I] =
+              static_cast<uint32_t>(mlir::cast<mlir::IntegerAttr>(Vals[I]).getInt());
+      }
+    }
+  }
+
+  // 2. Inspect spirv.GlobalVariables for built-ins, workgroup memory, and
+  // descriptor bindings.
+  StringMap<mlir::spirv::BuiltIn> BuiltInGlobals;
+  StringMap<BoundBufferInfo> BufferGlobals;
+  StringMap<BoundCBufferInfo> CBufferGlobals;
+  StringMap<WorkgroupGlobalInfo> WorkgroupGlobals;
+  SmallVector<mlir::spirv::GlobalVariableOp, 8> GlobalsToErase;
+  uint32_t NextSRVId = 0, NextUAVId = 0, NextCBVId = 0;
+
+  for (auto GV : SpvModule.getOps<mlir::spirv::GlobalVariableOp>()) {
+    if (auto BIName = GV.getBuiltIn()) {
+      auto BI = mlir::spirv::symbolizeBuiltIn(*BIName);
+      if (!BI)
+        return makeError("unknown SPIR-V built_in '{0}'", *BIName);
+      BuiltInGlobals[GV.getSymName()] = *BI;
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+
+    auto PtrTy = mlir::dyn_cast<mlir::spirv::PointerType>(GV.getType());
+    if (!PtrTy)
+      continue;
+    auto SC = PtrTy.getStorageClass();
+
+    if (SC == mlir::spirv::StorageClass::Workgroup) {
+      mlir::OpBuilder B(&Ctx);
+      WorkgroupGlobalInfo Info;
+      Info.Name = GV.getSymName().str();
+      Info.LLVMType = convertSpirvDataType(PtrTy.getPointeeType(), B);
+      WorkgroupGlobals[GV.getSymName()] = std::move(Info);
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+
+    auto DS = GV.getDescriptorSet();
+    auto Binding = GV.getBinding();
+    if (!DS || !Binding)
+      continue;
+    if (SC != mlir::spirv::StorageClass::Uniform &&
+        SC != mlir::spirv::StorageClass::StorageBuffer)
+      continue;
+
+    auto StructTy =
+        mlir::dyn_cast<mlir::spirv::StructType>(PtrTy.getPointeeType());
+    if (!StructTy || StructTy.getNumElements() == 0)
+      continue;
+
+    if (auto RTArr = mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(
+            StructTy.getElementType(0))) {
+      mlir::Type ElemTy = RTArr.getElementType();
+      uint32_t Stride = RTArr.getArrayStride();
+      if (Stride == 0)
+        Stride = 4;
+
+      bool IsReadOnly = false;
+      SmallVector<mlir::spirv::StructType::MemberDecorationInfo> MemDecs;
+      StructTy.getMemberDecorations(0, MemDecs);
+      for (const auto &D : MemDecs) {
+        if (D.decoration == mlir::spirv::Decoration::NonWritable)
+          IsReadOnly = true;
+      }
+
+      ResourceBinding RB;
+      RB.Class = IsReadOnly ? ResourceClass::SRV : ResourceClass::UAV;
+      RB.Kind = ResourceKind::StructuredBuffer;
+      RB.ElementType = toComponentType(ElemTy);
+      RB.RecordID = IsReadOnly ? NextSRVId++ : NextUAVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = *DS;
+      RB.LowerBound = *Binding;
+      RB.RangeSize = 1;
+      RB.ElementStride = Stride;
+
+      BoundBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.ElemType = ElemTy;
+      Info.ElemStride = Stride;
+      BufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+
+    // Uniform Block struct without RuntimeArray -> Constant Buffer (CBV).
+    if (SC == mlir::spirv::StorageClass::Uniform) {
+      uint32_t RawBytes = spirvTypeBytes(StructTy);
+      uint32_t PaddedBytes = ((RawBytes + 15u) / 16u) * 16u;
+      if (PaddedBytes == 0)
+        PaddedBytes = 16;
+
+      ResourceBinding RB;
+      RB.Class = ResourceClass::CBV;
+      RB.Kind = ResourceKind::CBuffer;
+      RB.RecordID = NextCBVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = *DS;
+      RB.LowerBound = *Binding;
+      RB.RangeSize = 1;
+      RB.ElementStride = PaddedBytes;
+
+      BoundCBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.StructTy = StructTy;
+      CBufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+  }
+
+  auto EntryFn = SpvModule.lookupSymbol<mlir::spirv::FuncOp>(Reflect.EntryName);
+  if (!EntryFn)
+    return makeError("SPIR-V entry function '{0}' not found", Reflect.EntryName);
+
+  // 3. Rewrite built-in & bound-buffer accesses inside the entry function.
+  mlir::OpBuilder EntryBuilder =
+      mlir::OpBuilder::atBlockBegin(&EntryFn.getBody().front());
+  mlir::Location FnLoc = EntryFn.getLoc();
+  mlir::LLVM::LLVMStructType HandleTy = getOrInitHandleType(&Ctx);
+  auto I1Ty = EntryBuilder.getI1Type();
+  auto I8Ty = EntryBuilder.getI8Type();
+  auto I32Ty = EntryBuilder.getI32Type();
+  auto VoidTy = mlir::LLVM::LLVMVoidType::get(&Ctx);
+
+  DenseMap<size_t, mlir::Value> HandleCache;
+  auto getHandleForIndex = [&](size_t ReflectIndex) -> mlir::Value {
+    auto It = HandleCache.find(ReflectIndex);
+    if (It != HandleCache.end())
+      return It->second;
+
+    EntryBuilder.setInsertionPointToStart(&EntryFn.getBody().front());
+    const ResourceBinding &RB = Reflect.Resources[ReflectIndex];
+    auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+        HandleTy, {I32Ty, I8Ty, I32Ty, I32Ty, I1Ty});
+    getOrCreateDecl(SpvModule, "dx.op.createHandle", FnTy);
+
+    auto OpC = mlir::LLVM::ConstantOp::create(
+        EntryBuilder, FnLoc, I32Ty, static_cast<int32_t>(DXILOp::CreateHandle));
+    auto ClassC = mlir::LLVM::ConstantOp::create(
+        EntryBuilder, FnLoc, I8Ty, static_cast<int8_t>(RB.Class));
+    auto IdC = mlir::LLVM::ConstantOp::create(
+        EntryBuilder, FnLoc, I32Ty, static_cast<int32_t>(RB.RecordID));
+    auto IdxC = mlir::LLVM::ConstantOp::create(
+        EntryBuilder, FnLoc, I32Ty, static_cast<int32_t>(RB.LowerBound));
+    auto NonUnifC =
+        mlir::LLVM::ConstantOp::create(EntryBuilder, FnLoc, I1Ty, false);
+
+    auto Call = mlir::LLVM::CallOp::create(
+        EntryBuilder, FnLoc, mlir::TypeRange{HandleTy}, "dx.op.createHandle",
+        mlir::ValueRange{OpC, ClassC, IdC, IdxC, NonUnifC});
+    HandleCache[ReflectIndex] = Call.getResult();
+    return Call.getResult();
+  };
+
+  SmallVector<mlir::spirv::AddressOfOp, 8> AddrOps;
+  EntryFn.walk([&](mlir::spirv::AddressOfOp AO) { AddrOps.push_back(AO); });
+
+  for (auto AO : AddrOps) {
+    StringRef Sym = AO.getVariable();
+
+    // 3a. Built-in globals (vector IDs -> gpu.*, LocalInvocationIndex -> gidx).
+    auto BIIt = BuiltInGlobals.find(Sym);
+    if (BIIt != BuiltInGlobals.end()) {
+      mlir::spirv::BuiltIn BI = BIIt->second;
+      SmallVector<mlir::Operation *, 4> Loads(AO->getUsers().begin(),
+                                              AO->getUsers().end());
+      for (mlir::Operation *U : Loads) {
+        auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(U);
+        if (!Load)
+          return makeError("unsupported user of built-in global '{0}'", Sym);
+        if (BI == mlir::spirv::BuiltIn::SubgroupLocalInvocationId ||
+            BI == mlir::spirv::BuiltIn::SubgroupSize) {
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          mlir::Value IdxVal =
+              BI == mlir::spirv::BuiltIn::SubgroupLocalInvocationId
+                  ? mlir::Value(mlir::gpu::LaneIdOp::create(B, Loc, /*upper_bound=*/nullptr))
+                  : mlir::Value(mlir::gpu::SubgroupSizeOp::create(B, Loc, /*upper_bound=*/nullptr));
+          mlir::Type DstTy = makeSignless(Load.getType(), B);
+          auto Cast =
+              mlir::arith::IndexCastUIOp::create(B, Loc, DstTy, IdxVal);
+          Load.replaceAllUsesWith(Cast.getResult());
+          Load.erase();
+          continue;
+        }
+        if (BI == mlir::spirv::BuiltIn::LocalInvocationIndex) {
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          auto FnTy = mlir::LLVM::LLVMFunctionType::get(I32Ty, {I32Ty});
+          getOrCreateDecl(SpvModule, "dx.op.flattenedThreadIdInGroup.i32", FnTy);
+          auto OpC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty,
+              static_cast<int32_t>(DXILOp::FlattenedThreadIdInGroup));
+          auto Call = mlir::LLVM::CallOp::create(
+              B, Loc, mlir::TypeRange{I32Ty},
+              "dx.op.flattenedThreadIdInGroup.i32", mlir::ValueRange{OpC});
+          Load.replaceAllUsesWith(Call.getResult());
+          Load.erase();
+          continue;
+        }
+        SmallVector<mlir::Operation *, 4> Extracts(Load->getUsers().begin(),
+                                                   Load->getUsers().end());
+        for (mlir::Operation *EU : Extracts) {
+          auto Extract = mlir::dyn_cast<mlir::spirv::CompositeExtractOp>(EU);
+          if (!Extract || Extract.getIndices().size() != 1)
+            return makeError("unsupported extract on built-in '{0}'", Sym);
+          uint32_t Comp = static_cast<uint32_t>(
+              mlir::cast<mlir::IntegerAttr>(Extract.getIndices()[0]).getInt());
+          mlir::OpBuilder B(Extract);
+          mlir::Value Rep =
+              emitGPUIdComponent(B, Extract.getLoc(), BI, Comp, Extract.getType());
+          if (!Rep)
+            return makeError("unsupported SPIR-V built-in '{0}'", Sym);
+          Extract.replaceAllUsesWith(Rep);
+          Extract.erase();
+        }
+        if (!Load->use_empty())
+          return makeError("unhandled vector use of built-in '{0}'", Sym);
+        Load.erase();
+      }
+      AO.erase();
+      continue;
+    }
+
+    // 3b. Descriptor-bound structured buffers -> dx.op.rawBufferLoad / Store.
+    auto BufIt = BufferGlobals.find(Sym);
+    if (BufIt != BufferGlobals.end()) {
+      const BoundBufferInfo &Info = BufIt->second;
+      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
+
+      SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
+                                                   AO->getUsers().end());
+      for (mlir::Operation *CU : ChainUsers) {
+        auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(CU);
+        if (!Chain || Chain.getIndices().size() < 2)
+          return makeError("unsupported access pattern on buffer '{0}'", Sym);
+
+        mlir::Value ElemIdx = Chain.getIndices()[1];
+        SmallVector<mlir::Operation *, 8> MemUsers(Chain->getUsers().begin(),
+                                                   Chain->getUsers().end());
+        for (mlir::Operation *MU : MemUsers) {
+          if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
+            mlir::OpBuilder B(Load);
+            mlir::Location Loc = Load.getLoc();
+            mlir::Type ValTy = makeSignless(Load.getType(), B);
+            auto ResRetTy = getOrInitResRetType(&Ctx, ValTy);
+            std::string Callee = "dx.op.rawBufferLoad." + typeSuffix(ValTy);
+            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+                ResRetTy, {I32Ty, HandleTy, I32Ty, I32Ty, I8Ty, I32Ty});
+            getOrCreateDecl(SpvModule, Callee, FnTy);
+
+            auto OpC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::RawBufferLoad));
+            auto OffC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+            auto MaskC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I8Ty, static_cast<int8_t>(1));
+            auto AlignC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(Info.ElemStride));
+
+            auto Call = mlir::LLVM::CallOp::create(
+                B, Loc, mlir::TypeRange{ResRetTy}, Callee,
+                mlir::ValueRange{OpC, Handle, ElemIdx, OffC, MaskC, AlignC});
+            auto Val = mlir::LLVM::ExtractValueOp::create(
+                B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
+            Load.replaceAllUsesWith(Val.getResult());
+            Load.erase();
+          } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(MU)) {
+            mlir::OpBuilder B(Store);
+            mlir::Location Loc = Store.getLoc();
+            mlir::Value StoreVal = Store.getValue();
+            mlir::Type ValTy = makeSignless(StoreVal.getType(), B);
+            std::string Callee = "dx.op.rawBufferStore." + typeSuffix(ValTy);
+            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+                VoidTy, {I32Ty, HandleTy, I32Ty, I32Ty, ValTy, ValTy, ValTy,
+                         ValTy, I8Ty, I32Ty});
+            getOrCreateDecl(SpvModule, Callee, FnTy);
+
+            auto OpC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::RawBufferStore));
+            auto OffC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+            auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ValTy);
+            auto MaskC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I8Ty, static_cast<int8_t>(1));
+            auto AlignC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(Info.ElemStride));
+
+            mlir::LLVM::CallOp::create(
+                B, Loc, mlir::TypeRange{}, Callee,
+                mlir::ValueRange{OpC, Handle, ElemIdx, OffC, StoreVal, Undef,
+                                 Undef, Undef, MaskC, AlignC});
+            Store.erase();
+          } else {
+            // Structured buffer atomics -> dx.op.atomicBinOp.
+            std::optional<DXILAtomicBinOp> ABinOp;
+            mlir::Value AVal;
+            if (auto A = mlir::dyn_cast<mlir::spirv::AtomicIAddOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Add;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicAndOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::And;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicOrOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Or;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicXorOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Xor;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicSMinOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::IMin;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicSMaxOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::IMax;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicUMinOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::UMin;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicUMaxOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::UMax;
+              AVal = A.getValue();
+            } else if (auto A =
+                           mlir::dyn_cast<mlir::spirv::AtomicExchangeOp>(MU)) {
+              ABinOp = DXILAtomicBinOp::Exchange;
+              AVal = A.getValue();
+            }
+            if (!ABinOp)
+              return makeError("unsupported memory op '{0}' on buffer '{1}'",
+                               MU->getName().getStringRef(), Sym);
+
+            mlir::OpBuilder B(MU);
+            mlir::Location Loc = MU->getLoc();
+            mlir::Type ValTy = makeSignless(AVal.getType(), B);
+            std::string Callee = "dx.op.atomicBinOp." + typeSuffix(ValTy);
+            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+                ValTy,
+                {I32Ty, HandleTy, I32Ty, I32Ty, I32Ty, I32Ty, ValTy});
+            getOrCreateDecl(SpvModule, Callee, FnTy);
+
+            auto OpC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::AtomicBinOp));
+            auto BinC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(*ABinOp));
+            auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+            auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
+
+            auto Call = mlir::LLVM::CallOp::create(
+                B, Loc, mlir::TypeRange{ValTy}, Callee,
+                mlir::ValueRange{OpC, Handle, BinC, ElemIdx, ZeroC, UndefI32,
+                                 AVal});
+            MU->getResult(0).replaceAllUsesWith(Call.getResult());
+            MU->erase();
+          }
+        }
+        Chain.erase();
+      }
+      AO.erase();
+      continue;
+    }
+
+    // 3c. Constant buffers (Uniform Block) -> dx.op.cbufferLoadLegacy.
+    auto CBIt = CBufferGlobals.find(Sym);
+    if (CBIt != CBufferGlobals.end()) {
+      const BoundCBufferInfo &Info = CBIt->second;
+      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
+
+      SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
+                                                   AO->getUsers().end());
+      for (mlir::Operation *CU : ChainUsers) {
+        auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(CU);
+        if (!Chain || Chain.getIndices().empty())
+          return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
+
+        // Compute static byte offset through nested structs/arrays.
+        mlir::Type CurTy = Info.StructTy;
+        uint32_t ByteOffset = 0;
+        for (mlir::Value IdxV : Chain.getIndices()) {
+          auto ConstIdx = getConstSpirvInt(IdxV);
+          if (!ConstIdx)
+            return makeError("dynamic indexing into cbuffer '{0}' not yet supported",
+                             Sym);
+          uint32_t I = static_cast<uint32_t>(*ConstIdx);
+          if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
+            ByteOffset += ST.getMemberOffset(I);
+            CurTy = ST.getElementType(I);
+          } else if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(CurTy)) {
+            uint32_t Stride = Arr.getArrayStride();
+            if (Stride == 0)
+              Stride = spirvTypeBytes(Arr.getElementType());
+            ByteOffset += I * Stride;
+            CurTy = Arr.getElementType();
+          } else {
+            return makeError("unsupported cbuffer index step on '{0}'", Sym);
+          }
+        }
+
+        uint32_t Row = ByteOffset / 16u;
+
+        SmallVector<mlir::Operation *, 4> MemUsers(Chain->getUsers().begin(),
+                                                   Chain->getUsers().end());
+        for (mlir::Operation *MU : MemUsers) {
+          auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU);
+          if (!Load)
+            return makeError("unsupported non-load user of cbuffer '{0}'", Sym);
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          mlir::Type ValTy = makeSignless(Load.getType(), B);
+          uint32_t ElemBytes = scalarTypeBytes(ValTy);
+          uint32_t Comp = (ByteOffset % 16u) / ElemBytes;
+          auto RetTy = getOrInitCBufRetType(&Ctx, ValTy);
+          std::string Callee = "dx.op.cbufferLoadLegacy." + typeSuffix(ValTy);
+          auto FnTy = mlir::LLVM::LLVMFunctionType::get(
+              RetTy, {I32Ty, HandleTy, I32Ty});
+          getOrCreateDecl(SpvModule, Callee, FnTy);
+
+          auto OpC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty, static_cast<int32_t>(DXILOp::CBufferLoadLegacy));
+          auto RowC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty, static_cast<int32_t>(Row));
+          auto Call = mlir::LLVM::CallOp::create(
+              B, Loc, mlir::TypeRange{RetTy}, Callee,
+              mlir::ValueRange{OpC, Handle, RowC});
+          auto Val = mlir::LLVM::ExtractValueOp::create(
+              B, Loc, Call.getResult(), ArrayRef<int64_t>{Comp});
+          Load.replaceAllUsesWith(Val.getResult());
+          Load.erase();
+        }
+        Chain.erase();
+      }
+      AO.erase();
+      continue;
+    }
+
+    // 3c2. Workgroup (groupshared) globals -> addrspace(3) LLVM ops.
+    auto WGIt = WorkgroupGlobals.find(Sym);
+    if (WGIt != WorkgroupGlobals.end()) {
+      const WorkgroupGlobalInfo &Info = WGIt->second;
+      mlir::OpBuilder AOB(AO);
+      auto Ptr3Ty = mlir::LLVM::LLVMPointerType::get(&Ctx, 3);
+      auto LLVMAddr = mlir::LLVM::AddressOfOp::create(
+          AOB, AO.getLoc(), Ptr3Ty,
+          mlir::FlatSymbolRefAttr::get(&Ctx, Info.Name));
+
+      auto rewritePtrUsers = [&](mlir::Value OldPtr, mlir::Value NewPtr) -> Error {
+        SmallVector<mlir::Operation *, 8> Users(OldPtr.getUsers().begin(),
+                                                OldPtr.getUsers().end());
+        for (mlir::Operation *MU : Users) {
+          if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
+            mlir::OpBuilder B(Load);
+            mlir::Type ValTy = makeSignless(Load.getType(), B);
+            auto LLVMLoad = mlir::LLVM::LoadOp::create(
+                B, Load.getLoc(), ValTy, NewPtr);
+            Load.replaceAllUsesWith(LLVMLoad.getResult());
+            Load.erase();
+          } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(MU)) {
+            mlir::OpBuilder B(Store);
+            mlir::LLVM::StoreOp::create(
+                B, Store.getLoc(), Store.getValue(), NewPtr);
+            Store.erase();
+          } else if (auto AAdd = mlir::dyn_cast<mlir::spirv::AtomicIAddOp>(MU)) {
+            mlir::OpBuilder B(AAdd);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AAdd.getLoc(), mlir::LLVM::AtomicBinOp::add, NewPtr,
+                AAdd.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AAdd.replaceAllUsesWith(RMW.getResult());
+            AAdd.erase();
+          } else if (auto ASub = mlir::dyn_cast<mlir::spirv::AtomicISubOp>(MU)) {
+            mlir::OpBuilder B(ASub);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, ASub.getLoc(), mlir::LLVM::AtomicBinOp::sub, NewPtr,
+                ASub.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            ASub.replaceAllUsesWith(RMW.getResult());
+            ASub.erase();
+          } else if (auto AAnd = mlir::dyn_cast<mlir::spirv::AtomicAndOp>(MU)) {
+            mlir::OpBuilder B(AAnd);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AAnd.getLoc(), mlir::LLVM::AtomicBinOp::_and, NewPtr,
+                AAnd.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AAnd.replaceAllUsesWith(RMW.getResult());
+            AAnd.erase();
+          } else if (auto AOr = mlir::dyn_cast<mlir::spirv::AtomicOrOp>(MU)) {
+            mlir::OpBuilder B(AOr);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AOr.getLoc(), mlir::LLVM::AtomicBinOp::_or, NewPtr,
+                AOr.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AOr.replaceAllUsesWith(RMW.getResult());
+            AOr.erase();
+          } else if (auto AXor = mlir::dyn_cast<mlir::spirv::AtomicXorOp>(MU)) {
+            mlir::OpBuilder B(AXor);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AXor.getLoc(), mlir::LLVM::AtomicBinOp::_xor, NewPtr,
+                AXor.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AXor.replaceAllUsesWith(RMW.getResult());
+            AXor.erase();
+          } else if (auto ASMin = mlir::dyn_cast<mlir::spirv::AtomicSMinOp>(MU)) {
+            mlir::OpBuilder B(ASMin);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, ASMin.getLoc(), mlir::LLVM::AtomicBinOp::min, NewPtr,
+                ASMin.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            ASMin.replaceAllUsesWith(RMW.getResult());
+            ASMin.erase();
+          } else if (auto ASMax = mlir::dyn_cast<mlir::spirv::AtomicSMaxOp>(MU)) {
+            mlir::OpBuilder B(ASMax);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, ASMax.getLoc(), mlir::LLVM::AtomicBinOp::max, NewPtr,
+                ASMax.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            ASMax.replaceAllUsesWith(RMW.getResult());
+            ASMax.erase();
+          } else if (auto AUMin = mlir::dyn_cast<mlir::spirv::AtomicUMinOp>(MU)) {
+            mlir::OpBuilder B(AUMin);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AUMin.getLoc(), mlir::LLVM::AtomicBinOp::umin, NewPtr,
+                AUMin.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AUMin.replaceAllUsesWith(RMW.getResult());
+            AUMin.erase();
+          } else if (auto AUMax = mlir::dyn_cast<mlir::spirv::AtomicUMaxOp>(MU)) {
+            mlir::OpBuilder B(AUMax);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AUMax.getLoc(), mlir::LLVM::AtomicBinOp::umax, NewPtr,
+                AUMax.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AUMax.replaceAllUsesWith(RMW.getResult());
+            AUMax.erase();
+          } else if (auto AXchg =
+                         mlir::dyn_cast<mlir::spirv::AtomicExchangeOp>(MU)) {
+            mlir::OpBuilder B(AXchg);
+            auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                B, AXchg.getLoc(), mlir::LLVM::AtomicBinOp::xchg, NewPtr,
+                AXchg.getValue(), mlir::LLVM::AtomicOrdering::monotonic);
+            AXchg.replaceAllUsesWith(RMW.getResult());
+            AXchg.erase();
+          } else {
+            return makeError("unsupported op '{0}' on workgroup global '{1}'",
+                             MU->getName().getStringRef(), Sym);
+          }
+        }
+        return Error::success();
+      };
+
+      SmallVector<mlir::Operation *, 8> AOUsers(AO->getUsers().begin(),
+                                                AO->getUsers().end());
+      for (mlir::Operation *U : AOUsers) {
+        if (auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
+          mlir::OpBuilder B(Chain);
+          SmallVector<mlir::LLVM::GEPArg, 4> GEPArgs;
+          GEPArgs.push_back(int32_t(0));
+          for (mlir::Value IdxV : Chain.getIndices()) {
+            if (auto C = getConstSpirvInt(IdxV))
+              GEPArgs.push_back(static_cast<int32_t>(*C));
+            else
+              GEPArgs.push_back(IdxV);
+          }
+          auto GEP = mlir::LLVM::GEPOp::create(
+              B, Chain.getLoc(), Ptr3Ty, Info.LLVMType, LLVMAddr.getResult(),
+              GEPArgs);
+          if (Error E = rewritePtrUsers(Chain.getResult(), GEP.getResult()))
+            return std::move(E);
+          Chain.erase();
+        } else {
+          if (Error E = rewritePtrUsers(AO.getResult(), LLVMAddr.getResult()))
+            return std::move(E);
+          break;
+        }
+      }
+      AO.erase();
+      continue;
+    }
+  }
+
+  // 3d. Lower spirv.ControlBarrier -> Layer 1 gpu.barrier.
+  SmallVector<mlir::spirv::ControlBarrierOp, 4> Barriers;
+  EntryFn.walk(
+      [&](mlir::spirv::ControlBarrierOp CB) { Barriers.push_back(CB); });
+  for (auto CB : Barriers) {
+    mlir::OpBuilder B(CB);
+    auto GPU = mlir::gpu::BarrierOp::create(B, CB.getLoc());
+    auto Sem = CB.getMemorySemantics();
+    if (mlir::spirv::bitEnumContainsAny(
+            Sem, mlir::spirv::MemorySemantics::UniformMemory |
+                     mlir::spirv::MemorySemantics::ImageMemory)) {
+      GPU->setAttr("crucible.device_fence", B.getUnitAttr());
+    }
+    CB.erase();
+  }
+
+  // 3e. Lower spirv.GroupNonUniform* subgroup ops -> Layer 1 gpu.* ops.
+  auto lowerGroupOp = [&](mlir::Operation *Op) {
+    mlir::OpBuilder B(Op);
+    mlir::Location Loc = Op->getLoc();
+
+    auto emitReduce = [&](mlir::Value Val,
+                          mlir::gpu::AllReduceOperation ReduceOp,
+                          mlir::spirv::GroupOperation GroupOp) {
+      auto Red = mlir::gpu::SubgroupReduceOp::create(B, Loc, Val, ReduceOp,
+                                                     /*uniform=*/false);
+      if (GroupOp == mlir::spirv::GroupOperation::ExclusiveScan)
+        Red->setAttr("crucible.scan_kind", B.getStringAttr("exclusive"));
+      else if (GroupOp == mlir::spirv::GroupOperation::InclusiveScan)
+        Red->setAttr("crucible.scan_kind", B.getStringAttr("inclusive"));
+      Op->getResult(0).replaceAllUsesWith(Red.getResult());
+      Op->erase();
+    };
+
+    if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformIAddOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::ADD,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFAddOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::ADD,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformIMulOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MUL,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFMulOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MUL,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformSMinOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINSI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformUMinOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINUI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFMinOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINNUMF,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformSMaxOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXSI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformUMaxOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXUI,
+                 G.getGroupOperation());
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformFMaxOp>(Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXNUMF,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseAndOp>(
+                   Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::AND,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseOrOp>(
+                   Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::OR,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseXorOp>(
+                   Op)) {
+      emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::XOR,
+                 G.getGroupOperation());
+    } else if (auto G = mlir::dyn_cast<
+                   mlir::spirv::GroupNonUniformBroadcastFirstOp>(Op)) {
+      auto BC = mlir::gpu::SubgroupBroadcastOp::create(
+          B, Loc, G.getValue(), /*subgroupId=*/nullptr,
+          mlir::gpu::BroadcastType::first_active_lane);
+      G.replaceAllUsesWith(BC.getResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformBroadcastOp>(Op)) {
+      auto BC = mlir::gpu::SubgroupBroadcastOp::create(
+          B, Loc, G.getValue(), G.getId(),
+          mlir::gpu::BroadcastType::specific_lane);
+      G.replaceAllUsesWith(BC.getResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleOp>(Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(
+          B, Loc, G.getValue(), G.getId(), Width, mlir::gpu::ShuffleMode::IDX);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleXorOp>(
+                   Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(
+          B, Loc, G.getValue(), G.getMask(), Width, mlir::gpu::ShuffleMode::XOR);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleUpOp>(
+                   Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(
+          B, Loc, G.getValue(), G.getDelta(), Width, mlir::gpu::ShuffleMode::UP);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformShuffleDownOp>(
+                       Op)) {
+      auto Width = mlir::arith::ConstantIntOp::create(B, Loc, 32, 32);
+      auto Shuf = mlir::gpu::ShuffleOp::create(B, Loc, G.getValue(),
+                                               G.getDelta(), Width,
+                                               mlir::gpu::ShuffleMode::DOWN);
+      G.replaceAllUsesWith(Shuf.getShuffleResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformElectOp>(Op)) {
+      auto One = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 1);
+      auto Zero = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+      auto Scan = mlir::gpu::SubgroupReduceOp::create(
+          B, Loc, One.getResult(), mlir::gpu::AllReduceOperation::ADD, false);
+      Scan->setAttr("crucible.scan_kind", B.getStringAttr("exclusive"));
+      auto Cmp = mlir::LLVM::ICmpOp::create(
+          B, Loc, mlir::LLVM::ICmpPredicate::eq, Scan.getResult(),
+          Zero.getResult());
+      G.replaceAllUsesWith(Cmp.getResult());
+      G.erase();
+    } else if (auto G =
+                   mlir::dyn_cast<mlir::spirv::GroupNonUniformBallotOp>(Op)) {
+      auto Bal = mlir::gpu::BallotOp::create(B, Loc, I32Ty, G.getPredicate());
+      SmallVector<mlir::Operation *, 4> Users(G->getUsers().begin(),
+                                              G->getUsers().end());
+      for (mlir::Operation *U : Users) {
+        if (auto Ext = mlir::dyn_cast<mlir::spirv::CompositeExtractOp>(U)) {
+          if (Ext.getIndices().size() == 1) {
+            int64_t Idx =
+                mlir::cast<mlir::IntegerAttr>(Ext.getIndices()[0]).getInt();
+            mlir::OpBuilder EB(Ext);
+            mlir::Value Rep =
+                Idx == 0
+                    ? Bal.getResult()
+                    : mlir::LLVM::ConstantOp::create(EB, Ext.getLoc(), I32Ty, 0)
+                          .getResult();
+            Ext.replaceAllUsesWith(Rep);
+            Ext.erase();
+          }
+        } else if (auto BC = mlir::dyn_cast<
+                       mlir::spirv::GroupNonUniformBallotBitCountOp>(U)) {
+          mlir::OpBuilder BCB(BC);
+          mlir::Location BLoc = BC.getLoc();
+          mlir::Value Masked = Bal.getResult();
+          if (BC.getGroupOperation() ==
+              mlir::spirv::GroupOperation::ExclusiveScan) {
+            auto LaneIdx =
+                mlir::gpu::LaneIdOp::create(BCB, BLoc, /*upper_bound=*/nullptr);
+            auto Lane =
+                mlir::arith::IndexCastUIOp::create(BCB, BLoc, I32Ty, LaneIdx);
+            auto One = mlir::LLVM::ConstantOp::create(BCB, BLoc, I32Ty, 1);
+            auto Shl = mlir::LLVM::ShlOp::create(BCB, BLoc, One, Lane);
+            auto Mask = mlir::LLVM::SubOp::create(BCB, BLoc, Shl, One);
+            Masked = mlir::LLVM::AndOp::create(BCB, BLoc, Masked, Mask);
+          }
+          auto Pop = mlir::math::CtPopOp::create(BCB, BLoc, Masked);
+          BC.replaceAllUsesWith(Pop.getResult());
+          BC.erase();
+        }
+      }
+      if (G->use_empty())
+        G.erase();
+    }
+  };
+
+  SmallVector<mlir::Operation *, 16> SubgroupOps;
+  EntryFn.walk([&](mlir::Operation *Op) {
+    StringRef Name = Op->getName().getStringRef();
+    if (Name.starts_with("spirv.GroupNonUniform") &&
+        Name != "spirv.GroupNonUniformBallotBitCount")
+      SubgroupOps.push_back(Op);
+  });
+  for (mlir::Operation *Op : SubgroupOps)
+    lowerGroupOp(Op);
+
+  // Erase rewritten shader-ABI globals and entry/execution-mode ops before
+  // running ConvertSPIRVToLLVM.
+  for (auto GV : GlobalsToErase)
+    GV.erase();
+
+  // Emit addrspace(3) LLVM globals for Workgroup variables now that the
+  // original spirv.GlobalVariable symbols have been erased.
+  {
+    mlir::OpBuilder GB =
+        mlir::OpBuilder::atBlockBegin(&SpvModule.getBodyRegion().front());
+    for (const auto &KV : WorkgroupGlobals) {
+      const WorkgroupGlobalInfo &Info = KV.second;
+      mlir::LLVM::GlobalOp::create(
+          GB, SpvModule.getLoc(), Info.LLVMType, /*isConstant=*/false,
+          mlir::LLVM::Linkage::Internal, Info.Name, /*value=*/mlir::Attribute(),
+          /*alignment=*/0, /*addrSpace=*/3);
+    }
+  }
+  SmallVector<mlir::Operation *, 4> MetaOps;
+  for (auto EP : SpvModule.getOps<mlir::spirv::EntryPointOp>())
+    MetaOps.push_back(EP);
+  for (auto EM : SpvModule.getOps<mlir::spirv::ExecutionModeOp>())
+    MetaOps.push_back(EM);
+  for (mlir::Operation *Op : MetaOps)
+    Op->erase();
+
+  // 4. Lower remaining SPIR-V ops (arithmetic, constants, casts, branches) to
+  // LLVM dialect via MLIR's upstream ConvertSPIRVToLLVM pass.
+  mlir::PassManager PM(&Ctx);
+  PM.addPass(mlir::createConvertSPIRVToLLVMPass());
+  if (mlir::failed(PM.run(*TopMod)))
+    return makeError("MLIR ConvertSPIRVToLLVM pass failed");
+
+  // Unwrap any remaining spirv.module container by hoisting its llvm.func ops
+  // into TopMod so structurizeMLIRModule sees a flat module.
+  SmallVector<mlir::spirv::ModuleOp, 1> RemainingSpvMods(
+      TopMod->getOps<mlir::spirv::ModuleOp>().begin(),
+      TopMod->getOps<mlir::spirv::ModuleOp>().end());
+  for (auto SM : RemainingSpvMods) {
+    mlir::Block &SMBody = SM.getBodyRegion().front();
+    SmallVector<mlir::Operation *, 8> OpsToMove;
+    for (mlir::Operation &Op : SMBody.without_terminator())
+      OpsToMove.push_back(&Op);
+    for (mlir::Operation *Op : OpsToMove)
+      Op->moveBefore(SM);
+    SM.erase();
+  }
+
+  if (mlir::failed(mlir::verify(*TopMod)))
+    return makeError("MLIR verification failed after SPIR-V lowering");
+
+  LoadedMLIRShader Out;
+  Out.Module = std::move(TopMod);
+  Out.Reflect = std::move(Reflect);
+  return std::move(Out);
+}
+
+} // namespace crucible

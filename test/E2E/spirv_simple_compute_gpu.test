@@ -1,0 +1,11 @@
+# End-to-end GPU test: HLSL -> dxc -spirv -> SPIR-V -> cruciblec -> metallib ->
+# Metal dispatch, asserting exact buffer contents.
+# REQUIRES: gpu
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 64,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:f32:8:iota | FileCheck %s
+
+# Out[i] = i * 2 + 1
+# CHECK: buffer0: 1 3 5 7 9 11 13 15

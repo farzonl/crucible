@@ -27,7 +27,9 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 
@@ -2357,7 +2359,7 @@ static bool mayWriteMemory(mlir::Operation *Op) {
     }
   }
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
-                mlir::LLVM::AtomicCmpXchgOp>(Op))
+                mlir::LLVM::AtomicCmpXchgOp, mlir::gpu::BarrierOp>(Op))
     return true;
   if (mlir::isa<mlir::LLVM::CallOp>(Op))
     return true; // unknown call
@@ -2371,6 +2373,24 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
   // Pointer producers are always folded into the lvalue they feed.
   if (mlir::isa<mlir::LLVM::GEPOp, mlir::LLVM::AddressOfOp>(Op))
     return true;
+
+  // Trivial GPU builtin reads (Layer 1): always re-spell at each use.
+  if (mlir::isa<mlir::gpu::GlobalIdOp, mlir::gpu::BlockIdOp,
+                mlir::gpu::ThreadIdOp, mlir::gpu::LaneIdOp,
+                mlir::gpu::SubgroupSizeOp>(Op))
+    return true;
+  if (mlir::isa<mlir::arith::IndexCastOp, mlir::arith::IndexCastUIOp>(Op)) {
+    if (auto *SrcOp = Op->getOperand(0).getDefiningOp()) {
+      if (mlir::isa<mlir::gpu::GlobalIdOp, mlir::gpu::BlockIdOp,
+                    mlir::gpu::ThreadIdOp, mlir::gpu::LaneIdOp,
+                    mlir::gpu::SubgroupSizeOp>(SrcOp))
+        return true;
+    }
+  }
+  // Convergent subgroup ops must be materialized as statements.
+  if (mlir::isa<mlir::gpu::SubgroupReduceOp, mlir::gpu::SubgroupBroadcastOp,
+                mlir::gpu::BallotOp, mlir::gpu::ShuffleOp>(Op))
+    return false;
 
   // Side-effecting or aggregate-producing ops are materialized as statements.
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
@@ -2873,6 +2893,8 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     if (!DstTy)
       return DstTy.takeError();
     mlir::Type T = Op->getOperand(0).getType();
+    if (T.isIndex() && *DstTy == "uint")
+      return Src;
     if (!T.isIndex() && mlir::isa<mlir::arith::IndexCastOp>(Op))
       Src->Text = signedView(T, Src->Text);
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
@@ -2978,6 +3000,253 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
 
   if (auto EV = mlir::dyn_cast<ExtractValueOp>(Op))
     return bufferElementExpr(EV);
+
+  // Layer 1 GPU compute IDs.
+  auto gpuDimSwizzle = [](mlir::gpu::Dimension D) -> char {
+    switch (D) {
+    case mlir::gpu::Dimension::x:
+      return 'x';
+    case mlir::gpu::Dimension::y:
+      return 'y';
+    case mlir::gpu::Dimension::z:
+      return 'z';
+    }
+    return 'x';
+  };
+  if (auto G = mlir::dyn_cast<mlir::gpu::GlobalIdOp>(Op)) {
+    UsesDTid = true;
+    return Expr{std::string("dtid.") + gpuDimSwizzle(G.getDimension()),
+                PrecPrimary};
+  }
+  if (auto B = mlir::dyn_cast<mlir::gpu::BlockIdOp>(Op)) {
+    UsesGid = true;
+    return Expr{std::string("gid.") + gpuDimSwizzle(B.getDimension()),
+                PrecPrimary};
+  }
+  if (auto T = mlir::dyn_cast<mlir::gpu::ThreadIdOp>(Op)) {
+    UsesGTid = true;
+    return Expr{std::string("gtid.") + gpuDimSwizzle(T.getDimension()),
+                PrecPrimary};
+  }
+  if (mlir::isa<mlir::gpu::LaneIdOp>(Op)) {
+    UsesLane = true;
+    return Expr{"lane", PrecPrimary};
+  }
+  if (mlir::isa<mlir::gpu::SubgroupSizeOp>(Op)) {
+    UsesLaneCount = true;
+    return Expr{"lanecount", PrecPrimary};
+  }
+
+  // Layer 1 GPU subgroup / wave operations.
+  if (auto Red = mlir::dyn_cast<mlir::gpu::SubgroupReduceOp>(Op)) {
+    auto V = exprFor(Red.getValue(), PrecUnknown);
+    if (!V)
+      return V.takeError();
+    mlir::Type T = Red.getType();
+    auto ScanAttr = Red->getAttrOfType<mlir::StringAttr>("crucible.scan_kind");
+    StringRef Scan = ScanAttr ? ScanAttr.getValue() : "";
+    bool IsSigned = false;
+    StringRef Fn;
+    switch (Red.getOp()) {
+    case mlir::gpu::AllReduceOperation::ADD:
+      Fn = Scan == "exclusive"   ? "simd_prefix_exclusive_sum"
+           : Scan == "inclusive" ? "simd_prefix_inclusive_sum"
+                                 : "simd_sum";
+      break;
+    case mlir::gpu::AllReduceOperation::MUL:
+      Fn = Scan == "exclusive"   ? "simd_prefix_exclusive_product"
+           : Scan == "inclusive" ? "simd_prefix_inclusive_product"
+                                 : "simd_product";
+      break;
+    case mlir::gpu::AllReduceOperation::MINUI:
+    case mlir::gpu::AllReduceOperation::MINNUMF:
+    case mlir::gpu::AllReduceOperation::MINIMUMF:
+      Fn = "simd_min";
+      break;
+    case mlir::gpu::AllReduceOperation::MINSI:
+      Fn = "simd_min";
+      IsSigned = true;
+      break;
+    case mlir::gpu::AllReduceOperation::MAXUI:
+    case mlir::gpu::AllReduceOperation::MAXNUMF:
+    case mlir::gpu::AllReduceOperation::MAXIMUMF:
+      Fn = "simd_max";
+      break;
+    case mlir::gpu::AllReduceOperation::MAXSI:
+      Fn = "simd_max";
+      IsSigned = true;
+      break;
+    case mlir::gpu::AllReduceOperation::AND:
+      Fn = "simd_and";
+      break;
+    case mlir::gpu::AllReduceOperation::OR:
+      Fn = "simd_or";
+      break;
+    case mlir::gpu::AllReduceOperation::XOR:
+      Fn = "simd_xor";
+      break;
+    }
+    if (IsSigned)
+      return Expr{unsignedView(T, (Fn + "(" + signedView(T, V->Text) + ")").str()),
+                  PrecPrimary};
+    return Expr{(Fn + "(" + V->Text + ")").str(), PrecPrimary};
+  }
+  if (auto BC = mlir::dyn_cast<mlir::gpu::SubgroupBroadcastOp>(Op)) {
+    auto V = exprFor(BC.getSrc(), PrecUnknown);
+    if (!V)
+      return V.takeError();
+    mlir::Type T = BC.getSrc().getType();
+    std::string Fn, LaneArg;
+    if (BC.getBroadcastType() == mlir::gpu::BroadcastType::first_active_lane) {
+      Fn = "simd_broadcast_first";
+    } else {
+      auto Idx = exprFor(BC->getOperand(1), PrecUnknown);
+      if (!Idx)
+        return Idx.takeError();
+      Fn = "simd_broadcast";
+      LaneArg = ", ushort(" + Idx->Text + ")";
+    }
+    if (T.isInteger(1))
+      return Expr{"bool(" + Fn + "(uint(" + V->Text + ")" + LaneArg + "))",
+                  PrecPrimary};
+    if (T.isInteger(64) || T.isF64())
+      return Expr{"as_type<ulong>(" + Fn + "(as_type<uint2>(" + V->Text + ")" +
+                      LaneArg + "))",
+                  PrecPrimary};
+    return Expr{Fn + "(" + V->Text + LaneArg + ")", PrecPrimary};
+  }
+  if (auto Bal = mlir::dyn_cast<mlir::gpu::BallotOp>(Op)) {
+    auto Pred = exprFor(Bal.getPredicate(), PrecUnknown);
+    if (!Pred)
+      return Pred.takeError();
+    auto DstTy = mslType(Bal.getType());
+    if (!DstTy)
+      return DstTy.takeError();
+    return Expr{*DstTy + "(uint64_t(simd_ballot(" + Pred->Text + ")))",
+                PrecPrimary};
+  }
+  if (auto Shuf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {
+    auto V = exprFor(Shuf.getValue(), PrecUnknown);
+    auto Off = exprFor(Shuf.getOffset(), PrecUnknown);
+    if (!V || !Off)
+      return makeError("invalid gpu.shuffle operand");
+    StringRef Fn;
+    switch (Shuf.getMode()) {
+    case mlir::gpu::ShuffleMode::IDX:
+      Fn = "simd_shuffle";
+      break;
+    case mlir::gpu::ShuffleMode::XOR:
+      Fn = "simd_shuffle_xor";
+      break;
+    case mlir::gpu::ShuffleMode::UP:
+      Fn = "simd_shuffle_up";
+      break;
+    case mlir::gpu::ShuffleMode::DOWN:
+      Fn = "simd_shuffle_down";
+      break;
+    }
+    mlir::Type T = Shuf.getValue().getType();
+    std::string LaneArg = ", ushort(" + Off->Text + ")";
+    if (T.isInteger(1))
+      return Expr{"bool(" + Fn.str() + "(uint(" + V->Text + ")" + LaneArg +
+                      "))",
+                  PrecPrimary};
+    if (T.isInteger(64) || T.isF64())
+      return Expr{"as_type<ulong>(" + Fn.str() + "(as_type<uint2>(" + V->Text +
+                      ")" + LaneArg + "))",
+                  PrecPrimary};
+    return Expr{Fn.str() + "(" + V->Text + LaneArg + ")", PrecPrimary};
+  }
+
+  // Layer 1 math & LLVM dialect intrinsics.
+  auto emitUnaryCall = [&](StringRef Fn) -> Expected<Expr> {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{(Fn + "(" + A->Text + ")").str(), PrecPrimary};
+  };
+  auto emitBinaryCall = [&](StringRef Fn) -> Expected<Expr> {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    auto B = exprFor(Op->getOperand(1), PrecUnknown);
+    if (!A || !B)
+      return makeError("invalid binary math operand");
+    return Expr{(Fn + "(" + A->Text + ", " + B->Text + ")").str(), PrecPrimary};
+  };
+  if (mlir::isa<mlir::LLVM::FAbsOp, mlir::math::AbsFOp>(Op))
+    return emitUnaryCall("fabs");
+  if (mlir::isa<mlir::LLVM::SqrtOp, mlir::math::SqrtOp>(Op))
+    return emitUnaryCall("sqrt");
+  if (mlir::isa<mlir::math::RsqrtOp>(Op))
+    return emitUnaryCall("rsqrt");
+  if (mlir::isa<mlir::LLVM::SinOp, mlir::math::SinOp>(Op))
+    return emitUnaryCall("sin");
+  if (mlir::isa<mlir::LLVM::CosOp, mlir::math::CosOp>(Op))
+    return emitUnaryCall("cos");
+  if (mlir::isa<mlir::math::TanOp>(Op))
+    return emitUnaryCall("tan");
+  if (mlir::isa<mlir::LLVM::ExpOp, mlir::math::ExpOp>(Op))
+    return emitUnaryCall("exp");
+  if (mlir::isa<mlir::LLVM::Exp2Op, mlir::math::Exp2Op>(Op))
+    return emitUnaryCall("exp2");
+  if (mlir::isa<mlir::LLVM::LogOp, mlir::math::LogOp>(Op))
+    return emitUnaryCall("log");
+  if (mlir::isa<mlir::LLVM::Log2Op, mlir::math::Log2Op>(Op))
+    return emitUnaryCall("log2");
+  if (mlir::isa<mlir::LLVM::FFloorOp, mlir::math::FloorOp>(Op))
+    return emitUnaryCall("floor");
+  if (mlir::isa<mlir::LLVM::FCeilOp, mlir::math::CeilOp>(Op))
+    return emitUnaryCall("ceil");
+  if (mlir::isa<mlir::LLVM::TruncOp, mlir::math::TruncOp>(Op))
+    return emitUnaryCall("trunc");
+  if (mlir::isa<mlir::LLVM::RoundEvenOp, mlir::LLVM::RintOp,
+                mlir::math::RoundEvenOp>(Op))
+    return emitUnaryCall("rint");
+  if (mlir::isa<mlir::LLVM::RoundOp, mlir::math::RoundOp>(Op))
+    return emitUnaryCall("round");
+  if (mlir::isa<mlir::LLVM::MinNumOp, mlir::LLVM::MinimumOp>(Op))
+    return emitBinaryCall("fmin");
+  if (mlir::isa<mlir::LLVM::MaxNumOp, mlir::LLVM::MaximumOp>(Op))
+    return emitBinaryCall("fmax");
+  if (mlir::isa<mlir::LLVM::PowOp, mlir::math::PowFOp>(Op))
+    return emitBinaryCall("pow");
+  if (mlir::isa<mlir::LLVM::CopySignOp, mlir::math::CopySignOp>(Op))
+    return emitBinaryCall("copysign");
+  if (mlir::isa<mlir::LLVM::FMAOp, mlir::LLVM::FMulAddOp, mlir::math::FmaOp>(
+          Op)) {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    auto B = exprFor(Op->getOperand(1), PrecUnknown);
+    auto C = exprFor(Op->getOperand(2), PrecUnknown);
+    if (!A || !B || !C)
+      return makeError("invalid fma operand");
+    return Expr{"fma(" + A->Text + ", " + B->Text + ", " + C->Text + ")",
+                PrecPrimary};
+  }
+  if (mlir::isa<mlir::LLVM::UMinOp>(Op))
+    return emitBinaryCall("min");
+  if (mlir::isa<mlir::LLVM::UMaxOp>(Op))
+    return emitBinaryCall("max");
+  if (mlir::isa<mlir::LLVM::SMinOp, mlir::LLVM::SMaxOp>(Op)) {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    auto B = exprFor(Op->getOperand(1), PrecUnknown);
+    if (!A || !B)
+      return makeError("invalid signed min/max operand");
+    mlir::Type T = Op->getResult(0).getType();
+    StringRef Fn = mlir::isa<mlir::LLVM::SMinOp>(Op) ? "min" : "max";
+    return Expr{unsignedView(T, (Fn + "(" + signedView(T, A->Text) + ", " +
+                                 signedView(T, B->Text) + ")")
+                                    .str()),
+                PrecPrimary};
+  }
+  if (mlir::isa<mlir::LLVM::CtPopOp, mlir::math::CtPopOp>(Op))
+    return emitUnaryCall("popcount");
+  if (mlir::isa<mlir::LLVM::BitReverseOp>(Op))
+    return emitUnaryCall("reverse_bits");
+  if (mlir::isa<mlir::LLVM::CountLeadingZerosOp,
+                mlir::math::CountLeadingZerosOp>(Op))
+    return emitUnaryCall("clz");
+  if (mlir::isa<mlir::LLVM::CountTrailingZerosOp,
+                mlir::math::CountTrailingZerosOp>(Op))
+    return emitUnaryCall("ctz");
 
   if (auto Call = mlir::dyn_cast<CallOp>(Op)) {
     auto DXOp = dxOpcode(Call);
@@ -5084,6 +5353,26 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return emitWhile(While, Ind);
   if (auto Switch = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(Op))
     return emitSwitch(Switch, Ind);
+  if (auto Barrier = mlir::dyn_cast<mlir::gpu::BarrierOp>(Op)) {
+    StringRef Flags = Barrier->hasAttr("crucible.device_fence")
+                          ? "mem_flags::mem_threadgroup | mem_flags::mem_device"
+                          : "mem_flags::mem_threadgroup";
+    line(Ind, ("threadgroup_barrier(" + Flags + ");").str());
+    return Error::success();
+  }
+  if (auto Shuf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {
+    auto Ty = mslType(Shuf.getShuffleResult().getType());
+    if (!Ty)
+      return Ty.takeError();
+    auto E = opExpr(Shuf);
+    if (!E)
+      return E.takeError();
+    std::string Name = freshName();
+    line(Ind, *Ty + " " + Name + " = " + E->Text + ";");
+    ValueNames[Shuf.getShuffleResult()] = Name;
+    ValueNames[Shuf.getValid()] = "true";
+    return Error::success();
+  }
   if (mlir::isa<mlir::scf::ForOp>(Op))
     return makeError("scf.for emission is not implemented yet");
 

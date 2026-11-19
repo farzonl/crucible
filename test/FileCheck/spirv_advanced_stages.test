@@ -1,0 +1,23 @@
+# DXIL -> SPIR-V test for Domain (ds_6_0) and Mesh (ms_6_5) shaders via --stage-as-compute,
+# plus clean diagnostic when --stage-as-compute is omitted on LLVM 23.
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T ds_6_0 -E main -Fo %t.ds.dxil %S/../Inputs/domain_system_values.hlsl
+# RUN: not %cruciblec --target=spirv %t.ds.dxil -o %t.ds.bad.spv 2>&1 | FileCheck %s --check-prefix=DIAG
+# RUN: %cruciblec --target=spirv --stage-as-compute %t.ds.dxil -o %t.ds.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.ds.spv
+# RUN: %spirv-dis %t.ds.spv | FileCheck %s --check-prefix=DS
+
+# RUN: %dxc -T ms_6_5 -E main -Fo %t.ms.dxil %S/../Inputs/spirv_mesh_shader.hlsl
+# RUN: %cruciblec --target=spirv --stage-as-compute %t.ms.dxil -o %t.ms.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.ms.spv
+# RUN: %spirv-dis %t.ms.spv | FileCheck %s --check-prefix=MS
+
+# DIAG: native execution model for shader stage {{[0-9]+}} is not supported by LLVM 23
+
+# DS: OpEntryPoint GLCompute %main "main"
+# DS: OpDecorate {{%[A-Za-z0-9_]+}} BuiltIn WorkgroupId
+# DS: OpVariable {{%[A-Za-z0-9_]+}} StorageBuffer
+
+# MS: OpEntryPoint GLCompute %main "main"
+# MS: OpVariable {{%[A-Za-z0-9_]+}} StorageBuffer

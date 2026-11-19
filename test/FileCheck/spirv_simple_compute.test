@@ -1,27 +1,27 @@
-# DXIL -> SPIR-V test for simple compute shader (StorageBuffer + ThreadId).
-# REQUIRES: spirv-tools
+# SPIR-V -> MSL golden test for Milestone 1 (HLSL -> dxc -spirv -> cruciblec).
 
-# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/simple_compute.hlsl
-# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv --reflect %t.json
-# RUN: %spirv-val --target-env vulkan1.3 %t.spv
-# RUN: %spirv-dis %t.spv | FileCheck %s
-# RUN: %cruciblec --target=spirv --spv-asm %t.dxil | FileCheck %s --check-prefix=ASM
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal --reflect %t.json
+# RUN: FileCheck %s --input-file=%t.metal
 # RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
 
-# CHECK: OpCapability Shader
-# CHECK: OpMemoryModel Logical GLSL450
-# CHECK: OpEntryPoint GLCompute %main "main"
-# CHECK: OpExecutionMode %main LocalSize 64 1 1
-# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} DescriptorSet 0
-# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} Binding 0
-# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} BuiltIn GlobalInvocationId
-# CHECK: OpFMul %float
-# CHECK: OpFAdd %float
+# CHECK: #include <metal_stdlib>
+# CHECK: using namespace metal;
+# CHECK: kernel void main0(
+# CHECK-NEXT: device float* [[BUF:(Out|uav0)]] {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK-NEXT: [[BUF]][dtid.x] = [[BUF]][dtid.x] * 2.0f + 1.0f;
+# CHECK-NEXT: }
 
-# ASM: OpCapability Shader
-# ASM: OpEntryPoint GLCompute
-# ASM: OpExecutionMode {{%[0-9]+}} LocalSize 64 1 1
-
+# REFLECT: "bindings"
 # REFLECT: "class": "uav"
-# REFLECT: "spirvBinding": 0
-# REFLECT: "spirvSet": 0
+# REFLECT: "elementStride": 4
+# REFLECT: "metalIndex": 0
+# REFLECT: "register": 0
+# REFLECT: "space": 0
+# REFLECT: "entry": "main"
+# REFLECT: "mslEntry": "main0"
+# REFLECT: "numThreads": [
+# REFLECT-NEXT: 64,
+# REFLECT-NEXT: 1,
+# REFLECT-NEXT: 1

@@ -1,14 +1,15 @@
-# DXIL -> SPIR-V test for groupshared memory, barriers, and workgroup atomics.
-# REQUIRES: spirv-tools
+# SPIR-V -> MSL test: groupshared (Workgroup) memory, atomics, LocalInvocationIndex, and gpu.barrier.
 
-# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/groupshared_reduce.hlsl
-# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
-# RUN: %spirv-val --target-env vulkan1.3 %t.spv
-# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/groupshared_reduce.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
 
-# CHECK: OpEntryPoint GLCompute %main "main"
-# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} BuiltIn LocalInvocationIndex
-# CHECK: OpVariable {{%[A-Za-z0-9_]+}} Workgroup
-# CHECK: OpControlBarrier
-# CHECK: OpAtomicIAdd
-# CHECK: OpControlBarrier
+# CHECK: kernel void main0(
+# CHECK-NEXT: device uint* Out {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint gidx {{\[\[}}thread_index_in_threadgroup{{\]\]}}) {
+# CHECK: threadgroup uint gsSum[1];
+# CHECK: gsSum[0u] = 0u;
+# CHECK: threadgroup_barrier(mem_flags::mem_threadgroup);
+# CHECK: atomic_fetch_add_explicit((threadgroup atomic_uint *)&gsSum[0u], gidx, memory_order_relaxed);
+# CHECK: threadgroup_barrier(mem_flags::mem_threadgroup);
+# CHECK: Out[0u] = gsSum[0u];

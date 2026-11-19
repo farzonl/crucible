@@ -23,7 +23,7 @@ using namespace llvm;
 static cl::OptionCategory CrucibleCat("cruciblec options");
 
 static cl::opt<std::string> InputFile(cl::Positional, cl::Required,
-                                      cl::desc("<input .dxil>"),
+                                      cl::desc("<input .dxil or .spv>"),
                                       cl::cat(CrucibleCat));
 static cl::opt<std::string> OutputFile("o", cl::desc("Output file (.metal or .spv, defaults to stdout)"),
                                        cl::value_desc("path"),
@@ -70,6 +70,9 @@ static cl::opt<bool> FlushDenormsF32("ftz",
 static cl::opt<bool> EmulateF64("emulate-f64",
                                 cl::desc("Emulate double (f64) operations using software IEEE-754 binary64"),
                                 cl::cat(CrucibleCat));
+static cl::opt<bool> StageAsCompute("stage-as-compute",
+                                    cl::desc("Lower Geometry/Hull/Domain/Mesh/Amplification stages as compute shaders"),
+                                    cl::cat(CrucibleCat));
 
 static int reportError(Error E) {
   logAllUnhandledErrors(std::move(E), errs(), "cruciblec: error: ");
@@ -136,6 +139,7 @@ int main(int argc, char **argv) {
   Opts.MSLStd = MSLStd;
   Opts.FlushDenormsF32 = FlushDenormsF32;
   Opts.EmulateF64 = EmulateF64;
+  Opts.StageAsCompute = StageAsCompute;
   Opts.EmitSPIRVAsm = EmitSPIRVAsm;
   Opts.VulkanVersion = VulkanVersion;
 
@@ -201,7 +205,7 @@ int main(int argc, char **argv) {
                        "' (expected 'msl' or 'spirv')");
 
   auto Result =
-      crucible::compileDXILToMSL((*BufOrErr)->getMemBufferRef(), Opts);
+      crucible::compileToMSL((*BufOrErr)->getMemBufferRef(), Opts);
   if (!Result)
     return reportError(Result.takeError());
 

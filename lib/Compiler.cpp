@@ -19,10 +19,34 @@ using namespace llvm;
 
 namespace crucible {
 
-Expected<CompileResult> compileDXILToMSL(MemoryBufferRef DXIL,
-                                         const Options &Opts) {
+Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
+                                       const Options &Opts) {
+  if (isSPIRVBinary(Input)) {
+    mlir::MLIRContext MCtx;
+    auto Loaded = loadSPIRV(Input, MCtx, Opts.EntryPoint);
+    if (!Loaded)
+      return Loaded.takeError();
+
+    if (Error E = assignMetalBindings(Loaded->Reflect, Opts))
+      return std::move(E);
+
+    auto Structured =
+        structurizeMLIRModule(std::move(Loaded->Module), Loaded->Reflect);
+    if (!Structured)
+      return Structured.takeError();
+
+    auto MSL = emitMSL(Structured->Entry, Loaded->Reflect, Opts);
+    if (!MSL)
+      return MSL.takeError();
+
+    CompileResult Result;
+    Result.MSL = std::move(*MSL);
+    Result.Reflect = std::move(Loaded->Reflect);
+    return Result;
+  }
+
   LLVMContext Ctx;
-  auto Shader = loadDXIL(DXIL, Ctx, Opts.EntryPoint);
+  auto Shader = loadDXIL(Input, Ctx, Opts.EntryPoint);
   if (!Shader)
     return Shader.takeError();
 
@@ -65,4 +89,8 @@ Expected<SPIRVCompileResult> compileDXILToSPIRV(MemoryBufferRef DXIL,
   return Result;
 }
 
+Expected<CompileResult> compileDXILToMSL(MemoryBufferRef DXIL,
+                                         const Options &Opts) {
+  return compileToMSL(DXIL, Opts);
+}
 } // namespace crucible
