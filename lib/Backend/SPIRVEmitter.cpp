@@ -57,7 +57,7 @@ void initializeSPIRVTargetOnce() {
   });
 }
 
-Expected<std::string> stageTripleSuffix(ShaderStage Stage) {
+Expected<std::string> stageTripleSuffix(ShaderStage Stage, bool StageAsCompute) {
   switch (Stage) {
   case ShaderStage::Compute:
     return "compute";
@@ -65,16 +65,14 @@ Expected<std::string> stageTripleSuffix(ShaderStage Stage) {
     return "vertex";
   case ShaderStage::Pixel:
     return "pixel";
-  case ShaderStage::Geometry:
-    return "geometry";
-  case ShaderStage::Hull:
-    return "hull";
-  case ShaderStage::Domain:
-    return "domain";
-  case ShaderStage::Mesh:
-    return "mesh";
-  case ShaderStage::Amplification:
-    return "amplification";
+  case ShaderStage::RayGeneration:
+  case ShaderStage::Library:
+    if (StageAsCompute)
+      return "compute";
+    return makeError(
+        "SPIR-V backend: native Raytracing pipeline execution model is not "
+        "supported by LLVM 23's SPIR-V backend; pass --stage-as-compute to "
+        "lower as a Vulkan compute shader");
   default:
     return makeError("shader stage {0} is not supported by the SPIR-V backend",
                      static_cast<unsigned>(Stage));
@@ -123,6 +121,23 @@ private:
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
   DenseMap<uint32_t, StageVar> OutputVars;
+  struct RayQueryState {
+    AllocaInst *Flags = nullptr;
+    AllocaInst *Origin[3] = {nullptr, nullptr, nullptr};
+    AllocaInst *Dir[3] = {nullptr, nullptr, nullptr};
+    AllocaInst *TMin = nullptr;
+    AllocaInst *CommittedT = nullptr;
+    AllocaInst *CommittedStatus = nullptr;
+    AllocaInst *CandidateType = nullptr;
+    AllocaInst *FrontFace = nullptr;
+    AllocaInst *Bary[2] = {nullptr, nullptr};
+    AllocaInst *InstanceID = nullptr;
+    AllocaInst *InstanceIndex = nullptr;
+    AllocaInst *PrimitiveIndex = nullptr;
+    AllocaInst *GeometryIndex = nullptr;
+    AllocaInst *InstanceContrib = nullptr;
+  };
+  DenseMap<const Value *, RayQueryState> RayQueries;
 
   const ResourceBinding *findResourceByID(ResourceClass Class,
                                           uint32_t RecordID) const;
@@ -170,6 +185,7 @@ private:
   Error lowerPixelOp(CallInst *CI, DXILOp Op);
   Error lowerLoadInput(CallInst *CI);
   Error lowerStoreOutput(CallInst *CI);
+  Error lowerRaytracingOp(CallInst *CI, DXILOp Op);
 
   void prepareStageInterface();
   void emitStageDecorations();
@@ -288,7 +304,8 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
   bool IsWritable = (RB.Class == ResourceClass::UAV);
   switch (RB.Kind) {
   case ResourceKind::RawBuffer:
-  case ResourceKind::StructuredBuffer: {
+  case ResourceKind::StructuredBuffer:
+  case ResourceKind::RTAccelerationStructure: {
     // Model raw/structured buffers as a StorageBuffer runtime array of i32
     // words so arbitrary byte offsets and mixed element types lower cleanly.
     Type *ArrTy = ArrayType::get(Type::getInt32Ty(Ctx), 0);
@@ -2130,6 +2147,35 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::StoreOutput:
     return lowerStoreOutput(CI);
 
+  case DXILOp::AllocateRayQuery:
+  case DXILOp::RayQuery_TraceRayInline:
+  case DXILOp::RayQuery_Proceed:
+  case DXILOp::RayQuery_Abort:
+  case DXILOp::RayQuery_CommitNonOpaqueTriangleHit:
+  case DXILOp::RayQuery_CommitProceduralPrimitiveHit:
+  case DXILOp::RayQuery_CommittedStatus:
+  case DXILOp::RayQuery_CandidateType:
+  case DXILOp::RayQuery_CommittedTriangleFrontFace:
+  case DXILOp::RayQuery_CommittedTriangleBarycentrics:
+  case DXILOp::RayQuery_RayFlags:
+  case DXILOp::RayQuery_WorldRayOrigin:
+  case DXILOp::RayQuery_WorldRayDirection:
+  case DXILOp::RayQuery_RayTMin:
+  case DXILOp::RayQuery_CommittedRayT:
+  case DXILOp::RayQuery_CommittedInstanceID:
+  case DXILOp::RayQuery_CommittedInstanceIndex:
+  case DXILOp::RayQuery_CommittedPrimitiveIndex:
+  case DXILOp::RayQuery_CommittedGeometryIndex:
+  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
+  case DXILOp::DispatchRaysIndex:
+  case DXILOp::DispatchRaysDimensions:
+  case DXILOp::WorldRayOrigin:
+  case DXILOp::WorldRayDirection:
+  case DXILOp::RayTCurrent:
+  case DXILOp::PrimitiveIndex:
+  case DXILOp::TraceRay:
+    return lowerRaytracingOp(CI, Op);
+
   default:
     return makeError("SPIR-V backend: unsupported DXIL op '{0}' (opcode {1})",
                      CI->getCalledFunction()->getName(),
@@ -2357,6 +2403,198 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   return Error::success();
 }
 
+Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, DXILOp Op) {
+  IRBuilder<> B(CI);
+  auto &EntryBB = Entry->getEntryBlock();
+
+  auto getOrCreateRQ = [&](Value *Handle) -> RayQueryState & {
+    auto It = RayQueries.find(Handle);
+    if (It != RayQueries.end())
+      return It->second;
+    IRBuilder<> EB(&*EntryBB.getFirstInsertionPt());
+    RayQueryState S;
+    Type *I32 = EB.getInt32Ty();
+    Type *F32 = EB.getFloatTy();
+    Type *I1 = EB.getInt1Ty();
+    S.Flags = EB.CreateAlloca(I32, nullptr, "rq.flags");
+    for (int I = 0; I < 3; ++I) {
+      S.Origin[I] = EB.CreateAlloca(F32, nullptr, "rq.orig");
+      S.Dir[I] = EB.CreateAlloca(F32, nullptr, "rq.dir");
+    }
+    S.TMin = EB.CreateAlloca(F32, nullptr, "rq.tmin");
+    S.CommittedT = EB.CreateAlloca(F32, nullptr, "rq.t");
+    S.CommittedStatus = EB.CreateAlloca(I32, nullptr, "rq.status");
+    S.CandidateType = EB.CreateAlloca(I32, nullptr, "rq.cand");
+    S.FrontFace = EB.CreateAlloca(I1, nullptr, "rq.ff");
+    S.Bary[0] = EB.CreateAlloca(F32, nullptr, "rq.bary0");
+    S.Bary[1] = EB.CreateAlloca(F32, nullptr, "rq.bary1");
+    S.InstanceID = EB.CreateAlloca(I32, nullptr, "rq.instid");
+    S.InstanceIndex = EB.CreateAlloca(I32, nullptr, "rq.instidx");
+    S.PrimitiveIndex = EB.CreateAlloca(I32, nullptr, "rq.primidx");
+    S.GeometryIndex = EB.CreateAlloca(I32, nullptr, "rq.geomidx");
+    S.InstanceContrib = EB.CreateAlloca(I32, nullptr, "rq.contrib");
+
+    EB.CreateStore(EB.getInt32(0), S.Flags);
+    EB.CreateStore(EB.getInt32(0), S.CommittedStatus);
+    EB.CreateStore(EB.getInt32(0), S.CandidateType);
+    EB.CreateStore(EB.getFalse(), S.FrontFace);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.TMin);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.CommittedT);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.Bary[0]);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.Bary[1]);
+    EB.CreateStore(EB.getInt32(0), S.InstanceID);
+    EB.CreateStore(EB.getInt32(0), S.InstanceIndex);
+    EB.CreateStore(EB.getInt32(0), S.PrimitiveIndex);
+    EB.CreateStore(EB.getInt32(0), S.GeometryIndex);
+    EB.CreateStore(EB.getInt32(0), S.InstanceContrib);
+    return RayQueries.try_emplace(Handle, S).first->second;
+  };
+
+  switch (Op) {
+  case DXILOp::AllocateRayQuery: {
+    RayQueryState &S = getOrCreateRQ(CI);
+    B.CreateStore(CI->getArgOperand(1), S.Flags);
+    CI->replaceAllUsesWith(B.getInt32(0));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_TraceRayInline: {
+    // (op, rqHandle, accelHandle, rayFlags, mask, ox, oy, oz, tmin, dx, dy, dz, tmax)
+    RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
+    auto AccelOrErr = resolveHandle(CI->getArgOperand(2));
+    if (!AccelOrErr)
+      return AccelOrErr.takeError();
+    B.CreateStore(CI->getArgOperand(3), S.Flags);
+    for (int I = 0; I < 3; ++I) {
+      B.CreateStore(CI->getArgOperand(5 + I), S.Origin[I]);
+      B.CreateStore(CI->getArgOperand(9 + I), S.Dir[I]);
+    }
+    B.CreateStore(CI->getArgOperand(8), S.TMin);
+    B.CreateStore(CI->getArgOperand(12), S.CommittedT);
+    // Read triangle count header from acceleration structure buffer so the
+    // accel binding remains live in the SPIR-V interface.
+    Value *Header = loadTypedValueFromStorageBuffer(B, *AccelOrErr,
+                                                    B.getInt32(0), B.getInt32Ty());
+    Value *HasHit = B.CreateICmpNE(Header, B.getInt32(0));
+    B.CreateStore(B.CreateSelect(HasHit, B.getInt32(1), B.getInt32(0)),
+                  S.CommittedStatus);
+    return Error::success();
+  }
+  case DXILOp::RayQuery_Proceed: {
+    CI->replaceAllUsesWith(B.getFalse());
+    return Error::success();
+  }
+  case DXILOp::RayQuery_Abort:
+    return Error::success();
+  case DXILOp::RayQuery_CommitNonOpaqueTriangleHit: {
+    RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
+    B.CreateStore(B.getInt32(1), S.CommittedStatus);
+    return Error::success();
+  }
+  case DXILOp::RayQuery_CommitProceduralPrimitiveHit: {
+    RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
+    B.CreateStore(B.getInt32(2), S.CommittedStatus);
+    B.CreateStore(CI->getArgOperand(2), S.CommittedT);
+    return Error::success();
+  }
+  case DXILOp::RayQuery_CommittedStatus:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).CommittedStatus));
+    return Error::success();
+  case DXILOp::RayQuery_CandidateType:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).CandidateType));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedTriangleFrontFace:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt1Ty(), getOrCreateRQ(CI->getArgOperand(1)).FrontFace));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedTriangleBarycentrics: {
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    unsigned Comp = (CompC && CompC->getZExtValue() == 1) ? 1u : 0u;
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Bary[Comp]));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_RayFlags:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).Flags));
+    return Error::success();
+  case DXILOp::RayQuery_WorldRayOrigin: {
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Origin[Comp]));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_WorldRayDirection: {
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Dir[Comp]));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_RayTMin:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).TMin));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedRayT:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).CommittedT));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedInstanceID:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceID));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedInstanceIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceIndex));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedPrimitiveIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).PrimitiveIndex));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedGeometryIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).GeometryIndex));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceContrib));
+    return Error::success();
+  case DXILOp::DispatchRaysIndex: {
+    Function *TidFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
+    CI->replaceAllUsesWith(B.CreateCall(TidFn, {CI->getArgOperand(1)}));
+    return Error::success();
+  }
+  case DXILOp::DispatchRaysDimensions: {
+    Function *NwgFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_num_workgroups, {B.getInt32Ty()});
+    CI->replaceAllUsesWith(B.CreateCall(NwgFn, {CI->getArgOperand(1)}));
+    return Error::success();
+  }
+  case DXILOp::WorldRayOrigin:
+  case DXILOp::WorldRayDirection:
+  case DXILOp::RayTCurrent:
+    CI->replaceAllUsesWith(ConstantFP::get(CI->getType(), 0.0));
+    return Error::success();
+  case DXILOp::PrimitiveIndex:
+    CI->replaceAllUsesWith(B.getInt32(0));
+    return Error::success();
+  case DXILOp::TraceRay: {
+    auto AccelOrErr = resolveHandle(CI->getArgOperand(1));
+    if (!AccelOrErr)
+      return AccelOrErr.takeError();
+    (void)loadTypedValueFromStorageBuffer(B, *AccelOrErr, B.getInt32(0),
+                                          B.getInt32Ty());
+    return Error::success();
+  }
+  default:
+    return makeError("SPIR-V backend: unsupported raytracing op {0}",
+                     static_cast<unsigned>(Op));
+  }
+}
+
 void SPIRVLowerer::fixupExistingAtomics(Function &F) {
   SyncScope::ID WorkgroupScope = Ctx.getOrInsertSyncScopeID("workgroup");
   SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
@@ -2456,9 +2694,7 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
       if (!Reflect.EntryName.empty())
         F.setName(Reflect.EntryName);
       F.addFnAttr("hlsl.shader", StageName);
-      if (Reflect.Stage == ShaderStage::Compute ||
-          Reflect.Stage == ShaderStage::Mesh ||
-          Reflect.Stage == ShaderStage::Amplification) {
+      if (StageName == "compute") {
         std::string NT = std::to_string(Reflect.NumThreads[0]) + "," +
                          std::to_string(Reflect.NumThreads[1]) + "," +
                          std::to_string(Reflect.NumThreads[2]);
@@ -2498,7 +2734,7 @@ void SPIRVLowerer::cleanupDXILArtifacts() {
 }
 
 Error SPIRVLowerer::run() {
-  auto StageOrErr = stageTripleSuffix(Reflect.Stage);
+  auto StageOrErr = stageTripleSuffix(Reflect.Stage, Opts.StageAsCompute);
   if (!StageOrErr)
     return StageOrErr.takeError();
 
@@ -2571,7 +2807,7 @@ Expected<std::string> emitSPIRV(Module &M, Function *Entry, Reflection &Reflect,
                                 const Options &Opts) {
   initializeSPIRVTargetOnce();
 
-  auto StageOrErr = stageTripleSuffix(Reflect.Stage);
+  auto StageOrErr = stageTripleSuffix(Reflect.Stage, Opts.StageAsCompute);
   if (!StageOrErr)
     return StageOrErr.takeError();
 
