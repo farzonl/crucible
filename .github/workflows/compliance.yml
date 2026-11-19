@@ -87,12 +87,14 @@ jobs:
         run: |
           lit -v --timeout=60 --output=offload-results-dxil-to-metal.json \
             build/test-offload || true
+          test -s offload-results-dxil-to-metal.json
 
       - name: Upload dxil-to-metal results
         uses: actions/upload-artifact@v4
         with:
           name: offload-results-dxil-to-metal
           path: offload-results-dxil-to-metal.json
+          if-no-files-found: error
 
   compliance-dxil-to-spirv:
     runs-on: ubuntu-latest
@@ -166,12 +168,14 @@ jobs:
         run: |
           lit -v --timeout=60 --output=offload-results-dxil-to-spirv.json \
             build/test-offload || true
+          test -s offload-results-dxil-to-spirv.json
 
       - name: Upload dxil-to-spirv results
         uses: actions/upload-artifact@v4
         with:
           name: offload-results-dxil-to-spirv
           path: offload-results-dxil-to-spirv.json
+          if-no-files-found: error
 
   publish:
     runs-on: ubuntu-latest

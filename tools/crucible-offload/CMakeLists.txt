@@ -88,8 +88,29 @@ if(APPLE)
   target_compile_definitions(api-query PRIVATE OFFLOADTEST_HAVE_SYSCTLBYNAME)
 endif()
 target_link_libraries(api-query PRIVATE crucible-offload-device)
+if(UNIX AND NOT APPLE)
+  # Mesa Lavapipe (libvulkan_lvp.so) links against the distro's libLLVM.so
+  # (e.g., LLVM 21) while Crucible links against a newer LLVM/MLIR (e.g., 23).
+  # Hide all LLVM/MLIR symbols in our executables so ELF symbol interposition
+  # never redirects Lavapipe's LLVM calls into Crucible's LLVM instantiations.
+  set(_crucible_hide_llvm_map "${CMAKE_CURRENT_BINARY_DIR}/hide-llvm-symbols.map")
+  file(WRITE "${_crucible_hide_llvm_map}"
+"{
+  local:
+    _Z*4llvm*;
+    _Z*4mlir*;
+    LLVM*;
+    MLIR*;
+};
+")
+endif()
 foreach(tool offloader api-query)
   target_compile_options(${tool} PRIVATE ${CRUCIBLE_COMMON_FLAGS})
+  if(UNIX AND NOT APPLE)
+    target_link_options(${tool} PRIVATE
+      "-Wl,--exclude-libs,ALL"
+      "-Wl,--version-script=${_crucible_hide_llvm_map}")
+  endif()
   if(APPLE AND CRUCIBLE_VULKAN_LIB)
     get_filename_component(_vk_lib_dir "${CRUCIBLE_VULKAN_LIB}" DIRECTORY)
     set_target_properties(${tool} PROPERTIES BUILD_RPATH "${_vk_lib_dir}")
