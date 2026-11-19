@@ -1,220 +1,153 @@
+<div align="center">
+
 # Crucible
 
-**An open-source DXIL → Metal Shading Language compiler.**
+**An open-source multi-frontend, multi-backend shader compiler for DXIL, SPIR-V, and Metal Shading Language.**
 
-Crucible (`cruciblec`) smelts DirectX Intermediate Language (`.dxil` /
-DXContainer) shader binaries down into clean, idiomatic **MSL source code**
-plus JSON binding reflection, then compiles them with Apple's native toolchain
-(`xcrun metal` / `metallib`) for execution on Apple Silicon GPUs.
+[![CI](https://github.com/farzonl/crucible/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/farzonl/crucible/actions/workflows/ci.yml)
+[![Offload Compliance](https://github.com/farzonl/crucible/actions/workflows/compliance.yml/badge.svg)](https://github.com/farzonl/crucible/actions/workflows/compliance.yml)
+[![macOS Benchmarks](https://github.com/farzonl/crucible/actions/workflows/macos-benchmark.yml/badge.svg)](https://github.com/farzonl/crucible/actions/workflows/macos-benchmark.yml)
+[![DXIL to Metal Pass Rate](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ffarzonl.github.io%2Fcrucible%2Fdata%2Flatest.json&query=%24.passRate&suffix=%25&label=DXIL%20%E2%86%92%20Metal&color=brightgreen)](https://farzonl.github.io/crucible/?track=dxil-to-metal)
+[![DXIL to SPIR-V Pass Rate](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ffarzonl.github.io%2Fcrucible%2Fdata%2Fdxil-to-spirv%2Flatest.json&query=%24.passRate&suffix=%25&label=DXIL%20%E2%86%92%20SPIR-V&color=blue)](https://farzonl.github.io/crucible/?track=dxil-to-spirv)
+[![Platforms](https://img.shields.io/badge/Platforms-macOS_%7C_Linux-success)](#building)
+[![License](https://img.shields.io/badge/License-Apache--2.0%20WITH%20LLVM--exception-blue)](LICENSE)
 
-## Why
+[**Live Compliance Dashboard**](https://farzonl.github.io/crucible/) · [**DXIL → Metal Track**](https://farzonl.github.io/crucible/?track=dxil-to-metal) · [**DXIL → SPIR-V Track**](https://farzonl.github.io/crucible/?track=dxil-to-spirv) · [**Live Benchmark Dashboard**](https://farzonl.github.io/crucible/bench.html)
 
-Apple's proprietary `metal-shaderconverter` is closed-source, lags behind
-modern Shader Model 6.8/6.9 intrinsics, and forces a heavyweight Tier-2
-argument-buffer ABI that inflates register pressure. Crucible instead emits
-zero-overhead direct `[[buffer(n)]]` bindings and human-readable MSL you can
-diff, profile, and tune.
+</div>
 
-```
-HLSL --dxc--> DXIL --cruciblec--> .metal + .json --xcrun metal--> .metallib
-```
+---
 
-Example — this HLSL:
+## Overview
 
-```hlsl
-RWStructuredBuffer<float> Out : register(u0);
-[numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-  Out[id.x] = Out[id.x] * 2.0f + 1.0f;
-}
-```
+**Crucible** (`cruciblec`) compiles shader binaries across modern GPU ecosystems using upstream **LLVM** and **MLIR**—no custom binary parsers, no closed-source `.air` bitcode hacks, and no heavyweight argument-buffer overhead.
 
-becomes exactly this MSL (no IR dump, no temp soup):
+- **Metal backend (`--target=msl`)**: Emits clean, human-readable **Metal Shading Language** with zero-overhead direct `[[buffer(n)]]` bindings and JSON reflection, compiled via Apple's native `xcrun metal` / `metallib` toolchain.
+- **Vulkan SPIR-V backend (`--target=spirv`)**: Lowers DXIL directly to **Vulkan 1.3 SPIR-V** via LLVM's built-in SPIR-V backend (`spirv1.6-unknown-vulkan1.3-*`), supporting compute, VS/PS graphics, textures/samplers, bindless descriptor heaps, inline `RayQuery`, and DXC-compatible `--vk-*-shift` register shifts.
+- **Multi-frontend ingestion**: Accepts **DXIL** (`.dxil` DXContainer or bare LLVM 3.7 bitcode) and **SPIR-V** (`.spv`, lowered via MLIR's `spirv` dialect).
 
-```cpp
-#include <metal_stdlib>
-using namespace metal;
+### Supported Translation Paths
 
-kernel void main0(
-    device float* uav0 [[buffer(0)]],
-    uint3 dtid [[thread_position_in_grid]]) {
-  uav0[dtid.x] = uav0[dtid.x] * 2.0f + 1.0f;
-}
-```
+| Frontend | Backend | Status | Execution / CI Track |
+| :--- | :--- | :--- | :--- |
+| **DXIL** (`.dxil` / DXContainer) | **Metal MSL** (`--target=msl`) | Compute, VS/PS Graphics, Wave/Quad, Atomics, Bindless | macOS Apple Silicon (`dxil-to-metal`) |
+| **DXIL** (`.dxil` / DXContainer) | **Vulkan SPIR-V** (`--target=spirv`) | Compute, VS/PS Graphics, Textures, Bindless, Inline RT | Linux Lavapipe & macOS MoltenVK (`dxil-to-spirv`) |
+| **SPIR-V** (`.spv`) | **Metal MSL** (`--target=msl`) | Compute, Structured/Raw Buffers, Wave/Subgroup Ops | macOS Apple Silicon (`spirv-to-metal`, in progress) |
+
+---
 
 ## Architecture
 
-| Stage | Component | What it does |
-|---|---|---|
-| 1 | `lib/Frontend/ContainerLoader` | `llvm::object::DXContainer` part extraction (DXIL, PSV0, signatures); bare bitcode passthrough |
-| 2 | `lib/Frontend/DXILUpgrader` | `llvm::parseBitcodeFile` auto-upgrades frozen LLVM 3.7 bitcode (incl. data-layout fix via `ParserCallbacks`); `DXILUpgradePass` + mem2reg/SROA/SimplifyCFG cleanup; `!dx.*` metadata reflection |
-| 3 | `lib/Transforms/ResourceLowering` | Deterministic `(class, space, register) → [[buffer(n)]]` direct binding assignment |
-| 4 | `lib/Transforms/CFGStructurizer` | Imports the module into MLIR and lifts the unstructured CFG to `scf.if`/`scf.while` regions via `LiftControlFlowToSCF` (goto-free by construction; value yields double as PHI demotion) |
-| 5 | `lib/Backend/MSLEmitter` | Structured SCF regions → MSL printer: if/else, do-while/while loops, use-count-based expression inlining, signedness recovery |
-| 6 | `lib/Backend/IntrinsicMap` | `@dx.op.*` → `metal_stdlib` mapping table |
-| 7 | `tools/cruciblec` | CLI driver + `xcrun metal`/`metallib` toolchain wrapper (`--metallib`) |
-| — | `tools/crucible-run` | Metal compute dispatch harness for GPU-verified lit tests |
+```mermaid
+flowchart LR
+    subgraph Frontends["Frontends (lib/Frontend)"]
+        DXIL["DXIL / DXContainer\nContainerLoader + DXILUpgrader"]
+        SPVIn["SPIR-V (.spv)\nSPIRVLoader (MLIR spirv)"]
+    end
 
-Design guardrails:
+    subgraph Transforms["Middle-End (lib/Transforms)"]
+        Res["ResourceLowering\nDirect bindings & --vk-*-shift"]
+        CFG["CFGStructurizer\nMLIR LiftControlFlowToSCF"]
+    end
 
-1. **Never emit Apple `.air` bitcode directly** — always human-readable MSL
-   compiled through the supported Apple toolchain.
-2. **Reuse upstream LLVM** for container & bitcode ingestion — no custom
-   binary parsers.
-3. **Every codegen feature ships with a lit test** that both FileChecks the
-   MSL text *and* compiles it with `xcrun metal -Werror`, plus a GPU
-   execution test asserting exact buffer contents.
+    subgraph Backends["Backends (lib/Backend)"]
+        MSL["MSLEmitter + IntrinsicMap\nHuman-readable .metal + JSON"]
+        SPVOut["SPIRVEmitter\nLLVM SPIR-V (Vulkan 1.3)"]
+    end
+
+    subgraph Runners["Execution & Compliance (tools/)"]
+        Metal["Metal Runtime\ncrucible-run / MetalDevice"]
+        Vulkan["Vulkan / MoltenVK / Lavapipe\ncrucible-vk-run / VulkanDevice"]
+    end
+
+    DXIL --> Res
+    SPVIn --> Res
+    Res --> CFG --> MSL --> Metal
+    Res --> SPVOut --> Vulkan
+```
+
+---
+
+## Benchmarks & Compliance
+
+### Apple Silicon Compute Benchmarks (`crucible` vs. `metal-shaderconverter`)
+
+Both compilers translate identical `dxc` DXIL and dispatch through the same native runner (`crucible-run --bench-json`, GPU timestamps; median ms, lower is better):
+
+| Workload | Crucible (ms) | `metal-shaderconverter` (ms) |
+| :--- | ---: | ---: |
+| **Streaming FMA** (memory-bound) | 1.59 | 1.59 |
+| **Mandelbrot Loop** (ALU-bound) | 1.54 | **1.16** |
+| **Groupshared Reduction** (barrier-bound) | **1.26** | 1.64 |
+| **Wave Prefix Ops** (SIMD-bound) | 1.55 | 1.54 |
+
+```mermaid
+xychart-beta
+    title "Apple Silicon Median GPU Dispatch Time — Lower is Better (ms)"
+    x-axis ["Streaming FMA", "Mandelbrot", "Groupshared Reduce", "Wave Prefix"]
+    y-axis "Median GPU Time (ms)" 0 --> 2.0
+    bar [1.59, 1.54, 1.26, 1.55]
+    bar [1.59, 1.16, 1.64, 1.54]
+```
+
+*Series order: 1st bar = **Crucible**, 2nd bar = **`metal-shaderconverter`**.*
+
+> [!TIP]
+> Track per-commit GPU timings on the [**Live Benchmark Dashboard**](https://farzonl.github.io/crucible/bench.html) and multi-backend [llvm/offload-test-suite](https://github.com/llvm/offload-test-suite) pass rates on the [**Live Compliance Dashboard**](https://farzonl.github.io/crucible/).
+
+### Multi-Runtime `offload-test-suite` Integration
+
+`tools/crucible-offload` builds upstream `offloader` and `api-query` against a unified multi-runtime device provider (`MetalDevice` + `VulkanDevice`). Crucible advertises itself as a `DirectX` implementation with the `Crucible` driver tag so tests are held to the full D3D12 contract:
+
+- **macOS (`dxil-to-metal`)**: `CRUCIBLE_OFFLOAD_RUNTIME=metal` (default on macOS) compiles DXIL → MSL and dispatches on Metal.
+- **Linux Lavapipe / macOS MoltenVK (`dxil-to-spirv`)**: `CRUCIBLE_OFFLOAD_RUNTIME=vulkan` (default on Linux) compiles DXIL → SPIR-V and dispatches on Vulkan.
+
+---
 
 ## Building
 
-Requirements: CMake ≥ 3.24, Ninja, LLVM ≥ 16 (Homebrew `llvm` works), `dxc`,
-Xcode command line tools, and `lit` (`pip install lit`).
+Requirements: **CMake ≥ 3.24**, **Ninja**, **LLVM + MLIR ≥ 16** (with the SPIR-V target enabled for `--target=spirv`), **`dxc`**, **`lit`**, and optionally **`spirv-val`** / **Vulkan SDK** (or MoltenVK / Mesa Lavapipe) and **Xcode CLT** (on macOS).
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ninja -C build check-crucible   # lit/FileCheck + GPU tests
+ninja -C build check-crucible          # FileCheck + Metal/Vulkan GPU E2E tests
+ninja -C build check-crucible-offload  # llvm/offload-test-suite (optional)
 ```
 
-Useful configure options:
+Useful CMake flags: `-DLLVM_DIR=...`, `-DDXC_EXECUTABLE=...`, `-DLLVM_EXTERNAL_LIT=...`, `-DCRUCIBLE_OFFLOAD_SUITE_DIR=...`.
 
-- `-DLLVM_DIR=/path/to/lib/cmake/llvm` — explicit LLVM
-- `-DDXC_EXECUTABLE=/path/to/dxc` — explicit DXC for tests
-- `-DLLVM_EXTERNAL_LIT=/path/to/lit` — explicit lit (binary or `lit.py`)
+---
 
-## Usage
+## Usage & Tools
 
 ```sh
-cruciblec input.dxil -o out.metal --reflect out.json --metallib out.metallib
-crucible-run --lib out.metallib --entry main0 --threads 64,1,1 \
-             --groups 1,1,1 --buffer 0:f32:64:iota
+# DXIL -> Metal MSL + reflection + .metallib
+cruciblec shader.dxil -o out.metal --reflect out.json --metallib out.metallib
+
+# DXIL -> Vulkan 1.3 SPIR-V (binary or --spv-asm text)
+cruciblec shader.dxil --target=spirv -o out.spv --reflect out.json
+cruciblec shader.dxil --target=spirv --spv-asm --vk-u-shift=10 -o out.spvasm
+
+# SPIR-V -> Metal MSL
+cruciblec shader.spv -o out.metal --reflect out.json
+
+# Run GPU E2E dispatches directly
+crucible-run --lib out.metallib --entry main0 --threads 64,1,1 --groups 1,1,1 --buffer 0:f32:64:iota
+crucible-vk-run --spv out.spv --reflect out.json --groups 1,1,1 --buffer 0:f32:64:iota
 ```
 
-The reflection JSON carries the exact `(space, register, kind) → metalIndex`
-mapping, thread-group size, and the (possibly sanitized) MSL kernel name.
+| Tool | Purpose |
+| :--- | :--- |
+| `tools/cruciblec` | Multi-frontend, multi-backend compiler CLI (`--target=msl\|spirv`, `--reflect`, `--metallib`, `--vk-*-shift`, `--stage-as-compute`). |
+| `tools/crucible-run` | Native Metal compute runner and GPU-timestamp benchmark harness (`--bench-json`). |
+| `tools/crucible-vk-run` | Vulkan / MoltenVK / Lavapipe compute runner for SPIR-V GPU E2E verification. |
+| `tools/crucible-offload` | Multi-runtime `llvm/offload-test-suite` device provider (`MetalDevice` + `VulkanDevice` via `CRUCIBLE_OFFLOAD_RUNTIME`). |
 
-## Testing & compliance
+---
 
-All testing is lit/FileCheck-driven (`test/FileCheck` for golden MSL +
-`-Werror` Apple-compile checks, `test/E2E` for GPU-verified dispatches).
+## Built On & License
 
-### offload-test-suite integration
+Crucible stands on **[LLVM + MLIR](https://llvm.org)**, **[DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler)**, **[SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools)**, and patterns lifted from **[Nacelle](https://github.com/farzonl/Nacelle)** (DXIL loading, lit conventions, benchmark & compliance dashboards).
 
-Crucible runs [llvm/offload-test-suite](https://github.com/llvm/offload-test-suite)
-natively: `tools/crucible-offload` builds upstream `offloader` and `api-query`
-from unmodified sources and links them to a Crucible device provider that
-reuses the suite's YAML pipeline parser and ULP/epsilon verification rules,
-but compiles the DXIL with crucible and dispatches on Metal with
-reflection-driven direct bindings.
-
-**Crucible advertises itself as a DirectX implementation** — the MoltenVK
-model: identity is the API contract you implement (DXIL + D3D12 binding
-semantics), not the backend you use (Metal). The lit feature set is therefore
-`DirectX + Crucible` (driver tag) rather than `Metal`, so crucible is held to
-the D3D12 contract instead of inheriting metal-shaderconverter's waivers.
-
-```sh
-cmake -S . -B build -G Ninja \
-  -DCRUCIBLE_OFFLOAD_SUITE_DIR=/path/to/offload-test-suite   # auto-detected
-ninja -C build check-crucible-offload
-```
-
-The integration requires `libpng` to build the suite's image tools and
-`PyYAML` for lit device discovery. Run `build/tools/crucible-offload/api-query`
-to report the default Metal adapter as a `DirectX` target with the `Crucible`
-driver tag. The local lit harness selects that record and invokes the linked
-`offloader` with `-api=dx` (required when invoking it manually on macOS).
-Add `--validation-layer` to enable Metal API Validation. The upstream checkout
-and test cases are not modified.
-
-Baseline at Milestone 2: **110 passed / 219 failed / 289 unsupported** of 619
-discovered tests (graphics, RT, wave ops, 16/64-bit types, and textures are
-still unimplemented). CI records every run with
-`scripts/record_offload_compliance.py` and publishes the dashboard in
-`pages/` to GitHub Pages — the same pipeline that powers
-[Nacelle's compliance site](https://farzon.org/Nacelle/).
-
-## Third-party foundation
-
-Crucible deliberately builds on best-in-class open source instead of
-reinventing it:
-
-- **[LLVM + MLIR](https://llvm.org)** — DXContainer object parsing, bitcode
-  auto-upgrade (LLVM 3.7 → modern opaque-pointer IR), pass infrastructure,
-  `llvm::json`, `Error`/`Expected` diagnostics, CommandLine; MLIR's
-  `LiftControlFlowToSCF` (the "perfect reconstructability" algorithm)
-  structurizes arbitrary shader CFGs instead of a hand-rolled structurizer.
-- **[DirectXShaderCompiler (dxc)](https://github.com/microsoft/DirectXShaderCompiler)**
-  — reference HLSL → DXIL compiler used by the test suite.
-- **[LLVM lit + FileCheck](https://llvm.org/docs/CommandGuide/lit.html)** —
-  the industry-standard compiler testing harness.
-- **[Nacelle](https://github.com/farzonl/Nacelle)** — DXIL loader patterns,
-  lit conventions, benchmark harness, and the compliance dashboard were
-  lifted from our DXIL software rasterizer.
-
-## Benchmarks
-
-`scripts/bench.py` benchmarks crucible against Apple's metal-shaderconverter
-on the same DXIL: both convert identical dxc output, dispatch through the same
-minimal native runner (`crucible-run --bench-json`, GPU timestamps), and the
-results publish to the `pages/bench.html` trend dashboard (ported from
-Nacelle). MSC's argument-buffer ABI is honored via root-descriptor GPU
-addresses at its fixed bind point — no IRConverter SDK required at runtime.
-
-First results on Apple Silicon (median GPU ms, lower is better):
-
-| Workload | crucible | metal-shaderconverter |
-|---|---|---|
-| Streaming FMA (memory-bound) | 1.59 | 1.59 |
-| Mandelbrot loop (ALU-bound) | 1.54 | **1.16** |
-| Groupshared reduction (barrier-bound) | **1.26** | 1.64 |
-| Wave prefix ops (simd-bound) | 1.55 | 1.54 |
-
-Direct bindings already win on binding-heavy workloads; loop codegen quality
-is the current optimization target.
-
-## Roadmap
-
-- [x] **Milestone 1** — DXContainer loader, compute kernels, structured
-  buffers, direct bindings, reflection JSON, `xcrun` integration, GPU-verified
-  lit suite.
-- [x] **Milestone 2** — CFG structurization via MLIR `ControlFlowToSCF`
-  (`if`/`else`, do-while/while loops, PHI demotion), cbuffers (incl. mixed
-  float/uint rows), raw buffer ops, signedness recovery.
-- [x] **Milestone 3** — groupshared + barriers, atomics, wave ops
-  (`simd_*`), SM 6.4/6.8 packed dot products, benchmarks vs.
-  `metal-shaderconverter`.
-- [x] **Milestone 4 (partial)** — offload-test-suite integration
-  (`crucible-offload` + `check-crucible-offload`) and public compliance
-  dashboard. Scalar `half`, `i16`, and `i64` are enabled in compliance tests.
-  Statically initialized scalar lookup tables can be dynamically indexed
-  from Metal constant memory, as in the upstream Mandelbrot image test.
-  Typed buffer loads and stores preserve DXIL's packed 32-bit word layout
-  for scalar and two-component 64-bit integers.
-  Long-vector integer `abs` and integer/float `dot` use LLVM's Scalarizer
-  rather than relying on Metal vector types wider than four lanes.
-  Wave and quad operations use Metal SIMD builtins. The backend uses
-  ballot and shuffle for 64-bit arithmetic reductions/scans and for
-  16-bit integer sums that need to preserve the active-lane mask.
-  32-bit resource atomics cover raw, structured, and typed UAV buffers
-  and integer `RWTexture2D`. When binding a texture whose reflection has
-  `requiresTextureAtomics` set, use `MTLTextureUsageShaderAtomic` and an
-  `R32Uint` or `R32Sint` pixel format.
-  Remaining: broader texture and sampler support, resource arrays, 64-bit
-  atomics, and fixed wave-size selection.
-- [x] **Graphics (initial)** — DXIL vertex/pixel signatures lower to Metal
-  attributes, interpolated varyings (including array and matrix varyings),
-  position, primitive ID, clip-distance outputs, and color and depth outputs.
-  The offload runner executes single-draw, single-color-target raster
-  pipelines with buffer bindings, fragment discard, and derivatives. It
-  uses a transient depth attachment for shaders that write depth.
-  Graphics textures and samplers, stencil, multisampling, cull distance,
-  geometry, and end-to-end tessellation remain unsupported. Standalone
-  triangle and quad domain shaders can lower to Metal post-tessellation
-  vertex functions, with a reflected patch-data layout for control points
-  and patch constants. The runner does not yet produce that data or
-  dispatch a tessellated draw.
-
-## License
-
-Apache-2.0 WITH LLVM-exception.
+Licensed under **Apache-2.0 WITH LLVM-exception**.
