@@ -87,6 +87,15 @@ struct ResolvedHandle {
   Type *SpvHandleTy = nullptr;
 };
 
+struct StageVar {
+  const StageParameter *Param = nullptr;
+  GlobalVariable *GV = nullptr;
+  Type *VarTy = nullptr;
+  SmallVector<SmallVector<uint32_t, 2>, 3> Decorations;
+  bool IsBoolBuiltIn = false;
+  bool Referenced = false;
+};
+
 class SPIRVLowerer {
 public:
   SPIRVLowerer(Module &M, Function *Entry, Reflection &Reflect,
@@ -104,6 +113,8 @@ private:
 
   DenseMap<const Value *, ResolvedHandle> HandleMap;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
+  DenseMap<uint32_t, StageVar> InputVars;
+  DenseMap<uint32_t, StageVar> OutputVars;
 
   const ResourceBinding *findResourceByID(ResourceClass Class,
                                           uint32_t RecordID) const;
@@ -142,7 +153,11 @@ private:
   Error lowerWaveOp(CallInst *CI, DXILOp Op);
   Error lowerMathOrBitOp(CallInst *CI, DXILOp Op);
   Error lowerPixelOp(CallInst *CI, DXILOp Op);
+  Error lowerLoadInput(CallInst *CI);
+  Error lowerStoreOutput(CallInst *CI);
 
+  void prepareStageInterface();
+  void emitStageDecorations();
   void fixupExistingAtomics(Function &F);
   void normalizeArrayGlobalAccesses(Function &F);
   void configureEntryAndLinkage(StringRef StageName);
@@ -1483,11 +1498,236 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::DerivFineY:
     return lowerPixelOp(CI, Op);
 
+  case DXILOp::LoadInput:
+    return lowerLoadInput(CI);
+  case DXILOp::StoreOutput:
+    return lowerStoreOutput(CI);
+
   default:
     return makeError("SPIR-V backend: unsupported DXIL op '{0}' (opcode {1})",
                      CI->getCalledFunction()->getName(),
                      static_cast<unsigned>(Op));
   }
+}
+
+void SPIRVLowerer::prepareStageInterface() {
+  if (Reflect.Stage != ShaderStage::Vertex &&
+      Reflect.Stage != ShaderStage::Pixel)
+    return;
+
+  auto buildStageVars = [&](const std::vector<StageParameter> &Params,
+                            unsigned AddrSpace, bool IsOutput,
+                            DenseMap<uint32_t, StageVar> &Table) {
+    uint32_t NextLoc = 0;
+    for (const StageParameter &P : Params) {
+      StageVar SV;
+      SV.Param = &P;
+
+      std::optional<uint32_t> BuiltIn;
+      bool IsBoolBI = false;
+      switch (P.Kind) {
+      case 1: // VertexID
+        BuiltIn = 42; // VertexIndex
+        break;
+      case 2: // InstanceID
+        BuiltIn = 43; // InstanceIndex
+        break;
+      case 3: // Position
+        BuiltIn = (Reflect.Stage == ShaderStage::Pixel && !IsOutput) ? 15u : 0u;
+        break;
+      case 4: // RenderTargetArrayIndex
+        BuiltIn = 9; // Layer
+        break;
+      case 5: // ViewPortArrayIndex
+        BuiltIn = 10; // ViewportIndex
+        break;
+      case 6: // ClipDistance
+        BuiltIn = 3;
+        break;
+      case 7: // CullDistance
+        BuiltIn = 4;
+        break;
+      case 10: // PrimitiveID
+        BuiltIn = 7;
+        break;
+      case 13: // IsFrontFace
+        BuiltIn = 17; // FrontFacing
+        IsBoolBI = true;
+        break;
+      case 14: // SampleIndex
+        BuiltIn = 18; // SampleId
+        break;
+      case 17: // Depth
+        BuiltIn = 22; // FragDepth
+        break;
+      case 18: // Coverage
+        BuiltIn = 20; // SampleMask
+        break;
+      default:
+        break;
+      }
+
+      SV.IsBoolBuiltIn = IsBoolBI;
+      Type *ScalarTy =
+          IsBoolBI ? static_cast<Type *>(Type::getInt1Ty(Ctx))
+                   : getComponentLLVMType(P.Type);
+      unsigned Cols = std::max(1u, P.Columns);
+      unsigned Rows = std::max(1u, P.Rows);
+      Type *RowTy =
+          (Cols == 1) ? ScalarTy : FixedVectorType::get(ScalarTy, Cols);
+      Type *VarTy = (Rows == 1) ? RowTy : ArrayType::get(RowTy, Rows);
+      SV.VarTy = VarTy;
+
+      std::string Name =
+          (IsOutput ? "out_" : "in_") +
+          (P.Semantic.empty() ? ("sig_" + std::to_string(P.ID)) : P.Semantic) +
+          "_" + std::to_string(P.SemanticIndex);
+      auto *GV = new GlobalVariable(
+          M, VarTy, /*isConstant=*/false, GlobalValue::InternalLinkage,
+          PoisonValue::get(VarTy), Name, /*InsertBefore=*/nullptr,
+          GlobalValue::NotThreadLocal, AddrSpace);
+      SV.GV = GV;
+
+      if (BuiltIn) {
+        SV.Decorations.push_back({11u /* BuiltIn */, *BuiltIn});
+      } else if (P.Kind == 16 /* Target */) {
+        SV.Decorations.push_back({30u /* Location */, P.SemanticIndex});
+      } else {
+        SV.Decorations.push_back({30u /* Location */, NextLoc});
+        NextLoc += Rows;
+      }
+
+      if (Reflect.Stage == ShaderStage::Pixel && !IsOutput && !BuiltIn) {
+        bool IsInt = ScalarTy->isIntegerTy();
+        if (IsInt || P.Interpolation == 1 /* Constant */)
+          SV.Decorations.push_back({14u /* Flat */});
+        else if (P.Interpolation == 3 /* LinearCentroid */)
+          SV.Decorations.push_back({16u /* Centroid */});
+        else if (P.Interpolation == 4 /* LinearNoPerspective */)
+          SV.Decorations.push_back({13u /* NoPerspective */});
+        else if (P.Interpolation == 5 /* LinearNoPerspectiveCentroid */) {
+          SV.Decorations.push_back({13u /* NoPerspective */});
+          SV.Decorations.push_back({16u /* Centroid */});
+        } else if (P.Interpolation == 6 /* LinearSample */)
+          SV.Decorations.push_back({17u /* Sample */});
+        else if (P.Interpolation == 7 /* LinearNoPerspectiveSample */) {
+          SV.Decorations.push_back({13u /* NoPerspective */});
+          SV.Decorations.push_back({17u /* Sample */});
+        }
+      }
+
+      Table[P.ID] = std::move(SV);
+    }
+  };
+
+  buildStageVars(Reflect.Inputs, 7 /* Input */, false, InputVars);
+  buildStageVars(Reflect.Outputs, 8 /* Output */, true, OutputVars);
+}
+
+void SPIRVLowerer::emitStageDecorations() {
+  if (InputVars.empty() && OutputVars.empty())
+    return;
+
+  IRBuilder<> B(&*Entry->getEntryBlock().getFirstInsertionPt());
+  auto emitForTable = [&](DenseMap<uint32_t, StageVar> &Table) {
+    for (auto &[ID, SV] : Table) {
+      if (!SV.Referenced) {
+        if (SV.GV && SV.GV->use_empty())
+          SV.GV->eraseFromParent();
+        continue;
+      }
+      SmallVector<Metadata *, 4> DecList;
+      for (const auto &D : SV.Decorations) {
+        SmallVector<Metadata *, 2> Ops;
+        for (uint32_t V : D)
+          Ops.push_back(ConstantAsMetadata::get(B.getInt32(V)));
+        DecList.push_back(MDNode::get(Ctx, Ops));
+      }
+      MDNode *DecMD = MDNode::get(Ctx, DecList);
+      Function *DecFn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_assign_decoration, {SV.GV->getType()});
+      B.CreateCall(DecFn, {SV.GV, MetadataAsValue::get(Ctx, DecMD)});
+    }
+  };
+  emitForTable(InputVars);
+  emitForTable(OutputVars);
+}
+
+Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
+  auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!IdC)
+    return makeError("SPIR-V backend: non-constant inputSigId in loadInput");
+
+  auto It = InputVars.find(static_cast<uint32_t>(IdC->getZExtValue()));
+  if (It == InputVars.end())
+    return makeError("SPIR-V backend: unknown input signature ID {0}",
+                     IdC->getZExtValue());
+  StageVar &SV = It->second;
+  SV.Referenced = true;
+
+  IRBuilder<> B(CI);
+  Value *Ptr = SV.GV;
+  Type *RowTy = SV.VarTy;
+  if (auto *AT = dyn_cast<ArrayType>(SV.VarTy)) {
+    Value *RowIdx = CI->getArgOperand(2);
+    Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, {B.getInt32(0), RowIdx});
+    RowTy = AT->getElementType();
+  }
+  Value *Loaded = B.CreateLoad(RowTy, Ptr);
+  Value *Val = Loaded;
+  if (isa<FixedVectorType>(RowTy)) {
+    Value *ColIdx = CI->getArgOperand(3);
+    Val = B.CreateExtractElement(Loaded, ColIdx);
+  }
+  if (Val->getType() != CI->getType()) {
+    if (Val->getType()->isIntegerTy(1) && CI->getType()->isIntegerTy())
+      Val = B.CreateZExt(Val, CI->getType());
+    else if (Val->getType()->isIntegerTy() && CI->getType()->isIntegerTy())
+      Val = B.CreateZExtOrTrunc(Val, CI->getType());
+    else
+      Val = B.CreateBitCast(Val, CI->getType());
+  }
+  CI->replaceAllUsesWith(Val);
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
+  auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!IdC)
+    return makeError("SPIR-V backend: non-constant outputSigId in storeOutput");
+
+  auto It = OutputVars.find(static_cast<uint32_t>(IdC->getZExtValue()));
+  if (It == OutputVars.end())
+    return makeError("SPIR-V backend: unknown output signature ID {0}",
+                     IdC->getZExtValue());
+  StageVar &SV = It->second;
+  SV.Referenced = true;
+
+  IRBuilder<> B(CI);
+  Value *Ptr = SV.GV;
+  Type *ElemTy = SV.VarTy;
+  SmallVector<Value *, 3> Indices;
+  Indices.push_back(B.getInt32(0));
+  if (auto *AT = dyn_cast<ArrayType>(ElemTy)) {
+    Indices.push_back(CI->getArgOperand(2));
+    ElemTy = AT->getElementType();
+  }
+  if (auto *VT = dyn_cast<FixedVectorType>(ElemTy)) {
+    Indices.push_back(CI->getArgOperand(3));
+    ElemTy = VT->getElementType();
+  }
+  if (Indices.size() > 1)
+    Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, Indices);
+
+  Value *Val = CI->getArgOperand(4);
+  if (Val->getType() != ElemTy) {
+    if (Val->getType()->isIntegerTy() && ElemTy->isIntegerTy())
+      Val = B.CreateZExtOrTrunc(Val, ElemTy);
+    else
+      Val = B.CreateBitCast(Val, ElemTy);
+  }
+  B.CreateStore(Val, Ptr);
+  return Error::success();
 }
 
 void SPIRVLowerer::fixupExistingAtomics(Function &F) {
@@ -1635,6 +1875,8 @@ Error SPIRVLowerer::run() {
   if (!StageOrErr)
     return StageOrErr.takeError();
 
+  prepareStageInterface();
+
   SmallVector<CallInst *, 64> DXILCalls;
   for (Function &F : M) {
     if (F.isDeclaration())
@@ -1690,6 +1932,8 @@ Error SPIRVLowerer::run() {
     if (!F.isDeclaration())
       normalizeArrayGlobalAccesses(F);
   }
+
+  emitStageDecorations();
 
   return Error::success();
 }

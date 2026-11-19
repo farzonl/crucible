@@ -1,0 +1,23 @@
+# DXIL -> SPIR-V test for Vertex and Pixel shaders (LoadInput, StoreOutput, BuiltIns, Derivatives).
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T vs_6_0 -E vs -Fo %t.vs.dxil %S/../Inputs/graphics_varyings.hlsl
+# RUN: %cruciblec --target=spirv %t.vs.dxil -o %t.vs.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.vs.spv
+# RUN: %spirv-dis %t.vs.spv | FileCheck %s --check-prefix=VS
+
+# RUN: %dxc -T ps_6_0 -E ps -Fo %t.ps.dxil %S/../Inputs/graphics_varyings.hlsl
+# RUN: %cruciblec --target=spirv %t.ps.dxil -o %t.ps.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.ps.spv
+# RUN: %spirv-dis %t.ps.spv | FileCheck %s --check-prefix=PS
+
+# VS: OpEntryPoint Vertex %vs "vs"
+# VS-DAG: OpDecorate {{%[A-Za-z0-9_]+}} BuiltIn Position
+# VS-DAG: OpDecorate {{%[A-Za-z0-9_]+}} Location 0
+
+# PS: OpEntryPoint Fragment %ps "ps"
+# PS: OpExecutionMode %ps OriginUpperLeft
+# PS-DAG: OpDecorate {{%[A-Za-z0-9_]+}} BuiltIn FragCoord
+# PS-DAG: OpDecorate {{%[A-Za-z0-9_]+}} Location 0
+# PS-DAG: OpDPdxFine
+# PS-DAG: OpDPdyCoarse
