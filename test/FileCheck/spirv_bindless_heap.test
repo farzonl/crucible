@@ -1,0 +1,16 @@
+# DXIL -> SPIR-V test for SM 6.6+ ResourceDescriptorHeap, unbounded descriptor
+# arrays, and NonUniformResourceIndex.
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T cs_6_6 -E main -Fo %t.dxil %S/../Inputs/spirv_bindless_heap.hlsl
+# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv --reflect %t.json
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %spirv-dis %t.spv | FileCheck %s
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+
+# CHECK: OpCapability ShaderNonUniform
+# CHECK: OpCapability StorageBufferArrayNonUniformIndexing
+# CHECK: OpEntryPoint GLCompute %main "main"
+# CHECK: OpDecorate {{%[A-Za-z0-9_]+}} NonUniform
+
+# REFLECT: "spirvResourceHeap"

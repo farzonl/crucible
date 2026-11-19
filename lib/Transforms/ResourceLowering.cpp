@@ -163,9 +163,8 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
           }
         }
       }
-      if (RB->RangeSize == 0 || RB->RangeSize == 0xFFFFFFFFu)
-        return makeError("resource '{0}': unbounded descriptor arrays with "
-                         "dynamic indexing are not supported yet",
+      if (RB->RangeSize == 0)
+        return makeError("resource '{0}': zero-sized descriptor array is invalid",
                          RB->Name);
       if (RB->Space != CurrentSpace) {
         CurrentSpace = RB->Space;
@@ -173,11 +172,23 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
       }
       RB->SPIRVSet = RB->Space;
       RB->SPIRVBinding = NextBinding;
-      NextBinding += RB->RangeSize;
+      uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+      NextBinding += SlotStep;
       if (RB->HasCounter) {
         RB->CounterSPIRVBinding = NextBinding;
-        NextBinding += RB->RangeSize;
+        NextBinding += SlotStep;
       }
+    }
+    uint32_t MaxSet = 0;
+    for (const ResourceBinding &RB : R.Resources)
+      MaxSet = std::max(MaxSet, RB.SPIRVSet + 1u);
+    if (R.HasResourceHeap) {
+      R.ResourceHeapSPIRVSet = MaxSet++;
+      R.ResourceHeapSPIRVBinding = 0;
+    }
+    if (R.HasSamplerHeap) {
+      R.SamplerHeapSPIRVSet = MaxSet++;
+      R.SamplerHeapSPIRVBinding = 0;
     }
     return llvm::Error::success();
   }
@@ -208,15 +219,15 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
         }
       }
     }
-    if (RB->RangeSize == 0 || RB->RangeSize == 0xFFFFFFFFu)
-      return makeError("resource '{0}': unbounded descriptor arrays with "
-                       "dynamic indexing are not supported yet",
+    if (RB->RangeSize == 0)
+      return makeError("resource '{0}': zero-sized descriptor array is invalid",
                        RB->Name);
     RB->SPIRVSet = RB->Space;
+    uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
     if (auto Shift = findShift(RB->Class, RB->Space)) {
       RB->SPIRVBinding = RB->LowerBound + *Shift;
-      if (llvm::Error E = reserveRange(RB->SPIRVSet, RB->SPIRVBinding,
-                                       RB->RangeSize, RB->Name))
+      if (llvm::Error E =
+              reserveRange(RB->SPIRVSet, RB->SPIRVBinding, SlotStep, RB->Name))
         return E;
     } else {
       Unshifted.push_back(RB);
@@ -243,12 +254,28 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
     }
   };
 
-  for (ResourceBinding *RB : Unshifted)
-    RB->SPIRVBinding = allocFreeRange(RB->SPIRVSet, RB->RangeSize);
+  for (ResourceBinding *RB : Unshifted) {
+    uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+    RB->SPIRVBinding = allocFreeRange(RB->SPIRVSet, SlotStep);
+  }
 
   for (ResourceBinding *RB : Order) {
-    if (RB->HasCounter)
-      RB->CounterSPIRVBinding = allocFreeRange(RB->SPIRVSet, RB->RangeSize);
+    if (RB->HasCounter) {
+      uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
+      RB->CounterSPIRVBinding = allocFreeRange(RB->SPIRVSet, SlotStep);
+    }
+  }
+
+  uint32_t MaxSet = 0;
+  for (const ResourceBinding &RB : R.Resources)
+    MaxSet = std::max(MaxSet, RB.SPIRVSet + 1u);
+  if (R.HasResourceHeap) {
+    R.ResourceHeapSPIRVSet = MaxSet++;
+    R.ResourceHeapSPIRVBinding = 0;
+  }
+  if (R.HasSamplerHeap) {
+    R.SamplerHeapSPIRVSet = MaxSet++;
+    R.SamplerHeapSPIRVBinding = 0;
   }
   return llvm::Error::success();
 }
