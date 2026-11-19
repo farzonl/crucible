@@ -32,7 +32,7 @@
 | :--- | :--- | :--- | :--- |
 | **DXIL** (`.dxil` / DXContainer) | **Metal MSL** (`--target=msl`) | Compute, VS/PS Graphics, Wave/Quad, Atomics, Bindless | macOS Apple Silicon (`dxil-to-metal`) |
 | **DXIL** (`.dxil` / DXContainer) | **Vulkan SPIR-V** (`--target=spirv`) | Compute, VS/PS Graphics, Textures, Bindless, Inline RT | Linux Lavapipe & macOS MoltenVK (`dxil-to-spirv`) |
-| **SPIR-V** (`.spv`) | **Metal MSL** (`--target=msl`) | Compute, Structured/Raw Buffers, Wave/Subgroup Ops | macOS Apple Silicon (`spirv-to-metal`, in progress) |
+| **SPIR-V** (`.spv`) | **Metal MSL** (`--target=msl`) | Compute, VS/PS Graphics, Textures/Samplers, Typed Buffers, Wave/Subgroup | macOS Apple Silicon (`spirv-to-metal`, in progress) |
 
 ---
 
@@ -82,6 +82,7 @@ Both compilers translate identical `dxc` DXIL and dispatch through the same nati
 | **Wave Prefix Ops** (SIMD-bound) | 1.55 | 1.54 |
 
 ```mermaid
+%%{init: {"themeVariables": {"xyChart": {"plotColorPalette": "#2563eb, #16a34a"}}}}%%
 xychart-beta
     title "Apple Silicon Median GPU Dispatch Time — Lower is Better (ms)"
     x-axis ["Streaming FMA", "Mandelbrot", "Groupshared Reduce", "Wave Prefix"]
@@ -90,7 +91,7 @@ xychart-beta
     bar [1.59, 1.16, 1.64, 1.54]
 ```
 
-*Series order: 1st bar = **Crucible**, 2nd bar = **`metal-shaderconverter`**.*
+🟦 **Blue**: Crucible · 🟩 **Green**: `metal-shaderconverter`
 
 > [!TIP]
 > Track per-commit GPU timings on the [**Live Benchmark Dashboard**](https://farzonl.github.io/crucible/bench.html) and multi-backend [llvm/offload-test-suite](https://github.com/llvm/offload-test-suite) pass rates on the [**Live Compliance Dashboard**](https://farzonl.github.io/crucible/).
