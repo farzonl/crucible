@@ -2,6 +2,7 @@
 
 config.cruciblec = "@CRUCIBLE_CRUCIBLEC_PATH@"
 config.crucible_run = "@CRUCIBLE_RUN_PATH@"
+config.crucible_vk_run = "@CRUCIBLE_VK_RUN_PATH@"
 config.crucible_offload = "@CRUCIBLE_OFFLOAD_PATH@"
 config.crucible_api_query = "@CRUCIBLE_API_QUERY_PATH@"
 config.dxc = "@DXC_EXECUTABLE@"
