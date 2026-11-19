@@ -29,6 +29,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 
@@ -2358,7 +2359,7 @@ static bool mayWriteMemory(mlir::Operation *Op) {
     }
   }
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
-                mlir::LLVM::AtomicCmpXchgOp>(Op))
+                mlir::LLVM::AtomicCmpXchgOp, mlir::gpu::BarrierOp>(Op))
     return true;
   if (mlir::isa<mlir::LLVM::CallOp>(Op))
     return true; // unknown call
@@ -3021,6 +3022,96 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return Expr{std::string("gtid.") + gpuDimSwizzle(T.getDimension()),
                 PrecPrimary};
   }
+
+  // Layer 1 math & LLVM dialect intrinsics.
+  auto emitUnaryCall = [&](StringRef Fn) -> Expected<Expr> {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    if (!A)
+      return A.takeError();
+    return Expr{(Fn + "(" + A->Text + ")").str(), PrecPrimary};
+  };
+  auto emitBinaryCall = [&](StringRef Fn) -> Expected<Expr> {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    auto B = exprFor(Op->getOperand(1), PrecUnknown);
+    if (!A || !B)
+      return makeError("invalid binary math operand");
+    return Expr{(Fn + "(" + A->Text + ", " + B->Text + ")").str(), PrecPrimary};
+  };
+  if (mlir::isa<mlir::LLVM::FAbsOp, mlir::math::AbsFOp>(Op))
+    return emitUnaryCall("fabs");
+  if (mlir::isa<mlir::LLVM::SqrtOp, mlir::math::SqrtOp>(Op))
+    return emitUnaryCall("sqrt");
+  if (mlir::isa<mlir::math::RsqrtOp>(Op))
+    return emitUnaryCall("rsqrt");
+  if (mlir::isa<mlir::LLVM::SinOp, mlir::math::SinOp>(Op))
+    return emitUnaryCall("sin");
+  if (mlir::isa<mlir::LLVM::CosOp, mlir::math::CosOp>(Op))
+    return emitUnaryCall("cos");
+  if (mlir::isa<mlir::math::TanOp>(Op))
+    return emitUnaryCall("tan");
+  if (mlir::isa<mlir::LLVM::ExpOp, mlir::math::ExpOp>(Op))
+    return emitUnaryCall("exp");
+  if (mlir::isa<mlir::LLVM::Exp2Op, mlir::math::Exp2Op>(Op))
+    return emitUnaryCall("exp2");
+  if (mlir::isa<mlir::LLVM::LogOp, mlir::math::LogOp>(Op))
+    return emitUnaryCall("log");
+  if (mlir::isa<mlir::LLVM::Log2Op, mlir::math::Log2Op>(Op))
+    return emitUnaryCall("log2");
+  if (mlir::isa<mlir::LLVM::FFloorOp, mlir::math::FloorOp>(Op))
+    return emitUnaryCall("floor");
+  if (mlir::isa<mlir::LLVM::FCeilOp, mlir::math::CeilOp>(Op))
+    return emitUnaryCall("ceil");
+  if (mlir::isa<mlir::LLVM::TruncOp, mlir::math::TruncOp>(Op))
+    return emitUnaryCall("trunc");
+  if (mlir::isa<mlir::LLVM::RoundEvenOp, mlir::LLVM::RintOp,
+                mlir::math::RoundEvenOp>(Op))
+    return emitUnaryCall("rint");
+  if (mlir::isa<mlir::LLVM::RoundOp, mlir::math::RoundOp>(Op))
+    return emitUnaryCall("round");
+  if (mlir::isa<mlir::LLVM::MinNumOp, mlir::LLVM::MinimumOp>(Op))
+    return emitBinaryCall("fmin");
+  if (mlir::isa<mlir::LLVM::MaxNumOp, mlir::LLVM::MaximumOp>(Op))
+    return emitBinaryCall("fmax");
+  if (mlir::isa<mlir::LLVM::PowOp, mlir::math::PowFOp>(Op))
+    return emitBinaryCall("pow");
+  if (mlir::isa<mlir::LLVM::CopySignOp, mlir::math::CopySignOp>(Op))
+    return emitBinaryCall("copysign");
+  if (mlir::isa<mlir::LLVM::FMAOp, mlir::LLVM::FMulAddOp, mlir::math::FmaOp>(
+          Op)) {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    auto B = exprFor(Op->getOperand(1), PrecUnknown);
+    auto C = exprFor(Op->getOperand(2), PrecUnknown);
+    if (!A || !B || !C)
+      return makeError("invalid fma operand");
+    return Expr{"fma(" + A->Text + ", " + B->Text + ", " + C->Text + ")",
+                PrecPrimary};
+  }
+  if (mlir::isa<mlir::LLVM::UMinOp>(Op))
+    return emitBinaryCall("min");
+  if (mlir::isa<mlir::LLVM::UMaxOp>(Op))
+    return emitBinaryCall("max");
+  if (mlir::isa<mlir::LLVM::SMinOp, mlir::LLVM::SMaxOp>(Op)) {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    auto B = exprFor(Op->getOperand(1), PrecUnknown);
+    if (!A || !B)
+      return makeError("invalid signed min/max operand");
+    mlir::Type T = Op->getResult(0).getType();
+    StringRef Fn = mlir::isa<mlir::LLVM::SMinOp>(Op) ? "min" : "max";
+    return Expr{unsignedView(T, (Fn + "(" + signedView(T, A->Text) + ", " +
+                                 signedView(T, B->Text) + ")")
+                                    .str()),
+                PrecPrimary};
+  }
+  if (mlir::isa<mlir::LLVM::CtPopOp, mlir::math::CtPopOp>(Op))
+    return emitUnaryCall("popcount");
+  if (mlir::isa<mlir::LLVM::BitReverseOp>(Op))
+    return emitUnaryCall("reverse_bits");
+  if (mlir::isa<mlir::LLVM::CountLeadingZerosOp,
+                mlir::math::CountLeadingZerosOp>(Op))
+    return emitUnaryCall("clz");
+  if (mlir::isa<mlir::LLVM::CountTrailingZerosOp,
+                mlir::math::CountTrailingZerosOp>(Op))
+    return emitUnaryCall("ctz");
 
   if (auto Call = mlir::dyn_cast<CallOp>(Op)) {
     auto DXOp = dxOpcode(Call);
@@ -5127,6 +5218,13 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return emitWhile(While, Ind);
   if (auto Switch = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(Op))
     return emitSwitch(Switch, Ind);
+  if (auto Barrier = mlir::dyn_cast<mlir::gpu::BarrierOp>(Op)) {
+    StringRef Flags = Barrier->hasAttr("crucible.device_fence")
+                          ? "mem_flags::mem_threadgroup | mem_flags::mem_device"
+                          : "mem_flags::mem_threadgroup";
+    line(Ind, ("threadgroup_barrier(" + Flags + ");").str());
+    return Error::success();
+  }
   if (mlir::isa<mlir::scf::ForOp>(Op))
     return makeError("scf.for emission is not implemented yet");
 
