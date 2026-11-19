@@ -2318,6 +2318,15 @@ Error validateRootParameters(const Pipeline &P) {
 
 // The suite tools use executeProgram; the lower-level device API is not
 // implemented by this provider.
+struct CapabilityValueString
+    : CapabilityValue<CapabilityValueString, std::string> {
+  CapabilityValueString(std::string V)
+      : CapabilityValue<CapabilityValueString, std::string>(std::move(V)) {}
+  static char ID;
+  static std::string valueToString(const std::string &V) { return V; }
+};
+char CapabilityValueString::ID = 0;
+
 class CrucibleDevice final : public offloadtest::Device {
   NS::SharedPtr<MTL::Device> Metal;
   Capabilities Caps;
@@ -2340,20 +2349,46 @@ public:
       GPUGeneration = StringRef(Description).split(' ').second.split(' ').first.str();
     else
       GPUGeneration = "Unknown";
-    for (auto [Name, Enabled] :
-         {std::pair<StringRef, bool>{"Native16BitShaderOpsSupported", true},
-          {"Int64ShaderOps", true},
-          {"DoublePrecisionFloatShaderOps", true},
-          {"AtomicInt64OnGroupSharedSupported", false},
-          {"AtomicInt64OnTypedResourceSupported", false},
-          {"SM_6_8", true}, {"SM_6_9", true},
-          {"WaveMultiPrefix", true}, {"WaveSize_32", true},
-          {"LodClamp", true}, {"ShaderStencilRef", true},
-          {"Float32GroupSharedAtomics", true}, {"MeshShader", true},
-          {"ResourceBindingTier3", true}, {"multi-viewport", true},
-          {"acceleration-structure", this->Metal->supportsRaytracing()},
-          {"raytracing-pipeline", this->Metal->supportsRaytracing()}})
-      Caps.try_emplace(Name, makeCapability(Name, Enabled));
+    auto MakeStr = [](StringRef Name, std::string V) {
+      return Capability(
+          Name, std::make_shared<CapabilityValueString>(std::move(V)));
+    };
+    Caps.try_emplace("WaveOps", makeCapability("WaveOps", true));
+    Caps.try_emplace("WaveLaneCountMin",
+                     makeCapability("WaveLaneCountMin", uint32_t(32)));
+    Caps.try_emplace("WaveLaneCountMax",
+                     makeCapability("WaveLaneCountMax", uint32_t(32)));
+    Caps.try_emplace("TotalLaneCount",
+                     makeCapability("TotalLaneCount", uint32_t(32)));
+    Caps.try_emplace("HighestShaderModel",
+                     MakeStr("HighestShaderModel", "6.9"));
+    Caps.try_emplace("Native16BitShaderOpsSupported",
+                     makeCapability("Native16BitShaderOpsSupported", true));
+    Caps.try_emplace("Int64ShaderOps", makeCapability("Int64ShaderOps", true));
+    Caps.try_emplace("DoublePrecisionFloatShaderOps",
+                     makeCapability("DoublePrecisionFloatShaderOps", true));
+    Caps.try_emplace("AtomicInt64OnGroupSharedSupported",
+                     makeCapability("AtomicInt64OnGroupSharedSupported", false));
+    Caps.try_emplace("AtomicInt64OnTypedResourceSupported",
+                     makeCapability("AtomicInt64OnTypedResourceSupported", false));
+    Caps.try_emplace("ResourceBindingTier",
+                     makeCapability("ResourceBindingTier", uint32_t(3)));
+    Caps.try_emplace("TiledResourcesTier",
+                     makeCapability("TiledResourcesTier", uint32_t(2)));
+    Caps.try_emplace("MeshShaderTier", MakeStr("MeshShaderTier", "Tier1"));
+    Caps.try_emplace("BarycentricsSupported",
+                     makeCapability("BarycentricsSupported", false));
+    Caps.try_emplace("PSSpecifiedStencilRefSupported",
+                     makeCapability("PSSpecifiedStencilRefSupported", true));
+    Caps.try_emplace(
+        "VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation",
+        makeCapability(
+            "VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation",
+            true));
+    Caps.try_emplace("RaytracingTier",
+                     MakeStr("RaytracingTier", this->Metal->supportsRaytracing()
+                                                   ? "1.1"
+                                                   : "NotSupported"));
   }
 
   const Capabilities &getCapabilities() override { return Caps; }
