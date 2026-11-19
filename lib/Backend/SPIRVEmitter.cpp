@@ -57,24 +57,26 @@ void initializeSPIRVTargetOnce() {
   });
 }
 
-Expected<std::string> stageTripleSuffix(ShaderStage Stage) {
+Expected<std::string> stageTripleSuffix(ShaderStage Stage, bool StageAsCompute) {
   switch (Stage) {
   case ShaderStage::Compute:
     return "compute";
   case ShaderStage::Vertex:
-    return "vertex";
+    return StageAsCompute ? "compute" : "vertex";
   case ShaderStage::Pixel:
     return "pixel";
   case ShaderStage::Geometry:
-    return "geometry";
   case ShaderStage::Hull:
-    return "hull";
   case ShaderStage::Domain:
-    return "domain";
   case ShaderStage::Mesh:
-    return "mesh";
   case ShaderStage::Amplification:
-    return "amplification";
+    if (StageAsCompute)
+      return "compute";
+    return makeError(
+        "SPIR-V backend: native execution model for shader stage {0} is not "
+        "supported by LLVM 23's SPIR-V backend; pass --stage-as-compute to "
+        "lower as a Vulkan compute shader",
+        static_cast<unsigned>(Stage));
   default:
     return makeError("shader stage {0} is not supported by the SPIR-V backend",
                      static_cast<unsigned>(Stage));
@@ -115,6 +117,10 @@ private:
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
   DenseMap<uint32_t, StageVar> OutputVars;
+  ResolvedHandle StageInBuf;
+  ResolvedHandle StageOutBuf;
+  std::unique_ptr<ResourceBinding> StageInRB;
+  std::unique_ptr<ResourceBinding> StageOutRB;
 
   const ResourceBinding *findResourceByID(ResourceClass Class,
                                           uint32_t RecordID) const;
@@ -161,7 +167,9 @@ private:
   Error lowerPixelOp(CallInst *CI, DXILOp Op);
   Error lowerLoadInput(CallInst *CI);
   Error lowerStoreOutput(CallInst *CI);
+  Error lowerAdvancedStageOp(CallInst *CI, DXILOp Op);
 
+  void ensureStageComputeBuffers(IRBuilder<> &B);
   void prepareStageInterface();
   void emitStageDecorations();
   void fixupExistingAtomics(Function &F);
@@ -1995,6 +2003,23 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::StoreOutput:
     return lowerStoreOutput(CI);
 
+  case DXILOp::EmitStream:
+  case DXILOp::CutStream:
+  case DXILOp::EmitThenCutStream:
+  case DXILOp::LoadOutputControlPoint:
+  case DXILOp::LoadPatchConstant:
+  case DXILOp::DomainLocation:
+  case DXILOp::StorePatchConstant:
+  case DXILOp::OutputControlPointID:
+  case DXILOp::PrimitiveID:
+  case DXILOp::SetMeshOutputCounts:
+  case DXILOp::EmitIndices:
+  case DXILOp::GetMeshPayload:
+  case DXILOp::StoreVertexOutput:
+  case DXILOp::StorePrimitiveOutput:
+  case DXILOp::DispatchMesh:
+    return lowerAdvancedStageOp(CI, Op);
+
   default:
     return makeError("SPIR-V backend: unsupported DXIL op '{0}' (opcode {1})",
                      CI->getCalledFunction()->getName(),
@@ -2002,7 +2027,43 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   }
 }
 
+void SPIRVLowerer::ensureStageComputeBuffers(IRBuilder<> &B) {
+  if (StageInBuf.SpvHandle)
+    return;
+
+  uint32_t StageSet = 0;
+  for (const ResourceBinding &RB : Reflect.Resources)
+    StageSet = std::max(StageSet, RB.SPIRVSet + 1u);
+
+  IRBuilder<> EntryB(&*Entry->getEntryBlock().getFirstInsertionPt());
+  auto createBuf = [&](std::unique_ptr<ResourceBinding> &RBOut,
+                       uint32_t Binding, bool Writable,
+                       const char *Name) -> ResolvedHandle {
+    RBOut = std::make_unique<ResourceBinding>();
+    RBOut->Class = Writable ? ResourceClass::UAV : ResourceClass::SRV;
+    RBOut->Kind = ResourceKind::RawBuffer;
+    RBOut->Name = Name;
+    RBOut->SPIRVSet = StageSet;
+    RBOut->SPIRVBinding = Binding;
+    RBOut->RangeSize = 1;
+    Type *ResTy = getSPIRVResourceType(*RBOut);
+    GlobalVariable *NameGV = getOrCreateResourceName(*RBOut);
+    Function *HandleFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
+    Value *H = EntryB.CreateCall(
+        HandleFn, {EntryB.getInt32(StageSet), EntryB.getInt32(Binding),
+                   EntryB.getInt32(1), EntryB.getInt32(0), NameGV});
+    return ResolvedHandle{RBOut.get(), H, ResTy};
+  };
+
+  StageInBuf = createBuf(StageInRB, 0, /*Writable=*/false, "stage_in");
+  StageOutBuf = createBuf(StageOutRB, 1, /*Writable=*/true, "stage_out");
+  (void)B;
+}
+
 void SPIRVLowerer::prepareStageInterface() {
+  if (Opts.StageAsCompute)
+    return;
   if (Reflect.Stage != ShaderStage::Vertex &&
       Reflect.Stage != ShaderStage::Pixel)
     return;
@@ -2145,7 +2206,33 @@ void SPIRVLowerer::emitStageDecorations() {
   emitForTable(OutputVars);
 }
 
+static Value *toI32(IRBuilder<> &B, Value *V) {
+  if (V->getType() == B.getInt32Ty())
+    return V;
+  return B.CreateZExtOrTrunc(V, B.getInt32Ty());
+}
+
 Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
+  if (Opts.StageAsCompute) {
+    IRBuilder<> B(CI);
+    ensureStageComputeBuffers(B);
+    Value *SigId = toI32(B, CI->getArgOperand(1));
+    Value *Row = toI32(B, CI->getArgOperand(2));
+    Value *Col = toI32(B, CI->getArgOperand(3));
+    Function *TidFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
+    Value *Tid = B.CreateCall(TidFn, {B.getInt32(0)});
+    Value *Word = B.CreateAdd(
+        B.CreateMul(Tid, B.getInt32(64)),
+        B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
+                    B.CreateAdd(B.CreateShl(Row, B.getInt32(2)), Col)));
+    Value *ByteOff = B.CreateShl(Word, B.getInt32(2));
+    Value *Val =
+        loadTypedValueFromStorageBuffer(B, StageInBuf, ByteOff, CI->getType());
+    CI->replaceAllUsesWith(Val);
+    return Error::success();
+  }
+
   auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
   if (!IdC)
     return makeError("SPIR-V backend: non-constant inputSigId in loadInput");
@@ -2184,6 +2271,25 @@ Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
 }
 
 Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
+  if (Opts.StageAsCompute) {
+    IRBuilder<> B(CI);
+    ensureStageComputeBuffers(B);
+    Value *SigId = toI32(B, CI->getArgOperand(1));
+    Value *Row = toI32(B, CI->getArgOperand(2));
+    Value *Col = toI32(B, CI->getArgOperand(3));
+    Function *TidFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
+    Value *Tid = B.CreateCall(TidFn, {B.getInt32(0)});
+    Value *Word = B.CreateAdd(
+        B.CreateMul(Tid, B.getInt32(64)),
+        B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
+                    B.CreateAdd(B.CreateShl(Row, B.getInt32(2)), Col)));
+    Value *ByteOff = B.CreateShl(Word, B.getInt32(2));
+    storeTypedValueToStorageBuffer(B, StageOutBuf, ByteOff,
+                                   CI->getArgOperand(4));
+    return Error::success();
+  }
+
   auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
   if (!IdC)
     return makeError("SPIR-V backend: non-constant outputSigId in storeOutput");
@@ -2220,6 +2326,152 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   }
   B.CreateStore(Val, Ptr);
   return Error::success();
+}
+
+Error SPIRVLowerer::lowerAdvancedStageOp(CallInst *CI, DXILOp Op) {
+  IRBuilder<> B(CI);
+  ensureStageComputeBuffers(B);
+  Function *TidFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
+  Function *GidFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_group_id, {B.getInt32Ty()});
+  Function *LidFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_thread_id_in_group, {B.getInt32Ty()});
+
+  switch (Op) {
+  case DXILOp::DomainLocation: {
+    // Read domain coordinate component from stage_in[tid * 4 + comp].
+    Value *Tid = B.CreateCall(TidFn, {B.getInt32(0)});
+    Value *Comp = toI32(B, CI->getArgOperand(1));
+    Value *ByteOff =
+        B.CreateShl(B.CreateAdd(B.CreateShl(Tid, B.getInt32(2)), Comp),
+                    B.getInt32(2));
+    Value *Val =
+        loadTypedValueFromStorageBuffer(B, StageInBuf, ByteOff, CI->getType());
+    CI->replaceAllUsesWith(Val);
+    return Error::success();
+  }
+  case DXILOp::PrimitiveID: {
+    Value *Prim = B.CreateCall(GidFn, {B.getInt32(0)});
+    CI->replaceAllUsesWith(Prim);
+    return Error::success();
+  }
+  case DXILOp::OutputControlPointID: {
+    Value *CpId = B.CreateCall(LidFn, {B.getInt32(0)});
+    CI->replaceAllUsesWith(CpId);
+    return Error::success();
+  }
+  case DXILOp::LoadOutputControlPoint: {
+    // (op, inputSigId, row, col, cpIdx)
+    Value *SigId = toI32(B, CI->getArgOperand(1));
+    Value *Row = toI32(B, CI->getArgOperand(2));
+    Value *Col = toI32(B, CI->getArgOperand(3));
+    Value *CpIdx = toI32(B, CI->getArgOperand(4));
+    Value *PatchId = B.CreateCall(GidFn, {B.getInt32(0)});
+    Value *Word = B.CreateAdd(
+        B.CreateMul(PatchId, B.getInt32(256)),
+        B.CreateAdd(B.CreateMul(CpIdx, B.getInt32(64)),
+                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
+                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
+                                            Col))));
+    Value *Val = loadTypedValueFromStorageBuffer(
+        B, StageInBuf, B.CreateShl(Word, B.getInt32(2)), CI->getType());
+    CI->replaceAllUsesWith(Val);
+    return Error::success();
+  }
+  case DXILOp::LoadPatchConstant: {
+    // (op, inputSigId, row, col)
+    Value *SigId = toI32(B, CI->getArgOperand(1));
+    Value *Row = toI32(B, CI->getArgOperand(2));
+    Value *Col = toI32(B, CI->getArgOperand(3));
+    Value *PatchId = B.CreateCall(GidFn, {B.getInt32(0)});
+    Value *Word = B.CreateAdd(
+        B.CreateMul(PatchId, B.getInt32(256)),
+        B.CreateAdd(B.getInt32(192),
+                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
+                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
+                                            Col))));
+    Value *Val = loadTypedValueFromStorageBuffer(
+        B, StageInBuf, B.CreateShl(Word, B.getInt32(2)), CI->getType());
+    CI->replaceAllUsesWith(Val);
+    return Error::success();
+  }
+  case DXILOp::StorePatchConstant: {
+    // (op, outputSigId, row, col, val)
+    Value *SigId = toI32(B, CI->getArgOperand(1));
+    Value *Row = toI32(B, CI->getArgOperand(2));
+    Value *Col = toI32(B, CI->getArgOperand(3));
+    Value *PatchId = B.CreateCall(GidFn, {B.getInt32(0)});
+    Value *Word = B.CreateAdd(
+        B.CreateMul(PatchId, B.getInt32(256)),
+        B.CreateAdd(B.getInt32(192),
+                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
+                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
+                                            Col))));
+    storeTypedValueToStorageBuffer(B, StageOutBuf,
+                                   B.CreateShl(Word, B.getInt32(2)),
+                                   CI->getArgOperand(4));
+    return Error::success();
+  }
+  case DXILOp::EmitStream:
+  case DXILOp::CutStream:
+  case DXILOp::EmitThenCutStream:
+    return Error::success();
+  case DXILOp::SetMeshOutputCounts: {
+    // Store (numVertices, numPrimitives) to stage_out[0..1].
+    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(0),
+                                   CI->getArgOperand(1));
+    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(4),
+                                   CI->getArgOperand(2));
+    return Error::success();
+  }
+  case DXILOp::EmitIndices: {
+    // (op, primIdx, v0, v1, v2)
+    Value *PrimIdx = CI->getArgOperand(1);
+    Value *BaseWord = B.CreateAdd(B.getInt32(2), B.CreateMul(PrimIdx, B.getInt32(3)));
+    for (unsigned I = 0; I < 3; ++I) {
+      Value *Off = B.CreateShl(B.CreateAdd(BaseWord, B.getInt32(I)), B.getInt32(2));
+      storeTypedValueToStorageBuffer(B, StageOutBuf, Off,
+                                     CI->getArgOperand(2 + I));
+    }
+    return Error::success();
+  }
+  case DXILOp::StoreVertexOutput:
+  case DXILOp::StorePrimitiveOutput: {
+    // (op, sigId, row, col, val, vertOrPrimIdx)
+    Value *SigId = toI32(B, CI->getArgOperand(1));
+    Value *Row = toI32(B, CI->getArgOperand(2));
+    Value *Col = toI32(B, CI->getArgOperand(3));
+    Value *Idx = toI32(B, CI->getArgOperand(5));
+    Value *Word = B.CreateAdd(
+        B.getInt32(1024),
+        B.CreateAdd(B.CreateMul(Idx, B.getInt32(64)),
+                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
+                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
+                                            Col))));
+    storeTypedValueToStorageBuffer(B, StageOutBuf,
+                                   B.CreateShl(Word, B.getInt32(2)),
+                                   CI->getArgOperand(4));
+    return Error::success();
+  }
+  case DXILOp::GetMeshPayload: {
+    Value *Ptr = getStorageBufferWordPtr(B, StageInBuf, B.getInt32(0));
+    CI->replaceAllUsesWith(Ptr);
+    return Error::success();
+  }
+  case DXILOp::DispatchMesh: {
+    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(0),
+                                   CI->getArgOperand(1));
+    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(4),
+                                   CI->getArgOperand(2));
+    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(8),
+                                   CI->getArgOperand(3));
+    return Error::success();
+  }
+  default:
+    return makeError("SPIR-V backend: unsupported advanced stage op {0}",
+                     static_cast<unsigned>(Op));
+  }
 }
 
 void SPIRVLowerer::fixupExistingAtomics(Function &F) {
@@ -2321,9 +2573,7 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
       if (!Reflect.EntryName.empty())
         F.setName(Reflect.EntryName);
       F.addFnAttr("hlsl.shader", StageName);
-      if (Reflect.Stage == ShaderStage::Compute ||
-          Reflect.Stage == ShaderStage::Mesh ||
-          Reflect.Stage == ShaderStage::Amplification) {
+      if (StageName == "compute") {
         std::string NT = std::to_string(Reflect.NumThreads[0]) + "," +
                          std::to_string(Reflect.NumThreads[1]) + "," +
                          std::to_string(Reflect.NumThreads[2]);
@@ -2363,7 +2613,7 @@ void SPIRVLowerer::cleanupDXILArtifacts() {
 }
 
 Error SPIRVLowerer::run() {
-  auto StageOrErr = stageTripleSuffix(Reflect.Stage);
+  auto StageOrErr = stageTripleSuffix(Reflect.Stage, Opts.StageAsCompute);
   if (!StageOrErr)
     return StageOrErr.takeError();
 
@@ -2436,7 +2686,7 @@ Expected<std::string> emitSPIRV(Module &M, Function *Entry, Reflection &Reflect,
                                 const Options &Opts) {
   initializeSPIRVTargetOnce();
 
-  auto StageOrErr = stageTripleSuffix(Reflect.Stage);
+  auto StageOrErr = stageTripleSuffix(Reflect.Stage, Opts.StageAsCompute);
   if (!StageOrErr)
     return StageOrErr.takeError();
 
