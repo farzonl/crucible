@@ -4,8 +4,8 @@
 # RUN: %cruciblec %t.quad.dxil -o %t.quad.metal
 # RUN: FileCheck %s --check-prefixes=TRI,COMMON < %t.tri.metal
 # RUN: FileCheck %s --check-prefixes=QUAD,COMMON < %t.quad.metal
-# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.tri.metal -o %t.tri.air
-# RUN: xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.quad.metal -o %t.quad.air
+# RUN: %if metal-tools %{ xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.tri.metal -o %t.tri.air %}
+# RUN: %if metal-tools %{ xcrun -sdk macosx metal -std=metal3.1 -Werror -c %t.quad.metal -o %t.quad.air %}
 
 # TRI: {{\[\[patch\(triangle, 3\)\]\]}}
 # QUAD: {{\[\[patch\(quad, 4\)\]\]}}
