@@ -1,0 +1,15 @@
+# SPIR-V -> MSL test: RWBuffer (typed buffer image) + local constant palette array.
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/constant_palette.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK-NEXT: device float* Output {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
+# CHECK: float v0[4];
+# CHECK: v0[0u] = 0.0f;
+# CHECK: v0[1u] = 0.25f;
+# CHECK: v0[2u] = 0.5f;
+# CHECK: v0[3u] = 1.0f;
+# CHECK: Output[dtid.x] = v0[dtid.x & 3u];

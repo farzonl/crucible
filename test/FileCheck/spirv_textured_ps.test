@@ -1,0 +1,21 @@
+# SPIR-V -> MSL test: fragment shader with Texture2D, SamplerState, TEXCOORD0, and SV_Target.
+
+# RUN: %dxc -spirv -T ps_6_0 -E ps -Fo %t.spv %S/../Inputs/spirv_textured_ps.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal --reflect %t.json
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+
+# CHECK: struct CrucibleStageIn {
+# CHECK-NEXT: float2 sig0 {{\[\[}}user(crucible_746578636f6f7264_0), center_perspective{{\]\]}};
+# CHECK: struct CrucibleStageOut {
+# CHECK-NEXT: float4 sig0 {{\[\[}}color(0){{\]\]}};
+# CHECK: fragment CrucibleStageOut ps(
+# CHECK-NEXT: CrucibleStageIn stageIn {{\[\[}}stage_in{{\]\]}},
+# CHECK-NEXT: texture2d<float, access::sample> Albedo {{\[\[}}texture(0){{\]\]}},
+# CHECK-NEXT: sampler LinearSamp {{\[\[}}sampler(0){{\]\]}}) {
+# CHECK: Albedo.sample(LinearSamp,
+# CHECK: return stageOut;
+
+# REFLECT: "class": "srv"
+# REFLECT: "class": "sampler"
+# REFLECT: "stage": "pixel"

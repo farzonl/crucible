@@ -1,0 +1,16 @@
+# SPIR-V -> MSL test: vertex shader stage I/O (POSITION -> SV_Position + COLOR2).
+
+# RUN: %dxc -spirv -T vs_6_0 -E vs -Fo %t.spv %S/../Inputs/graphics_varyings.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: struct CrucibleStageIn {
+# CHECK-NEXT: float2 sig0 {{\[\[}}attribute(0){{\]\]}};
+# CHECK: struct CrucibleStageOut {
+# CHECK-NEXT: float4 sig0 {{\[\[}}position{{\]\]}};
+# CHECK-NEXT: float2 sig1 {{\[\[}}user(crucible_636f6c6f72_2){{\]\]}};
+# CHECK: vertex CrucibleStageOut vs(
+# CHECK-NEXT: CrucibleStageIn stageIn {{\[\[}}stage_in{{\]\]}}) {
+# CHECK: float2(0.25f, 0.25f)
+# CHECK: float2(0.5f, 0.5f)
+# CHECK: return stageOut;
