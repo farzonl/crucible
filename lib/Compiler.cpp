@@ -93,5 +93,4 @@ Expected<CompileResult> compileDXILToMSL(MemoryBufferRef DXIL,
                                          const Options &Opts) {
   return compileToMSL(DXIL, Opts);
 }
-
 } // namespace crucible

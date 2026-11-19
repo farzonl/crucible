@@ -1,0 +1,16 @@
+# DXIL -> SPIR-V test for Inline RayQuery (cs_6_5) and RT pipeline diagnostic (lib_6_3).
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T cs_6_5 -E main -Fo %t.inline.dxil %S/../Inputs/inline_rt.hlsl
+# RUN: %cruciblec --target=spirv %t.inline.dxil -o %t.inline.spv --reflect %t.inline.json
+# RUN: %spirv-val --target-env vulkan1.3 %t.inline.spv
+# RUN: %spirv-dis %t.inline.spv | FileCheck %s --check-prefix=INLINE
+
+# RUN: %dxc -T lib_6_3 -Fo %t.rt.dxil %S/../Inputs/rt_pipeline.hlsl
+# RUN: not %cruciblec --target=spirv --entry=RayGen %t.rt.dxil -o %t.rt.spv 2>&1 | FileCheck %s --check-prefix=RTDIAG
+
+# INLINE: OpEntryPoint GLCompute %main "main"
+# INLINE-DAG: OpDecorate {{%[A-Za-z0-9_]+}} Binding 0
+# INLINE-DAG: OpDecorate {{%[A-Za-z0-9_]+}} Binding 1
+
+# RTDIAG: native Raytracing pipeline execution model is not supported by LLVM 23

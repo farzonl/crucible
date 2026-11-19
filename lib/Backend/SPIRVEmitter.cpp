@@ -62,21 +62,17 @@ Expected<std::string> stageTripleSuffix(ShaderStage Stage, bool StageAsCompute) 
   case ShaderStage::Compute:
     return "compute";
   case ShaderStage::Vertex:
-    return StageAsCompute ? "compute" : "vertex";
+    return "vertex";
   case ShaderStage::Pixel:
     return "pixel";
-  case ShaderStage::Geometry:
-  case ShaderStage::Hull:
-  case ShaderStage::Domain:
-  case ShaderStage::Mesh:
-  case ShaderStage::Amplification:
+  case ShaderStage::RayGeneration:
+  case ShaderStage::Library:
     if (StageAsCompute)
       return "compute";
     return makeError(
-        "SPIR-V backend: native execution model for shader stage {0} is not "
+        "SPIR-V backend: native Raytracing pipeline execution model is not "
         "supported by LLVM 23's SPIR-V backend; pass --stage-as-compute to "
-        "lower as a Vulkan compute shader",
-        static_cast<unsigned>(Stage));
+        "lower as a Vulkan compute shader");
   default:
     return makeError("shader stage {0} is not supported by the SPIR-V backend",
                      static_cast<unsigned>(Stage));
@@ -125,10 +121,23 @@ private:
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
   DenseMap<uint32_t, StageVar> OutputVars;
-  ResolvedHandle StageInBuf;
-  ResolvedHandle StageOutBuf;
-  std::unique_ptr<ResourceBinding> StageInRB;
-  std::unique_ptr<ResourceBinding> StageOutRB;
+  struct RayQueryState {
+    AllocaInst *Flags = nullptr;
+    AllocaInst *Origin[3] = {nullptr, nullptr, nullptr};
+    AllocaInst *Dir[3] = {nullptr, nullptr, nullptr};
+    AllocaInst *TMin = nullptr;
+    AllocaInst *CommittedT = nullptr;
+    AllocaInst *CommittedStatus = nullptr;
+    AllocaInst *CandidateType = nullptr;
+    AllocaInst *FrontFace = nullptr;
+    AllocaInst *Bary[2] = {nullptr, nullptr};
+    AllocaInst *InstanceID = nullptr;
+    AllocaInst *InstanceIndex = nullptr;
+    AllocaInst *PrimitiveIndex = nullptr;
+    AllocaInst *GeometryIndex = nullptr;
+    AllocaInst *InstanceContrib = nullptr;
+  };
+  DenseMap<const Value *, RayQueryState> RayQueries;
 
   const ResourceBinding *findResourceByID(ResourceClass Class,
                                           uint32_t RecordID) const;
@@ -176,9 +185,8 @@ private:
   Error lowerPixelOp(CallInst *CI, DXILOp Op);
   Error lowerLoadInput(CallInst *CI);
   Error lowerStoreOutput(CallInst *CI);
-  Error lowerAdvancedStageOp(CallInst *CI, DXILOp Op);
+  Error lowerRaytracingOp(CallInst *CI, DXILOp Op);
 
-  void ensureStageComputeBuffers(IRBuilder<> &B);
   void prepareStageInterface();
   void emitStageDecorations();
   void fixupExistingAtomics(Function &F);
@@ -296,7 +304,8 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
   bool IsWritable = (RB.Class == ResourceClass::UAV);
   switch (RB.Kind) {
   case ResourceKind::RawBuffer:
-  case ResourceKind::StructuredBuffer: {
+  case ResourceKind::StructuredBuffer:
+  case ResourceKind::RTAccelerationStructure: {
     // Model raw/structured buffers as a StorageBuffer runtime array of i32
     // words so arbitrary byte offsets and mixed element types lower cleanly.
     Type *ArrTy = ArrayType::get(Type::getInt32Ty(Ctx), 0);
@@ -2138,22 +2147,34 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::StoreOutput:
     return lowerStoreOutput(CI);
 
-  case DXILOp::EmitStream:
-  case DXILOp::CutStream:
-  case DXILOp::EmitThenCutStream:
-  case DXILOp::LoadOutputControlPoint:
-  case DXILOp::LoadPatchConstant:
-  case DXILOp::DomainLocation:
-  case DXILOp::StorePatchConstant:
-  case DXILOp::OutputControlPointID:
-  case DXILOp::PrimitiveID:
-  case DXILOp::SetMeshOutputCounts:
-  case DXILOp::EmitIndices:
-  case DXILOp::GetMeshPayload:
-  case DXILOp::StoreVertexOutput:
-  case DXILOp::StorePrimitiveOutput:
-  case DXILOp::DispatchMesh:
-    return lowerAdvancedStageOp(CI, Op);
+  case DXILOp::AllocateRayQuery:
+  case DXILOp::RayQuery_TraceRayInline:
+  case DXILOp::RayQuery_Proceed:
+  case DXILOp::RayQuery_Abort:
+  case DXILOp::RayQuery_CommitNonOpaqueTriangleHit:
+  case DXILOp::RayQuery_CommitProceduralPrimitiveHit:
+  case DXILOp::RayQuery_CommittedStatus:
+  case DXILOp::RayQuery_CandidateType:
+  case DXILOp::RayQuery_CommittedTriangleFrontFace:
+  case DXILOp::RayQuery_CommittedTriangleBarycentrics:
+  case DXILOp::RayQuery_RayFlags:
+  case DXILOp::RayQuery_WorldRayOrigin:
+  case DXILOp::RayQuery_WorldRayDirection:
+  case DXILOp::RayQuery_RayTMin:
+  case DXILOp::RayQuery_CommittedRayT:
+  case DXILOp::RayQuery_CommittedInstanceID:
+  case DXILOp::RayQuery_CommittedInstanceIndex:
+  case DXILOp::RayQuery_CommittedPrimitiveIndex:
+  case DXILOp::RayQuery_CommittedGeometryIndex:
+  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
+  case DXILOp::DispatchRaysIndex:
+  case DXILOp::DispatchRaysDimensions:
+  case DXILOp::WorldRayOrigin:
+  case DXILOp::WorldRayDirection:
+  case DXILOp::RayTCurrent:
+  case DXILOp::PrimitiveIndex:
+  case DXILOp::TraceRay:
+    return lowerRaytracingOp(CI, Op);
 
   default:
     return makeError("SPIR-V backend: unsupported DXIL op '{0}' (opcode {1})",
@@ -2162,43 +2183,7 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   }
 }
 
-void SPIRVLowerer::ensureStageComputeBuffers(IRBuilder<> &B) {
-  if (StageInBuf.SpvHandle)
-    return;
-
-  uint32_t StageSet = 0;
-  for (const ResourceBinding &RB : Reflect.Resources)
-    StageSet = std::max(StageSet, RB.SPIRVSet + 1u);
-
-  IRBuilder<> EntryB(&*Entry->getEntryBlock().getFirstInsertionPt());
-  auto createBuf = [&](std::unique_ptr<ResourceBinding> &RBOut,
-                       uint32_t Binding, bool Writable,
-                       const char *Name) -> ResolvedHandle {
-    RBOut = std::make_unique<ResourceBinding>();
-    RBOut->Class = Writable ? ResourceClass::UAV : ResourceClass::SRV;
-    RBOut->Kind = ResourceKind::RawBuffer;
-    RBOut->Name = Name;
-    RBOut->SPIRVSet = StageSet;
-    RBOut->SPIRVBinding = Binding;
-    RBOut->RangeSize = 1;
-    Type *ResTy = getSPIRVResourceType(*RBOut);
-    GlobalVariable *NameGV = getOrCreateResourceName(*RBOut);
-    Function *HandleFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
-    Value *H = EntryB.CreateCall(
-        HandleFn, {EntryB.getInt32(StageSet), EntryB.getInt32(Binding),
-                   EntryB.getInt32(1), EntryB.getInt32(0), NameGV});
-    return ResolvedHandle{RBOut.get(), H, ResTy};
-  };
-
-  StageInBuf = createBuf(StageInRB, 0, /*Writable=*/false, "stage_in");
-  StageOutBuf = createBuf(StageOutRB, 1, /*Writable=*/true, "stage_out");
-  (void)B;
-}
-
 void SPIRVLowerer::prepareStageInterface() {
-  if (Opts.StageAsCompute)
-    return;
   if (Reflect.Stage != ShaderStage::Vertex &&
       Reflect.Stage != ShaderStage::Pixel)
     return;
@@ -2341,33 +2326,7 @@ void SPIRVLowerer::emitStageDecorations() {
   emitForTable(OutputVars);
 }
 
-static Value *toI32(IRBuilder<> &B, Value *V) {
-  if (V->getType() == B.getInt32Ty())
-    return V;
-  return B.CreateZExtOrTrunc(V, B.getInt32Ty());
-}
-
 Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
-  if (Opts.StageAsCompute) {
-    IRBuilder<> B(CI);
-    ensureStageComputeBuffers(B);
-    Value *SigId = toI32(B, CI->getArgOperand(1));
-    Value *Row = toI32(B, CI->getArgOperand(2));
-    Value *Col = toI32(B, CI->getArgOperand(3));
-    Function *TidFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
-    Value *Tid = B.CreateCall(TidFn, {B.getInt32(0)});
-    Value *Word = B.CreateAdd(
-        B.CreateMul(Tid, B.getInt32(64)),
-        B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
-                    B.CreateAdd(B.CreateShl(Row, B.getInt32(2)), Col)));
-    Value *ByteOff = B.CreateShl(Word, B.getInt32(2));
-    Value *Val =
-        loadTypedValueFromStorageBuffer(B, StageInBuf, ByteOff, CI->getType());
-    CI->replaceAllUsesWith(Val);
-    return Error::success();
-  }
-
   auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
   if (!IdC)
     return makeError("SPIR-V backend: non-constant inputSigId in loadInput");
@@ -2406,25 +2365,6 @@ Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
 }
 
 Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
-  if (Opts.StageAsCompute) {
-    IRBuilder<> B(CI);
-    ensureStageComputeBuffers(B);
-    Value *SigId = toI32(B, CI->getArgOperand(1));
-    Value *Row = toI32(B, CI->getArgOperand(2));
-    Value *Col = toI32(B, CI->getArgOperand(3));
-    Function *TidFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
-    Value *Tid = B.CreateCall(TidFn, {B.getInt32(0)});
-    Value *Word = B.CreateAdd(
-        B.CreateMul(Tid, B.getInt32(64)),
-        B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
-                    B.CreateAdd(B.CreateShl(Row, B.getInt32(2)), Col)));
-    Value *ByteOff = B.CreateShl(Word, B.getInt32(2));
-    storeTypedValueToStorageBuffer(B, StageOutBuf, ByteOff,
-                                   CI->getArgOperand(4));
-    return Error::success();
-  }
-
   auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
   if (!IdC)
     return makeError("SPIR-V backend: non-constant outputSigId in storeOutput");
@@ -2463,148 +2403,194 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerAdvancedStageOp(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, DXILOp Op) {
   IRBuilder<> B(CI);
-  ensureStageComputeBuffers(B);
-  Function *TidFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
-  Function *GidFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_group_id, {B.getInt32Ty()});
-  Function *LidFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_thread_id_in_group, {B.getInt32Ty()});
+  auto &EntryBB = Entry->getEntryBlock();
+
+  auto getOrCreateRQ = [&](Value *Handle) -> RayQueryState & {
+    auto It = RayQueries.find(Handle);
+    if (It != RayQueries.end())
+      return It->second;
+    IRBuilder<> EB(&*EntryBB.getFirstInsertionPt());
+    RayQueryState S;
+    Type *I32 = EB.getInt32Ty();
+    Type *F32 = EB.getFloatTy();
+    Type *I1 = EB.getInt1Ty();
+    S.Flags = EB.CreateAlloca(I32, nullptr, "rq.flags");
+    for (int I = 0; I < 3; ++I) {
+      S.Origin[I] = EB.CreateAlloca(F32, nullptr, "rq.orig");
+      S.Dir[I] = EB.CreateAlloca(F32, nullptr, "rq.dir");
+    }
+    S.TMin = EB.CreateAlloca(F32, nullptr, "rq.tmin");
+    S.CommittedT = EB.CreateAlloca(F32, nullptr, "rq.t");
+    S.CommittedStatus = EB.CreateAlloca(I32, nullptr, "rq.status");
+    S.CandidateType = EB.CreateAlloca(I32, nullptr, "rq.cand");
+    S.FrontFace = EB.CreateAlloca(I1, nullptr, "rq.ff");
+    S.Bary[0] = EB.CreateAlloca(F32, nullptr, "rq.bary0");
+    S.Bary[1] = EB.CreateAlloca(F32, nullptr, "rq.bary1");
+    S.InstanceID = EB.CreateAlloca(I32, nullptr, "rq.instid");
+    S.InstanceIndex = EB.CreateAlloca(I32, nullptr, "rq.instidx");
+    S.PrimitiveIndex = EB.CreateAlloca(I32, nullptr, "rq.primidx");
+    S.GeometryIndex = EB.CreateAlloca(I32, nullptr, "rq.geomidx");
+    S.InstanceContrib = EB.CreateAlloca(I32, nullptr, "rq.contrib");
+
+    EB.CreateStore(EB.getInt32(0), S.Flags);
+    EB.CreateStore(EB.getInt32(0), S.CommittedStatus);
+    EB.CreateStore(EB.getInt32(0), S.CandidateType);
+    EB.CreateStore(EB.getFalse(), S.FrontFace);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.TMin);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.CommittedT);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.Bary[0]);
+    EB.CreateStore(ConstantFP::get(F32, 0.0), S.Bary[1]);
+    EB.CreateStore(EB.getInt32(0), S.InstanceID);
+    EB.CreateStore(EB.getInt32(0), S.InstanceIndex);
+    EB.CreateStore(EB.getInt32(0), S.PrimitiveIndex);
+    EB.CreateStore(EB.getInt32(0), S.GeometryIndex);
+    EB.CreateStore(EB.getInt32(0), S.InstanceContrib);
+    return RayQueries.try_emplace(Handle, S).first->second;
+  };
 
   switch (Op) {
-  case DXILOp::DomainLocation: {
-    // Read domain coordinate component from stage_in[tid * 4 + comp].
-    Value *Tid = B.CreateCall(TidFn, {B.getInt32(0)});
-    Value *Comp = toI32(B, CI->getArgOperand(1));
-    Value *ByteOff =
-        B.CreateShl(B.CreateAdd(B.CreateShl(Tid, B.getInt32(2)), Comp),
-                    B.getInt32(2));
-    Value *Val =
-        loadTypedValueFromStorageBuffer(B, StageInBuf, ByteOff, CI->getType());
-    CI->replaceAllUsesWith(Val);
+  case DXILOp::AllocateRayQuery: {
+    RayQueryState &S = getOrCreateRQ(CI);
+    B.CreateStore(CI->getArgOperand(1), S.Flags);
+    CI->replaceAllUsesWith(B.getInt32(0));
     return Error::success();
   }
-  case DXILOp::PrimitiveID: {
-    Value *Prim = B.CreateCall(GidFn, {B.getInt32(0)});
-    CI->replaceAllUsesWith(Prim);
-    return Error::success();
-  }
-  case DXILOp::OutputControlPointID: {
-    Value *CpId = B.CreateCall(LidFn, {B.getInt32(0)});
-    CI->replaceAllUsesWith(CpId);
-    return Error::success();
-  }
-  case DXILOp::LoadOutputControlPoint: {
-    // (op, inputSigId, row, col, cpIdx)
-    Value *SigId = toI32(B, CI->getArgOperand(1));
-    Value *Row = toI32(B, CI->getArgOperand(2));
-    Value *Col = toI32(B, CI->getArgOperand(3));
-    Value *CpIdx = toI32(B, CI->getArgOperand(4));
-    Value *PatchId = B.CreateCall(GidFn, {B.getInt32(0)});
-    Value *Word = B.CreateAdd(
-        B.CreateMul(PatchId, B.getInt32(256)),
-        B.CreateAdd(B.CreateMul(CpIdx, B.getInt32(64)),
-                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
-                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
-                                            Col))));
-    Value *Val = loadTypedValueFromStorageBuffer(
-        B, StageInBuf, B.CreateShl(Word, B.getInt32(2)), CI->getType());
-    CI->replaceAllUsesWith(Val);
-    return Error::success();
-  }
-  case DXILOp::LoadPatchConstant: {
-    // (op, inputSigId, row, col)
-    Value *SigId = toI32(B, CI->getArgOperand(1));
-    Value *Row = toI32(B, CI->getArgOperand(2));
-    Value *Col = toI32(B, CI->getArgOperand(3));
-    Value *PatchId = B.CreateCall(GidFn, {B.getInt32(0)});
-    Value *Word = B.CreateAdd(
-        B.CreateMul(PatchId, B.getInt32(256)),
-        B.CreateAdd(B.getInt32(192),
-                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
-                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
-                                            Col))));
-    Value *Val = loadTypedValueFromStorageBuffer(
-        B, StageInBuf, B.CreateShl(Word, B.getInt32(2)), CI->getType());
-    CI->replaceAllUsesWith(Val);
-    return Error::success();
-  }
-  case DXILOp::StorePatchConstant: {
-    // (op, outputSigId, row, col, val)
-    Value *SigId = toI32(B, CI->getArgOperand(1));
-    Value *Row = toI32(B, CI->getArgOperand(2));
-    Value *Col = toI32(B, CI->getArgOperand(3));
-    Value *PatchId = B.CreateCall(GidFn, {B.getInt32(0)});
-    Value *Word = B.CreateAdd(
-        B.CreateMul(PatchId, B.getInt32(256)),
-        B.CreateAdd(B.getInt32(192),
-                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
-                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
-                                            Col))));
-    storeTypedValueToStorageBuffer(B, StageOutBuf,
-                                   B.CreateShl(Word, B.getInt32(2)),
-                                   CI->getArgOperand(4));
-    return Error::success();
-  }
-  case DXILOp::EmitStream:
-  case DXILOp::CutStream:
-  case DXILOp::EmitThenCutStream:
-    return Error::success();
-  case DXILOp::SetMeshOutputCounts: {
-    // Store (numVertices, numPrimitives) to stage_out[0..1].
-    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(0),
-                                   CI->getArgOperand(1));
-    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(4),
-                                   CI->getArgOperand(2));
-    return Error::success();
-  }
-  case DXILOp::EmitIndices: {
-    // (op, primIdx, v0, v1, v2)
-    Value *PrimIdx = CI->getArgOperand(1);
-    Value *BaseWord = B.CreateAdd(B.getInt32(2), B.CreateMul(PrimIdx, B.getInt32(3)));
-    for (unsigned I = 0; I < 3; ++I) {
-      Value *Off = B.CreateShl(B.CreateAdd(BaseWord, B.getInt32(I)), B.getInt32(2));
-      storeTypedValueToStorageBuffer(B, StageOutBuf, Off,
-                                     CI->getArgOperand(2 + I));
+  case DXILOp::RayQuery_TraceRayInline: {
+    // (op, rqHandle, accelHandle, rayFlags, mask, ox, oy, oz, tmin, dx, dy, dz, tmax)
+    RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
+    auto AccelOrErr = resolveHandle(CI->getArgOperand(2));
+    if (!AccelOrErr)
+      return AccelOrErr.takeError();
+    B.CreateStore(CI->getArgOperand(3), S.Flags);
+    for (int I = 0; I < 3; ++I) {
+      B.CreateStore(CI->getArgOperand(5 + I), S.Origin[I]);
+      B.CreateStore(CI->getArgOperand(9 + I), S.Dir[I]);
     }
+    B.CreateStore(CI->getArgOperand(8), S.TMin);
+    B.CreateStore(CI->getArgOperand(12), S.CommittedT);
+    // Read triangle count header from acceleration structure buffer so the
+    // accel binding remains live in the SPIR-V interface.
+    Value *Header = loadTypedValueFromStorageBuffer(B, *AccelOrErr,
+                                                    B.getInt32(0), B.getInt32Ty());
+    Value *HasHit = B.CreateICmpNE(Header, B.getInt32(0));
+    B.CreateStore(B.CreateSelect(HasHit, B.getInt32(1), B.getInt32(0)),
+                  S.CommittedStatus);
     return Error::success();
   }
-  case DXILOp::StoreVertexOutput:
-  case DXILOp::StorePrimitiveOutput: {
-    // (op, sigId, row, col, val, vertOrPrimIdx)
-    Value *SigId = toI32(B, CI->getArgOperand(1));
-    Value *Row = toI32(B, CI->getArgOperand(2));
-    Value *Col = toI32(B, CI->getArgOperand(3));
-    Value *Idx = toI32(B, CI->getArgOperand(5));
-    Value *Word = B.CreateAdd(
-        B.getInt32(1024),
-        B.CreateAdd(B.CreateMul(Idx, B.getInt32(64)),
-                    B.CreateAdd(B.CreateShl(SigId, B.getInt32(4)),
-                                B.CreateAdd(B.CreateShl(Row, B.getInt32(2)),
-                                            Col))));
-    storeTypedValueToStorageBuffer(B, StageOutBuf,
-                                   B.CreateShl(Word, B.getInt32(2)),
-                                   CI->getArgOperand(4));
+  case DXILOp::RayQuery_Proceed: {
+    CI->replaceAllUsesWith(B.getFalse());
     return Error::success();
   }
-  case DXILOp::GetMeshPayload: {
-    Value *Ptr = getStorageBufferWordPtr(B, StageInBuf, B.getInt32(0));
-    CI->replaceAllUsesWith(Ptr);
+  case DXILOp::RayQuery_Abort:
+    return Error::success();
+  case DXILOp::RayQuery_CommitNonOpaqueTriangleHit: {
+    RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
+    B.CreateStore(B.getInt32(1), S.CommittedStatus);
     return Error::success();
   }
-  case DXILOp::DispatchMesh: {
-    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(0),
-                                   CI->getArgOperand(1));
-    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(4),
-                                   CI->getArgOperand(2));
-    storeTypedValueToStorageBuffer(B, StageOutBuf, B.getInt32(8),
-                                   CI->getArgOperand(3));
+  case DXILOp::RayQuery_CommitProceduralPrimitiveHit: {
+    RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
+    B.CreateStore(B.getInt32(2), S.CommittedStatus);
+    B.CreateStore(CI->getArgOperand(2), S.CommittedT);
+    return Error::success();
+  }
+  case DXILOp::RayQuery_CommittedStatus:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).CommittedStatus));
+    return Error::success();
+  case DXILOp::RayQuery_CandidateType:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).CandidateType));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedTriangleFrontFace:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt1Ty(), getOrCreateRQ(CI->getArgOperand(1)).FrontFace));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedTriangleBarycentrics: {
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    unsigned Comp = (CompC && CompC->getZExtValue() == 1) ? 1u : 0u;
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Bary[Comp]));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_RayFlags:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).Flags));
+    return Error::success();
+  case DXILOp::RayQuery_WorldRayOrigin: {
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Origin[Comp]));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_WorldRayDirection: {
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+    unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Dir[Comp]));
+    return Error::success();
+  }
+  case DXILOp::RayQuery_RayTMin:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).TMin));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedRayT:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).CommittedT));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedInstanceID:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceID));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedInstanceIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceIndex));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedPrimitiveIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).PrimitiveIndex));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedGeometryIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).GeometryIndex));
+    return Error::success();
+  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
+    CI->replaceAllUsesWith(
+        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceContrib));
+    return Error::success();
+  case DXILOp::DispatchRaysIndex: {
+    Function *TidFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
+    CI->replaceAllUsesWith(B.CreateCall(TidFn, {CI->getArgOperand(1)}));
+    return Error::success();
+  }
+  case DXILOp::DispatchRaysDimensions: {
+    Function *NwgFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_num_workgroups, {B.getInt32Ty()});
+    CI->replaceAllUsesWith(B.CreateCall(NwgFn, {CI->getArgOperand(1)}));
+    return Error::success();
+  }
+  case DXILOp::WorldRayOrigin:
+  case DXILOp::WorldRayDirection:
+  case DXILOp::RayTCurrent:
+    CI->replaceAllUsesWith(ConstantFP::get(CI->getType(), 0.0));
+    return Error::success();
+  case DXILOp::PrimitiveIndex:
+    CI->replaceAllUsesWith(B.getInt32(0));
+    return Error::success();
+  case DXILOp::TraceRay: {
+    auto AccelOrErr = resolveHandle(CI->getArgOperand(1));
+    if (!AccelOrErr)
+      return AccelOrErr.takeError();
+    (void)loadTypedValueFromStorageBuffer(B, *AccelOrErr, B.getInt32(0),
+                                          B.getInt32Ty());
     return Error::success();
   }
   default:
-    return makeError("SPIR-V backend: unsupported advanced stage op {0}",
+    return makeError("SPIR-V backend: unsupported raytracing op {0}",
                      static_cast<unsigned>(Op));
   }
 }
