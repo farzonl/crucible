@@ -49,7 +49,8 @@ if(TARGET LLVM)
 else()
   llvm_map_components_to_libnames(CRUCIBLE_LLVM_LIBS
     Core Object BitReader IRReader BinaryFormat Support TargetParser
-    Analysis Passes TransformUtils ScalarOpts)
+    Analysis Passes TransformUtils ScalarOpts
+    SPIRVCodeGen SPIRVDesc SPIRVInfo CodeGen Target MC AsmPrinter)
 endif()
 
 # MLIR is used to lift the unstructured DXIL CFG into structured scf.if /

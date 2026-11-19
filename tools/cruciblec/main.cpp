@@ -25,9 +25,18 @@ static cl::OptionCategory CrucibleCat("cruciblec options");
 static cl::opt<std::string> InputFile(cl::Positional, cl::Required,
                                       cl::desc("<input .dxil>"),
                                       cl::cat(CrucibleCat));
-static cl::opt<std::string> OutputFile("o", cl::desc("Output .metal file (defaults to stdout)"),
+static cl::opt<std::string> OutputFile("o", cl::desc("Output file (.metal or .spv, defaults to stdout)"),
                                        cl::value_desc("path"),
                                        cl::cat(CrucibleCat));
+static cl::opt<std::string> TargetOpt("target",
+                                      cl::desc("Target backend: msl (default) or spirv"),
+                                      cl::init("msl"), cl::cat(CrucibleCat));
+static cl::opt<bool> EmitSPIRVAsm("spv-asm",
+                                  cl::desc("Emit SPIR-V assembly text instead of binary words (--target=spirv)"),
+                                  cl::cat(CrucibleCat));
+static cl::opt<std::string> VulkanVersion("vulkan-version",
+                                          cl::desc("Vulkan target environment for SPIR-V backend (default vulkan1.3)"),
+                                          cl::init("vulkan1.3"), cl::cat(CrucibleCat));
 static cl::opt<std::string> ReflectFile("reflect",
                                         cl::desc("Write binding reflection JSON"),
                                         cl::value_desc("path"),
@@ -115,6 +124,34 @@ int main(int argc, char **argv) {
   Opts.MSLStd = MSLStd;
   Opts.FlushDenormsF32 = FlushDenormsF32;
   Opts.EmulateF64 = EmulateF64;
+  Opts.EmitSPIRVAsm = EmitSPIRVAsm;
+  Opts.VulkanVersion = VulkanVersion;
+
+  if (TargetOpt == "spirv") {
+    Opts.Target = crucible::TargetBackend::SPIRV;
+    if (!MetallibFile.empty())
+      return reportError("--metallib cannot be used with --target=spirv");
+
+    auto Result =
+        crucible::compileDXILToSPIRV((*BufOrErr)->getMemBufferRef(), Opts);
+    if (!Result)
+      return reportError(Result.takeError());
+
+    if (OutputFile.empty() || OutputFile == "-") {
+      outs().write(Result->Output.data(), Result->Output.size());
+    } else if (Error E = writeFile(OutputFile, Result->Output)) {
+      return reportError(std::move(E));
+    }
+
+    if (!ReflectFile.empty())
+      if (Error E = writeFile(ReflectFile, Result->Reflect.toJSON()))
+        return reportError(std::move(E));
+    return 0;
+  }
+
+  if (TargetOpt != "msl")
+    return reportError("unknown --target '" + TargetOpt +
+                       "' (expected 'msl' or 'spirv')");
 
   auto Result =
       crucible::compileDXILToMSL((*BufOrErr)->getMemBufferRef(), Opts);

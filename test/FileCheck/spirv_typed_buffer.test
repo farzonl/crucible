@@ -1,0 +1,11 @@
+# DXIL -> SPIR-V test for TypedBuffer (OpTypeImage Buffer).
+# REQUIRES: spirv-tools
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.dxil %S/../Inputs/typed_buffer_width.hlsl
+# RUN: %cruciblec --target=spirv %t.dxil -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %spirv-dis %t.spv | FileCheck %s
+
+# CHECK: OpEntryPoint GLCompute %main "main"
+# CHECK: OpTypeImage {{%[A-Za-z0-9_]+}} Buffer
+# CHECK: OpImageWrite

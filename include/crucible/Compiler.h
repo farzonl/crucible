@@ -29,6 +29,22 @@ struct CompileResult {
 llvm::Expected<CompileResult> compileDXILToMSL(llvm::MemoryBufferRef DXIL,
                                                const Options &Opts = {});
 
+struct SPIRVCompileResult {
+  /// Compiled SPIR-V binary (when Opts.EmitSPIRVAsm == false) or
+  /// human-readable SPIR-V assembly (when Opts.EmitSPIRVAsm == true).
+  std::string Output;
+  /// True when Output contains human-readable SPIR-V assembly text.
+  bool IsAssembly = false;
+  /// Binding reflection for the host runtime.
+  Reflection Reflect;
+};
+
+/// Translate a DXContainer (.dxil) binary -- or bare DXIL bitcode -- into
+/// Vulkan SPIR-V (binary or assembly) using LLVM's SPIR-V backend, plus
+/// binding reflection.
+llvm::Expected<SPIRVCompileResult>
+compileDXILToSPIRV(llvm::MemoryBufferRef DXIL, const Options &Opts = {});
+
 } // namespace crucible
 
 #endif // CRUCIBLE_COMPILER_H

@@ -94,6 +94,12 @@ struct ResourceBinding {
   uint32_t MetalIndex = 0;
   /// Assigned Metal [[buffer(n)]] slot for UAV atomic counter (when HasCounter).
   uint32_t CounterMetalIndex = 0;
+
+  /// Assigned Vulkan descriptor set and binding (SPIR-V backend).
+  uint32_t SPIRVSet = 0;
+  uint32_t SPIRVBinding = 0;
+  /// Assigned Vulkan binding for UAV atomic counter (when HasCounter).
+  uint32_t CounterSPIRVBinding = 0;
 };
 
 struct StageParameter {

@@ -119,4 +119,50 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
   return llvm::Error::success();
 }
 
+llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
+  std::vector<ResourceBinding *> Order;
+  Order.reserve(R.Resources.size());
+  for (ResourceBinding &RB : R.Resources)
+    Order.push_back(&RB);
+  std::stable_sort(Order.begin(), Order.end(),
+                   [](const ResourceBinding *A, const ResourceBinding *B) {
+                     auto Key = [](const ResourceBinding *RB) {
+                       return std::tuple(RB->Space,
+                                         static_cast<unsigned>(RB->Class),
+                                         RB->LowerBound);
+                     };
+                     return Key(A) < Key(B);
+                   });
+
+  uint32_t CurrentSpace = UINT32_MAX;
+  uint32_t NextBinding = 0;
+  for (ResourceBinding *RB : Order) {
+    if (RB->RangeSize == 0xFFFFFFFFu) {
+      for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
+        if (O.Class == RB->Class && O.Space == RB->Space &&
+            O.Register == RB->LowerBound && O.Size > 0) {
+          RB->RangeSize = O.Size;
+          break;
+        }
+      }
+    }
+    if (RB->RangeSize == 0 || RB->RangeSize == 0xFFFFFFFFu)
+      return makeError("resource '{0}': unbounded descriptor arrays with "
+                       "dynamic indexing are not supported yet",
+                       RB->Name);
+    if (RB->Space != CurrentSpace) {
+      CurrentSpace = RB->Space;
+      NextBinding = 0;
+    }
+    RB->SPIRVSet = RB->Space;
+    RB->SPIRVBinding = NextBinding;
+    NextBinding += RB->RangeSize;
+    if (RB->HasCounter) {
+      RB->CounterSPIRVBinding = NextBinding;
+      NextBinding += RB->RangeSize;
+    }
+  }
+  return llvm::Error::success();
+}
+
 } // namespace crucible

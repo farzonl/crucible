@@ -67,6 +67,8 @@ std::string Reflection::toJSON() const {
         {"rangeSize", static_cast<int64_t>(RB.RangeSize)},
         {"elementStride", static_cast<int64_t>(RB.ElementStride)},
         {"metalIndex", static_cast<int64_t>(RB.MetalIndex)},
+        {"spirvSet", static_cast<int64_t>(RB.SPIRVSet)},
+        {"spirvBinding", static_cast<int64_t>(RB.SPIRVBinding)},
         {"requiresTextureAtomics", RB.RequiresTextureAtomics},
     });
   }

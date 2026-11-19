@@ -8,6 +8,7 @@
 #include "crucible/Compiler.h"
 
 #include "Backend/MSLEmitter.h"
+#include "Backend/SPIRVEmitter.h"
 #include "Frontend/Frontend.h"
 #include "Transforms/Transforms.h"
 
@@ -39,6 +40,27 @@ Expected<CompileResult> compileDXILToMSL(MemoryBufferRef DXIL,
 
   CompileResult Result;
   Result.MSL = std::move(*MSL);
+  Result.Reflect = std::move(Shader->Reflect);
+  return Result;
+}
+
+Expected<SPIRVCompileResult> compileDXILToSPIRV(MemoryBufferRef DXIL,
+                                                const Options &Opts) {
+  LLVMContext Ctx;
+  auto Shader = loadDXIL(DXIL, Ctx, Opts.EntryPoint);
+  if (!Shader)
+    return Shader.takeError();
+
+  if (Error E = assignSPIRVBindings(Shader->Reflect, Opts))
+    return std::move(E);
+
+  auto Out = emitSPIRV(*Shader->M, Shader->Entry, Shader->Reflect, Opts);
+  if (!Out)
+    return Out.takeError();
+
+  SPIRVCompileResult Result;
+  Result.Output = std::move(*Out);
+  Result.IsAssembly = Opts.EmitSPIRVAsm;
   Result.Reflect = std::move(Shader->Reflect);
   return Result;
 }
