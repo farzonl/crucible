@@ -53,6 +53,15 @@ llvm::Expected<LoadedMLIRShader> loadSPIRV(llvm::MemoryBufferRef Buf,
                                            mlir::MLIRContext &Ctx,
                                            llvm::StringRef EntryOverride = {});
 
+/// Returns true when Buf contains standalone MLIR text (Layer 0 + Layer 1).
+bool isMLIRText(llvm::MemoryBufferRef Buf);
+
+/// Parse a standalone Layer 0 + Layer 1 MLIR text module directly for MSL
+/// emission (validates the PTX/compute-IR backend contract).
+llvm::Expected<LoadedMLIRShader> loadMLIR(llvm::MemoryBufferRef Buf,
+                                          mlir::MLIRContext &Ctx,
+                                          llvm::StringRef EntryOverride = {});
+
 } // namespace crucible
 
 #endif // CRUCIBLE_LIB_FRONTEND_FRONTEND_H

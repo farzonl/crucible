@@ -125,8 +125,10 @@ structurizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp> Mod,
   mlir::MLIRContext &Ctx = *Mod->getContext();
   std::string EntryName = Reflect.EntryName;
 
-  if (Error E = convertEntryToCF(*Mod, EntryName))
-    return std::move(E);
+  if (!Mod->lookupSymbol<mlir::func::FuncOp>(EntryName)) {
+    if (Error E = convertEntryToCF(*Mod, EntryName))
+      return std::move(E);
+  }
   if (Reflect.Hull) {
     if (Error E = convertEntryToCF(*Mod, Reflect.Hull->PatchConstantFuncName))
       return std::move(E);

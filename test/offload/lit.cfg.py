@@ -81,8 +81,13 @@ if sm >= "6.9":
     config.available_features.add("SM_6_9")
 
 # Substitution order matters: %dxc_target_lib before %dxc_target.
-config.substitutions.append(("%dxc_target_lib", config.dxc))
-config.substitutions.append(("%dxc_target", config.dxc))
+if lit_config.params.get("spirv_frontend"):
+    dxc_cmd = f"{config.dxc} -spirv -fspv-target-env=vulkan1.1"
+    config.substitutions.append(("%dxc_target_lib", dxc_cmd))
+    config.substitutions.append(("%dxc_target", dxc_cmd))
+else:
+    config.substitutions.append(("%dxc_target_lib", config.dxc))
+    config.substitutions.append(("%dxc_target", config.dxc))
 config.substitutions.append(("%offloader", f"{shlex.quote(config.crucible_offload)} -api=dx"))
 config.substitutions.append(("%api_query", shlex.quote(config.crucible_api_query)))
 for tool in ["FileCheck", "split-file", "obj2yaml", "not"]:
