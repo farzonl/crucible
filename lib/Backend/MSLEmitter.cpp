@@ -199,6 +199,48 @@ static inline T crucible_wave_wide(T v, uint lane) {
   return acc;
 }
 )MSL";
+  if (Name == "crucible_wave_wide_f64")
+    return R"MSL(template <uint Op, bool Prefix>
+static inline ulong crucible_wave_wide_f64(ulong v, uint lane) {
+  ulong bits = ulong((simd_vote::vote_t)simd_ballot(true));
+  ulong acc = Op == 1u ? 0x3ff0000000000000ul : 0ul;
+  bool first = true;
+  while (bits != 0ul) {
+    uint lo = uint(bits);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(bits >> 32));
+    ulong x = as_type<ulong>(simd_shuffle(as_type<uint2>(v), ushort(src)));
+    if (!Prefix || src < lane) {
+      if (Op == 0u) acc = first ? x : crucible_f64_add(acc, x);
+      if (Op == 1u) acc = first ? x : crucible_f64_mul(acc, x);
+      if (Op == 2u) acc = first ? x : crucible_f64_min(acc, x);
+      if (Op == 3u) acc = first ? x : crucible_f64_max(acc, x);
+      first = false;
+    }
+    bits &= bits - 1ul;
+  }
+  return acc;
+}
+)MSL";
+  if (Name == "crucible_wave_multi_prefix_f64")
+    return R"MSL(template <uint Op>
+static inline ulong crucible_wave_multi_prefix_f64(ulong v, uint mask0,
+                                                   uint mask1, uint lane) {
+  ulong active = ulong((simd_vote::vote_t)simd_ballot(true));
+  ulong acc = Op == 4u ? 0x3ff0000000000000ul : 0ul;
+  while (active != 0ul) {
+    uint lo = uint(active);
+    uint src = lo != 0u ? ctz(lo) : 32u + ctz(uint(active >> 32));
+    ulong x = as_type<ulong>(simd_shuffle(as_type<uint2>(v), ushort(src)));
+    uint m = src < 32u ? mask0 : mask1;
+    if (src < lane && ((m >> (src & 31u)) & 1u) != 0u) {
+      if (Op == 0u) acc = crucible_f64_add(acc, x);
+      if (Op == 4u) acc = crucible_f64_mul(acc, x);
+    }
+    active &= active - 1ul;
+  }
+  return acc;
+}
+)MSL";
   if (Name == "crucible_wave_prefix_sum")
     return "template <typename T> static inline T crucible_wave_prefix_sum(T v) {\n"
            "  T sum = simd_prefix_exclusive_sum(v);\n"
@@ -983,15 +1025,15 @@ private:
 namespace {
 enum SemanticKind : unsigned {
   UserSemantic = 0, VertexID = 1, InstanceID = 2, Position = 3,
-  ClipDistance = 6, PrimitiveID = 10, FrontFace = 13, ColorTarget = 16,
-  Depth = 17, DepthLess = 18, DepthGreater = 19,
+  ClipDistance = 6, CullDistance = 7, PrimitiveID = 10, FrontFace = 13,
+  ColorTarget = 16, Depth = 17, DepthLess = 18, DepthGreater = 19,
   TessFactor = 25, InsideTessFactor = 26,
 };
 
 unsigned clipDistanceOffset(ArrayRef<StageParameter> Params) {
   unsigned Offset = 0;
   for (const auto &P : Params)
-    if (P.Kind == ClipDistance)
+    if (P.Kind == ClipDistance || P.Kind == CullDistance)
       Offset += P.Rows * P.Columns;
   return Offset;
 }
@@ -1022,7 +1064,8 @@ Expected<std::string> Emitter::stageStruct(bool Input) {
     if (Input && ((Vertex && (P.Kind == VertexID || P.Kind == InstanceID)) ||
                   (!Vertex && (P.Kind == FrontFace || P.Kind == PrimitiveID))))
       continue;
-    if (Vertex && !Input && P.Kind == ClipDistance) {
+    if (Vertex && !Input &&
+        (P.Kind == ClipDistance || P.Kind == CullDistance)) {
       if (P.Type != ComponentType::F32 || !P.Rows || P.Rows > 8 ||
           !P.Columns || P.Columns > 4)
         return makeError("invalid DXIL clip-distance signature");
@@ -1113,7 +1156,7 @@ Expected<std::string> Emitter::stageElement(mlir::LLVM::CallOp Call,
   if (Input && R.Stage == ShaderStage::Pixel && P->Kind == PrimitiveID)
     return std::string("crucible_primitive_id");
   if (!Input && (R.Stage == ShaderStage::Vertex || R.Domain) &&
-      P->Kind == ClipDistance) {
+      (P->Kind == ClipDistance || P->Kind == CullDistance)) {
     unsigned Offset = clipDistanceOffset(ArrayRef(Params).take_front(
         std::distance(Params.begin(), P)));
     return "stageOut.clipDistances[" +
@@ -2123,8 +2166,23 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
       return true;
     case DXILOp::AtomicBinOp:
     case DXILOp::AtomicCompareExchange:
+    case DXILOp::WaveIsFirstLane:
+    case DXILOp::WaveAnyTrue:
+    case DXILOp::WaveAllTrue:
+    case DXILOp::WaveActiveAllEqual:
     case DXILOp::WaveActiveBallot:
-      return false; // materialized as statements
+    case DXILOp::WaveReadLaneAt:
+    case DXILOp::WaveReadLaneFirst:
+    case DXILOp::WaveActiveOp:
+    case DXILOp::WaveActiveBit:
+    case DXILOp::WavePrefixOp:
+    case DXILOp::QuadReadLaneAt:
+    case DXILOp::QuadOp:
+    case DXILOp::WaveAllBitCount:
+    case DXILOp::WavePrefixBitCount:
+    case DXILOp::WaveMultiPrefixOp:
+    case DXILOp::WaveMultiPrefixBitCount:
+      return false; // materialized as statements (convergent / side-effecting)
     default:
       break;
     }
@@ -3238,6 +3296,14 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     if (Args[1].getType().isInteger(1))
       return Expr{"(simd_all(" + A->Text + ") || !simd_any(" + A->Text + "))",
                   PrecPrimary};
+    if (Args[1].getType().isF64()) {
+      requireHelper("crucible_f64");
+      First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
+              A->Text + ")))";
+      return Expr{"simd_all(crucible_f64_cmp_eq(" + A->Text + ", " + First +
+                      "))",
+                  PrecPrimary};
+    }
     if (Args[1].getType().isInteger(64)) {
       First = "as_type<ulong>(simd_broadcast_first(as_type<uint2>(" +
               A->Text + ")))";
@@ -3275,7 +3341,7 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
       return Expr{"bool(" + Fn.str() + "(uint(" + V->Text + ")" + LaneArg +
                       "))",
                   PrecPrimary};
-    if (T.isInteger(64))
+    if (T.isInteger(64) || T.isF64())
       return Expr{"as_type<ulong>(" + Fn.str() + "(as_type<uint2>(" +
                       V->Text + ")" + LaneArg + "))",
                   PrecPrimary};
@@ -3315,6 +3381,15 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
     // Signed min/max (and ordering-sensitive prefix ops) need signed views;
     // sums/products are bit-identical for signed and unsigned.
     bool SignedOrder = IsSigned && (Fn == "simd_min" || Fn == "simd_max");
+    if (T.isF64()) {
+      requireHelper("crucible_f64");
+      requireHelper("crucible_wave_wide_f64");
+      UsesLane |= Prefix;
+      return Expr{"crucible_wave_wide_f64<" + std::to_string(*Kind) + ", " +
+                      (Prefix ? "true" : "false") + ">(" + V->Text + ", " +
+                      (Prefix ? "lane" : "0u") + ")",
+                  PrecPrimary};
+    }
     if (T.isInteger(64)) {
       requireHelper("crucible_wave_wide");
       UsesLane |= Prefix;
@@ -3378,6 +3453,12 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
                   PrecPrimary};
     return Expr{Fn.str() + "(" + V->Text + ")", PrecPrimary};
   }
+  case DXILOp::CheckAccessFullyMapped: {
+    auto S = exprFor(Args[1], PrecEq);
+    if (!S)
+      return S.takeError();
+    return Expr{S->Text + " != 0u", PrecEq};
+  }
   case DXILOp::WaveMultiPrefixBitCount: {
     auto V = exprFor(Args[1], PrecUnknown);
     if (!V)
@@ -3416,6 +3497,14 @@ Expected<Expr> Emitter::dxOpExpr(mlir::LLVM::CallOp Call, DXILOp Op) {
       return M1.takeError();
     requireHelper("crucible_wave_multi_prefix");
     UsesLane = true;
+    if (T.isF64()) {
+      requireHelper("crucible_f64");
+      requireHelper("crucible_wave_multi_prefix_f64");
+      return Expr{"crucible_wave_multi_prefix_f64<" + std::to_string(*Kind) +
+                      ">(" + V->Text + ", " + M0->Text + ", " + M1->Text +
+                      ", lane)",
+                  PrecPrimary};
+    }
     if (T.isF16())
       return Expr{"half(crucible_wave_multi_prefix_arith<float, " +
                       std::to_string(*Kind) + ">(float(" + V->Text + "), " +
@@ -3668,11 +3757,22 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
   }
 
   if (*Op == DXILOp::BufferLoad || *Op == DXILOp::RawBufferLoad) {
-    if (Comp > 3)
-      return makeError("buffer load status queries are not supported yet");
+    if (Comp > 4)
+      return makeError("invalid buffer load component");
     ResState *RS = stateFor(Args[1]);
     if (!RS)
       return makeError("buffer load through unresolved handle");
+    if (Comp == 4) {
+      if (!Opts.BoundsCheckBuffers || R.BufferSizesMetalIndex == UINT32_MAX)
+        return Expr{"1u", PrecPrimary};
+      auto Index = bufferIndexExpr(*RS, Args[2], Args[3], 0);
+      if (!Index)
+        return Index.takeError();
+      auto Bound = bufferBoundExpr(*RS, Args[1]);
+      if (!Bound)
+        return Bound.takeError();
+      return Expr{"uint(uint(" + *Index + ") < " + *Bound + ")", PrecPrimary};
+    }
     auto RName = resourceExpr(Args[1]);
     if (!RName)
       return RName.takeError();

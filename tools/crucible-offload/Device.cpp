@@ -1758,19 +1758,24 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
                    GetGPUCounter(Res.BufferPtr, I)});
             if (R.BufferSizesMetalIndex != UINT32_MAX &&
                 BaseSlot + I < BufferDims.size()) {
+              size_t EffectiveBytes = Res.BufferPtr->Size;
+              if (Res.IsReserved)
+                EffectiveBytes = std::min(
+                    EffectiveBytes,
+                    static_cast<size_t>(Res.TilesMapped.value_or(0)) * 65536u);
               uint32_t ElemCount = 0;
               if (Match->Kind == crucible::ResourceKind::StructuredBuffer &&
                   Match->ElementStride > 0)
-                ElemCount = static_cast<uint32_t>(Res.BufferPtr->Size /
+                ElemCount = static_cast<uint32_t>(EffectiveBytes /
                                                   Match->ElementStride);
               else if (Match->Kind == crucible::ResourceKind::RawBuffer)
-                ElemCount = static_cast<uint32_t>(Res.BufferPtr->Size);
+                ElemCount = static_cast<uint32_t>(EffectiveBytes);
               else if (Match->Kind == crucible::ResourceKind::TypedBuffer) {
                 uint32_t ElemBytes = Res.BufferPtr->getSingleElementSize() *
                                      Res.BufferPtr->Channels;
                 if (ElemBytes > 0)
                   ElemCount =
-                      static_cast<uint32_t>(Res.BufferPtr->Size / ElemBytes);
+                      static_cast<uint32_t>(EffectiveBytes / ElemBytes);
               }
               BufferDims[BaseSlot + I] = ElemCount;
             }

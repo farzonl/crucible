@@ -84,6 +84,7 @@ enum class DXILOp : uint32_t {
   BufferLoad = 68,
   BufferStore = 69,
   BufferUpdateCounter = 70,
+  CheckAccessFullyMapped = 71,
   GetDimensions = 72,
   TextureGather = 73,
   TextureGatherCmp = 74,
