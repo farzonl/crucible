@@ -6,6 +6,7 @@ add_library(crucible STATIC
   Frontend/SPIRVLoader.cpp
   Transforms/ResourceLowering.cpp
   Transforms/CFGStructurizer.cpp
+  Transforms/DXILToLayer1.cpp
   Backend/IntrinsicMap.cpp
   Backend/MSLEmitter.cpp
   Backend/SPIRVEmitter.cpp

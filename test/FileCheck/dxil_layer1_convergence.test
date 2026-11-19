@@ -1,0 +1,33 @@
+# Verify DXIL frontend converges onto Layer 1 MLIR (gpu.*, math.*, llvm.intr.*)
+# rather than forwarding @dx.op.* compute IDs, barriers, wave ops, or scalar math
+# to MSLEmitter.
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.wave.dxil %S/../Inputs/wave_ops.hlsl
+# RUN: %cruciblec %t.wave.dxil --dump-mlir -o /dev/null 2>&1 | FileCheck %s --check-prefix=WAVE
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.gs.dxil %S/../Inputs/groupshared_reduce.hlsl
+# RUN: %cruciblec %t.gs.dxil --dump-mlir -o /dev/null 2>&1 | FileCheck %s --check-prefix=GS
+
+# RUN: %dxc -T cs_6_0 -E main -Fo %t.math.dxil %S/../Inputs/intrinsics_math.hlsl
+# RUN: %cruciblec %t.math.dxil --dump-mlir -o /dev/null 2>&1 | FileCheck %s --check-prefix=MATH
+
+# WAVE-NOT: @dx.op.threadId
+# WAVE-NOT: @dx.op.waveActiveOp
+# WAVE-NOT: @dx.op.waveReadLaneFirst
+# WAVE-NOT: @dx.op.wavePrefixOp
+# WAVE: gpu.global_id x
+# WAVE: gpu.subgroup_reduce add
+# WAVE: gpu.subgroup_broadcast {{.*}}, first_active_lane
+# WAVE: gpu.subgroup_reduce add {{.*}} {crucible.scan_kind = "exclusive"}
+
+# GS-NOT: @dx.op.barrier
+# GS: gpu.barrier
+
+# MATH-NOT: @dx.op.threadId
+# MATH-NOT: @dx.op.unary
+# MATH-NOT: @dx.op.binary
+# MATH: gpu.global_id x
+# MATH: math.absf
+# MATH: math.sqrt
+# MATH: llvm.intr.maxnum
+# MATH: llvm.intr.minnum

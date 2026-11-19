@@ -3210,6 +3210,12 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto A = exprFor(Op->getOperand(0), PrecUnknown);
     if (!A)
       return A.takeError();
+    if (Opts.FlushDenormsF32 && Op->getResult(0).getType().isF32()) {
+      requireHelper("crucible_ftz");
+      return Expr{("crucible_ftz(" + Fn + "(crucible_ftz(" + A->Text + ")))")
+                      .str(),
+                  PrecPrimary};
+    }
     return Expr{(Fn + "(" + A->Text + ")").str(), PrecPrimary};
   };
   auto emitBinaryCall = [&](StringRef Fn) -> Expected<Expr> {
@@ -3251,9 +3257,9 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   if (mlir::isa<mlir::LLVM::RoundOp, mlir::math::RoundOp>(Op))
     return emitUnaryCall("round");
   if (mlir::isa<mlir::LLVM::MinNumOp, mlir::LLVM::MinimumOp>(Op))
-    return emitBinaryCall("fmin");
+    return emitBinaryCall("min");
   if (mlir::isa<mlir::LLVM::MaxNumOp, mlir::LLVM::MaximumOp>(Op))
-    return emitBinaryCall("fmax");
+    return emitBinaryCall("max");
   if (mlir::isa<mlir::LLVM::PowOp, mlir::math::PowFOp>(Op))
     return emitBinaryCall("pow");
   if (mlir::isa<mlir::LLVM::CopySignOp, mlir::math::CopySignOp>(Op))
@@ -5401,10 +5407,21 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
   if (auto Switch = mlir::dyn_cast<mlir::scf::IndexSwitchOp>(Op))
     return emitSwitch(Switch, Ind);
   if (auto Barrier = mlir::dyn_cast<mlir::gpu::BarrierOp>(Op)) {
-    StringRef Flags = Barrier->hasAttr("crucible.device_fence")
-                          ? "mem_flags::mem_threadgroup | mem_flags::mem_device"
-                          : "mem_flags::mem_threadgroup";
-    line(Ind, ("threadgroup_barrier(" + Flags + ");").str());
+    std::string Flags;
+    if (!Barrier->hasAttr("crucible.no_tgsm_fence"))
+      Flags = "mem_flags::mem_threadgroup";
+    if (Barrier->hasAttr("crucible.device_fence")) {
+      Flags = Flags.empty() ? "mem_flags::mem_device"
+                            : Flags + " | mem_flags::mem_device";
+      if (any_of(ResStates, [](const ResState &RS) {
+            return RS.RB->Class == ResourceClass::UAV &&
+                   isTextureKind(RS.RB->Kind);
+          }))
+        Flags += " | mem_flags::mem_texture";
+    }
+    if (Flags.empty())
+      Flags = "mem_flags::mem_none";
+    line(Ind, "threadgroup_barrier(" + Flags + ");");
     return Error::success();
   }
   if (auto Shuf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {

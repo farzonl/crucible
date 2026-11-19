@@ -35,6 +35,11 @@ Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
     if (!Structured)
       return Structured.takeError();
 
+    if (Opts.DumpMLIR) {
+      Structured->Entry.print(llvm::errs());
+      llvm::errs() << "\n";
+    }
+
     auto MSL = emitMSL(Structured->Entry, Loaded->Reflect, Opts);
     if (!MSL)
       return MSL.takeError();
@@ -57,6 +62,11 @@ Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
   auto Structured = structurizeCFG(*Shader, MCtx);
   if (!Structured)
     return Structured.takeError();
+
+  if (Opts.DumpMLIR) {
+    Structured->Entry.print(llvm::errs());
+    llvm::errs() << "\n";
+  }
 
   auto MSL = emitMSL(Structured->Entry, Shader->Reflect, Opts);
   if (!MSL)

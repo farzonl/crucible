@@ -82,6 +82,9 @@ struct Options {
   /// IEEE-754 binary64 arithmetic on ulong.
   bool EmulateF64 = false;
 
+  /// Print the structurized MLIR entry function to stderr before MSL emission.
+  bool DumpMLIR = false;
+
   /// Explicit array sizes for unbounded DXIL resource arrays (rangeSize == -1).
   std::vector<ArraySizeOverride> ArraySizeOverrides;
 

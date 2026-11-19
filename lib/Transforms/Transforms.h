@@ -51,6 +51,10 @@ llvm::Expected<StructurizedShader>
 structurizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp> Mod,
                       const Reflection &Reflect);
 
+/// Lower DXIL @dx.op.* calls for compute IDs, barriers, wave ops, and scalar
+/// math/bit ops into Layer 1 MLIR ops (gpu.*, math.*, llvm.intr.*).
+void lowerDXILToLayer1(mlir::ModuleOp Mod);
+
 } // namespace crucible
 
 #endif // CRUCIBLE_LIB_TRANSFORMS_TRANSFORMS_H
