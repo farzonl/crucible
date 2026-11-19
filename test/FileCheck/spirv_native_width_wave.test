@@ -1,0 +1,18 @@
+# SPIR-V -> MSL test: 16-bit/64-bit cbuffer + 64-bit wave sum/prefix, shuffle, and ballot bitcount.
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.1 -T cs_6_2 -E main -enable-16bit-types -Fo %t.spv %S/../Inputs/native_width_wave.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void main0(
+# CHECK-NEXT: device uint* Out {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: constant uint4* Params {{\[\[}}buffer(1){{\]\]}},
+# CHECK-NEXT: uint gidx {{\[\[}}thread_index_in_threadgroup{{\]\]}}) {
+# CHECK: as_type<ulong2>(Params[0u])[1]
+# CHECK: Params[0u].x >> 16u
+# CHECK: simd_sum(
+# CHECK: simd_prefix_exclusive_sum(
+# CHECK: simd_shuffle(
+# CHECK: simd_ballot(
+# CHECK: popcount(
+# CHECK: Out[gidx] =
