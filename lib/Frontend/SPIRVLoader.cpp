@@ -838,14 +838,16 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       const BoundBufferInfo &Info = BufIt->second;
       mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
 
-      SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
-                                                   AO->getUsers().end());
-      for (mlir::Operation *CU : ChainUsers) {
-        auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(CU);
-        if (!Chain || Chain.getIndices().size() < 2)
+      std::function<Error(mlir::spirv::AccessChainOp,
+                          SmallVector<mlir::Value, 8>)>
+          lowerBufferChain = [&](mlir::spirv::AccessChainOp Chain,
+                                 SmallVector<mlir::Value, 8> AllIndices) -> Error {
+        for (mlir::Value Idx : Chain.getIndices())
+          AllIndices.push_back(Idx);
+        if (AllIndices.size() < 2)
           return makeError("unsupported access pattern on buffer '{0}'", Sym);
 
-        mlir::Value ElemIdx = Chain.getIndices()[1];
+        mlir::Value ElemIdx = AllIndices[1];
         // Compute sub-element byte offset (constant or dynamic) for struct/
         // array/vector fields.
         auto computeByteOff = [&](mlir::OpBuilder &B,
@@ -853,8 +855,8 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           uint32_t ConstOff = 0;
           mlir::Value DynOff;
           mlir::Type CurTy = Info.ElemType;
-          for (size_t K = 2; K < Chain.getIndices().size(); ++K) {
-            mlir::Value IdxV = Chain.getIndices()[K];
+          for (size_t K = 2; K < AllIndices.size(); ++K) {
+            mlir::Value IdxV = AllIndices[K];
             auto CIdx = getConstSpirvInt(IdxV);
             if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
               if (!CIdx)
@@ -911,7 +913,10 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         SmallVector<mlir::Operation *, 8> MemUsers(Chain->getUsers().begin(),
                                                    Chain->getUsers().end());
         for (mlir::Operation *MU : MemUsers) {
-          if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
+          if (auto SubChain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(MU)) {
+            if (auto Err = lowerBufferChain(SubChain, AllIndices))
+              return Err;
+          } else if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
             mlir::OpBuilder B(Load);
             mlir::Location Loc = Load.getLoc();
             auto OffValOrErr = computeByteOff(B, Loc);
@@ -1043,6 +1048,16 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           }
         }
         Chain.erase();
+        return Error::success();
+      };
+      SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
+                                                   AO->getUsers().end());
+      for (mlir::Operation *CU : ChainUsers) {
+        auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(CU);
+        if (!Chain)
+          return makeError("unsupported access pattern on buffer '{0}'", Sym);
+        if (auto Err = lowerBufferChain(Chain, {}))
+          return Err;
       }
       AO.erase();
       continue;

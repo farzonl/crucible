@@ -479,6 +479,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
   if (!P.isTraditionalRaster() || P.Shaders.size() < 2)
     return Fail("raster execution requires one vertex and one pixel shader");
   auto &B = P.Bindings;
+  if (B.SampleCount == 0 || B.SampleCount > 64 ||
+      (B.SampleCount & (B.SampleCount - 1)) != 0)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "SampleCount must be one of 1, 2, 4, 8, 16, 32, or 64; got %u",
+        B.SampleCount);
   bool HasStencil = P.Stencil && P.Stencil->Enabled;
   if (B.SampleCount < 1 ||
       (B.SampleCount > 1 && !Device->supportsTextureSampleCount(B.SampleCount)) ||
@@ -1994,9 +2000,13 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
                     static_cast<size_t>(Res.TilesMapped.value_or(0)) * 65536u);
               uint32_t ElemCount = 0;
               if (Match->Kind == crucible::ResourceKind::StructuredBuffer &&
-                  Match->ElementStride > 0)
-                ElemCount = static_cast<uint32_t>(EffectiveBytes /
-                                                  Match->ElementStride);
+                  Match->ElementStride > 0) {
+                uint32_t Stride = Match->ElementStride;
+                if (UseVulkanBinding && Res.BufferPtr->Stride > 0 &&
+                    Res.BufferPtr->Stride < Stride)
+                  Stride = Res.BufferPtr->Stride;
+                ElemCount = static_cast<uint32_t>(EffectiveBytes / Stride);
+              }
               else if (Match->Kind == crucible::ResourceKind::RawBuffer)
                 ElemCount = static_cast<uint32_t>(EffectiveBytes);
               else if (Match->Kind == crucible::ResourceKind::TypedBuffer) {
