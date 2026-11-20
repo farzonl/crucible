@@ -84,21 +84,39 @@ if(LLVM_EXTERNAL_LIT)
     file(GENERATE
       OUTPUT "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py"
       INPUT "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py.gen")
-    add_custom_target(check-crucible-offload
+    add_custom_target(check-crucible-offload-d3d12
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv
               "${CMAKE_BINARY_DIR}/test-offload"
       DEPENDS offloader api-query
       USES_TERMINAL
-      COMMENT "Running llvm/offload-test-suite against crucible")
-    add_custom_target(check-crucible-offload-spirv
+      COMMENT "Running llvm/offload-test-suite against Crucible (D3D12 frontend -> Metal/Vulkan)")
+    add_custom_target(check-crucible-offload-vk
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
               "${CMAKE_BINARY_DIR}/test-offload"
       DEPENDS offloader api-query
       USES_TERMINAL
-      COMMENT "Running llvm/offload-test-suite against crucible (SPIR-V frontend -> Metal)")
+      COMMENT "Running llvm/offload-test-suite against Crucible (Vulkan frontend -> Metal)")
+    add_custom_target(check-crucible-offload-vk-kosmickrisp
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
+              -Dvulkan_driver=KosmicKrisp "${CMAKE_BINARY_DIR}/test-offload"
+      DEPENDS offloader api-query
+      USES_TERMINAL
+      COMMENT "Running llvm/offload-test-suite against KosmicKrisp")
+    add_custom_target(check-crucible-offload-vk-molten
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
+              -Dvulkan_driver=MoltenVK "${CMAKE_BINARY_DIR}/test-offload"
+      DEPENDS offloader api-query
+      USES_TERMINAL
+      COMMENT "Running llvm/offload-test-suite against MoltenVK")
+    add_custom_target(check-crucible-offload-dx
+      DEPENDS check-crucible-offload-d3d12)
+    add_custom_target(check-crucible-offload-spirv
+      DEPENDS check-crucible-offload-vk)
     if(TARGET imgdiff)
-      add_dependencies(check-crucible-offload imgdiff)
-      add_dependencies(check-crucible-offload-spirv imgdiff)
+      add_dependencies(check-crucible-offload-d3d12 imgdiff)
+      add_dependencies(check-crucible-offload-vk imgdiff)
+      add_dependencies(check-crucible-offload-vk-kosmickrisp imgdiff)
+      add_dependencies(check-crucible-offload-vk-molten imgdiff)
     endif()
   endif()
 else()

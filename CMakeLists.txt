@@ -97,7 +97,7 @@ endif()
 # Optional Vulkan / MoltenVK E2E compute runner (crucible-vk-run).
 find_path(CRUCIBLE_VULKAN_INCLUDE_DIR vulkan/vulkan.h
   HINTS /usr/local/include /opt/homebrew/include)
-find_library(CRUCIBLE_VULKAN_LIB NAMES libMoltenVK.dylib vulkan vulkan-1
+find_library(CRUCIBLE_VULKAN_LIB NAMES vulkan vulkan-1 libMoltenVK.dylib
   HINTS /opt/homebrew/lib /usr/local/lib)
 if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   message(STATUS "Found Vulkan/MoltenVK: ${CRUCIBLE_VULKAN_LIB}")

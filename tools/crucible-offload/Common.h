@@ -44,7 +44,8 @@ llvm::Error validateRootParameters(const offloadtest::Pipeline &P);
 
 #ifdef CRUCIBLE_HAS_METAL_OFFLOAD
 llvm::Expected<llvm::SmallVector<std::unique_ptr<offloadtest::Device>>>
-createMetalDevices(const offloadtest::DeviceConfig &Config);
+createMetalDevices(const offloadtest::DeviceConfig &Config,
+                   offloadtest::Device *VulkanInfo);
 #endif
 
 #ifdef CRUCIBLE_HAS_VULKAN_OFFLOAD
