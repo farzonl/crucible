@@ -196,6 +196,9 @@ public:
   Error run();
   bool usedArrayLength() const { return !ArrayLengthHelpers.empty(); }
   bool usedCmpXchg() const { return !CmpXchgHelpers.empty(); }
+  bool usedImageAtomics() const {
+    return !ImgAtomicHelpers.empty() || !ImgCmpXchgHelpers.empty();
+  }
 
 private:
   Module &M;
@@ -205,8 +208,13 @@ private:
   const Options &Opts;
 
   DenseMap<const Value *, ResolvedHandle> HandleMap;
+  DenseSet<const ResourceBinding *> AtomicImageBindings;
   DenseMap<Type *, Function *> ArrayLengthHelpers;
   DenseMap<unsigned, Function *> CmpXchgHelpers;
+  DenseMap<std::tuple<uint32_t, uint32_t, uint32_t, Type *>, Function *>
+      ImgAtomicHelpers;
+  DenseMap<std::tuple<uint32_t, uint32_t, Type *>, Function *>
+      ImgCmpXchgHelpers;
   std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
@@ -418,7 +426,11 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
   case ResourceKind::Texture2DMSArray:
   case ResourceKind::TextureCubeArray: {
     Type *SampledTy = getComponentLLVMType(RB.ElementType);
-    if (SampledTy->isHalfTy())
+    unsigned Format = 0u; // Unknown
+    if (IsWritable && AtomicImageBindings.contains(&RB)) {
+      SampledTy = Type::getInt32Ty(Ctx);
+      Format = 33u; // R32ui (required by OpImageTexelPointer)
+    } else if (SampledTy->isHalfTy())
       SampledTy = Type::getFloatTy(Ctx);
     else if (SampledTy->isIntegerTy(16))
       SampledTy = Type::getInt32Ty(Ctx);
@@ -429,7 +441,6 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
     unsigned Arrayed = isArrayedResource(RB.Kind) ? 1u : 0u;
     unsigned MS = isMSResource(RB.Kind) ? 1u : 0u;
     unsigned Sampled = IsWritable ? 2u : 1u;
-    unsigned Format = 0u; // Unknown
     return TargetExtType::get(Ctx, "spirv.Image", {SampledTy},
                               {Dim, 2u /* Depth unknown */, Arrayed, MS,
                                Sampled, Format});
@@ -747,7 +758,9 @@ Error SPIRVLowerer::lowerBufferLoad(CallInst *CI) {
     bool Is64BitTyped =
         SampledTy->isIntegerTy(64) || SampledTy->isDoubleTy() ||
         ElemTy->isIntegerTy(64) || ElemTy->isDoubleTy();
-    if (SampledTy->isHalfTy())
+    if (AtomicImageBindings.contains(RH.RB))
+      SampledTy = Type::getInt32Ty(Ctx);
+    else if (SampledTy->isHalfTy())
       SampledTy = Type::getFloatTy(Ctx);
     else if (SampledTy->isIntegerTy(16) || Is64BitTyped)
       SampledTy = Type::getInt32Ty(Ctx);
@@ -840,7 +853,9 @@ Error SPIRVLowerer::lowerBufferStore(CallInst *CI) {
     bool Is64BitTyped =
         SampledTy->isIntegerTy(64) || SampledTy->isDoubleTy() ||
         ValTy->isIntegerTy(64) || ValTy->isDoubleTy();
-    if (SampledTy->isHalfTy())
+    if (AtomicImageBindings.contains(RH.RB))
+      SampledTy = Type::getInt32Ty(Ctx);
+    else if (SampledTy->isHalfTy())
       SampledTy = Type::getFloatTy(Ctx);
     else if (SampledTy->isIntegerTy(16) || Is64BitTyped)
       SampledTy = Type::getInt32Ty(Ctx);
@@ -1078,7 +1093,9 @@ Error SPIRVLowerer::lowerTextureLoad(CallInst *CI) {
   Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
 
   Type *SampledTy = getComponentLLVMType(RH.RB->ElementType);
-  if (SampledTy->isHalfTy())
+  if (AtomicImageBindings.contains(RH.RB))
+    SampledTy = Type::getInt32Ty(Ctx);
+  else if (SampledTy->isHalfTy())
     SampledTy = Type::getFloatTy(Ctx);
   else if (SampledTy->isIntegerTy(16))
     SampledTy = Type::getInt32Ty(Ctx);
@@ -1123,7 +1140,9 @@ Error SPIRVLowerer::lowerTextureStore(CallInst *CI) {
   Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
 
   Type *SampledTy = getComponentLLVMType(RH.RB->ElementType);
-  if (SampledTy->isHalfTy())
+  if (AtomicImageBindings.contains(RH.RB))
+    SampledTy = Type::getInt32Ty(Ctx);
+  else if (SampledTy->isHalfTy())
     SampledTy = Type::getFloatTy(Ctx);
   else if (SampledTy->isIntegerTy(16))
     SampledTy = Type::getInt32Ty(Ctx);
@@ -1532,36 +1551,81 @@ Error SPIRVLowerer::lowerAtomicBinOp(CallInst *CI) {
   }
 
   IRBuilder<> B(CI);
-  Value *Ptr = nullptr;
+  Value *Val = CI->getArgOperand(6);
   if (RH.RB->Kind == ResourceKind::RawBuffer ||
       RH.RB->Kind == ResourceKind::StructuredBuffer) {
     Value *ByteOff = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(3),
                                              CI->getArgOperand(4));
     Value *WordIdx = B.CreateLShr(ByteOff, B.getInt32(2));
-    Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
-  } else {
-#if LLVM_VERSION_MAJOR >= 24
-    unsigned Coords = textureCoordDims(RH.RB->Kind);
-    SmallVector<Value *, 3> CoordVals;
-    for (unsigned I = 0; I < Coords; ++I)
-      CoordVals.push_back(CI->getArgOperand(3 + I));
-    Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
-    Type *ImgPtrTy = PointerType::get(Ctx, 12); // Image storage class (OpImageTexelPointer)
-    Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_resource_getpointer,
-        {ImgPtrTy, RH.SpvHandleTy, Coord->getType()});
-    Ptr = B.CreateCall(GetPtrFn, {RH.SpvHandle, Coord});
-#else
-    return makeError("SPIR-V backend: atomicBinOp on non-storage buffer '{0}' "
-                     "requires LLVM 24+",
-                     RH.RB->Name);
-#endif
+    Value *Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+    SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
+    auto *RMW = B.CreateAtomicRMW(BinOp, Ptr, Val, Align(4),
+                                  AtomicOrdering::AcquireRelease, DeviceScope);
+    CI->replaceAllUsesWith(RMW);
+    return Error::success();
   }
-  SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
-  Value *Val = CI->getArgOperand(6);
-  auto *RMW = B.CreateAtomicRMW(BinOp, Ptr, Val, Align(4),
-                                AtomicOrdering::AcquireRelease, DeviceScope);
-  CI->replaceAllUsesWith(RMW);
+
+  // Image / TypedBuffer atomic via sentinel rewritten to OpImageTexelPointer +
+  // OpAtomic* in the SPIR-V binary post-pass.
+  uint32_t SpvAtomicOp = 234u; // OpAtomicIAdd
+  switch (static_cast<ir::AtomicOp>(OpC->getZExtValue())) {
+  case ir::AtomicOp::Add: SpvAtomicOp = 234u; break;
+  case ir::AtomicOp::And: SpvAtomicOp = 240u; break;
+  case ir::AtomicOp::Or:  SpvAtomicOp = 241u; break;
+  case ir::AtomicOp::Xor: SpvAtomicOp = 242u; break;
+  case ir::AtomicOp::SMin: SpvAtomicOp = 236u; break;
+  case ir::AtomicOp::SMax: SpvAtomicOp = 238u; break;
+  case ir::AtomicOp::UMin: SpvAtomicOp = 237u; break;
+  case ir::AtomicOp::UMax: SpvAtomicOp = 239u; break;
+  case ir::AtomicOp::Xchg: SpvAtomicOp = 229u; break;
+  }
+  unsigned Coords = textureCoordDims(RH.RB->Kind);
+  SmallVector<Value *, 3> CoordVals;
+  for (unsigned I = 0; I < Coords; ++I)
+    CoordVals.push_back(CI->getArgOperand(3 + I));
+  Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
+  if (Val->getType()->isFloatTy())
+    Val = B.CreateBitCast(Val, B.getInt32Ty());
+  // Force LLVM SPIR-V to materialize the OpVariable for this image handle in
+  // the entry function, then pass a keep-alive scalar to a sentinel helper
+  // encoding (spvOp, set, binding) in its name.
+  Intrinsic::ID DimID =
+      (Coords == 1)
+          ? Intrinsic::spv_resource_getdimensions_x
+          : ((Coords == 2) ? Intrinsic::spv_resource_getdimensions_xy
+                           : Intrinsic::spv_resource_getdimensions_xyz);
+  Function *DimFn =
+      Intrinsic::getOrInsertDeclaration(&M, DimID, {RH.SpvHandleTy});
+  Value *DimVal = B.CreateCall(DimFn, {RH.SpvHandle});
+  Value *KeepAlive =
+      (Coords == 1) ? DimVal : B.CreateExtractElement(DimVal, B.getInt32(0));
+
+  auto Key = std::make_tuple(SpvAtomicOp, RH.RB->SPIRVSet, RH.RB->SPIRVBinding,
+                             Coord->getType());
+  Function *&HelperFn = ImgAtomicHelpers[Key];
+  if (!HelperFn) {
+    Type *I32Ty = B.getInt32Ty();
+    FunctionType *FT = FunctionType::get(
+        I32Ty, {Coord->getType(), I32Ty, I32Ty, I32Ty, I32Ty, I32Ty}, false);
+    std::string FnName = "__crucible_spv_img_atomic." +
+                         std::to_string(SpvAtomicOp) + "." +
+                         std::to_string(RH.RB->SPIRVSet) + "." +
+                         std::to_string(RH.RB->SPIRVBinding) + "." +
+                         std::to_string(ImgAtomicHelpers.size());
+    HelperFn = Function::Create(FT, GlobalValue::InternalLinkage, FnName, M);
+    HelperFn->addFnAttr(Attribute::NoInline);
+    HelperFn->addFnAttr(Attribute::OptimizeNone);
+    BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", HelperFn);
+    IRBuilder<> HB(HBB);
+    HB.CreateRet(HelperFn->getArg(5));
+  }
+  uint32_t Scope = 1u;   // Device
+  uint32_t Sem = 0x808u; // AcquireRelease | ImageMemory
+  Value *Old = B.CreateCall(HelperFn, {Coord, B.getInt32(0), B.getInt32(Scope),
+                                       B.getInt32(Sem), Val, KeepAlive});
+  if (CI->getType()->isFloatTy())
+    Old = B.CreateBitCast(Old, CI->getType());
+  CI->replaceAllUsesWith(Old);
   return Error::success();
 }
 
@@ -1582,9 +1646,58 @@ Error SPIRVLowerer::lowerAtomicCompareExchange(CallInst *CI) {
     Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
     AS = 11;
   } else {
-    return makeError("SPIR-V backend: atomicCompareExchange on image/typed "
-                     "resource '{0}' is not yet supported",
-                     RH.RB->Name);
+    unsigned Coords = textureCoordDims(RH.RB->Kind);
+    SmallVector<Value *, 3> CoordVals;
+    for (unsigned I = 0; I < Coords; ++I)
+      CoordVals.push_back(CI->getArgOperand(2 + I));
+    Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
+    Value *Cmp = CI->getArgOperand(5);
+    Value *Val = CI->getArgOperand(6);
+    if (Cmp->getType()->isFloatTy())
+      Cmp = B.CreateBitCast(Cmp, B.getInt32Ty());
+    if (Val->getType()->isFloatTy())
+      Val = B.CreateBitCast(Val, B.getInt32Ty());
+    Intrinsic::ID DimID =
+        (Coords == 1)
+            ? Intrinsic::spv_resource_getdimensions_x
+            : ((Coords == 2) ? Intrinsic::spv_resource_getdimensions_xy
+                             : Intrinsic::spv_resource_getdimensions_xyz);
+    Function *DimFn =
+        Intrinsic::getOrInsertDeclaration(&M, DimID, {RH.SpvHandleTy});
+    Value *DimVal = B.CreateCall(DimFn, {RH.SpvHandle});
+    Value *KeepAlive =
+        (Coords == 1) ? DimVal : B.CreateExtractElement(DimVal, B.getInt32(0));
+
+    auto Key = std::make_tuple(RH.RB->SPIRVSet, RH.RB->SPIRVBinding,
+                               Coord->getType());
+    Function *&HelperFn = ImgCmpXchgHelpers[Key];
+    if (!HelperFn) {
+      Type *I32Ty = B.getInt32Ty();
+      FunctionType *FT = FunctionType::get(
+          I32Ty,
+          {Coord->getType(), I32Ty, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty},
+          false);
+      std::string FnName = "__crucible_spv_img_cmpxchg." +
+                           std::to_string(RH.RB->SPIRVSet) + "." +
+                           std::to_string(RH.RB->SPIRVBinding) + "." +
+                           std::to_string(ImgCmpXchgHelpers.size());
+      HelperFn = Function::Create(FT, GlobalValue::InternalLinkage, FnName, M);
+      HelperFn->addFnAttr(Attribute::NoInline);
+      HelperFn->addFnAttr(Attribute::OptimizeNone);
+      BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", HelperFn);
+      IRBuilder<> HB(HBB);
+      HB.CreateRet(HelperFn->getArg(7));
+    }
+    uint32_t Scope = 1u;       // Device
+    uint32_t EqSem = 0x808u;   // AcquireRelease | ImageMemory
+    uint32_t UneqSem = 0x802u; // Acquire | ImageMemory
+    Value *Old = B.CreateCall(
+        HelperFn, {Coord, B.getInt32(0), B.getInt32(Scope), B.getInt32(EqSem),
+                   B.getInt32(UneqSem), Val, Cmp, KeepAlive});
+    if (CI->getType()->isFloatTy())
+      Old = B.CreateBitCast(Old, CI->getType());
+    CI->replaceAllUsesWith(Old);
+    return Error::success();
   }
   Value *Cmp = CI->getArgOperand(5);
   Value *Val = CI->getArgOperand(6);
@@ -3235,6 +3348,41 @@ Error SPIRVLowerer::run() {
     }
   }
 
+  // Pre-scan for image/typed-buffer resources used by atomic ops so
+  // getSPIRVResourceType emits explicit R32ui format (required by
+  // OpImageTexelPointer).
+  for (CallInst *CI : BridgeCalls) {
+    auto *OpC = dyn_cast<ConstantInt>(CI->getArgOperand(0));
+    if (!OpC)
+      continue;
+    auto Op = static_cast<SpvOp>(OpC->getZExtValue());
+    if (Op != SpvOp::BufferAtomic && Op != SpvOp::BufferAtomicCmpXchg)
+      continue;
+    Value *H = CI->getArgOperand(1);
+    if (auto *BindCI = dyn_cast<CallInst>(H)) {
+      if (auto *BOpC = dyn_cast<ConstantInt>(BindCI->getArgOperand(0));
+          BOpC && static_cast<SpvOp>(BOpC->getZExtValue()) == SpvOp::BindResource) {
+        auto *ClassC = dyn_cast<ConstantInt>(BindCI->getArgOperand(1));
+        auto *HasRecC = dyn_cast<ConstantInt>(BindCI->getArgOperand(2));
+        auto *RecC = dyn_cast<ConstantInt>(BindCI->getArgOperand(3));
+        auto *SpaceC = dyn_cast<ConstantInt>(BindCI->getArgOperand(4));
+        auto *BindC = dyn_cast<ConstantInt>(BindCI->getArgOperand(5));
+        if (ClassC && HasRecC && RecC && SpaceC && BindC) {
+          auto RC = static_cast<ResourceClass>(ClassC->getZExtValue());
+          const ResourceBinding *RB =
+              !HasRecC->isZero()
+                  ? findResourceByID(RC, static_cast<uint32_t>(RecC->getZExtValue()))
+                  : findResourceByBinding(
+                        RC, static_cast<uint32_t>(SpaceC->getZExtValue()),
+                        static_cast<uint32_t>(BindC->getZExtValue()));
+          if (RB && RB->Kind != ResourceKind::RawBuffer &&
+              RB->Kind != ResourceKind::StructuredBuffer)
+            AtomicImageBindings.insert(RB);
+        }
+      }
+    }
+  }
+
   for (CallInst *CI : BridgeCalls) {
     if (Error E = lowerBridgeCall(CI))
       return E;
@@ -4198,16 +4346,19 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
   CodeGenPM.run(M);
   std::string Result(OutBuf.data(), OutBuf.size());
 
-  // Rewrite sentinel __crucible_spv_arraylength.* and __crucible_spv_cmpxchg.*
-  // calls into SPIR-V OpArrayLength (68) / OpAtomicCompareExchange (230) and
-  // strip the stub functions.
+  // Rewrite sentinel __crucible_spv_arraylength.*, __crucible_spv_cmpxchg.*,
+  // and __crucible_spv_img_{atomic,cmpxchg}.* calls into native SPIR-V
+  // OpArrayLength (68) / OpAtomicCompareExchange (230) / OpImageTexelPointer
+  // (98) + OpAtomic* and strip the stub functions.
   if (!Opts.EmitSPIRVAsm &&
-      (Lowerer.usedArrayLength() || Lowerer.usedCmpXchg()) &&
+      (Lowerer.usedArrayLength() || Lowerer.usedCmpXchg() ||
+       Lowerer.usedImageAtomics()) &&
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
     if (Words[0] == 0x07230203u) {
       constexpr uint16_t OpName = 5;
+      constexpr uint16_t OpTypeInt = 21;
       constexpr uint16_t OpTypeRuntimeArray = 29;
       constexpr uint16_t OpTypeStruct = 30;
       constexpr uint16_t OpTypePointer = 32;
@@ -4215,21 +4366,33 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       constexpr uint16_t OpFunctionParameter = 55;
       constexpr uint16_t OpFunctionEnd = 56;
       constexpr uint16_t OpFunctionCall = 57;
+      constexpr uint16_t OpLoad = 61;
       constexpr uint16_t OpArrayLength = 68;
       constexpr uint16_t OpDecorate = 71;
       constexpr uint16_t OpMemberDecorate = 72;
       constexpr uint16_t OpCopyObject = 83;
+      constexpr uint16_t OpImageTexelPointer = 60;
       constexpr uint16_t OpBitcast = 124;
       constexpr uint16_t OpAtomicCompareExchange = 230;
       constexpr uint16_t OpLabel = 248;
 
+      struct ImgHelperInfo {
+        uint16_t SpvOp = 0;
+        uint32_t Set = 0;
+        uint32_t Binding = 0;
+      };
       DenseSet<uint32_t> ArrayLenHelperIds;
       DenseSet<uint32_t> CmpXchgHelperIds;
+      DenseMap<uint32_t, ImgHelperInfo> ImgAtomicHelpersMap;
+      DenseMap<uint32_t, ImgHelperInfo> ImgCmpXchgHelpersMap;
       DenseSet<uint32_t> HelperIds;
       DenseMap<uint32_t, uint32_t> CopyOf;
+      DenseMap<uint32_t, uint32_t> VarSet;
+      DenseMap<uint32_t, uint32_t> VarBinding;
       DenseSet<uint32_t> RuntimeArrays;
       DenseSet<uint32_t> BlockedStructs;
       DenseSet<uint32_t> DeadBitcasts;
+      uint32_t UintTyId = 0;
       for (size_t I = 5; I < NumWords;) {
         uint32_t WC = Words[I] >> 16;
         uint16_t Op = Words[I] & 0xFFFFu;
@@ -4245,15 +4408,53 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
           } else if (Name.starts_with("__crucible_spv_cmpxchg.")) {
             CmpXchgHelperIds.insert(Words[I + 1]);
             HelperIds.insert(Words[I + 1]);
+          } else if (Name.starts_with("__crucible_spv_img_atomic.")) {
+            SmallVector<StringRef, 6> Parts;
+            Name.drop_front(strlen("__crucible_spv_img_atomic."))
+                .split(Parts, '.');
+            uint32_t SpvOpNum = 0, SetNum = 0, BindNum = 0;
+            if (Parts.size() >= 3 && !Parts[0].getAsInteger(10, SpvOpNum) &&
+                !Parts[1].getAsInteger(10, SetNum) &&
+                !Parts[2].getAsInteger(10, BindNum)) {
+              ImgAtomicHelpersMap[Words[I + 1]] = {
+                  static_cast<uint16_t>(SpvOpNum), SetNum, BindNum};
+              HelperIds.insert(Words[I + 1]);
+            }
+          } else if (Name.starts_with("__crucible_spv_img_cmpxchg.")) {
+            SmallVector<StringRef, 5> Parts;
+            Name.drop_front(strlen("__crucible_spv_img_cmpxchg."))
+                .split(Parts, '.');
+            uint32_t SetNum = 0, BindNum = 0;
+            if (Parts.size() >= 2 && !Parts[0].getAsInteger(10, SetNum) &&
+                !Parts[1].getAsInteger(10, BindNum)) {
+              ImgCmpXchgHelpersMap[Words[I + 1]] = {OpAtomicCompareExchange,
+                                                    SetNum, BindNum};
+              HelperIds.insert(Words[I + 1]);
+            }
           }
         } else if ((Op == OpCopyObject || Op == OpBitcast) && WC == 4) {
           CopyOf[Words[I + 2]] = Words[I + 3];
+        } else if (Op == OpTypeInt && WC == 4 && Words[I + 2] == 32u &&
+                   Words[I + 3] == 0u && UintTyId == 0) {
+          UintTyId = Words[I + 1];
         } else if (Op == OpTypeRuntimeArray && WC >= 3) {
           RuntimeArrays.insert(Words[I + 1]);
-        } else if (Op == OpDecorate && WC >= 3 && Words[I + 2] == 2u /*Block*/) {
-          BlockedStructs.insert(Words[I + 1]);
+        } else if (Op == OpDecorate && WC >= 3) {
+          if (Words[I + 2] == 2u /*Block*/)
+            BlockedStructs.insert(Words[I + 1]);
+          else if (Words[I + 2] == 33u /*Binding*/ && WC >= 4)
+            VarBinding[Words[I + 1]] = Words[I + 3];
+          else if (Words[I + 2] == 34u /*DescriptorSet*/ && WC >= 4)
+            VarSet[Words[I + 1]] = Words[I + 3];
         }
         I += WC;
+      }
+
+      DenseMap<std::pair<uint32_t, uint32_t>, uint32_t> SetBindToVar;
+      for (const auto &[VarId, Bind] : VarBinding) {
+        auto It = VarSet.find(VarId);
+        uint32_t Set = (It != VarSet.end()) ? It->second : 0u;
+        SetBindToVar[{Set, Bind}] = VarId;
       }
 
       if (!HelperIds.empty()) {
@@ -4297,12 +4498,21 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
           I += WC;
         }
 
+        uint32_t Bound = Words[3];
+        uint32_t PtrImageUintTyId = 0;
+        bool NeedPtrImageUint =
+            (!ImgAtomicHelpersMap.empty() || !ImgCmpXchgHelpersMap.empty()) &&
+            UintTyId != 0;
+        if (NeedPtrImageUint)
+          PtrImageUintTyId = Bound++;
+
         std::vector<uint32_t> Patched;
-        Patched.reserve(NumWords);
+        Patched.reserve(NumWords + 64);
         for (size_t I = 0; I < 5; ++I)
           Patched.push_back(Words[I]);
 
         bool SkippingFn = false;
+        bool EmittedPtrImageUint = false;
         for (size_t I = 5; I < NumWords;) {
           uint32_t WC = Words[I] >> 16;
           uint16_t Op = Words[I] & 0xFFFFu;
@@ -4361,10 +4571,64 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             I += WC;
             continue;
           }
+          if (Op == OpFunctionCall && WC == 10 &&
+              ImgAtomicHelpersMap.contains(Words[I + 3]) && NeedPtrImageUint) {
+            const ImgHelperInfo &Info = ImgAtomicHelpersMap[Words[I + 3]];
+            uint32_t ImgVarPtr = SetBindToVar.lookup({Info.Set, Info.Binding});
+            uint32_t TexelPtrId = Bound++;
+            Patched.push_back((6u << 16) | OpImageTexelPointer);
+            Patched.push_back(PtrImageUintTyId);
+            Patched.push_back(TexelPtrId);
+            Patched.push_back(ImgVarPtr);
+            Patched.push_back(Words[I + 4]); // Coordinate
+            Patched.push_back(Words[I + 5]); // Sample (0)
+            Patched.push_back((7u << 16) | Info.SpvOp);
+            Patched.push_back(Words[I + 1]); // ResultType (uint)
+            Patched.push_back(Words[I + 2]); // ResultId
+            Patched.push_back(TexelPtrId);   // Pointer (Image)
+            Patched.push_back(Words[I + 6]); // Scope
+            Patched.push_back(Words[I + 7]); // Semantics
+            Patched.push_back(Words[I + 8]); // Value
+            I += WC;
+            continue;
+          }
+          if (Op == OpFunctionCall && WC == 12 &&
+              ImgCmpXchgHelpersMap.contains(Words[I + 3]) && NeedPtrImageUint) {
+            const ImgHelperInfo &Info = ImgCmpXchgHelpersMap[Words[I + 3]];
+            uint32_t ImgVarPtr = SetBindToVar.lookup({Info.Set, Info.Binding});
+            uint32_t TexelPtrId = Bound++;
+            Patched.push_back((6u << 16) | OpImageTexelPointer);
+            Patched.push_back(PtrImageUintTyId);
+            Patched.push_back(TexelPtrId);
+            Patched.push_back(ImgVarPtr);
+            Patched.push_back(Words[I + 4]);  // Coordinate
+            Patched.push_back(Words[I + 5]);  // Sample (0)
+            Patched.push_back((9u << 16) | OpAtomicCompareExchange);
+            Patched.push_back(Words[I + 1]);  // ResultType (uint)
+            Patched.push_back(Words[I + 2]);  // ResultId
+            Patched.push_back(TexelPtrId);    // Pointer (Image)
+            Patched.push_back(Words[I + 6]);  // Scope
+            Patched.push_back(Words[I + 7]);  // EqualSemantics
+            Patched.push_back(Words[I + 8]);  // UnequalSemantics
+            Patched.push_back(Words[I + 9]);  // Value
+            Patched.push_back(Words[I + 10]); // Comparator
+            I += WC;
+            continue;
+          }
           for (uint32_t K = 0; K < WC; ++K)
             Patched.push_back(Words[I + K]);
+          if (NeedPtrImageUint && !EmittedPtrImageUint && Op == OpTypeInt &&
+              WC == 4 && Words[I + 1] == UintTyId) {
+            // Emit OpTypePointer %PtrImageUintTyId Image(11) %UintTyId
+            Patched.push_back((4u << 16) | OpTypePointer);
+            Patched.push_back(PtrImageUintTyId);
+            Patched.push_back(11u); // StorageClass::Image
+            Patched.push_back(UintTyId);
+            EmittedPtrImageUint = true;
+          }
           I += WC;
         }
+        Patched[3] = Bound;
         Result.assign(reinterpret_cast<const char *>(Patched.data()),
                       Patched.size() * 4);
       }
