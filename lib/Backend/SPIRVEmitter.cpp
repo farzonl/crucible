@@ -1572,8 +1572,8 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
     break;
   }
   case DXILOp::WaveGetLaneCount: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_wave_get_lane_count);
+    Function *Fn =
+        Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_subgroup_size);
     Res = B.CreateCall(Fn);
     break;
   }
@@ -1615,9 +1615,27 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
   }
   case DXILOp::WaveReadLaneFirst: {
     Value *Val = CI->getArgOperand(1);
+    Function *BallotFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_subgroup_ballot);
+    Value *Ballot = B.CreateCall(BallotFn, {B.getTrue()});
+    Function *FblFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_firstbitlow, {B.getInt32Ty()});
+    Value *W0 = B.CreateExtractElement(Ballot, B.getInt32(0));
+    Value *W1 = B.CreateExtractElement(Ballot, B.getInt32(1));
+    Value *W2 = B.CreateExtractElement(Ballot, B.getInt32(2));
+    Value *W3 = B.CreateExtractElement(Ballot, B.getInt32(3));
+    Value *L3 = B.CreateAdd(B.CreateCall(FblFn, {W3}), B.getInt32(96));
+    Value *L2 = B.CreateSelect(
+        B.CreateICmpNE(W2, B.getInt32(0)),
+        B.CreateAdd(B.CreateCall(FblFn, {W2}), B.getInt32(64)), L3);
+    Value *L1 = B.CreateSelect(
+        B.CreateICmpNE(W1, B.getInt32(0)),
+        B.CreateAdd(B.CreateCall(FblFn, {W1}), B.getInt32(32)), L2);
+    Value *FirstLane = B.CreateSelect(B.CreateICmpNE(W0, B.getInt32(0)),
+                                      B.CreateCall(FblFn, {W0}), L1);
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_wave_readlane, {Val->getType()});
-    Res = B.CreateCall(Fn, {Val, B.getInt32(0)});
+    Res = B.CreateCall(Fn, {Val, FirstLane});
     break;
   }
   case DXILOp::WaveActiveOp: {
