@@ -718,6 +718,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     struct BoundResource {
       uint32_t Set = 0;
       uint32_t Binding = 0;
+      uint32_t ArrayElem = 0;
       VkDescriptorType DescType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       VkBuffer Buffer = VK_NULL_HANDLE;
       VkDeviceSize BufferSize = 0;
@@ -747,7 +748,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
         if (!Match)
           continue;
         uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
-        uint32_t VkBind = Match->SPIRVBinding + SlotOffset;
+        uint32_t VkBind = Match->SPIRVBinding;
 
         if (Res.Kind == ResourceKind::Sampler) {
           if (!Res.SamplerPtr)
@@ -758,63 +759,71 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
             cleanup();
             return SampOrErr.takeError();
           }
-          BoundList.push_back({Match->SPIRVSet, VkBind,
+          BoundList.push_back({Match->SPIRVSet, VkBind, SlotOffset,
                                VK_DESCRIPTOR_TYPE_SAMPLER, VK_NULL_HANDLE, 0,
                                VK_NULL_HANDLE, *SampOrErr});
           continue;
         }
 
+        if (!Res.BufferPtr)
+          continue;
+        uint32_t ArrayCount =
+            std::max<uint32_t>(1u, static_cast<uint32_t>(Res.BufferPtr->ArraySize));
+        if (Res.BufferPtr->Data.size() > ArrayCount)
+          ArrayCount = static_cast<uint32_t>(Res.BufferPtr->Data.size());
+
         if (isTextureKind(Res.Kind)) {
-          if (!Res.BufferPtr)
-            continue;
           bool IsUAV = isUAVKind(Res.Kind);
-          auto ImgOrErr = getOrCreateImage(Res.BufferPtr, 0, Res.Kind, IsUAV);
-          if (!ImgOrErr) {
-            vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
-            cleanup();
-            return ImgOrErr.takeError();
+          for (uint32_t Slice = 0; Slice < ArrayCount; ++Slice) {
+            auto ImgOrErr = getOrCreateImage(Res.BufferPtr, Slice, Res.Kind, IsUAV);
+            if (!ImgOrErr) {
+              vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
+              cleanup();
+              return ImgOrErr.takeError();
+            }
+            VkImgAlloc *IA = *ImgOrErr;
+            BoundList.push_back({Match->SPIRVSet, VkBind, SlotOffset + Slice,
+                                 IsUAV ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                       : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                 VK_NULL_HANDLE, 0, VK_NULL_HANDLE,
+                                 VK_NULL_HANDLE, IA->View});
           }
-          VkImgAlloc *IA = *ImgOrErr;
-          BoundList.push_back({Match->SPIRVSet, VkBind,
-                               IsUAV ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
-                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                               VK_NULL_HANDLE, 0, VK_NULL_HANDLE,
-                               VK_NULL_HANDLE, IA->View});
           continue;
         }
 
-        if (!Res.BufferPtr)
-          continue;
         bool IsUniform = (Res.Kind == ResourceKind::ConstantBuffer);
         bool IsTyped = isTypedBufferKind(Res.Kind);
         bool IsUAV = isUAVKind(Res.Kind);
-        auto BufOrErr =
-            getOrCreateBuffer(Res.BufferPtr, 0, IsUniform, IsTyped, IsUAV);
-        if (!BufOrErr) {
-          vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
-          cleanup();
-          return BufOrErr.takeError();
-        }
-        VkBufAlloc *BA = *BufOrErr;
         VkDescriptorType DT =
             IsUniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
             : IsTyped ? (IsUAV ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
                                : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER)
                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        BoundList.push_back({Match->SPIRVSet, VkBind, DT, BA->Buffer,
-                             BA->SizeBytes, BA->View, VK_NULL_HANDLE});
-        if (Match->HasCounter) {
-          auto CntOrErr = getOrCreateCounterBuffer(Res.BufferPtr, 0);
-          if (!CntOrErr) {
+        for (uint32_t Slice = 0; Slice < ArrayCount; ++Slice) {
+          auto BufOrErr =
+              getOrCreateBuffer(Res.BufferPtr, Slice, IsUniform, IsTyped, IsUAV);
+          if (!BufOrErr) {
             vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
             cleanup();
-            return CntOrErr.takeError();
+            return BufOrErr.takeError();
           }
-          VkBufAlloc *CA = *CntOrErr;
-          BoundList.push_back({Match->SPIRVSet,
-                               Match->CounterSPIRVBinding + SlotOffset,
-                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, CA->Buffer,
-                               CA->SizeBytes, VK_NULL_HANDLE, VK_NULL_HANDLE});
+          VkBufAlloc *BA = *BufOrErr;
+          BoundList.push_back({Match->SPIRVSet, VkBind, SlotOffset + Slice, DT,
+                               BA->Buffer, BA->SizeBytes, BA->View,
+                               VK_NULL_HANDLE});
+          if (Match->HasCounter) {
+            auto CntOrErr = getOrCreateCounterBuffer(Res.BufferPtr, Slice);
+            if (!CntOrErr) {
+              vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
+              cleanup();
+              return CntOrErr.takeError();
+            }
+            VkBufAlloc *CA = *CntOrErr;
+            BoundList.push_back({Match->SPIRVSet, Match->CounterSPIRVBinding,
+                                 SlotOffset + Slice,
+                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, CA->Buffer,
+                                 CA->SizeBytes, VK_NULL_HANDLE, VK_NULL_HANDLE});
+          }
         }
       }
     }
@@ -864,9 +873,8 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
                   return BufOrErr.takeError();
                 }
                 BoundList.push_back(
-                    {Match->SPIRVSet,
-                     Match->SPIRVBinding +
-                         (Info->ShaderRegister - Match->LowerBound),
+                    {Match->SPIRVSet, Match->SPIRVBinding,
+                     Info->ShaderRegister - Match->LowerBound,
                      VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, (*BufOrErr)->Buffer,
                      (*BufOrErr)->SizeBytes, VK_NULL_HANDLE, VK_NULL_HANDLE});
               }
@@ -895,9 +903,8 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
                     return BufOrErr.takeError();
                   }
                   BoundList.push_back(
-                      {Match->SPIRVSet,
-                       Match->SPIRVBinding +
-                           (Info->ShaderRegister - Match->LowerBound),
+                      {Match->SPIRVSet, Match->SPIRVBinding,
+                       Info->ShaderRegister - Match->LowerBound,
                        IsUniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                                  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                        (*BufOrErr)->Buffer, (*BufOrErr)->SizeBytes,
@@ -917,17 +924,40 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     std::vector<VkDescriptorSetLayout> SetLayouts(MaxSet, VK_NULL_HANDLE);
     std::map<VkDescriptorType, uint32_t> PoolCounts;
     for (uint32_t SetIdx = 0; SetIdx < MaxSet; ++SetIdx) {
-      std::vector<VkDescriptorSetLayoutBinding> LayoutBinds;
+      struct BindingLayoutInfo {
+        VkDescriptorType Type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        uint32_t Count = 0;
+      };
+      std::map<uint32_t, BindingLayoutInfo> BindingMap;
       for (const auto &B : BoundList) {
         if (B.Set != SetIdx)
           continue;
+        auto &Info = BindingMap[B.Binding];
+        Info.Type = B.DescType;
+        Info.Count = std::max(Info.Count, B.ArrayElem + 1u);
+      }
+      for (const crucible::ResourceBinding &RB : R.Resources) {
+        if (RB.SPIRVSet != SetIdx)
+          continue;
+        if (RB.RangeSize > 1u && RB.RangeSize != 0xFFFFFFFFu) {
+          if (auto It = BindingMap.find(RB.SPIRVBinding); It != BindingMap.end())
+            It->second.Count = std::max(It->second.Count, RB.RangeSize);
+          if (RB.HasCounter) {
+            if (auto It = BindingMap.find(RB.CounterSPIRVBinding);
+                It != BindingMap.end())
+              It->second.Count = std::max(It->second.Count, RB.RangeSize);
+          }
+        }
+      }
+      std::vector<VkDescriptorSetLayoutBinding> LayoutBinds;
+      for (const auto &[BindIdx, Info] : BindingMap) {
         VkDescriptorSetLayoutBinding LB{};
-        LB.binding = B.Binding;
-        LB.descriptorType = B.DescType;
-        LB.descriptorCount = 1;
+        LB.binding = BindIdx;
+        LB.descriptorType = Info.Type;
+        LB.descriptorCount = Info.Count;
         LB.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         LayoutBinds.push_back(LB);
-        PoolCounts[B.DescType]++;
+        PoolCounts[Info.Type] += Info.Count;
       }
       VkDescriptorSetLayoutCreateInfo DSLCI{};
       DSLCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -1024,6 +1054,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
         W.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         W.dstSet = DSets[B.Set];
         W.dstBinding = B.Binding;
+        W.dstArrayElement = B.ArrayElem;
         W.descriptorCount = 1;
         W.descriptorType = B.DescType;
         if (B.DescType == VK_DESCRIPTOR_TYPE_SAMPLER) {
@@ -1999,6 +2030,18 @@ createVulkanDevices(const DeviceConfig &Config) {
     EnabledVk12.runtimeDescriptorArray = SupportedVk12.runtimeDescriptorArray;
     EnabledVk12.descriptorBindingPartiallyBound =
         SupportedVk12.descriptorBindingPartiallyBound;
+    EnabledVk12.shaderStorageBufferArrayNonUniformIndexing =
+        SupportedVk12.shaderStorageBufferArrayNonUniformIndexing;
+    EnabledVk12.shaderUniformBufferArrayNonUniformIndexing =
+        SupportedVk12.shaderUniformBufferArrayNonUniformIndexing;
+    EnabledVk12.shaderSampledImageArrayNonUniformIndexing =
+        SupportedVk12.shaderSampledImageArrayNonUniformIndexing;
+    EnabledVk12.shaderStorageImageArrayNonUniformIndexing =
+        SupportedVk12.shaderStorageImageArrayNonUniformIndexing;
+    EnabledVk12.shaderStorageTexelBufferArrayNonUniformIndexing =
+        SupportedVk12.shaderStorageTexelBufferArrayNonUniformIndexing;
+    EnabledVk12.shaderUniformTexelBufferArrayNonUniformIndexing =
+        SupportedVk12.shaderUniformTexelBufferArrayNonUniformIndexing;
     EnabledVk12.shaderBufferInt64Atomics =
         SupportedVk12.shaderBufferInt64Atomics;
     EnabledVk12.shaderSharedInt64Atomics =
