@@ -17,6 +17,7 @@
 
 #include "Transforms.h"
 #include "crucible/Diagnostic.h"
+#include "crucible/Dialect/CrucibleDialect.h"
 
 #include "llvm/IR/Module.h"
 
@@ -159,8 +160,8 @@ structurizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp> Mod,
   return std::move(Out);
 }
 
-Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
-                                            mlir::MLIRContext &Ctx) {
+Expected<mlir::OwningOpRef<mlir::ModuleOp>>
+importDXILToMLIR(LoadedShader &Shader, mlir::MLIRContext &Ctx) {
   // The MLIR importer rejects DXIL's named metadata; reflection was already
   // captured by the frontend, so drop it.
   llvm::Module &M = *Shader.M;
@@ -174,17 +175,27 @@ Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
   Registry.insert<mlir::LLVM::LLVMDialect, mlir::DLTIDialect,
                   mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
                   mlir::scf::SCFDialect, mlir::arith::ArithDialect,
-                  mlir::gpu::GPUDialect, mlir::math::MathDialect>();
+                  mlir::gpu::GPUDialect, mlir::math::MathDialect,
+                  crucible::ir::CrucibleDialect>();
   mlir::registerLLVMDialectImport(Registry);
   Ctx.appendDialectRegistry(Registry);
-  Ctx.loadDialect<mlir::gpu::GPUDialect, mlir::math::MathDialect>();
+  Ctx.loadDialect<mlir::gpu::GPUDialect, mlir::math::MathDialect,
+                  crucible::ir::CrucibleDialect>();
 
   auto Mod = mlir::translateLLVMIRToModule(std::move(Shader.M), &Ctx);
   if (!Mod)
     return makeError("MLIR import of the DXIL module failed");
 
   lowerDXILToLayer1(*Mod);
-  return structurizeMLIRModule(std::move(Mod), Shader.Reflect);
+  return std::move(Mod);
+}
+
+Expected<StructurizedShader> structurizeCFG(LoadedShader &Shader,
+                                            mlir::MLIRContext &Ctx) {
+  auto Mod = importDXILToMLIR(Shader, Ctx);
+  if (!Mod)
+    return Mod.takeError();
+  return structurizeMLIRModule(std::move(*Mod), Shader.Reflect);
 }
 
 } // namespace crucible

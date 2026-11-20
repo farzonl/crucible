@@ -90,7 +90,17 @@ Expected<SPIRVCompileResult> compileDXILToSPIRV(MemoryBufferRef DXIL,
   if (Error E = assignSPIRVBindings(Shader->Reflect, Opts))
     return std::move(E);
 
-  auto Out = emitSPIRV(*Shader->M, Shader->Entry, Shader->Reflect, Opts);
+  mlir::MLIRContext MCtx;
+  auto Mod = importDXILToMLIR(*Shader, MCtx);
+  if (!Mod)
+    return Mod.takeError();
+
+  if (Opts.DumpMLIR) {
+    (*Mod)->print(llvm::errs());
+    llvm::errs() << "\n";
+  }
+
+  auto Out = emitSPIRV(**Mod, Shader->Reflect, Opts);
   if (!Out)
     return Out.takeError();
 

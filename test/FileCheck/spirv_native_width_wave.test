@@ -7,11 +7,12 @@
 # CHECK: kernel void main0(
 # CHECK-NEXT: device uint* Out {{\[\[}}buffer(0){{\]\]}},
 # CHECK-NEXT: constant uint4* Params {{\[\[}}buffer(1){{\]\]}},
-# CHECK-NEXT: uint gidx {{\[\[}}thread_index_in_threadgroup{{\]\]}}) {
+# CHECK-NEXT: uint gidx {{\[\[}}thread_index_in_threadgroup{{\]\]}},
+# CHECK-NEXT: uint lane {{\[\[}}thread_index_in_simdgroup{{\]\]}}) {
 # CHECK: as_type<ulong2>(Params[0u])[1]
 # CHECK: Params[0u].x >> 16u
-# CHECK: simd_sum(
-# CHECK: simd_prefix_exclusive_sum(
+# CHECK: crucible_wave_wide<ulong, 0, false>(
+# CHECK: crucible_wave_wide<ulong, 0, true>(
 # CHECK: simd_shuffle(
 # CHECK: simd_ballot(
 # CHECK: popcount(
