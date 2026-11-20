@@ -191,6 +191,7 @@ def main() -> None:
     data_dir = args.out_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
+    ignored_track_ids = {"history", "latest", "badge", "tracks"}
     previous_tracks = {}
     if args.pages_url:
         loaded_tracks = fetch_json(
@@ -200,7 +201,9 @@ def main() -> None:
             previous_tracks = {
                 track.get("id"): track
                 for track in loaded_tracks
-                if isinstance(track, dict) and track.get("id")
+                if isinstance(track, dict)
+                and track.get("id")
+                and track.get("id") not in ignored_track_ids
             }
 
     tracks_manifest = []
