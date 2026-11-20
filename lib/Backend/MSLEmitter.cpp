@@ -2434,6 +2434,9 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
                 mlir::LLVM::AtomicCmpXchgOp, mlir::LLVM::AllocaOp>(Op))
     return false;
+  if (auto Ld = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
+      Ld && mlir::isa<mlir::LLVM::LLVMArrayType>(Ld.getType()))
+    return true;
 
   if (auto DXOp = dxOpcode(Op)) {
     switch (*DXOp) {
@@ -4341,6 +4344,16 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     if (!Cmp)
       return Cmp.takeError();
     return Expr{It->second + " == " + Cmp->Text, PrecEq};
+  }
+
+  if (auto Ld = mlir::dyn_cast_or_null<mlir::LLVM::LoadOp>(Producer)) {
+    auto LV = lvalueFor(Ld.getAddr(), /*DecayArray=*/false);
+    if (!LV)
+      return LV.takeError();
+    std::string Text = LV->Text;
+    for (int64_t Idx : Pos)
+      Text += "[" + std::to_string(Idx) + "]";
+    return Expr{std::move(Text), PrecPrimary};
   }
 
   auto Call = mlir::dyn_cast_or_null<mlir::LLVM::CallOp>(Producer);

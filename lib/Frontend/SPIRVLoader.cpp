@@ -1205,6 +1205,23 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             mlir::Value Val = castToSignless(B, Loc, Store.getValue());
             mlir::LLVM::StoreOp::create(B, Loc, Val, NewPtr);
             Store.erase();
+          } else if (auto CX =
+                         mlir::dyn_cast<mlir::spirv::AtomicCompareExchangeOp>(
+                             MU)) {
+            mlir::OpBuilder B(CX);
+            mlir::Location Loc = CX.getLoc();
+            mlir::Type OrigTy = CX.getValue().getType();
+            mlir::Value Cmp = castToSignless(B, Loc, CX.getComparator());
+            mlir::Value Val = castToSignless(B, Loc, CX.getValue());
+            auto CmpXchg = mlir::LLVM::AtomicCmpXchgOp::create(
+                B, Loc, NewPtr, Cmp, Val,
+                mlir::LLVM::AtomicOrdering::monotonic,
+                mlir::LLVM::AtomicOrdering::monotonic);
+            auto OrigVal = mlir::LLVM::ExtractValueOp::create(
+                B, Loc, CmpXchg.getResult(), ArrayRef<int64_t>{0});
+            CX.replaceAllUsesWith(
+                castFromSignless(B, Loc, OrigVal.getResult(), OrigTy));
+            CX.erase();
           } else {
             std::optional<mlir::LLVM::AtomicBinOp> BinOp;
             mlir::Value AVal;
@@ -1247,12 +1264,24 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             mlir::Location Loc = MU->getLoc();
             mlir::Type OrigTy = AVal.getType();
             mlir::Value SignlessVal = castToSignless(B, Loc, AVal);
-            auto RMW = mlir::LLVM::AtomicRMWOp::create(
-                B, Loc, *BinOp, NewPtr, SignlessVal,
-                mlir::LLVM::AtomicOrdering::monotonic);
-            MU->getResult(0).replaceAllUsesWith(
-                castFromSignless(B, Loc, RMW.getResult(), OrigTy));
-            MU->erase();
+            if (SignlessVal.getType().isF32()) {
+              SignlessVal =
+                  mlir::LLVM::BitcastOp::create(B, Loc, I32Ty, SignlessVal);
+              auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                  B, Loc, *BinOp, NewPtr, SignlessVal,
+                  mlir::LLVM::AtomicOrdering::monotonic);
+              auto FRes = mlir::LLVM::BitcastOp::create(B, Loc, OrigTy,
+                                                        RMW.getResult());
+              MU->getResult(0).replaceAllUsesWith(FRes.getResult());
+              MU->erase();
+            } else {
+              auto RMW = mlir::LLVM::AtomicRMWOp::create(
+                  B, Loc, *BinOp, NewPtr, SignlessVal,
+                  mlir::LLVM::AtomicOrdering::monotonic);
+              MU->getResult(0).replaceAllUsesWith(
+                  castFromSignless(B, Loc, RMW.getResult(), OrigTy));
+              MU->erase();
+            }
           }
         }
         return Error::success();
@@ -1269,7 +1298,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             if (auto C = getConstSpirvInt(IdxV))
               GEPArgs.push_back(static_cast<int32_t>(*C));
             else
-              GEPArgs.push_back(IdxV);
+              GEPArgs.push_back(castToSignless(B, Chain.getLoc(), IdxV));
           }
           auto GEP = mlir::LLVM::GEPOp::create(
               B, Chain.getLoc(), Ptr3Ty, Info.LLVMType, LLVMAddr.getResult(),

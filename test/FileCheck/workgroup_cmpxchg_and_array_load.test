@@ -1,0 +1,6 @@
+# RUN: %cruciblec %S/../Inputs/workgroup_cmpxchg_and_array_load.mlir -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void wg_cmpxchg_and_arr(
+# CHECK: crucible_atomic_cmpxchg((threadgroup atomic_uint *)&wg
+# CHECK: {{.*}}[0] + {{.*}}[1]
