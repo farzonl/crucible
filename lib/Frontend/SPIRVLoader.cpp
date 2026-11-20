@@ -2113,16 +2113,76 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     SW.erase();
   }
 
-  // 3g4. Lower spirv.GL.Atan2, Step, Normalize -> math.* / llvm.*.
-  SmallVector<mlir::Operation *, 8> GLMathOps;
+  // 3g4. Lower spirv.GL.* and spirv.*Dot ops -> math.* / llvm.*.
+  SmallVector<mlir::Operation *, 16> GLMathOps;
   EntryFn.walk([&](mlir::Operation *Op) {
     if (mlir::isa<mlir::spirv::GLAtan2Op, mlir::spirv::GLStepOp,
-                  mlir::spirv::GLNormalizeOp>(Op))
+                  mlir::spirv::GLNormalizeOp, mlir::spirv::DotOp,
+                  mlir::spirv::SDotOp, mlir::spirv::UDotOp,
+                  mlir::spirv::SUDotOp, mlir::spirv::GLFSignOp,
+                  mlir::spirv::GLSSignOp, mlir::spirv::GLLengthOp,
+                  mlir::spirv::GLDistanceOp, mlir::spirv::GLCrossOp,
+                  mlir::spirv::GLReflectOp, mlir::spirv::GLSmoothStepOp,
+                  mlir::spirv::GLPackHalf2x16Op,
+                  mlir::spirv::GLUnpackHalf2x16Op, mlir::spirv::GLFindILsbOp,
+                  mlir::spirv::GLFindUMsbOp, mlir::spirv::GLFindSMsbOp>(Op))
       GLMathOps.push_back(Op);
   });
   for (mlir::Operation *Op : GLMathOps) {
     mlir::OpBuilder B(Op);
     mlir::Location Loc = Op->getLoc();
+    auto mkFloatConst = [&](mlir::Type Ty, double V) -> mlir::Value {
+      mlir::Type ElemTy = Ty;
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(Ty))
+        ElemTy = VTy.getElementType();
+      auto FTy = mlir::cast<mlir::FloatType>(ElemTy);
+      mlir::Attribute A =
+          mlir::isa<mlir::VectorType>(Ty)
+              ? mlir::Attribute(mlir::DenseElementsAttr::get(
+                    mlir::cast<mlir::VectorType>(Ty), B.getFloatAttr(FTy, V)))
+              : mlir::Attribute(B.getFloatAttr(FTy, V));
+      return mlir::LLVM::ConstantOp::create(B, Loc, Ty, A);
+    };
+    auto mkIntConst = [&](mlir::Type Ty, int64_t V) -> mlir::Value {
+      mlir::Type ElemTy = Ty;
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(Ty))
+        ElemTy = VTy.getElementType();
+      auto ITy = mlir::cast<mlir::IntegerType>(ElemTy);
+      mlir::Attribute A =
+          mlir::isa<mlir::VectorType>(Ty)
+              ? mlir::Attribute(mlir::DenseElementsAttr::get(
+                    mlir::cast<mlir::VectorType>(Ty),
+                    B.getIntegerAttr(ITy, V)))
+              : mlir::Attribute(B.getIntegerAttr(ITy, V));
+      return mlir::LLVM::ConstantOp::create(B, Loc, Ty, A);
+    };
+    auto emitFloatDot = [&](mlir::Value A, mlir::Value BVal) -> mlir::Value {
+      mlir::Value Prod = mlir::LLVM::FMulOp::create(B, Loc, A, BVal);
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(A.getType())) {
+        mlir::Value Sum;
+        for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
+          auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                     static_cast<int32_t>(C));
+          mlir::Value Lane =
+              mlir::LLVM::ExtractElementOp::create(B, Loc, Prod, IdxC);
+          Sum = Sum ? mlir::Value(mlir::LLVM::FAddOp::create(B, Loc, Sum, Lane))
+                    : Lane;
+        }
+        return Sum;
+      }
+      return Prod;
+    };
+    auto splatScalar = [&](mlir::Value Scalar,
+                           mlir::VectorType VTy) -> mlir::Value {
+      mlir::Value Splat = mlir::LLVM::UndefOp::create(B, Loc, VTy);
+      for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
+        auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                   static_cast<int32_t>(C));
+        Splat = mlir::LLVM::InsertElementOp::create(B, Loc, Splat, Scalar, IdxC);
+      }
+      return Splat;
+    };
+
     if (auto At2 = mlir::dyn_cast<mlir::spirv::GLAtan2Op>(Op)) {
       auto Rep = mlir::math::Atan2Op::create(B, Loc, At2->getOperand(0),
                                              At2->getOperand(1));
@@ -2132,47 +2192,19 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       mlir::Value Edge = St->getOperand(0);
       mlir::Value X = St->getOperand(1);
       mlir::Type Ty = X.getType();
-      mlir::Type ElemTy = Ty;
-      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(Ty))
-        ElemTy = VTy.getElementType();
-      auto FTy = mlir::cast<mlir::FloatType>(ElemTy);
-      auto mkConst = [&](double V) -> mlir::Value {
-        mlir::Attribute A =
-            mlir::isa<mlir::VectorType>(Ty)
-                ? mlir::Attribute(mlir::DenseElementsAttr::get(
-                      mlir::cast<mlir::VectorType>(Ty),
-                      B.getFloatAttr(FTy, V)))
-                : mlir::Attribute(B.getFloatAttr(FTy, V));
-        return mlir::LLVM::ConstantOp::create(B, Loc, Ty, A);
-      };
       auto Cmp = mlir::LLVM::FCmpOp::create(
           B, Loc, mlir::LLVM::FCmpPredicate::olt, X, Edge);
-      auto Sel = mlir::LLVM::SelectOp::create(B, Loc, Cmp, mkConst(0.0),
-                                              mkConst(1.0));
+      auto Sel = mlir::LLVM::SelectOp::create(
+          B, Loc, Cmp, mkFloatConst(Ty, 0.0), mkFloatConst(Ty, 1.0));
       St.replaceAllUsesWith(Sel.getResult());
       St.erase();
     } else if (auto Norm = mlir::dyn_cast<mlir::spirv::GLNormalizeOp>(Op)) {
       mlir::Value X = Norm.getOperand();
       mlir::Type Ty = X.getType();
       if (auto VTy = mlir::dyn_cast<mlir::VectorType>(Ty)) {
-        mlir::Value Sq = mlir::LLVM::FMulOp::create(B, Loc, X, X);
-        mlir::Value Sum;
-        for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
-          auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
-                                                     static_cast<int32_t>(C));
-          mlir::Value Lane =
-              mlir::LLVM::ExtractElementOp::create(B, Loc, Sq, IdxC);
-          Sum = Sum ? mlir::Value(mlir::LLVM::FAddOp::create(B, Loc, Sum, Lane))
-                    : Lane;
-        }
+        mlir::Value Sum = emitFloatDot(X, X);
         mlir::Value InvLen = mlir::math::RsqrtOp::create(B, Loc, Sum);
-        mlir::Value Splat = mlir::LLVM::UndefOp::create(B, Loc, VTy);
-        for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
-          auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
-                                                     static_cast<int32_t>(C));
-          Splat =
-              mlir::LLVM::InsertElementOp::create(B, Loc, Splat, InvLen, IdxC);
-        }
+        mlir::Value Splat = splatScalar(InvLen, VTy);
         auto Res = mlir::LLVM::FMulOp::create(B, Loc, X, Splat);
         Norm.replaceAllUsesWith(Res.getResult());
         Norm.erase();
@@ -2182,6 +2214,223 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         Norm.replaceAllUsesWith(Res.getResult());
         Norm.erase();
       }
+    } else if (auto Dot = mlir::dyn_cast<mlir::spirv::DotOp>(Op)) {
+      mlir::Value Sum = emitFloatDot(Dot.getVector1(), Dot.getVector2());
+      Dot.replaceAllUsesWith(Sum);
+      Dot.erase();
+    } else if (mlir::isa<mlir::spirv::SDotOp, mlir::spirv::UDotOp,
+                         mlir::spirv::SUDotOp>(Op)) {
+      bool Signed1 =
+          mlir::isa<mlir::spirv::SDotOp, mlir::spirv::SUDotOp>(Op);
+      bool Signed2 = mlir::isa<mlir::spirv::SDotOp>(Op);
+      mlir::Value V1 = castToSignless(B, Loc, Op->getOperand(0));
+      mlir::Value V2 = castToSignless(B, Loc, Op->getOperand(1));
+      mlir::Type OrigResTy = Op->getResult(0).getType();
+      mlir::Type SignlessResTy =
+          B.getIntegerType(OrigResTy.getIntOrFloatBitWidth());
+      auto I8V4Ty = mlir::VectorType::get({4}, B.getI8Type());
+      if (V1.getType().isInteger(32))
+        V1 = mlir::LLVM::BitcastOp::create(B, Loc, I8V4Ty, V1);
+      if (V2.getType().isInteger(32))
+        V2 = mlir::LLVM::BitcastOp::create(B, Loc, I8V4Ty, V2);
+      auto VTy = mlir::cast<mlir::VectorType>(V1.getType());
+      mlir::Value Sum;
+      for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
+        auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                   static_cast<int32_t>(C));
+        mlir::Value E1 = mlir::LLVM::ExtractElementOp::create(B, Loc, V1, IdxC);
+        mlir::Value E2 = mlir::LLVM::ExtractElementOp::create(B, Loc, V2, IdxC);
+        if (E1.getType() != SignlessResTy)
+          E1 = Signed1
+                   ? mlir::Value(mlir::LLVM::SExtOp::create(B, Loc,
+                                                            SignlessResTy, E1))
+                   : mlir::Value(mlir::LLVM::ZExtOp::create(B, Loc,
+                                                            SignlessResTy, E1));
+        if (E2.getType() != SignlessResTy)
+          E2 = Signed2
+                   ? mlir::Value(mlir::LLVM::SExtOp::create(B, Loc,
+                                                            SignlessResTy, E2))
+                   : mlir::Value(mlir::LLVM::ZExtOp::create(B, Loc,
+                                                            SignlessResTy, E2));
+        mlir::Value P = mlir::LLVM::MulOp::create(B, Loc, E1, E2);
+        Sum = Sum ? mlir::Value(mlir::LLVM::AddOp::create(B, Loc, Sum, P)) : P;
+      }
+      Op->getResult(0).replaceAllUsesWith(
+          castFromSignless(B, Loc, Sum, OrigResTy));
+      Op->erase();
+    } else if (auto FS = mlir::dyn_cast<mlir::spirv::GLFSignOp>(Op)) {
+      mlir::Value X = FS.getOperand();
+      mlir::Type Ty = X.getType();
+      mlir::Value Zero = mkFloatConst(Ty, 0.0);
+      mlir::Value Gt = mlir::LLVM::FCmpOp::create(
+          B, Loc, mlir::LLVM::FCmpPredicate::ogt, X, Zero);
+      mlir::Value Lt = mlir::LLVM::FCmpOp::create(
+          B, Loc, mlir::LLVM::FCmpPredicate::olt, X, Zero);
+      mlir::Value Pos = mlir::LLVM::UIToFPOp::create(B, Loc, Ty, Gt);
+      mlir::Value Neg = mlir::LLVM::UIToFPOp::create(B, Loc, Ty, Lt);
+      mlir::Value Res = mlir::LLVM::FSubOp::create(B, Loc, Pos, Neg);
+      FS.replaceAllUsesWith(Res);
+      FS.erase();
+    } else if (auto SS = mlir::dyn_cast<mlir::spirv::GLSSignOp>(Op)) {
+      mlir::Type OrigTy = SS.getType();
+      mlir::Value X = castToSignless(B, Loc, SS.getOperand());
+      mlir::Type Ty = X.getType();
+      mlir::Value Zero = mkIntConst(Ty, 0);
+      mlir::Value Gt = mlir::LLVM::ICmpOp::create(
+          B, Loc, mlir::LLVM::ICmpPredicate::sgt, X, Zero);
+      mlir::Value Lt = mlir::LLVM::ICmpOp::create(
+          B, Loc, mlir::LLVM::ICmpPredicate::slt, X, Zero);
+      mlir::Value Pos = mlir::LLVM::ZExtOp::create(B, Loc, Ty, Gt);
+      mlir::Value Neg = mlir::LLVM::ZExtOp::create(B, Loc, Ty, Lt);
+      mlir::Value Res = mlir::LLVM::SubOp::create(B, Loc, Pos, Neg);
+      SS.replaceAllUsesWith(castFromSignless(B, Loc, Res, OrigTy));
+      SS.erase();
+    } else if (auto Len = mlir::dyn_cast<mlir::spirv::GLLengthOp>(Op)) {
+      mlir::Value X = Len.getOperand();
+      mlir::Value Res;
+      if (mlir::isa<mlir::VectorType>(X.getType())) {
+        mlir::Value Sum = emitFloatDot(X, X);
+        Res = mlir::math::SqrtOp::create(B, Loc, Sum);
+      } else {
+        Res = mlir::math::AbsFOp::create(B, Loc, X);
+      }
+      Len.replaceAllUsesWith(Res);
+      Len.erase();
+    } else if (auto Dist = mlir::dyn_cast<mlir::spirv::GLDistanceOp>(Op)) {
+      mlir::Value Diff =
+          mlir::LLVM::FSubOp::create(B, Loc, Dist->getOperand(0),
+                                     Dist->getOperand(1));
+      mlir::Value Res;
+      if (mlir::isa<mlir::VectorType>(Diff.getType())) {
+        mlir::Value Sum = emitFloatDot(Diff, Diff);
+        Res = mlir::math::SqrtOp::create(B, Loc, Sum);
+      } else {
+        Res = mlir::math::AbsFOp::create(B, Loc, Diff);
+      }
+      Dist.replaceAllUsesWith(Res);
+      Dist.erase();
+    } else if (auto Cross = mlir::dyn_cast<mlir::spirv::GLCrossOp>(Op)) {
+      mlir::Value A = Cross->getOperand(0);
+      mlir::Value BVal = Cross->getOperand(1);
+      auto VTy = mlir::cast<mlir::VectorType>(A.getType());
+      auto c0 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, int32_t(0));
+      auto c1 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, int32_t(1));
+      auto c2 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, int32_t(2));
+      mlir::Value ax = mlir::LLVM::ExtractElementOp::create(B, Loc, A, c0);
+      mlir::Value ay = mlir::LLVM::ExtractElementOp::create(B, Loc, A, c1);
+      mlir::Value az = mlir::LLVM::ExtractElementOp::create(B, Loc, A, c2);
+      mlir::Value bx = mlir::LLVM::ExtractElementOp::create(B, Loc, BVal, c0);
+      mlir::Value by = mlir::LLVM::ExtractElementOp::create(B, Loc, BVal, c1);
+      mlir::Value bz = mlir::LLVM::ExtractElementOp::create(B, Loc, BVal, c2);
+      mlir::Value rx = mlir::LLVM::FSubOp::create(
+          B, Loc, mlir::LLVM::FMulOp::create(B, Loc, ay, bz),
+          mlir::LLVM::FMulOp::create(B, Loc, az, by));
+      mlir::Value ry = mlir::LLVM::FSubOp::create(
+          B, Loc, mlir::LLVM::FMulOp::create(B, Loc, az, bx),
+          mlir::LLVM::FMulOp::create(B, Loc, ax, bz));
+      mlir::Value rz = mlir::LLVM::FSubOp::create(
+          B, Loc, mlir::LLVM::FMulOp::create(B, Loc, ax, by),
+          mlir::LLVM::FMulOp::create(B, Loc, ay, bx));
+      mlir::Value Res = mlir::LLVM::UndefOp::create(B, Loc, VTy);
+      Res = mlir::LLVM::InsertElementOp::create(B, Loc, Res, rx, c0);
+      Res = mlir::LLVM::InsertElementOp::create(B, Loc, Res, ry, c1);
+      Res = mlir::LLVM::InsertElementOp::create(B, Loc, Res, rz, c2);
+      Cross.replaceAllUsesWith(Res);
+      Cross.erase();
+    } else if (auto Refl = mlir::dyn_cast<mlir::spirv::GLReflectOp>(Op)) {
+      mlir::Value I = Refl->getOperand(0);
+      mlir::Value N = Refl->getOperand(1);
+      mlir::Value D = emitFloatDot(N, I);
+      mlir::Value Two = mkFloatConst(D.getType(), 2.0);
+      mlir::Value TwoD = mlir::LLVM::FMulOp::create(B, Loc, Two, D);
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(N.getType()))
+        TwoD = splatScalar(TwoD, VTy);
+      mlir::Value Scaled = mlir::LLVM::FMulOp::create(B, Loc, TwoD, N);
+      mlir::Value Res = mlir::LLVM::FSubOp::create(B, Loc, I, Scaled);
+      Refl.replaceAllUsesWith(Res);
+      Refl.erase();
+    } else if (auto Sm = mlir::dyn_cast<mlir::spirv::GLSmoothStepOp>(Op)) {
+      mlir::Value Edge0 = Sm->getOperand(0);
+      mlir::Value Edge1 = Sm->getOperand(1);
+      mlir::Value X = Sm->getOperand(2);
+      mlir::Type Ty = X.getType();
+      mlir::Value Num = mlir::LLVM::FSubOp::create(B, Loc, X, Edge0);
+      mlir::Value Den = mlir::LLVM::FSubOp::create(B, Loc, Edge1, Edge0);
+      mlir::Value Ratio = mlir::LLVM::FDivOp::create(B, Loc, Num, Den);
+      mlir::Value ClampedLo = mlir::LLVM::MaxNumOp::create(
+          B, Loc, Ratio, mkFloatConst(Ty, 0.0));
+      mlir::Value T = mlir::LLVM::MinNumOp::create(B, Loc, ClampedLo,
+                                                   mkFloatConst(Ty, 1.0));
+      mlir::Value TT = mlir::LLVM::FMulOp::create(B, Loc, T, T);
+      mlir::Value TwoT =
+          mlir::LLVM::FMulOp::create(B, Loc, mkFloatConst(Ty, 2.0), T);
+      mlir::Value ThreeMinus2T =
+          mlir::LLVM::FSubOp::create(B, Loc, mkFloatConst(Ty, 3.0), TwoT);
+      mlir::Value Res = mlir::LLVM::FMulOp::create(B, Loc, TT, ThreeMinus2T);
+      Sm.replaceAllUsesWith(Res);
+      Sm.erase();
+    } else if (auto Pack = mlir::dyn_cast<mlir::spirv::GLPackHalf2x16Op>(Op)) {
+      auto F16V2Ty = mlir::VectorType::get({2}, B.getF16Type());
+      mlir::Value H2 =
+          mlir::LLVM::FPTruncOp::create(B, Loc, F16V2Ty, Pack.getOperand());
+      mlir::Value Bits = mlir::LLVM::BitcastOp::create(B, Loc, I32Ty, H2);
+      Pack.replaceAllUsesWith(
+          castFromSignless(B, Loc, Bits, Pack.getType()));
+      Pack.erase();
+    } else if (auto Unpack =
+                   mlir::dyn_cast<mlir::spirv::GLUnpackHalf2x16Op>(Op)) {
+      auto F16V2Ty = mlir::VectorType::get({2}, B.getF16Type());
+      mlir::Value S = castToSignless(B, Loc, Unpack.getOperand());
+      mlir::Value H2 = mlir::LLVM::BitcastOp::create(B, Loc, F16V2Ty, S);
+      mlir::Value Res =
+          mlir::LLVM::FPExtOp::create(B, Loc, Unpack.getType(), H2);
+      Unpack.replaceAllUsesWith(Res);
+      Unpack.erase();
+    } else if (auto FLsb = mlir::dyn_cast<mlir::spirv::GLFindILsbOp>(Op)) {
+      mlir::Type OrigTy = FLsb.getType();
+      mlir::Value X = castToSignless(B, Loc, FLsb.getOperand());
+      mlir::Type Ty = X.getType();
+      mlir::Value Ctz = mlir::LLVM::CountTrailingZerosOp::create(
+          B, Loc, X, /*is_zero_poison=*/false);
+      mlir::Value IsZero = mlir::LLVM::ICmpOp::create(
+          B, Loc, mlir::LLVM::ICmpPredicate::eq, X, mkIntConst(Ty, 0));
+      mlir::Value Mask = mlir::LLVM::SExtOp::create(B, Loc, Ty, IsZero);
+      mlir::Value Res = mlir::LLVM::OrOp::create(B, Loc, Ctz, Mask);
+      FLsb.replaceAllUsesWith(castFromSignless(B, Loc, Res, OrigTy));
+      FLsb.erase();
+    } else if (auto FUMsb = mlir::dyn_cast<mlir::spirv::GLFindUMsbOp>(Op)) {
+      mlir::Type OrigTy = FUMsb.getType();
+      mlir::Value X = castToSignless(B, Loc, FUMsb.getOperand());
+      mlir::Type Ty = X.getType();
+      mlir::Type ElemTy = Ty;
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(Ty))
+        ElemTy = VTy.getElementType();
+      int64_t BitsMinus1 =
+          static_cast<int64_t>(ElemTy.getIntOrFloatBitWidth()) - 1;
+      mlir::Value Clz = mlir::LLVM::CountLeadingZerosOp::create(
+          B, Loc, X, /*is_zero_poison=*/false);
+      mlir::Value Res = mlir::LLVM::SubOp::create(
+          B, Loc, mkIntConst(Ty, BitsMinus1), Clz);
+      FUMsb.replaceAllUsesWith(castFromSignless(B, Loc, Res, OrigTy));
+      FUMsb.erase();
+    } else if (auto FSMsb = mlir::dyn_cast<mlir::spirv::GLFindSMsbOp>(Op)) {
+      mlir::Type OrigTy = FSMsb.getType();
+      mlir::Value X = castToSignless(B, Loc, FSMsb.getOperand());
+      mlir::Type Ty = X.getType();
+      mlir::Type ElemTy = Ty;
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(Ty))
+        ElemTy = VTy.getElementType();
+      int64_t BitsMinus1 =
+          static_cast<int64_t>(ElemTy.getIntOrFloatBitWidth()) - 1;
+      mlir::Value SignMask = mlir::LLVM::AShrOp::create(
+          B, Loc, X, mkIntConst(Ty, BitsMinus1));
+      mlir::Value Norm = mlir::LLVM::XOrOp::create(B, Loc, X, SignMask);
+      mlir::Value Clz = mlir::LLVM::CountLeadingZerosOp::create(
+          B, Loc, Norm, /*is_zero_poison=*/false);
+      mlir::Value Res = mlir::LLVM::SubOp::create(
+          B, Loc, mkIntConst(Ty, BitsMinus1), Clz);
+      FSMsb.replaceAllUsesWith(castFromSignless(B, Loc, Res, OrigTy));
+      FSMsb.erase();
     }
   }
 

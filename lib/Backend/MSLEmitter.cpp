@@ -3361,8 +3361,20 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return emitUnaryCall("sin");
   if (mlir::isa<mlir::LLVM::CosOp, mlir::math::CosOp>(Op))
     return emitUnaryCall("cos");
-  if (mlir::isa<mlir::math::TanOp>(Op))
+  if (mlir::isa<mlir::LLVM::TanOp, mlir::math::TanOp>(Op))
     return emitUnaryCall("tan");
+  if (mlir::isa<mlir::LLVM::ASinOp, mlir::math::AsinOp>(Op))
+    return emitUnaryCall("asin");
+  if (mlir::isa<mlir::LLVM::ACosOp, mlir::math::AcosOp>(Op))
+    return emitUnaryCall("acos");
+  if (mlir::isa<mlir::LLVM::ATanOp, mlir::math::AtanOp>(Op))
+    return emitUnaryCall("atan");
+  if (mlir::isa<mlir::LLVM::SinhOp, mlir::math::SinhOp>(Op))
+    return emitUnaryCall("sinh");
+  if (mlir::isa<mlir::LLVM::CoshOp, mlir::math::CoshOp>(Op))
+    return emitUnaryCall("cosh");
+  if (mlir::isa<mlir::LLVM::TanhOp, mlir::math::TanhOp>(Op))
+    return emitUnaryCall("tanh");
   if (mlir::isa<mlir::LLVM::ExpOp, mlir::math::ExpOp>(Op))
     return emitUnaryCall("exp");
   if (mlir::isa<mlir::LLVM::Exp2Op, mlir::math::Exp2Op>(Op))
@@ -3375,7 +3387,7 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return emitUnaryCall("floor");
   if (mlir::isa<mlir::LLVM::FCeilOp, mlir::math::CeilOp>(Op))
     return emitUnaryCall("ceil");
-  if (mlir::isa<mlir::LLVM::TruncOp, mlir::math::TruncOp>(Op))
+  if (mlir::isa<mlir::LLVM::FTruncOp, mlir::math::TruncOp>(Op))
     return emitUnaryCall("trunc");
   if (mlir::isa<mlir::LLVM::RoundEvenOp, mlir::LLVM::RintOp,
                 mlir::math::RoundEvenOp>(Op))
@@ -3388,7 +3400,7 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return emitBinaryCall("max");
   if (mlir::isa<mlir::LLVM::PowOp, mlir::math::PowFOp>(Op))
     return emitBinaryCall("pow");
-  if (mlir::isa<mlir::math::Atan2Op>(Op))
+  if (mlir::isa<mlir::LLVM::ATan2Op, mlir::math::Atan2Op>(Op))
     return emitBinaryCall("atan2");
   if (mlir::isa<mlir::LLVM::CopySignOp, mlir::math::CopySignOp>(Op))
     return emitBinaryCall("copysign");
