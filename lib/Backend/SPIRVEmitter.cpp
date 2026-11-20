@@ -2004,6 +2004,55 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = Ret;
     break;
   }
+  case DXILOp::MakeDouble: {
+    Value *Lo = B.CreateZExt(CI->getArgOperand(1), B.getInt64Ty());
+    Value *Hi = B.CreateShl(B.CreateZExt(CI->getArgOperand(2), B.getInt64Ty()),
+                            B.getInt64(32));
+    Res = B.CreateBitCast(B.CreateOr(Lo, Hi), Type::getDoubleTy(Ctx));
+    break;
+  }
+  case DXILOp::SplitDouble: {
+    Value *Bits = B.CreateBitCast(CI->getArgOperand(1), B.getInt64Ty());
+    Value *Lo = B.CreateTrunc(Bits, B.getInt32Ty());
+    Value *Hi = B.CreateTrunc(B.CreateLShr(Bits, B.getInt64(32)), B.getInt32Ty());
+    Value *Ret = PoisonValue::get(CI->getType());
+    Ret = B.CreateInsertValue(Ret, Lo, {0});
+    Ret = B.CreateInsertValue(Ret, Hi, {1});
+    Res = Ret;
+    break;
+  }
+  case DXILOp::UAddc: {
+    Value *A = CI->getArgOperand(1);
+    Value *BV = CI->getArgOperand(2);
+    Value *Sum = B.CreateAdd(A, BV);
+    Value *Carry = B.CreateICmpULT(Sum, A);
+    auto *ST = cast<StructType>(CI->getType());
+    Value *CarryVal = (ST->getElementType(1)->isIntegerTy(1))
+                          ? Carry
+                          : B.CreateZExt(Carry, ST->getElementType(1));
+    Value *Ret = PoisonValue::get(ST);
+    Ret = B.CreateInsertValue(Ret, Sum, {0});
+    Ret = B.CreateInsertValue(Ret, CarryVal, {1});
+    Res = Ret;
+    break;
+  }
+  case DXILOp::Dot2AddHalf: {
+    Type *F32 = Type::getFloatTy(Ctx);
+    Value *Acc = CI->getArgOperand(1);
+    Value *A0 = B.CreateFPExt(CI->getArgOperand(2), F32);
+    Value *A1 = B.CreateFPExt(CI->getArgOperand(3), F32);
+    Value *B0 = B.CreateFPExt(CI->getArgOperand(4), F32);
+    Value *B1 = B.CreateFPExt(CI->getArgOperand(5), F32);
+    Value *Prod = B.CreateFAdd(B.CreateFMul(A0, B0), B.CreateFMul(A1, B1));
+    Res = B.CreateFAdd(Acc, Prod);
+    break;
+  }
+  case DXILOp::CheckAccessFullyMapped: {
+    // Non-sparse resources are always fully mapped; return status != 0.
+    Res = B.CreateICmpNE(CI->getArgOperand(1),
+                         ConstantInt::get(CI->getArgOperand(1)->getType(), 0));
+    break;
+  }
   default:
     return makeError("SPIR-V backend: unsupported math/bit op {0}",
                      static_cast<unsigned>(Op));
@@ -2211,6 +2260,11 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::Dot4AddU8Packed:
   case DXILOp::Pack4x8:
   case DXILOp::Unpack4x8:
+  case DXILOp::MakeDouble:
+  case DXILOp::SplitDouble:
+  case DXILOp::UAddc:
+  case DXILOp::Dot2AddHalf:
+  case DXILOp::CheckAccessFullyMapped:
     return lowerMathOrBitOp(CI, Op);
 
   case DXILOp::Discard:
