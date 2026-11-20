@@ -3343,8 +3343,18 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return emitBinaryCall("max");
   if (mlir::isa<mlir::LLVM::PowOp, mlir::math::PowFOp>(Op))
     return emitBinaryCall("pow");
+  if (mlir::isa<mlir::math::Atan2Op>(Op))
+    return emitBinaryCall("atan2");
   if (mlir::isa<mlir::LLVM::CopySignOp, mlir::math::CopySignOp>(Op))
     return emitBinaryCall("copysign");
+  if (mlir::isa<mlir::LLVM::AbsOp>(Op)) {
+    auto A = exprFor(Op->getOperand(0), PrecUnknown);
+    if (!A)
+      return A.takeError();
+    mlir::Type T = Op->getResult(0).getType();
+    return Expr{unsignedView(T, "abs(" + signedView(T, A->Text) + ")"),
+                PrecPrimary};
+  }
   if (mlir::isa<mlir::LLVM::FMAOp, mlir::LLVM::FMulAddOp, mlir::math::FmaOp>(
           Op)) {
     auto A = exprFor(Op->getOperand(0), PrecUnknown);
