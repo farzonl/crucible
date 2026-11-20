@@ -1992,9 +1992,24 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
   case DXILOp::Bfrev:
     Res = CallUnary(Intrinsic::bitreverse);
     break;
-  case DXILOp::Countbits:
-    Res = CallUnary(Intrinsic::ctpop);
+  case DXILOp::Countbits: {
+    Value *X = CI->getArgOperand(1);
+    unsigned Bits = X->getType()->getIntegerBitWidth();
+    Function *Ctpop32 =
+        Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctpop, {B.getInt32Ty()});
+    if (Bits == 32) {
+      Res = B.CreateCall(Ctpop32, {X});
+    } else if (Bits < 32) {
+      Res = B.CreateCall(Ctpop32, {B.CreateZExt(X, B.getInt32Ty())});
+    } else if (Bits == 64) {
+      Value *Lo = B.CreateTrunc(X, B.getInt32Ty());
+      Value *Hi = B.CreateTrunc(B.CreateLShr(X, B.getInt64(32)), B.getInt32Ty());
+      Res = B.CreateAdd(B.CreateCall(Ctpop32, {Lo}), B.CreateCall(Ctpop32, {Hi}));
+    } else {
+      Res = CallUnary(Intrinsic::ctpop);
+    }
     break;
+  }
   case DXILOp::FirstbitLo: {
     Value *X = CI->getArgOperand(1);
     Function *Fn = Intrinsic::getOrInsertDeclaration(
@@ -2002,18 +2017,33 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = B.CreateCall(Fn, {X});
     break;
   }
-  case DXILOp::FirstbitHi: {
-    Value *X = CI->getArgOperand(1);
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_firstbituhigh, {X->getType()});
-    Res = B.CreateCall(Fn, {X});
-    break;
-  }
+  case DXILOp::FirstbitHi:
   case DXILOp::FirstbitSHi: {
     Value *X = CI->getArgOperand(1);
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_firstbitshigh, {X->getType()});
-    Res = B.CreateCall(Fn, {X});
+    unsigned Bits = X->getType()->getIntegerBitWidth();
+    bool IsSigned = (Op == DXILOp::FirstbitSHi);
+    if (IsSigned) {
+      Value *IsNeg = B.CreateICmpSLT(X, ConstantInt::get(X->getType(), 0));
+      X = B.CreateSelect(IsNeg, B.CreateNot(X), X);
+    }
+    Function *UMsb32 = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_firstbituhigh, {B.getInt32Ty()});
+    Value *Neg1 = B.getInt32(-1);
+    if (Bits == 64) {
+      Value *Lo = B.CreateTrunc(X, B.getInt32Ty());
+      Value *Hi = B.CreateTrunc(B.CreateLShr(X, B.getInt64(32)), B.getInt32Ty());
+      Value *HiMsb = B.CreateCall(UMsb32, {Hi});
+      Value *LoMsb = B.CreateCall(UMsb32, {Lo});
+      Value *LoRes = B.CreateSelect(B.CreateICmpEQ(LoMsb, Neg1), Neg1,
+                                    B.CreateSub(B.getInt32(63), LoMsb));
+      Res = B.CreateSelect(B.CreateICmpEQ(HiMsb, Neg1), LoRes,
+                           B.CreateSub(B.getInt32(31), HiMsb));
+    } else {
+      Value *X32 = (Bits < 32) ? B.CreateZExt(X, B.getInt32Ty()) : X;
+      Value *Msb = B.CreateCall(UMsb32, {X32});
+      Res = B.CreateSelect(B.CreateICmpEQ(Msb, Neg1), Neg1,
+                           B.CreateSub(B.getInt32(Bits - 1), Msb));
+    }
     break;
   }
   case DXILOp::FMax:
