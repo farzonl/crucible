@@ -73,6 +73,8 @@ std::string signedView(mlir::Type T, StringRef Value) {
     return "(-int(" + Value.str() + "))";
   if (auto VT = mlir::dyn_cast<mlir::VectorType>(T)) {
     mlir::Type E = VT.getElementType();
+    if (E.isInteger(1))
+      return "(-int" + std::to_string(VT.getNumElements()) + "(" + Value.str() + "))";
     StringRef Base = E.isInteger(8) ? "char" : E.isInteger(16) ? "short" : E.isInteger(64) ? "long" : "int";
     return ("as_type<" + Base + std::to_string(VT.getNumElements()) + ">(" + Value + ")").str();
   }
@@ -2911,27 +2913,35 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   }
 
   if (auto Sel = mlir::dyn_cast<SelectOp>(Op)) {
-    auto C = exprFor(Sel.getCondition(), PrecLOr);
+    bool VecCond = mlir::isa<mlir::VectorType>(Sel.getCondition().getType());
+    auto C = exprFor(Sel.getCondition(), VecCond ? PrecUnknown : PrecLOr);
     if (!C)
       return C.takeError();
-    auto T = exprFor(Sel.getTrueValue(), PrecTernary);
+    auto T = exprFor(Sel.getTrueValue(), VecCond ? PrecUnknown : PrecTernary);
     if (!T)
       return T.takeError();
-    auto F = exprFor(Sel.getFalseValue(), PrecTernary);
+    auto F = exprFor(Sel.getFalseValue(), VecCond ? PrecUnknown : PrecTernary);
     if (!F)
       return F.takeError();
+    if (VecCond)
+      return Expr{"select(" + F->Text + ", " + T->Text + ", " + C->Text + ")",
+                  PrecPrimary};
     return Expr{C->Text + " ? " + T->Text + " : " + F->Text, PrecTernary};
   }
   if (auto Sel = mlir::dyn_cast<mlir::arith::SelectOp>(Op)) {
-    auto C = exprFor(Sel.getCondition(), PrecLOr);
+    bool VecCond = mlir::isa<mlir::VectorType>(Sel.getCondition().getType());
+    auto C = exprFor(Sel.getCondition(), VecCond ? PrecUnknown : PrecLOr);
     if (!C)
       return C.takeError();
-    auto T = exprFor(Sel.getTrueValue(), PrecTernary);
+    auto T = exprFor(Sel.getTrueValue(), VecCond ? PrecUnknown : PrecTernary);
     if (!T)
       return T.takeError();
-    auto F = exprFor(Sel.getFalseValue(), PrecTernary);
+    auto F = exprFor(Sel.getFalseValue(), VecCond ? PrecUnknown : PrecTernary);
     if (!F)
       return F.takeError();
+    if (VecCond)
+      return Expr{"select(" + F->Text + ", " + T->Text + ", " + C->Text + ")",
+                  PrecPrimary};
     return Expr{C->Text + " ? " + T->Text + " : " + F->Text, PrecTernary};
   }
 
@@ -2982,9 +2992,13 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     auto DstTy = mslType(DstMlirTy);
     if (!DstTy)
       return DstTy.takeError();
-    if (mlir::isa<TruncOp, mlir::arith::TruncIOp>(Op) &&
-        DstMlirTy.isInteger(1))
-      return Expr{"bool((" + Src->Text + ") & 1u)", PrecPrimary};
+    if (mlir::isa<TruncOp, mlir::arith::TruncIOp>(Op)) {
+      if (DstMlirTy.isInteger(1))
+        return Expr{"bool((" + Src->Text + ") & 1u)", PrecPrimary};
+      if (auto VT = mlir::dyn_cast<mlir::VectorType>(DstMlirTy);
+          VT && VT.getElementType().isInteger(1))
+        return Expr{*DstTy + "((" + Src->Text + ") & 1u)", PrecPrimary};
+    }
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
   }
   if (mlir::isa<SExtOp, SIToFPOp, mlir::arith::ExtSIOp>(Op)) {
@@ -3017,9 +3031,15 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
       StringRef Ty = T.isInteger(16) ? "short" : "int";
       return Expr{unsignedView(T, (Ty + "(" + I64 + ")").str()), PrecPrimary};
     }
-    StringRef Ty = T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
-    return Expr{unsignedView(T, (Ty + "(" + Src->Text + ")").str()),
-                PrecPrimary};
+    std::string Ty;
+    if (auto VT = mlir::dyn_cast<mlir::VectorType>(T)) {
+      mlir::Type E = VT.getElementType();
+      StringRef Base = E.isInteger(8) ? "char" : E.isInteger(16) ? "short" : E.isInteger(64) ? "long" : "int";
+      Ty = (Base + std::to_string(VT.getNumElements())).str();
+    } else {
+      Ty = T.isInteger(8) ? "char" : T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
+    }
+    return Expr{unsignedView(T, Ty + "(" + Src->Text + ")"), PrecPrimary};
   }
   if (mlir::isa<BitcastOp>(Op)) {
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);

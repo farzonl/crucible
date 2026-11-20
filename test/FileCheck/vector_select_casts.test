@@ -1,0 +1,6 @@
+# RUN: %cruciblec %S/../Inputs/vector_select_casts.mlir -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void vec_select_and_fptosi(
+# CHECK: select(float4(1.0f, 1.0f, 1.0f, 1.0f), {{.*}}, {{.*}} > float4(0.0f, 0.0f, 0.0f, 0.0f))
+# CHECK: as_type<uint4>(int4({{.*}}))
