@@ -1306,10 +1306,21 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     return E;
   }
 
-  // Offscreen color attachment image + view.
+  // Offscreen color attachment image + view (+ optional MSAA and depth/stencil).
+  bool HasStencil = P.Stencil && P.Stencil->Enabled;
+  uint32_t SampleCount = std::max<uint32_t>(1u, B.SampleCount);
+  VkSampleCountFlagBits SampleBits = static_cast<VkSampleCountFlagBits>(SampleCount);
+  VkFormat DepthFmt = VK_FORMAT_D32_SFLOAT_S8_UINT;
+
   VkImage ColorImg = VK_NULL_HANDLE;
   VkDeviceMemory ColorMem = VK_NULL_HANDLE;
   VkImageView ColorView = VK_NULL_HANDLE;
+  VkImage MSAAImg = VK_NULL_HANDLE;
+  VkDeviceMemory MSAAMem = VK_NULL_HANDLE;
+  VkImageView MSAAView = VK_NULL_HANDLE;
+  VkImage DepthImg = VK_NULL_HANDLE;
+  VkDeviceMemory DepthMem = VK_NULL_HANDLE;
+  VkImageView DepthView = VK_NULL_HANDLE;
   VkBuffer ReadbackBuf = VK_NULL_HANDLE;
   VkDeviceMemory ReadbackMem = VK_NULL_HANDLE;
   VkBuffer VertBuf = VK_NULL_HANDLE;
@@ -1365,6 +1376,12 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     if (VertMem) vkFreeMemory(VK.Device, VertMem, nullptr);
     if (ReadbackBuf) vkDestroyBuffer(VK.Device, ReadbackBuf, nullptr);
     if (ReadbackMem) vkFreeMemory(VK.Device, ReadbackMem, nullptr);
+    if (DepthView) vkDestroyImageView(VK.Device, DepthView, nullptr);
+    if (DepthImg) vkDestroyImage(VK.Device, DepthImg, nullptr);
+    if (DepthMem) vkFreeMemory(VK.Device, DepthMem, nullptr);
+    if (MSAAView) vkDestroyImageView(VK.Device, MSAAView, nullptr);
+    if (MSAAImg) vkDestroyImage(VK.Device, MSAAImg, nullptr);
+    if (MSAAMem) vkFreeMemory(VK.Device, MSAAMem, nullptr);
     if (ColorView) vkDestroyImageView(VK.Device, ColorView, nullptr);
     if (ColorImg) vkDestroyImage(VK.Device, ColorImg, nullptr);
     if (ColorMem) vkFreeMemory(VK.Device, ColorMem, nullptr);
@@ -1479,26 +1496,163 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   }
 
   // RenderPass & Framebuffer.
+  // Optional MSAA color target.
+  if (SampleCount > 1u) {
+    VkImageCreateInfo MCI{};
+    MCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    MCI.imageType = VK_IMAGE_TYPE_2D;
+    MCI.format = ColorFmt;
+    MCI.extent = {Width, Height, 1};
+    MCI.mipLevels = 1;
+    MCI.arrayLayers = 1;
+    MCI.samples = SampleBits;
+    MCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+    MCI.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    MCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    MCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (VkResult R = vkCreateImage(VK.Device, &MCI, nullptr, &MSAAImg)) {
+      cleanup();
+      return vkErr(R, "vkCreateImage (MSAA)");
+    }
+    VkMemoryRequirements MMR{};
+    vkGetImageMemoryRequirements(VK.Device, MSAAImg, &MMR);
+    auto MMemType =
+        VK.findMemoryType(MMR.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!MMemType)
+      MMemType = VK.findMemoryType(MMR.memoryTypeBits,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (!MMemType) {
+      cleanup();
+      return MMemType.takeError();
+    }
+    VkMemoryAllocateInfo MMAI{};
+    MMAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    MMAI.allocationSize = MMR.size;
+    MMAI.memoryTypeIndex = *MMemType;
+    if (VkResult R = vkAllocateMemory(VK.Device, &MMAI, nullptr, &MSAAMem)) {
+      cleanup();
+      return vkErr(R, "vkAllocateMemory (MSAA)");
+    }
+    vkBindImageMemory(VK.Device, MSAAImg, MSAAMem, 0);
+    VkImageViewCreateInfo MIVCI{};
+    MIVCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    MIVCI.image = MSAAImg;
+    MIVCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    MIVCI.format = ColorFmt;
+    MIVCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (VkResult R = vkCreateImageView(VK.Device, &MIVCI, nullptr, &MSAAView)) {
+      cleanup();
+      return vkErr(R, "vkCreateImageView (MSAA)");
+    }
+  }
+
+  // Depth/stencil attachment image + view.
+  {
+    VkImageCreateInfo DCI{};
+    DCI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    DCI.imageType = VK_IMAGE_TYPE_2D;
+    DCI.format = DepthFmt;
+    DCI.extent = {Width, Height, 1};
+    DCI.mipLevels = 1;
+    DCI.arrayLayers = 1;
+    DCI.samples = SampleBits;
+    DCI.tiling = VK_IMAGE_TILING_OPTIMAL;
+    DCI.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    DCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    DCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (VkResult R = vkCreateImage(VK.Device, &DCI, nullptr, &DepthImg)) {
+      cleanup();
+      return vkErr(R, "vkCreateImage (depth/stencil)");
+    }
+    VkMemoryRequirements DMR{};
+    vkGetImageMemoryRequirements(VK.Device, DepthImg, &DMR);
+    auto DMemType =
+        VK.findMemoryType(DMR.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (!DMemType)
+      DMemType = VK.findMemoryType(DMR.memoryTypeBits,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (!DMemType) {
+      cleanup();
+      return DMemType.takeError();
+    }
+    VkMemoryAllocateInfo DMAI{};
+    DMAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    DMAI.allocationSize = DMR.size;
+    DMAI.memoryTypeIndex = *DMemType;
+    if (VkResult R = vkAllocateMemory(VK.Device, &DMAI, nullptr, &DepthMem)) {
+      cleanup();
+      return vkErr(R, "vkAllocateMemory (depth/stencil)");
+    }
+    vkBindImageMemory(VK.Device, DepthImg, DepthMem, 0);
+    VkImageViewCreateInfo DIVCI{};
+    DIVCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    DIVCI.image = DepthImg;
+    DIVCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    DIVCI.format = DepthFmt;
+    DIVCI.subresourceRange = {
+        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+    if (VkResult R = vkCreateImageView(VK.Device, &DIVCI, nullptr, &DepthView)) {
+      cleanup();
+      return vkErr(R, "vkCreateImageView (depth/stencil)");
+    }
+  }
+
+  std::vector<VkAttachmentDescription> Atts;
   VkAttachmentDescription ColorAtt{};
   ColorAtt.format = ColorFmt;
-  ColorAtt.samples = VK_SAMPLE_COUNT_1_BIT;
+  ColorAtt.samples = SampleBits;
   ColorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-  ColorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  ColorAtt.storeOp = SampleCount > 1u ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                      : VK_ATTACHMENT_STORE_OP_STORE;
   ColorAtt.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   ColorAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   ColorAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  ColorAtt.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  ColorAtt.finalLayout = SampleCount > 1u
+                             ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                             : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  Atts.push_back(ColorAtt);
+
+  VkAttachmentDescription DepthAtt{};
+  DepthAtt.format = DepthFmt;
+  DepthAtt.samples = SampleBits;
+  DepthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  DepthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  DepthAtt.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+  DepthAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  DepthAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  DepthAtt.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  Atts.push_back(DepthAtt);
 
   VkAttachmentReference ColorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkAttachmentReference DepthRef{1,
+                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+  VkAttachmentReference ResolveRef{2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+
+  if (SampleCount > 1u) {
+    VkAttachmentDescription ResolveAtt{};
+    ResolveAtt.format = ColorFmt;
+    ResolveAtt.samples = VK_SAMPLE_COUNT_1_BIT;
+    ResolveAtt.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ResolveAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ResolveAtt.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ResolveAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    ResolveAtt.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ResolveAtt.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    Atts.push_back(ResolveAtt);
+  }
+
   VkSubpassDescription Subpass{};
   Subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   Subpass.colorAttachmentCount = 1;
   Subpass.pColorAttachments = &ColorRef;
+  Subpass.pDepthStencilAttachment = &DepthRef;
+  if (SampleCount > 1u)
+    Subpass.pResolveAttachments = &ResolveRef;
 
   VkRenderPassCreateInfo RPCI{};
   RPCI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  RPCI.attachmentCount = 1;
-  RPCI.pAttachments = &ColorAtt;
+  RPCI.attachmentCount = static_cast<uint32_t>(Atts.size());
+  RPCI.pAttachments = Atts.data();
   RPCI.subpassCount = 1;
   RPCI.pSubpasses = &Subpass;
   if (VkResult R = vkCreateRenderPass(VK.Device, &RPCI, nullptr, &RenderPass)) {
@@ -1506,11 +1660,20 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     return vkErr(R, "vkCreateRenderPass");
   }
 
+  SmallVector<VkImageView, 3> FBViews;
+  if (SampleCount > 1u) {
+    FBViews.push_back(MSAAView);
+    FBViews.push_back(DepthView);
+    FBViews.push_back(ColorView);
+  } else {
+    FBViews.push_back(ColorView);
+    FBViews.push_back(DepthView);
+  }
   VkFramebufferCreateInfo FBCI{};
   FBCI.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
   FBCI.renderPass = RenderPass;
-  FBCI.attachmentCount = 1;
-  FBCI.pAttachments = &ColorView;
+  FBCI.attachmentCount = static_cast<uint32_t>(FBViews.size());
+  FBCI.pAttachments = FBViews.data();
   FBCI.width = Width;
   FBCI.height = Height;
   FBCI.layers = 1;
@@ -2117,12 +2280,33 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   RSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
   RSCI.polygonMode = VK_POLYGON_MODE_FILL;
   RSCI.cullMode = VK_CULL_MODE_NONE;
-  RSCI.frontFace = VK_FRONT_FACE_CLOCKWISE;
+  // Viewport Y is flipped above to match DX clip space, which reverses
+  // screen-space winding; use CCW so SV_IsFrontFace matches DirectX.
+  RSCI.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
   RSCI.lineWidth = 1.0f;
 
   VkPipelineMultisampleStateCreateInfo MSSCI{};
   MSSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  MSSCI.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  MSSCI.rasterizationSamples = SampleBits;
+
+  VkPipelineDepthStencilStateCreateInfo DSSCI{};
+  DSSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+  DSSCI.depthTestEnable = VK_TRUE;
+  DSSCI.depthWriteEnable = VK_TRUE;
+  DSSCI.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+  if (HasStencil) {
+    DSSCI.stencilTestEnable = VK_TRUE;
+    VkStencilOpState StencilOp{};
+    StencilOp.failOp = VK_STENCIL_OP_KEEP;
+    StencilOp.passOp = VK_STENCIL_OP_KEEP;
+    StencilOp.depthFailOp = VK_STENCIL_OP_KEEP;
+    StencilOp.compareOp = vkCompare(P.Stencil->ComparisonOp);
+    StencilOp.compareMask = 0xFFu;
+    StencilOp.writeMask = 0xFFu;
+    StencilOp.reference = 0u;
+    DSSCI.front = StencilOp;
+    DSSCI.back = StencilOp;
+  }
 
   VkPipelineColorBlendAttachmentState CBAtt{};
   CBAtt.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -2141,6 +2325,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   GPCI.pViewportState = &VPSCI;
   GPCI.pRasterizationState = &RSCI;
   GPCI.pMultisampleState = &MSSCI;
+  GPCI.pDepthStencilState = &DSSCI;
   GPCI.pColorBlendState = &CBSCI;
   GPCI.layout = PipeLayout;
   GPCI.renderPass = RenderPass;
@@ -2168,14 +2353,16 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   CBBI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vkBeginCommandBuffer(CB, &CBBI);
 
-  VkClearValue ClearVal{};
+  VkClearValue ClearVals[2]{};
+  ClearVals[1].depthStencil = {
+      1.0f, HasStencil ? static_cast<uint32_t>(P.Stencil->ClearValue) : 0u};
   VkRenderPassBeginInfo RPBI{};
   RPBI.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
   RPBI.renderPass = RenderPass;
   RPBI.framebuffer = FB;
   RPBI.renderArea = {{0, 0}, {Width, Height}};
-  RPBI.clearValueCount = 1;
-  RPBI.pClearValues = &ClearVal;
+  RPBI.clearValueCount = 2;
+  RPBI.pClearValues = ClearVals;
   vkCmdBeginRenderPass(CB, &RPBI, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(CB, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipe);
   if (!DSets.empty()) {

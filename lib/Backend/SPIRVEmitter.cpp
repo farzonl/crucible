@@ -199,6 +199,7 @@ public:
   bool usedImageAtomics() const {
     return !ImgAtomicHelpers.empty() || !ImgCmpXchgHelpers.empty();
   }
+  uint32_t getDepthOutputMode() const { return DepthOutputMode; }
 
 private:
   Module &M;
@@ -215,6 +216,7 @@ private:
       ImgAtomicHelpers;
   DenseMap<std::tuple<uint32_t, uint32_t, Type *>, Function *>
       ImgCmpXchgHelpers;
+  uint32_t DepthOutputMode = 0; // 1=Replacing, 2=Greater, 3=Less
   std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
@@ -2531,11 +2533,23 @@ void SPIRVLowerer::prepareStageInterface() {
       case 14: // SampleIndex
         BuiltIn = 18; // SampleId
         break;
+      case 15: // Coverage
+        BuiltIn = 20; // SampleMask
+        break;
       case 17: // Depth
         BuiltIn = 22; // FragDepth
+        if (IsOutput)
+          DepthOutputMode = 1u;
         break;
-      case 18: // Coverage
-        BuiltIn = 20; // SampleMask
+      case 18: // DepthLessEqual
+        BuiltIn = 22; // FragDepth
+        if (IsOutput)
+          DepthOutputMode = 3u;
+        break;
+      case 19: // DepthGreaterEqual
+        BuiltIn = 22; // FragDepth
+        if (IsOutput)
+          DepthOutputMode = 2u;
         break;
       default:
         break;
@@ -4629,6 +4643,64 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
           I += WC;
         }
         Patched[3] = Bound;
+        Result.assign(reinterpret_cast<const char *>(Patched.data()),
+                      Patched.size() * 4);
+      }
+    }
+  }
+  // Emit OpExecutionMode DepthReplacing / DepthGreater / DepthLess for PS
+  // shaders writing SV_Depth* (BuiltIn FragDepth).
+  if (!Opts.EmitSPIRVAsm && Lowerer.getDepthOutputMode() != 0 &&
+      Result.size() >= 20 && (Result.size() % 4) == 0) {
+    const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
+    size_t NumWords = Result.size() / 4;
+    if (Words[0] == 0x07230203u) {
+      constexpr uint16_t OpEntryPoint = 15;
+      constexpr uint16_t OpExecutionMode = 16;
+      uint32_t EntryId = 0;
+      for (size_t I = 5; I < NumWords;) {
+        uint32_t WC = Words[I] >> 16;
+        uint16_t Op = Words[I] & 0xFFFFu;
+        if (WC == 0 || I + WC > NumWords)
+          break;
+        if (Op == OpEntryPoint && WC >= 3) {
+          EntryId = Words[I + 2];
+          break;
+        }
+        I += WC;
+      }
+      if (EntryId != 0) {
+        std::vector<uint32_t> Patched;
+        Patched.reserve(NumWords + 6);
+        for (size_t I = 0; I < 5; ++I)
+          Patched.push_back(Words[I]);
+        bool Inserted = false;
+        for (size_t I = 5; I < NumWords;) {
+          uint32_t WC = Words[I] >> 16;
+          uint16_t Op = Words[I] & 0xFFFFu;
+          if (WC == 0 || I + WC > NumWords)
+            break;
+          for (uint32_t K = 0; K < WC; ++K)
+            Patched.push_back(Words[I + K]);
+          if (!Inserted && Op == OpExecutionMode && WC >= 2 &&
+              Words[I + 1] == EntryId) {
+            // OpExecutionMode %entry DepthReplacing (12)
+            Patched.push_back((3u << 16) | OpExecutionMode);
+            Patched.push_back(EntryId);
+            Patched.push_back(12u);
+            if (Lowerer.getDepthOutputMode() == 2u) {
+              Patched.push_back((3u << 16) | OpExecutionMode);
+              Patched.push_back(EntryId);
+              Patched.push_back(14u); // DepthGreater
+            } else if (Lowerer.getDepthOutputMode() == 3u) {
+              Patched.push_back((3u << 16) | OpExecutionMode);
+              Patched.push_back(EntryId);
+              Patched.push_back(15u); // DepthLess
+            }
+            Inserted = true;
+          }
+          I += WC;
+        }
         Result.assign(reinterpret_cast<const char *>(Patched.data()),
                       Patched.size() * 4);
       }
