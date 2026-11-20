@@ -1295,7 +1295,7 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, ID,
         {B.getFloatTy(), TexRH->SpvHandleTy, SampRH->SpvHandleTy,
-         Coord->getType(), CmpVal->getType(), Offset->getType()});
+         Coord->getType(), Offset->getType()});
     Value *Scalar = B.CreateCall(
         Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
     Value *Res = PoisonValue::get(RetStructTy);
@@ -1344,7 +1344,7 @@ Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_gather_cmp,
         {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
-         CmpVal->getType(), Offset->getType()});
+         Offset->getType()});
     ResVec = B.CreateCall(
         Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
   } else {
@@ -1352,7 +1352,7 @@ Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_gather,
         {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
-         Channel->getType(), Offset->getType()});
+         Offset->getType()});
     ResVec = B.CreateCall(
         Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Channel, Offset});
   }
