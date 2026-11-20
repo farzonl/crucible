@@ -3214,8 +3214,33 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
       Fn = "simd_xor";
       break;
     }
+    bool IsFloat = mlir::isa<mlir::FloatType>(T);
+    bool IsAdd = Red.getOp() == mlir::gpu::AllReduceOperation::ADD;
+    bool IsMul = Red.getOp() == mlir::gpu::AllReduceOperation::MUL;
+    bool IsExclusive = Scan == "exclusive";
+    bool IsInclusive = Scan == "inclusive";
     if (IsSigned)
       return Expr{unsignedView(T, (Fn + "(" + signedView(T, V->Text) + ")").str()),
+                  PrecPrimary};
+    if (IsExclusive && Fn == "simd_prefix_exclusive_sum" && IsFloat) {
+      requireHelper("crucible_wave_prefix_sum");
+      Fn = "crucible_wave_prefix_sum";
+    }
+    if (T.isInteger(16) && IsAdd && !IsInclusive) {
+      // Some Metal compilers merge identical narrow reductions across
+      // different control-flow masks. Capture the participating lanes.
+      requireHelper("crucible_wave_wide");
+      UsesLane |= IsExclusive;
+      return Expr{std::string("ushort(crucible_wave_wide<ulong, 0, ") +
+                      (IsExclusive ? "true>(ulong(" : "false>(ulong(") +
+                      V->Text + "), " + (IsExclusive ? "lane" : "0u") + "))",
+                  PrecPrimary};
+    }
+    if (T.isInteger(16) && IsMul)
+      return Expr{"ushort(" + Fn.str() + "(uint(" + V->Text + ")))",
+                  PrecPrimary};
+    if (T.isF16() && (IsAdd || IsMul))
+      return Expr{"half(" + Fn.str() + "(float(" + V->Text + ")))",
                   PrecPrimary};
     return Expr{(Fn + "(" + V->Text + ")").str(), PrecPrimary};
   }

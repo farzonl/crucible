@@ -21,13 +21,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1
 
       - name: Install DXC (from Vulkan SDK)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           mkdir -p .sdk/bin .sdk/lib
-          VULKAN_VER="1.4.357.0"
+          VULKAN_VER="1.4.363.1"
           curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/linux/vulkansdk-linux-x86_64-${VULKAN_VER}.tar.xz" -o /tmp/vulkansdk.tar.xz
           tar -xf /tmp/vulkansdk.tar.xz -C /tmp
           cp -a /tmp/${VULKAN_VER}/x86_64/bin/dxc* .sdk/bin/
@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1
 
       - name: Install build dependencies
         run: |
@@ -79,7 +79,7 @@ jobs:
           path: lit-results.json
 
   build-test-macos:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -88,13 +88,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1
 
       - name: Install DXC (from Vulkan SDK)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           mkdir -p .sdk/bin .sdk/lib
-          VULKAN_VER="1.4.357.0"
+          VULKAN_VER="1.4.363.1"
           curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
           unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
           INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
@@ -109,7 +109,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1
 
       - name: Install build dependencies
         run: |
