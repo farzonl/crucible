@@ -2960,26 +2960,85 @@ void SPIRVLowerer::fixupExistingAtomics(Function &F) {
 
 void SPIRVLowerer::normalizeArrayGlobalAccesses(Function &F) {
   auto FixPtr = [&](Instruction *I, unsigned PtrOpIdx, Type *AccessTy) {
-    auto *GV = dyn_cast<GlobalVariable>(I->getOperand(PtrOpIdx));
-    if (!GV)
+    Value *Ptr = I->getOperand(PtrOpIdx);
+    Type *BaseTy = nullptr;
+    if (auto *GV = dyn_cast<GlobalVariable>(Ptr))
+      BaseTy = GV->getValueType();
+    else if (auto *AI = dyn_cast<AllocaInst>(Ptr))
+      BaseTy = AI->getAllocatedType();
+    if (!BaseTy || BaseTy == AccessTy)
       return;
-    Type *GVTy = GV->getValueType();
-    if (!isa<ArrayType>(GVTy) || GVTy == AccessTy)
+    if (!isa<ArrayType>(BaseTy) && !isa<StructType>(BaseTy))
       return;
     IRBuilder<> B(I);
     SmallVector<Value *, 4> Indices;
     Indices.push_back(B.getInt32(0));
-    Type *Cur = GVTy;
-    while (auto *AT = dyn_cast<ArrayType>(Cur)) {
-      Indices.push_back(B.getInt32(0));
-      Cur = AT->getElementType();
-      if (Cur == AccessTy)
+    Type *Cur = BaseTy;
+    while (Cur != AccessTy) {
+      if (auto *AT = dyn_cast<ArrayType>(Cur)) {
+        Indices.push_back(B.getInt32(0));
+        Cur = AT->getElementType();
+      } else if (auto *ST = dyn_cast<StructType>(Cur);
+                 ST && ST->getNumElements() > 0) {
+        Indices.push_back(B.getInt32(0));
+        Cur = ST->getElementType(0);
+      } else {
         break;
+      }
     }
-    auto *GEP = GetElementPtrInst::CreateInBounds(GVTy, GV, Indices, "",
+    if (Indices.size() <= 1)
+      return;
+    auto *GEP = GetElementPtrInst::CreateInBounds(BaseTy, Ptr, Indices, "",
                                                   I->getIterator());
     I->setOperand(PtrOpIdx, GEP);
   };
+
+  // Rewrite `gep ElemTy, ptr %arr, idx` (or `gep i8, ptr %arr, byteOff`) on an
+  // `alloca [N x ElemTy]` or global `[N x ElemTy]` back into
+  // `gep [N x ElemTy], ptr %arr, i32 0, elemIdx` so LLVM's SPIR-V backend does
+  // not insert a `spv_ptrcast` that crashes SPIRVLegalizePointerCast.
+  SmallVector<GetElementPtrInst *, 16> GEPsToRewrite;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+        GEPsToRewrite.push_back(GEP);
+    }
+  }
+  const DataLayout &DL = M.getDataLayout();
+  for (GetElementPtrInst *GEP : GEPsToRewrite) {
+    Value *Ptr = GEP->getPointerOperand();
+    Type *BaseTy = nullptr;
+    if (auto *GV = dyn_cast<GlobalVariable>(Ptr))
+      BaseTy = GV->getValueType();
+    else if (auto *AI = dyn_cast<AllocaInst>(Ptr))
+      BaseTy = AI->getAllocatedType();
+    auto *AT = dyn_cast_or_null<ArrayType>(BaseTy);
+    if (!AT || GEP->getSourceElementType() == BaseTy || GEP->getNumIndices() != 1)
+      continue;
+    Type *ElemTy = AT->getElementType();
+    Value *Idx = GEP->getOperand(1);
+    IRBuilder<> B(GEP);
+    Value *ElemIdx = nullptr;
+    if (GEP->getSourceElementType() == ElemTy) {
+      ElemIdx = Idx;
+    } else if (GEP->getSourceElementType()->isIntegerTy(8)) {
+      uint64_t ElemSize = DL.getTypeAllocSize(ElemTy);
+      if (ElemSize > 0 && isPowerOf2_64(ElemSize)) {
+        unsigned Shift = llvm::Log2_64(ElemSize);
+        ElemIdx = (Shift == 0)
+                      ? Idx
+                      : B.CreateAShr(Idx, ConstantInt::get(Idx->getType(), Shift));
+      } else if (ElemSize > 0) {
+        ElemIdx = B.CreateSDiv(Idx, ConstantInt::get(Idx->getType(), ElemSize));
+      }
+    }
+    if (!ElemIdx)
+      continue;
+    Value *NewGEP =
+        B.CreateInBoundsGEP(BaseTy, Ptr, {B.getInt32(0), ElemIdx}, GEP->getName());
+    GEP->replaceAllUsesWith(NewGEP);
+    GEP->eraseFromParent();
+  }
 
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
@@ -3164,7 +3223,7 @@ Expected<std::string> emitSPIRV(Module &M, Function *Entry, Reflection &Reflect,
   TargetOptions TOpts;
   std::unique_ptr<TargetMachine> TM(T->createTargetMachine(
       TheTriple, /*CPU=*/"", /*Features=*/"", TOpts, Reloc::Static,
-      CodeModel::Small, CodeGenOptLevel::Default));
+      CodeModel::Small, CodeGenOptLevel::None));
   if (!TM)
     return makeError("failed to create SPIR-V TargetMachine for '{0}'",
                      TripleStr);
