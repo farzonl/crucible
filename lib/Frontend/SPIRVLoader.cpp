@@ -246,7 +246,27 @@ mlir::Type makeSignless(mlir::Type T, mlir::OpBuilder &B) {
     if (!IT.isSignless())
       return B.getIntegerType(IT.getWidth());
   }
+  if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T)) {
+    mlir::Type E = makeSignless(Vec.getElementType(), B);
+    if (E != Vec.getElementType())
+      return mlir::VectorType::get(Vec.getShape(), E);
+  }
   return T;
+}
+
+mlir::Value castToSignless(mlir::OpBuilder &B, mlir::Location Loc,
+                           mlir::Value V) {
+  mlir::Type DstTy = makeSignless(V.getType(), B);
+  if (DstTy == V.getType())
+    return V;
+  return mlir::spirv::BitcastOp::create(B, Loc, DstTy, V);
+}
+
+mlir::Value castFromSignless(mlir::OpBuilder &B, mlir::Location Loc,
+                             mlir::Value V, mlir::Type OrigTy) {
+  if (OrigTy == V.getType())
+    return V;
+  return mlir::spirv::BitcastOp::create(B, Loc, OrigTy, V);
 }
 
 mlir::LLVM::LLVMStructType getHandleType(mlir::MLIRContext *Ctx) {
@@ -735,6 +755,31 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       SmallVector<mlir::Operation *, 4> Loads(AO->getUsers().begin(),
                                               AO->getUsers().end());
       for (mlir::Operation *U : Loads) {
+        if (auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
+          if (Chain.getIndices().size() != 1)
+            return makeError("unsupported access chain on built-in '{0}'", Sym);
+          auto ConstComp = getConstSpirvInt(Chain.getIndices()[0]);
+          if (!ConstComp)
+            return makeError("dynamic index on built-in '{0}'", Sym);
+          uint32_t Comp = static_cast<uint32_t>(*ConstComp);
+          SmallVector<mlir::Operation *, 4> CLoads(Chain->getUsers().begin(),
+                                                   Chain->getUsers().end());
+          for (mlir::Operation *CLU : CLoads) {
+            auto CLoad = mlir::dyn_cast<mlir::spirv::LoadOp>(CLU);
+            if (!CLoad)
+              return makeError("unsupported user of built-in chain '{0}'", Sym);
+            mlir::OpBuilder B(CLoad);
+            mlir::Value Rep =
+                emitGPUIdComponent(B, CLoad.getLoc(), BI, Comp, CLoad.getType());
+            if (!Rep)
+              return makeError("unsupported SPIR-V built-in '{0}'", Sym);
+            Rep = castFromSignless(B, CLoad.getLoc(), Rep, CLoad.getType());
+            CLoad.replaceAllUsesWith(Rep);
+            CLoad.erase();
+          }
+          Chain.erase();
+          continue;
+        }
         auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(U);
         if (!Load)
           return makeError("unsupported user of built-in global '{0}'", Sym);
@@ -806,58 +851,165 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           return makeError("unsupported access pattern on buffer '{0}'", Sym);
 
         mlir::Value ElemIdx = Chain.getIndices()[1];
+        // Compute sub-element byte offset (constant or dynamic) for struct/
+        // array/vector fields.
+        auto computeByteOff = [&](mlir::OpBuilder &B,
+                                  mlir::Location Loc) -> Expected<mlir::Value> {
+          uint32_t ConstOff = 0;
+          mlir::Value DynOff;
+          mlir::Type CurTy = Info.ElemType;
+          for (size_t K = 2; K < Chain.getIndices().size(); ++K) {
+            mlir::Value IdxV = Chain.getIndices()[K];
+            auto CIdx = getConstSpirvInt(IdxV);
+            if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
+              if (!CIdx)
+                return makeError("dynamic struct index on buffer '{0}'", Sym);
+              uint32_t I = static_cast<uint32_t>(*CIdx);
+              ConstOff += ST.getMemberOffset(I);
+              CurTy = ST.getElementType(I);
+            } else if (auto Arr =
+                           mlir::dyn_cast<mlir::spirv::ArrayType>(CurTy)) {
+              uint32_t S = Arr.getArrayStride();
+              if (S == 0)
+                S = spirvTypeBytes(Arr.getElementType());
+              if (CIdx) {
+                ConstOff += static_cast<uint32_t>(*CIdx) * S;
+              } else {
+                mlir::Value Idx32 = castToSignless(B, Loc, IdxV);
+                auto StrideC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(S));
+                mlir::Value Term =
+                    mlir::LLVM::MulOp::create(B, Loc, Idx32, StrideC);
+                DynOff = DynOff
+                             ? mlir::Value(
+                                   mlir::LLVM::AddOp::create(B, Loc, DynOff, Term))
+                             : Term;
+              }
+              CurTy = Arr.getElementType();
+            } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(CurTy)) {
+              uint32_t S = scalarTypeBytes(Vec.getElementType());
+              if (CIdx) {
+                ConstOff += static_cast<uint32_t>(*CIdx) * S;
+              } else {
+                mlir::Value Idx32 = castToSignless(B, Loc, IdxV);
+                auto StrideC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(S));
+                mlir::Value Term =
+                    mlir::LLVM::MulOp::create(B, Loc, Idx32, StrideC);
+                DynOff = DynOff
+                             ? mlir::Value(
+                                   mlir::LLVM::AddOp::create(B, Loc, DynOff, Term))
+                             : Term;
+              }
+              CurTy = Vec.getElementType();
+            }
+          }
+          mlir::Value Base = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty, static_cast<int32_t>(ConstOff));
+          if (DynOff) {
+            if (ConstOff == 0)
+              return DynOff;
+            return mlir::Value(mlir::LLVM::AddOp::create(B, Loc, Base, DynOff));
+          }
+          return Base;
+        };
         SmallVector<mlir::Operation *, 8> MemUsers(Chain->getUsers().begin(),
                                                    Chain->getUsers().end());
         for (mlir::Operation *MU : MemUsers) {
           if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
             mlir::OpBuilder B(Load);
             mlir::Location Loc = Load.getLoc();
-            mlir::Type ValTy = makeSignless(Load.getType(), B);
-            auto ResRetTy = getOrInitResRetType(&Ctx, ValTy);
-            std::string Callee = "dx.op.rawBufferLoad." + typeSuffix(ValTy);
+            auto OffValOrErr = computeByteOff(B, Loc);
+            if (!OffValOrErr)
+              return OffValOrErr.takeError();
+            mlir::Value OffC = *OffValOrErr;
+            mlir::Type OrigTy = Load.getType();
+            auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy);
+            mlir::Type ScalarTy = makeSignless(
+                VecTy ? VecTy.getElementType() : OrigTy, B);
+            unsigned NumComps =
+                VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
+            uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
+            auto ResRetTy = getOrInitResRetType(&Ctx, ScalarTy);
+            std::string Callee = "dx.op.rawBufferLoad." + typeSuffix(ScalarTy);
             auto FnTy = mlir::LLVM::LLVMFunctionType::get(
                 ResRetTy, {I32Ty, HandleTy, I32Ty, I32Ty, I8Ty, I32Ty});
             getOrCreateDecl(SpvModule, Callee, FnTy);
 
+            mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
             auto OpC = mlir::LLVM::ConstantOp::create(
                 B, Loc, I32Ty, static_cast<int32_t>(DXILOp::RawBufferLoad));
-            auto OffC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
             auto MaskC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I8Ty, static_cast<int8_t>(1));
+                B, Loc, I8Ty, static_cast<int8_t>(Mask));
             auto AlignC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(Info.ElemStride));
+                B, Loc, I32Ty, static_cast<int32_t>(scalarTypeBytes(ScalarTy)));
 
             auto Call = mlir::LLVM::CallOp::create(
                 B, Loc, mlir::TypeRange{ResRetTy}, Callee,
-                mlir::ValueRange{OpC, Handle, ElemIdx, OffC, MaskC, AlignC});
-            auto Val = mlir::LLVM::ExtractValueOp::create(
-                B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
-            Load.replaceAllUsesWith(Val.getResult());
+                mlir::ValueRange{OpC, Handle, IdxVal, OffC, MaskC, AlignC});
+            mlir::Value ResultVal;
+            if (!VecTy) {
+              ResultVal = mlir::LLVM::ExtractValueOp::create(
+                  B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
+            } else {
+              mlir::Type SignlessVecTy = makeSignless(VecTy, B);
+              mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+              for (unsigned C = 0; C < NumComps && C < 4; ++C) {
+                auto VC = mlir::LLVM::ExtractValueOp::create(
+                    B, Loc, Call.getResult(), ArrayRef<int64_t>{C});
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(C));
+                Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
+              }
+              ResultVal = Vec;
+            }
+            ResultVal = castFromSignless(B, Loc, ResultVal, OrigTy);
+            Load.replaceAllUsesWith(ResultVal);
             Load.erase();
           } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(MU)) {
             mlir::OpBuilder B(Store);
             mlir::Location Loc = Store.getLoc();
-            mlir::Value StoreVal = Store.getValue();
-            mlir::Type ValTy = makeSignless(StoreVal.getType(), B);
-            std::string Callee = "dx.op.rawBufferStore." + typeSuffix(ValTy);
+            auto OffValOrErr = computeByteOff(B, Loc);
+            if (!OffValOrErr)
+              return OffValOrErr.takeError();
+            mlir::Value OffC = *OffValOrErr;
+            mlir::Value StoreVal = castToSignless(B, Loc, Store.getValue());
+            auto VecTy = mlir::dyn_cast<mlir::VectorType>(StoreVal.getType());
+            mlir::Type ScalarTy =
+                VecTy ? VecTy.getElementType() : StoreVal.getType();
+            unsigned NumComps =
+                VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
+            uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
+            std::string Callee = "dx.op.rawBufferStore." + typeSuffix(ScalarTy);
             auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                VoidTy, {I32Ty, HandleTy, I32Ty, I32Ty, ValTy, ValTy, ValTy,
-                         ValTy, I8Ty, I32Ty});
+                VoidTy, {I32Ty, HandleTy, I32Ty, I32Ty, ScalarTy, ScalarTy,
+                         ScalarTy, ScalarTy, I8Ty, I32Ty});
             getOrCreateDecl(SpvModule, Callee, FnTy);
 
+            mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
             auto OpC = mlir::LLVM::ConstantOp::create(
                 B, Loc, I32Ty, static_cast<int32_t>(DXILOp::RawBufferStore));
-            auto OffC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
-            auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ValTy);
+            auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ScalarTy);
+            SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
+            if (!VecTy) {
+              Vals[0] = StoreVal;
+            } else {
+              for (unsigned C = 0; C < NumComps && C < 4; ++C) {
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(C));
+                Vals[C] = mlir::LLVM::ExtractElementOp::create(B, Loc, StoreVal,
+                                                               IdxC);
+              }
+            }
             auto MaskC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I8Ty, static_cast<int8_t>(1));
+                B, Loc, I8Ty, static_cast<int8_t>(Mask));
             auto AlignC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(Info.ElemStride));
+                B, Loc, I32Ty, static_cast<int32_t>(scalarTypeBytes(ScalarTy)));
 
             mlir::LLVM::CallOp::create(
                 B, Loc, mlir::TypeRange{}, Callee,
-                mlir::ValueRange{OpC, Handle, ElemIdx, OffC, StoreVal, Undef,
-                                 Undef, Undef, MaskC, AlignC});
+                mlir::ValueRange{OpC, Handle, IdxVal, OffC, Vals[0], Vals[1],
+                                 Vals[2], Vals[3], MaskC, AlignC});
             Store.erase();
           } else {
             // Structured buffer atomics -> dx.op.atomicBinOp.
@@ -1243,11 +1395,11 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           if (auto IW = mlir::dyn_cast<mlir::spirv::ImageWriteOp>(IU)) {
             mlir::OpBuilder B(IW);
             mlir::Location Loc = IW.getLoc();
-            mlir::Value Coord = IW.getCoordinate();
-            mlir::Value Texel = IW.getTexel();
+            mlir::Value Coord = castToSignless(B, Loc, IW.getCoordinate());
+            mlir::Value Texel = castToSignless(B, Loc, IW.getTexel());
             auto TexVec = mlir::dyn_cast<mlir::VectorType>(Texel.getType());
-            mlir::Type ElemTy = makeSignless(
-                TexVec ? TexVec.getElementType() : Texel.getType(), B);
+            mlir::Type ElemTy =
+                TexVec ? TexVec.getElementType() : Texel.getType();
             auto UndefVal = mlir::LLVM::UndefOp::create(B, Loc, ElemTy);
             auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
 
@@ -1258,11 +1410,12 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               Mask = 1;
             } else {
               unsigned N = static_cast<unsigned>(TexVec.getNumElements());
-              Mask = static_cast<uint8_t>((1u << N) - 1u);
+              Mask = static_cast<uint8_t>((1u << std::min(N, 4u)) - 1u);
               for (unsigned C = 0; C < N && C < 4; ++C) {
-                Vals[C] = mlir::spirv::CompositeExtractOp::create(
-                    B, Loc, ElemTy, Texel,
-                    B.getI32ArrayAttr({static_cast<int32_t>(C)}));
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(C));
+                Vals[C] =
+                    mlir::LLVM::ExtractElementOp::create(B, Loc, Texel, IdxC);
               }
             }
 
@@ -1307,14 +1460,19 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                    Vals[0], Vals[1], Vals[2], Vals[3], MaskC});
             }
             IW.erase();
-          } else if (auto Fetch = mlir::dyn_cast<mlir::spirv::ImageFetchOp>(IU)) {
-            mlir::OpBuilder B(Fetch);
-            mlir::Location Loc = Fetch.getLoc();
-            mlir::Value Coord = Fetch.getCoordinate();
-            mlir::Type ResTy = Fetch.getType();
-            auto ResVec = mlir::dyn_cast<mlir::VectorType>(ResTy);
+          } else if (mlir::isa<mlir::spirv::ImageFetchOp,
+                               mlir::spirv::ImageReadOp>(IU)) {
+            mlir::OpBuilder B(IU);
+            mlir::Location Loc = IU->getLoc();
+            mlir::Value Coord =
+                mlir::isa<mlir::spirv::ImageFetchOp>(IU)
+                    ? mlir::cast<mlir::spirv::ImageFetchOp>(IU).getCoordinate()
+                    : mlir::cast<mlir::spirv::ImageReadOp>(IU).getCoordinate();
+            Coord = castToSignless(B, Loc, Coord);
+            mlir::Type OrigResTy = IU->getResult(0).getType();
+            auto ResVec = mlir::dyn_cast<mlir::VectorType>(OrigResTy);
             mlir::Type ElemTy = makeSignless(
-                ResVec ? ResVec.getElementType() : ResTy, B);
+                ResVec ? ResVec.getElementType() : OrigResTy, B);
             auto ResRetTy = getOrInitResRetType(&Ctx, ElemTy);
             auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
             auto ZeroI32 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
@@ -1342,9 +1500,10 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               if (auto CVec =
                       mlir::dyn_cast<mlir::VectorType>(Coord.getType())) {
                 for (unsigned C = 0; C < CVec.getNumElements() && C < 3; ++C) {
-                  Coords[C] = mlir::spirv::CompositeExtractOp::create(
-                      B, Loc, I32Ty, Coord,
-                      B.getI32ArrayAttr({static_cast<int32_t>(C)}));
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(C));
+                  Coords[C] = mlir::LLVM::ExtractElementOp::create(
+                      B, Loc, Coord, IdxC);
                 }
               } else {
                 Coords[0] = Coord;
@@ -1354,23 +1513,27 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                   mlir::ValueRange{OpC, Handle, ZeroI32, Coords[0], Coords[1],
                                    Coords[2], UndefI32, UndefI32, UndefI32});
             }
+            mlir::Value ResultVal;
             if (!ResVec) {
-              auto V0 = mlir::LLVM::ExtractValueOp::create(
+              ResultVal = mlir::LLVM::ExtractValueOp::create(
                   B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
-              Fetch.replaceAllUsesWith(V0.getResult());
             } else {
+              mlir::Type SignlessVecTy = makeSignless(ResVec, B);
               unsigned N = static_cast<unsigned>(ResVec.getNumElements());
-              mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, ResTy);
-              for (unsigned C = 0; C < N; ++C) {
+              mlir::Value Vec =
+                  mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+              for (unsigned C = 0; C < N && C < 4; ++C) {
                 auto VC = mlir::LLVM::ExtractValueOp::create(
                     B, Loc, Call.getResult(), ArrayRef<int64_t>{C});
                 auto IdxC = mlir::LLVM::ConstantOp::create(
                     B, Loc, I32Ty, static_cast<int32_t>(C));
                 Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
               }
-              Fetch.replaceAllUsesWith(Vec);
+              ResultVal = Vec;
             }
-            Fetch.erase();
+            ResultVal = castFromSignless(B, Loc, ResultVal, OrigResTy);
+            IU->getResult(0).replaceAllUsesWith(ResultVal);
+            IU->erase();
           } else if (auto SI = mlir::dyn_cast<mlir::spirv::SampledImageOp>(IU)) {
             // Lower SampledImage + ImageSample{Implicit,Explicit}Lod.
             auto SampLoad =
@@ -1527,16 +1690,19 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     mlir::OpBuilder B(Op);
     mlir::Location Loc = Op->getLoc();
 
-    auto emitReduce = [&](mlir::Value Val,
+    auto emitReduce = [&](mlir::Value RawVal,
                           mlir::gpu::AllReduceOperation ReduceOp,
                           mlir::spirv::GroupOperation GroupOp) {
+      mlir::Type OrigTy = RawVal.getType();
+      mlir::Value Val = castToSignless(B, Loc, RawVal);
       auto Red = mlir::gpu::SubgroupReduceOp::create(B, Loc, Val, ReduceOp,
                                                      /*uniform=*/false);
       if (GroupOp == mlir::spirv::GroupOperation::ExclusiveScan)
         Red->setAttr("crucible.scan_kind", B.getStringAttr("exclusive"));
       else if (GroupOp == mlir::spirv::GroupOperation::InclusiveScan)
         Red->setAttr("crucible.scan_kind", B.getStringAttr("inclusive"));
-      Op->getResult(0).replaceAllUsesWith(Red.getResult());
+      mlir::Value Res = castFromSignless(B, Loc, Red.getResult(), OrigTy);
+      Op->getResult(0).replaceAllUsesWith(Res);
       Op->erase();
     };
 
@@ -1726,14 +1892,16 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
   EntryFn.walk(
       [&](mlir::spirv::CompositeConstructOp CC) { CCOps.push_back(CC); });
   for (auto CC : CCOps) {
-    auto VecTy = mlir::dyn_cast<mlir::VectorType>(CC.getType());
-    if (!VecTy)
+    auto OrigVecTy = mlir::dyn_cast<mlir::VectorType>(CC.getType());
+    if (!OrigVecTy)
       continue;
     mlir::OpBuilder B(CC);
     mlir::Location Loc = CC.getLoc();
-    mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, VecTy);
+    mlir::Type SignlessVecTy = makeSignless(OrigVecTy, B);
+    mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
     unsigned Lane = 0;
-    for (mlir::Value Opnd : CC.getConstituents()) {
+    for (mlir::Value RawOpnd : CC.getConstituents()) {
+      mlir::Value Opnd = castToSignless(B, Loc, RawOpnd);
       if (auto SubVec = mlir::dyn_cast<mlir::VectorType>(Opnd.getType())) {
         for (unsigned K = 0; K < SubVec.getNumElements(); ++K) {
           auto KIdx = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
@@ -1749,6 +1917,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, Opnd, DstIdx);
       }
     }
+    Vec = castFromSignless(B, Loc, Vec, OrigVecTy);
     CC.replaceAllUsesWith(Vec);
     CC.erase();
   }
@@ -1768,6 +1937,118 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                mlir::ValueRange{OpC, TrueC});
     mlir::spirv::ReturnOp::create(B, Loc);
     K.erase();
+  }
+
+  // 3g2. Lower spirv.All, spirv.Any, spirv.IsNan, spirv.IsInf to LLVM ops.
+  SmallVector<mlir::Operation *, 8> LogicOps;
+  EntryFn.walk([&](mlir::Operation *Op) {
+    if (mlir::isa<mlir::spirv::AllOp, mlir::spirv::AnyOp, mlir::spirv::IsNanOp,
+                  mlir::spirv::IsInfOp>(Op))
+      LogicOps.push_back(Op);
+  });
+  for (mlir::Operation *Op : LogicOps) {
+    mlir::OpBuilder B(Op);
+    mlir::Location Loc = Op->getLoc();
+    if (auto All = mlir::dyn_cast<mlir::spirv::AllOp>(Op)) {
+      mlir::Value Vec = All.getVector();
+      auto VTy = mlir::cast<mlir::VectorType>(Vec.getType());
+      mlir::Value Acc;
+      for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
+        auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                   static_cast<int32_t>(C));
+        mlir::Value Lane =
+            mlir::LLVM::ExtractElementOp::create(B, Loc, Vec, IdxC);
+        Acc = Acc ? mlir::Value(mlir::LLVM::AndOp::create(B, Loc, Acc, Lane))
+                  : Lane;
+      }
+      All.replaceAllUsesWith(Acc);
+      All.erase();
+    } else if (auto Any = mlir::dyn_cast<mlir::spirv::AnyOp>(Op)) {
+      mlir::Value Vec = Any.getVector();
+      auto VTy = mlir::cast<mlir::VectorType>(Vec.getType());
+      mlir::Value Acc;
+      for (unsigned C = 0; C < VTy.getNumElements(); ++C) {
+        auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                   static_cast<int32_t>(C));
+        mlir::Value Lane =
+            mlir::LLVM::ExtractElementOp::create(B, Loc, Vec, IdxC);
+        Acc = Acc ? mlir::Value(mlir::LLVM::OrOp::create(B, Loc, Acc, Lane))
+                  : Lane;
+      }
+      Any.replaceAllUsesWith(Acc);
+      Any.erase();
+    } else if (auto IsN = mlir::dyn_cast<mlir::spirv::IsNanOp>(Op)) {
+      mlir::Value X = IsN.getOperand();
+      auto Cmp = mlir::LLVM::FCmpOp::create(
+          B, Loc, mlir::LLVM::FCmpPredicate::uno, X, X);
+      IsN.replaceAllUsesWith(Cmp.getResult());
+      IsN.erase();
+    } else if (auto IsI = mlir::dyn_cast<mlir::spirv::IsInfOp>(Op)) {
+      mlir::Value X = IsI.getOperand();
+      mlir::Type XTy = X.getType();
+      mlir::Type ElemTy = XTy;
+      if (auto VTy = mlir::dyn_cast<mlir::VectorType>(XTy))
+        ElemTy = VTy.getElementType();
+      auto FTy = mlir::cast<mlir::FloatType>(ElemTy);
+      auto InfVal = APFloat::getInf(FTy.getFloatSemantics());
+      mlir::Attribute InfAttr =
+          mlir::isa<mlir::VectorType>(XTy)
+              ? mlir::Attribute(mlir::DenseElementsAttr::get(
+                    mlir::cast<mlir::VectorType>(XTy), InfVal))
+              : mlir::Attribute(B.getFloatAttr(FTy, InfVal));
+      auto Abs = mlir::LLVM::FAbsOp::create(B, Loc, X);
+      auto InfC = mlir::LLVM::ConstantOp::create(B, Loc, XTy, InfAttr);
+      auto Cmp = mlir::LLVM::FCmpOp::create(
+          B, Loc, mlir::LLVM::FCmpPredicate::oeq, Abs, InfC);
+      IsI.replaceAllUsesWith(Cmp.getResult());
+      IsI.erase();
+    }
+  }
+
+  // 3g3. Lower spirv.Switch -> chain of spirv.IEqual + spirv.BranchConditional
+  // so ConvertSPIRVToLLVM + LiftControlFlowToSCF handle switches cleanly.
+  SmallVector<mlir::spirv::SwitchOp, 4> SwitchOps;
+  EntryFn.walk([&](mlir::spirv::SwitchOp SW) { SwitchOps.push_back(SW); });
+  for (auto SW : SwitchOps) {
+    mlir::Location Loc = SW.getLoc();
+    mlir::Value Sel = SW.getSelector();
+    mlir::Block *DefaultBB = SW.getDefaultTarget();
+    mlir::ValueRange DefaultArgs = SW.getDefaultOperands();
+    auto Literals = SW.getLiterals();
+    auto Targets = SW.getTargets();
+
+    if (!Literals || Targets.empty()) {
+      mlir::OpBuilder B(SW);
+      mlir::spirv::BranchOp::create(B, Loc, DefaultBB, DefaultArgs);
+      SW.erase();
+      continue;
+    }
+
+    auto LitVals = Literals->getValues<llvm::APInt>();
+    unsigned NumCases = static_cast<unsigned>(Targets.size());
+    mlir::Block *CurBB = SW->getBlock();
+    mlir::Region *Reg = CurBB->getParent();
+
+    for (unsigned I = 0; I < NumCases; ++I) {
+      mlir::OpBuilder B = mlir::OpBuilder::atBlockEnd(CurBB);
+      if (I == 0)
+        B.setInsertionPoint(SW);
+      mlir::Block *NextBB = DefaultBB;
+      mlir::ValueRange NextArgs = DefaultArgs;
+      if (I + 1 < NumCases) {
+        NextBB = new mlir::Block();
+        Reg->push_back(NextBB);
+        NextArgs = {};
+      }
+      auto CaseAttr = B.getIntegerAttr(Sel.getType(), LitVals[I]);
+      auto CaseC = mlir::spirv::ConstantOp::create(B, Loc, Sel.getType(),
+                                                   CaseAttr);
+      auto Cmp = mlir::spirv::IEqualOp::create(B, Loc, Sel, CaseC);
+      mlir::spirv::BranchConditionalOp::create(
+          B, Loc, Cmp, Targets[I], SW.getTargetOperands(I), NextBB, NextArgs);
+      CurBB = NextBB;
+    }
+    SW.erase();
   }
 
   // 3h. Lower Function-scope array spirv.Variable (including constant-array
