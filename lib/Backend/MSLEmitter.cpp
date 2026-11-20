@@ -4871,6 +4871,9 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
   if (!C0)
     return C0.takeError();
 
+  auto sliceIndex = [](const std::string &S) {
+    return "uint(max(rint(" + S + "), 0.0f))";
+  };
   std::string Coord, Slice;
   switch (K) {
   case ResourceKind::Texture1D:
@@ -4881,7 +4884,7 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
     if (!C1)
       return C1.takeError();
     Coord = "float2(" + C0->Text + ", 0.5f)";
-    Slice = "uint(" + C1->Text + ")";
+    Slice = sliceIndex(C1->Text);
     break;
   }
   case ResourceKind::Texture2D: {
@@ -4899,7 +4902,7 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
     if (!C2)
       return C2.takeError();
     Coord = "float2(" + C0->Text + ", " + C1->Text + ")";
-    Slice = "uint(" + C2->Text + ")";
+    Slice = sliceIndex(C2->Text);
     break;
   }
   case ResourceKind::Texture3D:
@@ -4924,7 +4927,7 @@ Error Emitter::emitTextureSample(mlir::LLVM::CallOp Call, DXILOp Op,
     if (!C3)
       return C3.takeError();
     Coord = "float3(" + C0->Text + ", " + C1->Text + ", " + C2->Text + ")";
-    Slice = "uint(" + C3->Text + ")";
+    Slice = sliceIndex(C3->Text);
     break;
   }
   default:
