@@ -416,6 +416,13 @@ Value *SPIRVLowerer::loadTypedValueFromStorageBuffer(IRBuilder<> &B,
     Value *Short = B.CreateTrunc(Shifted, B.getInt16Ty());
     return ElemTy->isIntegerTy(16) ? Short : B.CreateBitCast(Short, ElemTy);
   }
+  if (Bits == 8) {
+    Value *Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+    Value *Word = B.CreateAlignedLoad(B.getInt32Ty(), Ptr, Align(4));
+    Value *Shift = B.CreateShl(B.CreateAnd(ByteOffset, B.getInt32(3)),
+                               B.getInt32(3));
+    return B.CreateTrunc(B.CreateLShr(Word, Shift), ElemTy);
+  }
   Value *Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
   Value *Word = B.CreateAlignedLoad(B.getInt32Ty(), Ptr, Align(4));
   return B.CreateTrunc(Word, ElemTy);
@@ -452,14 +459,28 @@ void SPIRVLowerer::storeTypedValueToStorageBuffer(IRBuilder<> &B,
     Value *Val16 =
         ElemTy->isIntegerTy(16) ? Val : B.CreateBitCast(Val, B.getInt16Ty());
     Value *Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
-    Value *OldWord = B.CreateAlignedLoad(B.getInt32Ty(), Ptr, Align(4));
     Value *Shift = B.CreateShl(B.CreateAnd(ByteOffset, B.getInt32(2)),
                                B.getInt32(3));
-    Value *Mask = B.CreateNot(B.CreateShl(B.getInt32(0xFFFFu), Shift));
-    Value *Inserted =
-        B.CreateOr(B.CreateAnd(OldWord, Mask),
-                   B.CreateShl(B.CreateZExt(Val16, B.getInt32Ty()), Shift));
-    B.CreateAlignedStore(Inserted, Ptr, Align(4));
+    Value *ClearMask = B.CreateNot(B.CreateShl(B.getInt32(0xFFFFu), Shift));
+    Value *SetBits = B.CreateShl(B.CreateZExt(Val16, B.getInt32Ty()), Shift);
+    SyncScope::ID DeviceSS = Ctx.getOrInsertSyncScopeID("device");
+    B.CreateAtomicRMW(AtomicRMWInst::And, Ptr, ClearMask, Align(4),
+                      AtomicOrdering::AcquireRelease, DeviceSS);
+    B.CreateAtomicRMW(AtomicRMWInst::Or, Ptr, SetBits, Align(4),
+                      AtomicOrdering::AcquireRelease, DeviceSS);
+    return;
+  }
+  if (Bits == 8) {
+    Value *Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+    Value *Shift = B.CreateShl(B.CreateAnd(ByteOffset, B.getInt32(3)),
+                               B.getInt32(3));
+    Value *ClearMask = B.CreateNot(B.CreateShl(B.getInt32(0xFFu), Shift));
+    Value *SetBits = B.CreateShl(B.CreateZExt(Val, B.getInt32Ty()), Shift);
+    SyncScope::ID DeviceSS = Ctx.getOrInsertSyncScopeID("device");
+    B.CreateAtomicRMW(AtomicRMWInst::And, Ptr, ClearMask, Align(4),
+                      AtomicOrdering::AcquireRelease, DeviceSS);
+    B.CreateAtomicRMW(AtomicRMWInst::Or, Ptr, SetBits, Align(4),
+                      AtomicOrdering::AcquireRelease, DeviceSS);
     return;
   }
   Value *Word = B.CreateZExt(Val, B.getInt32Ty());
@@ -945,18 +966,33 @@ Error SPIRVLowerer::lowerBufferUpdateCounter(CallInst *CI) {
   Type *CounterArrTy = ArrayType::get(Type::getInt32Ty(Ctx), 0);
   Type *CounterTy = TargetExtType::get(Ctx, "spirv.VulkanBuffer",
                                        {CounterArrTy}, {12u, 1u});
-  GlobalVariable *NameGV = getOrCreateResourceName(*RH.RB);
-  Function *CounterHandleFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_resource_counterhandlefrombinding, {CounterTy});
+  std::string CntName = (RH.RB->Name.empty() ? "uav" : RH.RB->Name) + ".counter";
+  Constant *NameInit = ConstantDataArray::getString(Ctx, CntName);
+  auto *NameGV = new GlobalVariable(
+      M, NameInit->getType(), /*isConstant=*/true, GlobalValue::PrivateLinkage,
+      NameInit, ".spv.name." + CntName, /*InsertBefore=*/nullptr,
+      GlobalValue::NotThreadLocal, /*AddressSpace=*/0);
+  NameGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+  Function *HandleFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_resource_handlefrombinding, {CounterTy});
   Value *CounterH = B.CreateCall(
-      CounterHandleFn,
+      HandleFn,
       {B.getInt32(RH.RB->SPIRVSet), B.getInt32(RH.RB->CounterSPIRVBinding),
        B.getInt32(RH.RB->RangeSize), B.getInt32(0), NameGV});
-  Function *UpdateFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_resource_updatecounter, {CounterTy});
-  Value *Inc = CI->getArgOperand(2);
-  Value *Old = B.CreateCall(UpdateFn, {CounterH, Inc});
-  CI->replaceAllUsesWith(Old);
+  PointerType *BufPtrTy = PointerType::get(Ctx, 11);
+  Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_resource_getpointer,
+      {BufPtrTy, CounterTy, B.getInt32Ty()});
+  Value *Ptr = B.CreateCall(GetPtrFn, {CounterH, B.getInt32(0)});
+  Value *Inc32 = B.CreateSExt(CI->getArgOperand(2), B.getInt32Ty());
+  SyncScope::ID DeviceSS = Ctx.getOrInsertSyncScopeID("device");
+  Value *Old = B.CreateAtomicRMW(AtomicRMWInst::Add, Ptr, Inc32, Align(4),
+                                 AtomicOrdering::AcquireRelease, DeviceSS);
+  // HLSL IncrementCounter (+1) returns pre-increment (old);
+  // DecrementCounter (-1) returns post-decrement (old - 1).
+  Value *IsDec = B.CreateICmpSLT(Inc32, B.getInt32(0));
+  Value *Result = B.CreateSelect(IsDec, B.CreateAdd(Old, Inc32), Old);
+  CI->replaceAllUsesWith(Result);
   return Error::success();
 }
 

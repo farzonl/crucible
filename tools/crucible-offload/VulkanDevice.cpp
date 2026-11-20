@@ -189,6 +189,7 @@ struct VkBufAlloc {
   bool IsUniform = false;
   bool IsTyped = false;
   bool IsUAV = false;
+  bool IsCounter = false;
   CPUBuffer *CPU = nullptr;
   uint32_t Slice = 0;
 };
@@ -269,6 +270,8 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
 
   using BufKey = std::tuple<CPUBuffer *, uint32_t, bool, bool>;
   std::map<BufKey, size_t> BufMap;
+  using CounterKey = std::pair<CPUBuffer *, uint32_t>;
+  std::map<CounterKey, size_t> CounterBufMap;
   using ImgKey = std::pair<CPUBuffer *, uint32_t>;
   std::map<ImgKey, size_t> ImgMap;
   std::map<YAMLSampler *, VkSampler> SamplerMap;
@@ -346,6 +349,64 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     size_t Idx = AllBufs.size();
     AllBufs.push_back(A);
     BufMap[Key] = Idx;
+    return &AllBufs[Idx];
+  };
+
+  auto getOrCreateCounterBuffer =
+      [&](CPUBuffer *CPU, uint32_t Slice) -> Expected<VkBufAlloc *> {
+    CounterKey Key{CPU, Slice};
+    auto It = CounterBufMap.find(Key);
+    if (It != CounterBufMap.end())
+      return &AllBufs[It->second];
+
+    if (CPU->Counters.size() <= Slice)
+      CPU->Counters.resize(Slice + 1, 0);
+
+    VkBufAlloc A;
+    A.CPU = CPU;
+    A.Slice = Slice;
+    A.IsUAV = true;
+    A.IsCounter = true;
+    A.SizeBytes = 16;
+
+    VkBufferCreateInfo BCI{};
+    BCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    BCI.size = A.SizeBytes;
+    BCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    BCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (VkResult R = vkCreateBuffer(VK.Device, &BCI, nullptr, &A.Buffer))
+      return vkErr(R, "vkCreateBuffer (counter)");
+
+    VkMemoryRequirements MR{};
+    vkGetBufferMemoryRequirements(VK.Device, A.Buffer, &MR);
+    auto MemType = VK.findMemoryType(
+        MR.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (!MemType)
+      return MemType.takeError();
+    VkMemoryAllocateInfo MAI{};
+    MAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    MAI.allocationSize = MR.size;
+    MAI.memoryTypeIndex = *MemType;
+    if (VkResult R = vkAllocateMemory(VK.Device, &MAI, nullptr, &A.Memory))
+      return vkErr(R, "vkAllocateMemory (counter)");
+    if (VkResult R = vkBindBufferMemory(VK.Device, A.Buffer, A.Memory, 0))
+      return vkErr(R, "vkBindBufferMemory (counter)");
+
+    void *Mapped = nullptr;
+    if (VkResult R =
+            vkMapMemory(VK.Device, A.Memory, 0, A.SizeBytes, 0, &Mapped))
+      return vkErr(R, "vkMapMemory (counter)");
+    memset(Mapped, 0, A.SizeBytes);
+    uint32_t InitVal = CPU->Counters[Slice];
+    memcpy(Mapped, &InitVal, sizeof(InitVal));
+    vkUnmapMemory(VK.Device, A.Memory);
+
+    size_t Idx = AllBufs.size();
+    AllBufs.push_back(A);
+    CounterBufMap[Key] = Idx;
     return &AllBufs[Idx];
   };
 
@@ -486,6 +547,19 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         BoundList.push_back({Match->SPIRVSet, VkBind, DT, BA->Buffer,
                              BA->SizeBytes, BA->View, VK_NULL_HANDLE});
+        if (Match->HasCounter) {
+          auto CntOrErr = getOrCreateCounterBuffer(Res.BufferPtr, 0);
+          if (!CntOrErr) {
+            vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
+            cleanup();
+            return CntOrErr.takeError();
+          }
+          VkBufAlloc *CA = *CntOrErr;
+          BoundList.push_back({Match->SPIRVSet,
+                               Match->CounterSPIRVBinding + SlotOffset,
+                               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, CA->Buffer,
+                               CA->SizeBytes, VK_NULL_HANDLE, VK_NULL_HANDLE});
+        }
       }
     }
 
@@ -738,9 +812,26 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     }
   }
 
-  // Copy back UAV buffers to CPU buffers for offload-test-suite verification.
+  // Copy back UAV buffers and UAV counters to CPU buffers for verification.
   for (const auto &Buf : AllBufs) {
-    if (!Buf.IsUAV || !Buf.CPU || Buf.Slice >= Buf.CPU->Data.size())
+    if (!Buf.IsUAV || !Buf.CPU)
+      continue;
+    if (Buf.IsCounter) {
+      if (Buf.Slice >= Buf.CPU->Counters.size())
+        Buf.CPU->Counters.resize(Buf.Slice + 1, 0);
+      void *Mapped = nullptr;
+      if (VkResult R =
+              vkMapMemory(VK.Device, Buf.Memory, 0, Buf.SizeBytes, 0, &Mapped)) {
+        cleanup();
+        return vkErr(R, "vkMapMemory (counter readback)");
+      }
+      uint32_t Val = 0;
+      memcpy(&Val, Mapped, sizeof(Val));
+      Buf.CPU->Counters[Buf.Slice] = Val;
+      vkUnmapMemory(VK.Device, Buf.Memory);
+      continue;
+    }
+    if (Buf.Slice >= Buf.CPU->Data.size())
       continue;
     void *Mapped = nullptr;
     if (VkResult R =
