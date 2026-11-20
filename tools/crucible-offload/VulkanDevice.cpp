@@ -1317,8 +1317,43 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   VkPipelineLayout PipeLayout = VK_NULL_HANDLE;
   VkPipeline Pipe = VK_NULL_HANDLE;
   VkCommandPool CmdPool = VK_NULL_HANDLE;
+  VkDescriptorPool DPool = VK_NULL_HANDLE;
+  std::vector<VkDescriptorSetLayout> SetLayouts;
+
+  struct RasterBuf {
+    VkBuffer Buffer = VK_NULL_HANDLE;
+    VkDeviceMemory Memory = VK_NULL_HANDLE;
+    VkBufferView View = VK_NULL_HANDLE;
+    VkDeviceSize SizeBytes = 0;
+    CPUBuffer *CPU = nullptr;
+    uint32_t Slice = 0;
+    bool IsUAV = false;
+  };
+  struct RasterImg {
+    VkImage Image = VK_NULL_HANDLE;
+    VkDeviceMemory Memory = VK_NULL_HANDLE;
+    VkImageView View = VK_NULL_HANDLE;
+  };
+  std::vector<RasterBuf> RasterBufs;
+  std::vector<RasterImg> RasterImgs;
+  std::vector<VkSampler> RasterSamplers;
 
   auto cleanup = [&]() {
+    if (DPool) vkDestroyDescriptorPool(VK.Device, DPool, nullptr);
+    for (auto L : SetLayouts)
+      if (L) vkDestroyDescriptorSetLayout(VK.Device, L, nullptr);
+    for (auto S : RasterSamplers)
+      if (S) vkDestroySampler(VK.Device, S, nullptr);
+    for (auto &RI : RasterImgs) {
+      if (RI.View) vkDestroyImageView(VK.Device, RI.View, nullptr);
+      if (RI.Image) vkDestroyImage(VK.Device, RI.Image, nullptr);
+      if (RI.Memory) vkFreeMemory(VK.Device, RI.Memory, nullptr);
+    }
+    for (auto &RB : RasterBufs) {
+      if (RB.View) vkDestroyBufferView(VK.Device, RB.View, nullptr);
+      if (RB.Buffer) vkDestroyBuffer(VK.Device, RB.Buffer, nullptr);
+      if (RB.Memory) vkFreeMemory(VK.Device, RB.Memory, nullptr);
+    }
     if (CmdPool) vkDestroyCommandPool(VK.Device, CmdPool, nullptr);
     if (Pipe) vkDestroyPipeline(VK.Device, Pipe, nullptr);
     if (PipeLayout) vkDestroyPipelineLayout(VK.Device, PipeLayout, nullptr);
@@ -1505,8 +1540,538 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     }
   }
 
+  // Create command pool early so texture uploads can run before pipeline draw.
+  VkCommandPoolCreateInfo PoolCI{};
+  PoolCI.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  PoolCI.queueFamilyIndex = VK.GraphicsQF;
+  if (VkResult R = vkCreateCommandPool(VK.Device, &PoolCI, nullptr, &CmdPool)) {
+    cleanup();
+    return vkErr(R, "vkCreateCommandPool");
+  }
+
+  auto runRasterOneShot = [&](auto &&Record) -> Error {
+    VkCommandBufferAllocateInfo AI{};
+    AI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    AI.commandPool = CmdPool;
+    AI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    AI.commandBufferCount = 1;
+    VkCommandBuffer TmpCB = VK_NULL_HANDLE;
+    if (VkResult R = vkAllocateCommandBuffers(VK.Device, &AI, &TmpCB))
+      return vkErr(R, "vkAllocateCommandBuffers (raster upload)");
+    VkCommandBufferBeginInfo BI{};
+    BI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    BI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(TmpCB, &BI);
+    Record(TmpCB);
+    vkEndCommandBuffer(TmpCB);
+    VkSubmitInfo SI{};
+    SI.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    SI.commandBufferCount = 1;
+    SI.pCommandBuffers = &TmpCB;
+    if (VkResult R = vkQueueSubmit(VK.Queue, 1, &SI, VK_NULL_HANDLE)) {
+      vkFreeCommandBuffers(VK.Device, CmdPool, 1, &TmpCB);
+      return vkErr(R, "vkQueueSubmit (raster upload)");
+    }
+    vkQueueWaitIdle(VK.Queue);
+    vkFreeCommandBuffers(VK.Device, CmdPool, 1, &TmpCB);
+    return Error::success();
+  };
+
+  struct RasterBound {
+    uint32_t Set = 0;
+    uint32_t Binding = 0;
+    uint32_t ArrayElem = 0;
+    VkDescriptorType DescType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    VkBuffer Buffer = VK_NULL_HANDLE;
+    VkDeviceSize BufferSize = 0;
+    VkBufferView BufferView = VK_NULL_HANDLE;
+    VkSampler Sampler = VK_NULL_HANDLE;
+    VkImageView ImageView = VK_NULL_HANDLE;
+  };
+  std::vector<RasterBound> BoundList;
+
+  auto findStageReg = [&](const crucible::Reflection &Ref,
+                          crucible::ResourceClass Class, uint32_t Space,
+                          uint32_t Reg) -> const crucible::ResourceBinding * {
+    for (const crucible::ResourceBinding &RB : Ref.Resources) {
+      if (RB.Class == Class && RB.Space == Space && Reg >= RB.LowerBound &&
+          (RB.RangeSize == 0xFFFFFFFFu || Reg - RB.LowerBound < RB.RangeSize))
+        return &RB;
+    }
+    return nullptr;
+  };
+
+  for (const DescriptorSet &DS : P.Sets) {
+    for (const offloadtest::Resource &Res : DS.Resources) {
+      auto Class = classifyResource(Res.Kind);
+      if (!Class || !Res.DXBinding)
+        continue;
+      SmallVector<const crucible::ResourceBinding *, 2> Matches;
+      if (const auto *M = findStageReg(VSCompiled->Reflect, *Class,
+                                       Res.DXBinding->Space,
+                                       Res.DXBinding->Register))
+        Matches.push_back(M);
+      if (const auto *M = findStageReg(PSCompiled->Reflect, *Class,
+                                       Res.DXBinding->Space,
+                                       Res.DXBinding->Register)) {
+        bool Dup = false;
+        for (const auto *E : Matches)
+          if (E->SPIRVSet == M->SPIRVSet && E->SPIRVBinding == M->SPIRVBinding)
+            Dup = true;
+        if (!Dup)
+          Matches.push_back(M);
+      }
+      if (Matches.empty())
+        continue;
+
+      if (Res.Kind == ResourceKind::Sampler) {
+        if (!Res.SamplerPtr)
+          continue;
+        VkSamplerCreateInfo SCI{};
+        SCI.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        SCI.magFilter = vkFilter(Res.SamplerPtr->MagFilter);
+        SCI.minFilter = vkFilter(Res.SamplerPtr->MinFilter);
+        SCI.mipmapMode = Res.SamplerPtr->MinFilter == FilterMode::Nearest
+                             ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+                             : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        SCI.addressModeU = vkAddress(Res.SamplerPtr->Address);
+        SCI.addressModeV = vkAddress(Res.SamplerPtr->Address);
+        SCI.addressModeW = vkAddress(Res.SamplerPtr->Address);
+        SCI.minLod = Res.SamplerPtr->MinLOD;
+        SCI.maxLod = Res.SamplerPtr->MaxLOD;
+        if (Res.SamplerPtr->Kind == SamplerKind::SamplerComparison) {
+          SCI.compareEnable = VK_TRUE;
+          SCI.compareOp = vkCompare(Res.SamplerPtr->ComparisonOp);
+        }
+        VkSampler Samp = VK_NULL_HANDLE;
+        if (VkResult R = vkCreateSampler(VK.Device, &SCI, nullptr, &Samp)) {
+          cleanup();
+          return vkErr(R, "vkCreateSampler (raster)");
+        }
+        RasterSamplers.push_back(Samp);
+        for (const auto *Match : Matches) {
+          uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
+          BoundList.push_back({Match->SPIRVSet, Match->SPIRVBinding, SlotOffset,
+                               VK_DESCRIPTOR_TYPE_SAMPLER, VK_NULL_HANDLE, 0,
+                               VK_NULL_HANDLE, Samp, VK_NULL_HANDLE});
+        }
+        continue;
+      }
+
+      if (!Res.BufferPtr)
+        continue;
+      uint32_t ArrayCount =
+          std::max<uint32_t>(1u, static_cast<uint32_t>(Res.BufferPtr->ArraySize));
+      if (Res.BufferPtr->Data.size() > ArrayCount)
+        ArrayCount = static_cast<uint32_t>(Res.BufferPtr->Data.size());
+
+      if (isTextureKind(Res.Kind)) {
+        bool IsUAV = isUAVKind(Res.Kind);
+        for (uint32_t Slice = 0; Slice < ArrayCount; ++Slice) {
+          CPUBuffer *CPU = Res.BufferPtr;
+          uint32_t TW = std::max(1, CPU->OutputProps.Width);
+          uint32_t TH = std::max(1, CPU->OutputProps.Height);
+          uint32_t TD = std::max(1, CPU->OutputProps.Depth);
+          uint32_t Layers = std::max(1, CPU->OutputProps.ArraySlices);
+          uint32_t Mips = std::max(1, CPU->OutputProps.MipLevels);
+          VkImageType ImgType = VK_IMAGE_TYPE_2D;
+          VkImageViewType ViewType = VK_IMAGE_VIEW_TYPE_2D;
+          VkImageCreateFlags ImgFlags = 0;
+          switch (Res.Kind) {
+          case ResourceKind::Texture1D:
+          case ResourceKind::RWTexture1D:
+            ImgType = VK_IMAGE_TYPE_1D;
+            ViewType = VK_IMAGE_VIEW_TYPE_1D;
+            TH = 1; TD = 1; Layers = 1;
+            break;
+          case ResourceKind::Texture1DArray:
+          case ResourceKind::RWTexture1DArray:
+            ImgType = VK_IMAGE_TYPE_1D;
+            ViewType = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+            TH = 1; TD = 1;
+            break;
+          case ResourceKind::Texture2D:
+          case ResourceKind::RWTexture2D:
+            ImgType = VK_IMAGE_TYPE_2D;
+            ViewType = VK_IMAGE_VIEW_TYPE_2D;
+            TD = 1; Layers = 1;
+            break;
+          case ResourceKind::Texture2DArray:
+          case ResourceKind::RWTexture2DArray:
+            ImgType = VK_IMAGE_TYPE_2D;
+            ViewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            TD = 1;
+            break;
+          case ResourceKind::Texture3D:
+          case ResourceKind::RWTexture3D:
+            ImgType = VK_IMAGE_TYPE_3D;
+            ViewType = VK_IMAGE_VIEW_TYPE_3D;
+            Layers = 1;
+            break;
+          case ResourceKind::TextureCube:
+            ImgType = VK_IMAGE_TYPE_2D;
+            ViewType = VK_IMAGE_VIEW_TYPE_CUBE;
+            ImgFlags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+            TD = 1; Layers = 6;
+            break;
+          case ResourceKind::TextureCubeArray:
+            ImgType = VK_IMAGE_TYPE_2D;
+            ViewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+            ImgFlags = VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+            TD = 1;
+            if (Layers < 6) Layers = 6;
+            break;
+          default:
+            break;
+          }
+          VkFormat Fmt = vkFormatForBuffer(*CPU);
+          uint32_t TexelBytes = std::max<uint32_t>(
+              1u, static_cast<uint32_t>(CPU->getSingleElementSize()) *
+                      std::max<uint32_t>(1u, CPU->Channels));
+          RasterImg RI;
+          VkImageCreateInfo TICI{};
+          TICI.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+          TICI.flags = ImgFlags;
+          TICI.imageType = ImgType;
+          TICI.format = Fmt;
+          TICI.extent = {TW, TH, TD};
+          TICI.mipLevels = Mips;
+          TICI.arrayLayers = Layers;
+          TICI.samples = VK_SAMPLE_COUNT_1_BIT;
+          TICI.tiling = VK_IMAGE_TILING_OPTIMAL;
+          TICI.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       (IsUAV ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+          TICI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+          TICI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+          if (VkResult R = vkCreateImage(VK.Device, &TICI, nullptr, &RI.Image)) {
+            cleanup();
+            return vkErr(R, "vkCreateImage (raster tex)");
+          }
+          VkMemoryRequirements TMR{};
+          vkGetImageMemoryRequirements(VK.Device, RI.Image, &TMR);
+          auto TMemType = VK.findMemoryType(TMR.memoryTypeBits,
+                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+          if (!TMemType)
+            TMemType = VK.findMemoryType(TMR.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+          if (!TMemType) {
+            vkDestroyImage(VK.Device, RI.Image, nullptr);
+            cleanup();
+            return TMemType.takeError();
+          }
+          VkMemoryAllocateInfo TMAI{};
+          TMAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+          TMAI.allocationSize = TMR.size;
+          TMAI.memoryTypeIndex = *TMemType;
+          if (VkResult R = vkAllocateMemory(VK.Device, &TMAI, nullptr, &RI.Memory)) {
+            vkDestroyImage(VK.Device, RI.Image, nullptr);
+            cleanup();
+            return vkErr(R, "vkAllocateMemory (raster tex)");
+          }
+          vkBindImageMemory(VK.Device, RI.Image, RI.Memory, 0);
+          VkImageViewCreateInfo TIVCI{};
+          TIVCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+          TIVCI.image = RI.Image;
+          TIVCI.viewType = ViewType;
+          TIVCI.format = Fmt;
+          TIVCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+          if (VkResult R = vkCreateImageView(VK.Device, &TIVCI, nullptr, &RI.View)) {
+            vkFreeMemory(VK.Device, RI.Memory, nullptr);
+            vkDestroyImage(VK.Device, RI.Image, nullptr);
+            cleanup();
+            return vkErr(R, "vkCreateImageView (raster tex)");
+          }
+          RasterImgs.push_back(RI);
+
+          VkDeviceSize StageBytes = std::max<VkDeviceSize>(CPU->Size, 16);
+          VkBuffer StageBuf = VK_NULL_HANDLE;
+          VkDeviceMemory StageMem = VK_NULL_HANDLE;
+          VkBufferCreateInfo SBCI{};
+          SBCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+          SBCI.size = StageBytes;
+          SBCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+          SBCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+          vkCreateBuffer(VK.Device, &SBCI, nullptr, &StageBuf);
+          VkMemoryRequirements SMR{};
+          vkGetBufferMemoryRequirements(VK.Device, StageBuf, &SMR);
+          auto SMemType = VK.findMemoryType(
+              SMR.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+          if (!SMemType) {
+            vkDestroyBuffer(VK.Device, StageBuf, nullptr);
+            cleanup();
+            return SMemType.takeError();
+          }
+          VkMemoryAllocateInfo SMAI{};
+          SMAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+          SMAI.allocationSize = SMR.size;
+          SMAI.memoryTypeIndex = *SMemType;
+          vkAllocateMemory(VK.Device, &SMAI, nullptr, &StageMem);
+          vkBindBufferMemory(VK.Device, StageBuf, StageMem, 0);
+          void *SMapped = nullptr;
+          vkMapMemory(VK.Device, StageMem, 0, StageBytes, 0, &SMapped);
+          memset(SMapped, 0, StageBytes);
+          if (Slice < CPU->Data.size() && CPU->Data[Slice])
+            memcpy(SMapped, CPU->Data[Slice].get(), CPU->Size);
+          vkUnmapMemory(VK.Device, StageMem);
+
+          Error UpErr = runRasterOneShot([&](VkCommandBuffer UCB) {
+            VkImageMemoryBarrier B1{};
+            B1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            B1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            B1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            B1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            B1.image = RI.Image;
+            B1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+            vkCmdPipelineBarrier(UCB, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                                 0, nullptr, 1, &B1);
+            VkDeviceSize Off = 0;
+            for (uint32_t L = 0; L < Layers; ++L) {
+              for (uint32_t M = 0; M < Mips; ++M) {
+                uint32_t MW = std::max(1u, TW >> M);
+                uint32_t MH = std::max(1u, TH >> M);
+                uint32_t MD = std::max(1u, TD >> M);
+                VkDeviceSize SubBytes =
+                    static_cast<VkDeviceSize>(MW) * MH * MD * TexelBytes;
+                if (Off + SubBytes <= StageBytes) {
+                  VkBufferImageCopy Reg{};
+                  Reg.bufferOffset = Off;
+                  Reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, M, L, 1};
+                  Reg.imageExtent = {MW, MH, MD};
+                  vkCmdCopyBufferToImage(UCB, StageBuf, RI.Image,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                         &Reg);
+                }
+                Off += SubBytes;
+              }
+            }
+            VkImageMemoryBarrier B2{};
+            B2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            B2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            B2.newLayout = IsUAV ? VK_IMAGE_LAYOUT_GENERAL
+                                 : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            B2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            B2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                               (IsUAV ? VK_ACCESS_SHADER_WRITE_BIT : 0);
+            B2.image = RI.Image;
+            B2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+            vkCmdPipelineBarrier(UCB, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &B2);
+          });
+          vkDestroyBuffer(VK.Device, StageBuf, nullptr);
+          vkFreeMemory(VK.Device, StageMem, nullptr);
+          if (UpErr) {
+            cleanup();
+            return UpErr;
+          }
+          for (const auto *Match : Matches) {
+            uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
+            BoundList.push_back({Match->SPIRVSet, Match->SPIRVBinding,
+                                 SlotOffset + Slice,
+                                 IsUAV ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                                       : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                 VK_NULL_HANDLE, 0, VK_NULL_HANDLE,
+                                 VK_NULL_HANDLE, RI.View});
+          }
+        }
+        continue;
+      }
+
+      bool IsUniform = (Res.Kind == ResourceKind::ConstantBuffer);
+      bool IsTyped = isTypedBufferKind(Res.Kind);
+      bool IsUAV = isUAVKind(Res.Kind);
+      VkDescriptorType DT =
+          IsUniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+          : IsTyped ? (IsUAV ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER
+                             : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER)
+                    : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      for (uint32_t Slice = 0; Slice < ArrayCount; ++Slice) {
+        CPUBuffer *CPU = Res.BufferPtr;
+        RasterBuf RB;
+        RB.CPU = CPU;
+        RB.Slice = Slice;
+        RB.IsUAV = IsUAV;
+        RB.SizeBytes = std::max<VkDeviceSize>(CPU->Size, 16);
+        if (IsUniform && (RB.SizeBytes % 16) != 0)
+          RB.SizeBytes = ((RB.SizeBytes + 15) / 16) * 16;
+        VkBufferCreateInfo BCI{};
+        BCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        BCI.size = RB.SizeBytes;
+        BCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (IsUniform)
+          BCI.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        else if (IsTyped)
+          BCI.usage |= VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+                       VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+        else
+          BCI.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        BCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (VkResult R = vkCreateBuffer(VK.Device, &BCI, nullptr, &RB.Buffer)) {
+          cleanup();
+          return vkErr(R, "vkCreateBuffer (raster)");
+        }
+        VkMemoryRequirements BMR{};
+        vkGetBufferMemoryRequirements(VK.Device, RB.Buffer, &BMR);
+        auto BMemType = VK.findMemoryType(
+            BMR.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (!BMemType) {
+          vkDestroyBuffer(VK.Device, RB.Buffer, nullptr);
+          cleanup();
+          return BMemType.takeError();
+        }
+        VkMemoryAllocateInfo BMAI{};
+        BMAI.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        BMAI.allocationSize = BMR.size;
+        BMAI.memoryTypeIndex = *BMemType;
+        if (VkResult R = vkAllocateMemory(VK.Device, &BMAI, nullptr, &RB.Memory)) {
+          vkDestroyBuffer(VK.Device, RB.Buffer, nullptr);
+          cleanup();
+          return vkErr(R, "vkAllocateMemory (raster)");
+        }
+        vkBindBufferMemory(VK.Device, RB.Buffer, RB.Memory, 0);
+        void *BMapped = nullptr;
+        vkMapMemory(VK.Device, RB.Memory, 0, RB.SizeBytes, 0, &BMapped);
+        memset(BMapped, 0, RB.SizeBytes);
+        if (Slice < CPU->Data.size() && CPU->Data[Slice])
+          memcpy(BMapped, CPU->Data[Slice].get(), CPU->Size);
+        vkUnmapMemory(VK.Device, RB.Memory);
+        if (IsTyped) {
+          VkBufferViewCreateInfo BVCI{};
+          BVCI.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+          BVCI.buffer = RB.Buffer;
+          BVCI.format = vkFormatForBuffer(*CPU);
+          BVCI.offset = 0;
+          BVCI.range = RB.SizeBytes;
+          if (VkResult R = vkCreateBufferView(VK.Device, &BVCI, nullptr, &RB.View)) {
+            vkFreeMemory(VK.Device, RB.Memory, nullptr);
+            vkDestroyBuffer(VK.Device, RB.Buffer, nullptr);
+            cleanup();
+            return vkErr(R, "vkCreateBufferView (raster)");
+          }
+        }
+        RasterBufs.push_back(RB);
+        for (const auto *Match : Matches) {
+          uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
+          BoundList.push_back({Match->SPIRVSet, Match->SPIRVBinding,
+                               SlotOffset + Slice, DT, RB.Buffer, RB.SizeBytes,
+                               RB.View, VK_NULL_HANDLE, VK_NULL_HANDLE});
+        }
+      }
+    }
+  }
+
+  uint32_t MaxSet = 0;
+  for (const auto &RB : BoundList)
+    MaxSet = std::max(MaxSet, RB.Set + 1u);
+  SetLayouts.assign(MaxSet, VK_NULL_HANDLE);
+  std::map<VkDescriptorType, uint32_t> PoolCounts;
+  for (uint32_t SetIdx = 0; SetIdx < MaxSet; ++SetIdx) {
+    struct BindInfo {
+      VkDescriptorType Type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      uint32_t Count = 0;
+    };
+    std::map<uint32_t, BindInfo> BMap;
+    for (const auto &RB : BoundList) {
+      if (RB.Set != SetIdx)
+        continue;
+      auto &Info = BMap[RB.Binding];
+      Info.Type = RB.DescType;
+      Info.Count = std::max(Info.Count, RB.ArrayElem + 1u);
+    }
+    std::vector<VkDescriptorSetLayoutBinding> LayoutBinds;
+    for (const auto &[BindIdx, Info] : BMap) {
+      VkDescriptorSetLayoutBinding LB{};
+      LB.binding = BindIdx;
+      LB.descriptorType = Info.Type;
+      LB.descriptorCount = Info.Count;
+      LB.stageFlags =
+          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+      LayoutBinds.push_back(LB);
+      PoolCounts[Info.Type] += Info.Count;
+    }
+    VkDescriptorSetLayoutCreateInfo DSLCI{};
+    DSLCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    DSLCI.bindingCount = static_cast<uint32_t>(LayoutBinds.size());
+    DSLCI.pBindings = LayoutBinds.data();
+    if (VkResult R = vkCreateDescriptorSetLayout(VK.Device, &DSLCI, nullptr,
+                                                 &SetLayouts[SetIdx])) {
+      cleanup();
+      return vkErr(R, "vkCreateDescriptorSetLayout (raster)");
+    }
+  }
+
+  std::vector<VkDescriptorSet> DSets;
+  if (MaxSet > 0) {
+    std::vector<VkDescriptorPoolSize> PoolSizes;
+    for (auto &[DT, Cnt] : PoolCounts)
+      PoolSizes.push_back({DT, Cnt});
+    if (PoolSizes.empty())
+      PoolSizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1});
+    VkDescriptorPoolCreateInfo DPCI{};
+    DPCI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    DPCI.maxSets = MaxSet;
+    DPCI.poolSizeCount = static_cast<uint32_t>(PoolSizes.size());
+    DPCI.pPoolSizes = PoolSizes.data();
+    if (VkResult R = vkCreateDescriptorPool(VK.Device, &DPCI, nullptr, &DPool)) {
+      cleanup();
+      return vkErr(R, "vkCreateDescriptorPool (raster)");
+    }
+    DSets.resize(MaxSet, VK_NULL_HANDLE);
+    VkDescriptorSetAllocateInfo DSAI{};
+    DSAI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    DSAI.descriptorPool = DPool;
+    DSAI.descriptorSetCount = MaxSet;
+    DSAI.pSetLayouts = SetLayouts.data();
+    if (VkResult R = vkAllocateDescriptorSets(VK.Device, &DSAI, DSets.data())) {
+      cleanup();
+      return vkErr(R, "vkAllocateDescriptorSets (raster)");
+    }
+    std::vector<VkDescriptorBufferInfo> BufInfos(BoundList.size());
+    std::vector<VkDescriptorImageInfo> ImgInfos(BoundList.size());
+    std::vector<VkWriteDescriptorSet> Writes;
+    for (size_t I = 0; I < BoundList.size(); ++I) {
+      const auto &RB = BoundList[I];
+      VkWriteDescriptorSet W{};
+      W.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      W.dstSet = DSets[RB.Set];
+      W.dstBinding = RB.Binding;
+      W.dstArrayElement = RB.ArrayElem;
+      W.descriptorCount = 1;
+      W.descriptorType = RB.DescType;
+      if (RB.DescType == VK_DESCRIPTOR_TYPE_SAMPLER) {
+        ImgInfos[I].sampler = RB.Sampler;
+        W.pImageInfo = &ImgInfos[I];
+      } else if (RB.DescType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                 RB.DescType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+        ImgInfos[I].imageView = RB.ImageView;
+        ImgInfos[I].imageLayout =
+            (RB.DescType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                ? VK_IMAGE_LAYOUT_GENERAL
+                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        W.pImageInfo = &ImgInfos[I];
+      } else if (RB.DescType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
+                 RB.DescType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+        W.pTexelBufferView = &BoundList[I].BufferView;
+      } else {
+        BufInfos[I] = {RB.Buffer, 0, RB.BufferSize};
+        W.pBufferInfo = &BufInfos[I];
+      }
+      Writes.push_back(W);
+    }
+    if (!Writes.empty())
+      vkUpdateDescriptorSets(VK.Device, static_cast<uint32_t>(Writes.size()),
+                             Writes.data(), 0, nullptr);
+  }
+
   VkPipelineLayoutCreateInfo PLCI{};
   PLCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  PLCI.setLayoutCount = static_cast<uint32_t>(SetLayouts.size());
+  PLCI.pSetLayouts = SetLayouts.data();
   if (VkResult R = vkCreatePipelineLayout(VK.Device, &PLCI, nullptr, &PipeLayout)) {
     cleanup();
     return vkErr(R, "vkCreatePipelineLayout");
@@ -1585,14 +2150,6 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     return vkErr(R, "vkCreateGraphicsPipelines");
   }
 
-  VkCommandPoolCreateInfo PoolCI{};
-  PoolCI.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  PoolCI.queueFamilyIndex = VK.GraphicsQF;
-  if (VkResult R = vkCreateCommandPool(VK.Device, &PoolCI, nullptr, &CmdPool)) {
-    cleanup();
-    return vkErr(R, "vkCreateCommandPool");
-  }
-
   VkCommandBufferAllocateInfo CBAI{};
   CBAI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
   CBAI.commandPool = CmdPool;
@@ -1619,6 +2176,11 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   RPBI.pClearValues = &ClearVal;
   vkCmdBeginRenderPass(CB, &RPBI, VK_SUBPASS_CONTENTS_INLINE);
   vkCmdBindPipeline(CB, VK_PIPELINE_BIND_POINT_GRAPHICS, Pipe);
+  if (!DSets.empty()) {
+    vkCmdBindDescriptorSets(CB, VK_PIPELINE_BIND_POINT_GRAPHICS, PipeLayout, 0,
+                            static_cast<uint32_t>(DSets.size()), DSets.data(),
+                            0, nullptr);
+  }
   if (VertBuf) {
     VkDeviceSize Off = 0;
     vkCmdBindVertexBuffers(CB, 0, 1, &VertBuf, &Off);
@@ -1654,6 +2216,20 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   }
   memcpy(Output->Data[0].get(), Mapped, ReadbackBytes);
   vkUnmapMemory(VK.Device, ReadbackMem);
+
+  // Copy back UAV buffers written by VS/PS shaders.
+  for (const auto &RB : RasterBufs) {
+    if (!RB.IsUAV || !RB.CPU || RB.Slice >= RB.CPU->Data.size())
+      continue;
+    void *BMapped = nullptr;
+    if (VkResult R =
+            vkMapMemory(VK.Device, RB.Memory, 0, RB.SizeBytes, 0, &BMapped)) {
+      cleanup();
+      return vkErr(R, "vkMapMemory (raster UAV readback)");
+    }
+    memcpy(RB.CPU->Data[RB.Slice].get(), BMapped, RB.CPU->Size);
+    vkUnmapMemory(VK.Device, RB.Memory);
+  }
 
   cleanup();
   return Error::success();
@@ -2006,6 +2582,11 @@ createVulkanDevices(const DeviceConfig &Config) {
   EnabledFeats.shaderInt64 = SupportedFeats2.features.shaderInt64;
   EnabledFeats.shaderFloat64 = SupportedFeats2.features.shaderFloat64;
   EnabledFeats.shaderInt16 = SupportedFeats2.features.shaderInt16;
+  EnabledFeats.fragmentStoresAndAtomics =
+      SupportedFeats2.features.fragmentStoresAndAtomics;
+  EnabledFeats.vertexPipelineStoresAndAtomics =
+      SupportedFeats2.features.vertexPipelineStoresAndAtomics;
+  EnabledFeats.imageCubeArray = SupportedFeats2.features.imageCubeArray;
   EnabledFeats.shaderResourceMinLod =
       SupportedFeats2.features.shaderResourceMinLod;
   EnabledFeats.multiViewport = SupportedFeats2.features.multiViewport;
