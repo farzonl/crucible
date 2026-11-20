@@ -82,7 +82,10 @@ if sm >= "6.9":
 
 # Substitution order matters: %dxc_target_lib before %dxc_target.
 if lit_config.params.get("spirv_frontend"):
-    dxc_cmd = f"{config.dxc} -spirv -fspv-target-env=vulkan1.3"
+    dxc_cmd = (
+        f"{config.dxc} -spirv -fspv-target-env=vulkan1.3 "
+        "-fvk-t-shift 10000 all -fvk-u-shift 20000 all -fvk-s-shift 30000 all"
+    )
     config.substitutions.append(("%dxc_target_lib", dxc_cmd))
     config.substitutions.append(("%dxc_target", dxc_cmd))
 else:
