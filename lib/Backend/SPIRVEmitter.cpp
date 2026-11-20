@@ -508,18 +508,49 @@ Error SPIRVLowerer::lowerCreateHandle(CallInst *CI) {
   return Error::success();
 }
 
+static bool extractConstantAggregateU32(Value *V, unsigned Idx, uint32_t &Out) {
+  if (!V)
+    return false;
+  if (isa<ConstantAggregateZero>(V)) {
+    Out = 0;
+    return true;
+  }
+  if (auto *C = dyn_cast<Constant>(V)) {
+    if (Constant *Elem = C->getAggregateElement(Idx)) {
+      if (auto *CI = dyn_cast<ConstantInt>(Elem)) {
+        Out = static_cast<uint32_t>(CI->getZExtValue());
+        return true;
+      }
+      if (isa<UndefValue>(Elem)) {
+        Out = 0;
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto *IV = dyn_cast<InsertValueInst>(V)) {
+    if (IV->getNumIndices() == 1 && IV->getIndices()[0] == Idx) {
+      if (auto *CI = dyn_cast<ConstantInt>(IV->getInsertedValueOperand())) {
+        Out = static_cast<uint32_t>(CI->getZExtValue());
+        return true;
+      }
+      return false;
+    }
+    return extractConstantAggregateU32(IV->getAggregateOperand(), Idx, Out);
+  }
+  return false;
+}
+
 Error SPIRVLowerer::lowerCreateHandleFromBinding(CallInst *CI) {
-  auto *BindC = dyn_cast<ConstantStruct>(CI->getArgOperand(1));
-  if (!BindC || BindC->getNumOperands() < 4)
+  Value *BindVal = CI->getArgOperand(1);
+  uint32_t LB = 0, Space = 0, RawRC = 0;
+  if (!extractConstantAggregateU32(BindVal, 0, LB) ||
+      !extractConstantAggregateU32(BindVal, 2, Space) ||
+      !extractConstantAggregateU32(BindVal, 3, RawRC))
     return makeError(
         "SPIR-V backend: non-constant ResBind in createHandleFromBinding");
 
-  uint32_t LB =
-      static_cast<uint32_t>(cast<ConstantInt>(BindC->getOperand(0))->getZExtValue());
-  uint32_t Space =
-      static_cast<uint32_t>(cast<ConstantInt>(BindC->getOperand(2))->getZExtValue());
-  auto RC = static_cast<ResourceClass>(
-      cast<ConstantInt>(BindC->getOperand(3))->getZExtValue());
+  auto RC = static_cast<ResourceClass>(RawRC);
 
   const ResourceBinding *RB = findResourceByBinding(RC, Space, LB);
   if (!RB)
@@ -1928,6 +1959,51 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
                             CI->getArgOperand(3)});
     break;
   }
+  case DXILOp::Pack4x8: {
+    auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+    uint64_t Mode = ModeC ? ModeC->getZExtValue() : 0;
+    Value *Acc = B.getInt32(0);
+    for (unsigned I = 0; I < 4; ++I) {
+      Value *V = CI->getArgOperand(2 + I);
+      Type *ElemTy = V->getType();
+      if (Mode == 1) {
+        // UClamp: signed clamp [0, 255]
+        Value *Lo = ConstantInt::get(ElemTy, 0);
+        Value *Hi = ConstantInt::get(ElemTy, 255);
+        V = B.CreateSelect(B.CreateICmpSLT(V, Lo), Lo, V);
+        V = B.CreateSelect(B.CreateICmpSGT(V, Hi), Hi, V);
+      } else if (Mode == 2) {
+        // SClamp: signed clamp [-128, 127]
+        Value *Lo = ConstantInt::getSigned(ElemTy, -128);
+        Value *Hi = ConstantInt::getSigned(ElemTy, 127);
+        V = B.CreateSelect(B.CreateICmpSLT(V, Lo), Lo, V);
+        V = B.CreateSelect(B.CreateICmpSGT(V, Hi), Hi, V);
+      }
+      Value *Byte = B.CreateZExt(B.CreateTrunc(V, B.getInt8Ty()), B.getInt32Ty());
+      if (I > 0)
+        Byte = B.CreateShl(Byte, B.getInt32(I * 8));
+      Acc = B.CreateOr(Acc, Byte);
+    }
+    Res = Acc;
+    break;
+  }
+  case DXILOp::Unpack4x8: {
+    auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+    uint64_t Mode = ModeC ? ModeC->getZExtValue() : 0;
+    Value *Pk = CI->getArgOperand(2);
+    auto *ST = cast<StructType>(CI->getType());
+    Type *ElemTy = ST->getElementType(0);
+    Value *Ret = PoisonValue::get(ST);
+    for (unsigned I = 0; I < 4; ++I) {
+      Value *Shifted = (I == 0) ? Pk : B.CreateLShr(Pk, B.getInt32(I * 8));
+      Value *Byte = B.CreateTrunc(Shifted, B.getInt8Ty());
+      Value *Ext = (Mode == 1) ? B.CreateSExt(Byte, ElemTy)
+                               : B.CreateZExt(Byte, ElemTy);
+      Ret = B.CreateInsertValue(Ret, Ext, {I});
+    }
+    Res = Ret;
+    break;
+  }
   default:
     return makeError("SPIR-V backend: unsupported math/bit op {0}",
                      static_cast<unsigned>(Op));
@@ -2133,6 +2209,8 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::LegacyF16ToF32:
   case DXILOp::Dot4AddI8Packed:
   case DXILOp::Dot4AddU8Packed:
+  case DXILOp::Pack4x8:
+  case DXILOp::Unpack4x8:
     return lowerMathOrBitOp(CI, Op);
 
   case DXILOp::Discard:
