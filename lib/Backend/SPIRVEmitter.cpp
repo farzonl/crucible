@@ -2966,6 +2966,84 @@ void SPIRVLowerer::cleanupBridgeArtifacts() {
     GV->eraseFromParent();
 }
 
+static bool isScalarOrVecFloat32(Type *Ty) {
+  if (Ty->isFloatTy())
+    return true;
+  if (auto *VT = dyn_cast<FixedVectorType>(Ty))
+    return VT->getElementType()->isFloatTy();
+  return false;
+}
+
+static Value *flushF32Denorm(IRBuilder<> &B, Value *V) {
+  if (isa<Constant>(V) || !isScalarOrVecFloat32(V->getType()))
+    return V;
+  Type *Ty = V->getType();
+  Type *IntTy = Ty->isFloatTy()
+                    ? static_cast<Type *>(B.getInt32Ty())
+                    : static_cast<Type *>(FixedVectorType::get(
+                          B.getInt32Ty(),
+                          cast<FixedVectorType>(Ty)->getNumElements()));
+  Value *Bits = B.CreateBitCast(V, IntTy);
+  Value *AbsBits = B.CreateAnd(Bits, ConstantInt::get(IntTy, 0x7FFFFFFFu));
+  Value *IsSubnorm =
+      B.CreateICmpULT(AbsBits, ConstantInt::get(IntTy, 0x00800000u));
+  Value *SignOnly = B.CreateAnd(Bits, ConstantInt::get(IntTy, 0x80000000u));
+  Value *Flushed = B.CreateSelect(IsSubnorm, SignOnly, Bits);
+  return B.CreateBitCast(Flushed, Ty);
+}
+
+// DXIL defaults to flush-to-zero for 32-bit float denormals, whereas CPU
+// Vulkan drivers like Lavapipe preserve subnormals by default. Flush f32
+// denormal operands on math/FMul operations to signed zero for portable
+// HLSL compliance without altering raw bit-preserving loads/stores/casts.
+static void flushF32DenormalsForMath(Function &F) {
+  SmallVector<Instruction *, 32> Work;
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (I.getOpcode() == Instruction::FMul &&
+          isScalarOrVecFloat32(I.getType())) {
+        Work.push_back(&I);
+      } else if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+        switch (II->getIntrinsicID()) {
+        case Intrinsic::log2:
+        case Intrinsic::log:
+        case Intrinsic::log10:
+        case Intrinsic::sqrt:
+        case Intrinsic::sinh:
+        case Intrinsic::fma:
+        case Intrinsic::fmuladd:
+        case Intrinsic::spv_rsqrt:
+        case Intrinsic::spv_degrees:
+        case Intrinsic::spv_radians:
+          if (isScalarOrVecFloat32(II->getType()))
+            Work.push_back(II);
+          break;
+        default:
+          break;
+        }
+      }
+    }
+  }
+  for (Instruction *I : Work) {
+    IRBuilder<> B(I);
+    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
+      for (unsigned Arg = 0, E = II->arg_size(); Arg < E; ++Arg) {
+        Value *V = II->getArgOperand(Arg);
+        Value *FV = flushF32Denorm(B, V);
+        if (FV != V)
+          II->setArgOperand(Arg, FV);
+      }
+    } else {
+      for (unsigned OpIdx = 0, E = I->getNumOperands(); OpIdx < E; ++OpIdx) {
+        Value *V = I->getOperand(OpIdx);
+        Value *FV = flushF32Denorm(B, V);
+        if (FV != V)
+          I->setOperand(OpIdx, FV);
+      }
+    }
+  }
+}
+
 Error SPIRVLowerer::run() {
   auto StageOrErr = stageTripleSuffix(Reflect.Stage, Opts.StageAsCompute);
   if (!StageOrErr)
@@ -3030,8 +3108,10 @@ Error SPIRVLowerer::run() {
   MPM.run(M, MAM);
 
   for (Function &F : M) {
-    if (!F.isDeclaration())
+    if (!F.isDeclaration()) {
       normalizeArrayGlobalAccesses(F);
+      flushF32DenormalsForMath(F);
+    }
   }
 
   emitStageDecorations();
