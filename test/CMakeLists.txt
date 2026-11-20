@@ -90,6 +90,12 @@ if(LLVM_EXTERNAL_LIT)
       DEPENDS offloader api-query
       USES_TERMINAL
       COMMENT "Running llvm/offload-test-suite against Crucible (D3D12 frontend -> Metal/Vulkan)")
+    add_custom_target(check-crucible-offload-dx-spirv
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Doffload_runtime=vulkan
+              "${CMAKE_BINARY_DIR}/test-offload"
+      DEPENDS offloader api-query
+      USES_TERMINAL
+      COMMENT "Running llvm/offload-test-suite against Crucible (D3D12/DXIL frontend -> SPIR-V/Vulkan)")
     add_custom_target(check-crucible-offload-vk
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
               "${CMAKE_BINARY_DIR}/test-offload"
@@ -114,6 +120,7 @@ if(LLVM_EXTERNAL_LIT)
       DEPENDS check-crucible-offload-vk)
     if(TARGET imgdiff)
       add_dependencies(check-crucible-offload-d3d12 imgdiff)
+      add_dependencies(check-crucible-offload-dx-spirv imgdiff)
       add_dependencies(check-crucible-offload-vk imgdiff)
       add_dependencies(check-crucible-offload-vk-kosmickrisp imgdiff)
       add_dependencies(check-crucible-offload-vk-molten imgdiff)
