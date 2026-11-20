@@ -159,6 +159,7 @@ def main() -> None:
                     with open(data_dir / fname, "w", encoding="utf-8") as f:
                         json.dump(obj, f, indent=2)
 
+    ignored_track_ids = {"history", "latest", "badge", "tracks"}
     preserved_tracks = {}
     if args.pages_url:
         tracks = fetch_json_url(
@@ -166,14 +167,15 @@ def main() -> None:
         )
         if isinstance(tracks, list):
             for track in tracks:
-                if isinstance(track, dict) and track.get("id"):
-                    preserved_tracks[track["id"]] = track
-                    track_dir = data_dir / track["id"]
+                track_id = track.get("id") if isinstance(track, dict) else None
+                if track_id and track_id not in ignored_track_ids:
+                    preserved_tracks[track_id] = track
+                    track_dir = data_dir / track_id
                     track_dir.mkdir(parents=True, exist_ok=True)
                     for fname in ("history.json", "latest.json", "badge.json"):
                         obj = fetch_json_url(
                             args.pages_url.rstrip("/")
-                            + f"/data/{track['id']}/{fname}"
+                            + f"/data/{track_id}/{fname}"
                         )
                         if obj is not None:
                             with open(
@@ -183,24 +185,26 @@ def main() -> None:
 
     if args.compliance_cache_dir:
         for cache_file in sorted(args.compliance_cache_dir.glob("*.json")):
+            track_id = cache_file.stem
+            if track_id in ignored_track_ids:
+                continue
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
-                    history = json.load(f)
+                    track_history = json.load(f)
             except (OSError, json.JSONDecodeError) as exc:
                 print(
                     f"Warning: failed to read compliance cache "
                     f"{cache_file}: {exc}"
                 )
                 continue
-            if not isinstance(history, list) or not history:
+            if not isinstance(track_history, list) or not track_history:
                 continue
-            latest = history[-1]
-            track_id = cache_file.stem
+            latest = track_history[-1]
             track_dir = data_dir / track_id
             track_dir.mkdir(parents=True, exist_ok=True)
             if not (track_dir / "history.json").exists():
                 with open(track_dir / "history.json", "w", encoding="utf-8") as f:
-                    json.dump(history, f, indent=2)
+                    json.dump(track_history, f, indent=2)
             if not (track_dir / "latest.json").exists():
                 with open(track_dir / "latest.json", "w", encoding="utf-8") as f:
                     json.dump({**latest, "failures": []}, f, indent=2)
@@ -223,7 +227,7 @@ def main() -> None:
                     json.dump(badge, f, indent=2)
             if track_id == "dxil-to-metal":
                 for fname, value in (
-                    ("history.json", history),
+                    ("history.json", track_history),
                     ("latest.json", {**latest, "failures": []}),
                     ("badge.json", {
                         "schemaVersion": 1,
