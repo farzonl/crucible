@@ -202,7 +202,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             llvm-24-dev llvm-24-tools libmlir-24-dev mlir-24-tools
           # Work around apt.llvm.org LLVM 24 MLIRTargets.cmake referencing unshipped binaries (e.g. cir-lsp-server).
-          for bin in $(grep -oE 'bin/[A-Za-z0-9_.-]+' /usr/lib/llvm-24/lib/cmake/mlir/MLIRTargets*.cmake | sort -u); do
+          for bin in $(grep -hoE 'bin/[A-Za-z0-9_.-]+' /usr/lib/llvm-24/lib/cmake/mlir/MLIRTargets*.cmake | sort -u); do
             [ -e "/usr/lib/llvm-24/$bin" ] || sudo touch "/usr/lib/llvm-24/$bin"
           done
           pip3 install --break-system-packages lit psutil pyyaml
