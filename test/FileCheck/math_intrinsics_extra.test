@@ -1,0 +1,5 @@
+# RUN: %cruciblec %S/../Inputs/math_intrinsics_extra.mlir -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+
+# CHECK: kernel void extra_math(
+# CHECK: trunc(tanh(cosh(sinh(tan(atan(asin(acos({{.*}}))))))))
