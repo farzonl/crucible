@@ -195,6 +195,7 @@ public:
 
   Error run();
   bool usedArrayLength() const { return !ArrayLengthHelpers.empty(); }
+  bool usedCmpXchg() const { return !CmpXchgHelpers.empty(); }
 
 private:
   Module &M;
@@ -205,6 +206,7 @@ private:
 
   DenseMap<const Value *, ResolvedHandle> HandleMap;
   DenseMap<Type *, Function *> ArrayLengthHelpers;
+  DenseMap<unsigned, Function *> CmpXchgHelpers;
   std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
@@ -273,6 +275,7 @@ private:
 
   void prepareStageInterface();
   void emitStageDecorations();
+  void rewriteFloatAtomicGlobals();
   void fixupExistingAtomics(Function &F);
   void normalizeArrayGlobalAccesses(Function &F);
   void configureEntryAndLinkage(StringRef StageName);
@@ -1559,40 +1562,47 @@ Error SPIRVLowerer::lowerAtomicCompareExchange(CallInst *CI) {
     return RHOrErr.takeError();
   const ResolvedHandle &RH = *RHOrErr;
 
-#if LLVM_VERSION_MAJOR < 24
-  return makeError("SPIR-V backend: atomicCompareExchange requires LLVM 24+ "
-                   "(upstream LLVM 23 SPIRVLegalizePointerCast bug on cmpxchg)");
-#else
   IRBuilder<> B(CI);
   Value *Ptr = nullptr;
+  unsigned AS = 11;
   if (RH.RB->Kind == ResourceKind::RawBuffer ||
       RH.RB->Kind == ResourceKind::StructuredBuffer) {
     Value *ByteOff = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(2),
                                              CI->getArgOperand(3));
     Value *WordIdx = B.CreateLShr(ByteOff, B.getInt32(2));
     Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+    AS = 11;
   } else {
-    unsigned Coords = textureCoordDims(RH.RB->Kind);
-    SmallVector<Value *, 3> CoordVals;
-    for (unsigned I = 0; I < Coords; ++I)
-      CoordVals.push_back(CI->getArgOperand(2 + I));
-    Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
-    Type *ImgPtrTy = PointerType::get(Ctx, 12); // Image storage class (OpImageTexelPointer)
-    Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_resource_getpointer,
-        {ImgPtrTy, RH.SpvHandleTy, Coord->getType()});
-    Ptr = B.CreateCall(GetPtrFn, {RH.SpvHandle, Coord});
+    return makeError("SPIR-V backend: atomicCompareExchange on image/typed "
+                     "resource '{0}' is not yet supported",
+                     RH.RB->Name);
   }
-  SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
   Value *Cmp = CI->getArgOperand(5);
   Value *Val = CI->getArgOperand(6);
-  auto *CX = B.CreateAtomicCmpXchg(
-      Ptr, Cmp, Val, Align(4), AtomicOrdering::AcquireRelease,
-      AtomicOrdering::Acquire, DeviceScope);
-  Value *Old = B.CreateExtractValue(CX, {0});
+  Function *&HelperFn = CmpXchgHelpers[AS];
+  if (!HelperFn) {
+    Type *I32Ty = Type::getInt32Ty(Ctx);
+    Type *PtrTy = PointerType::get(Ctx, AS);
+    FunctionType *FT = FunctionType::get(
+        I32Ty, {PtrTy, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty}, false);
+    std::string FnName = "__crucible_spv_cmpxchg." + std::to_string(AS);
+    HelperFn = Function::Create(FT, GlobalValue::InternalLinkage, FnName, M);
+    HelperFn->addFnAttr(Attribute::NoInline);
+    HelperFn->addFnAttr(Attribute::OptimizeNone);
+    BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", HelperFn);
+    IRBuilder<> HB(HBB);
+    Value *Dummy = HB.CreateAlignedLoad(I32Ty, HelperFn->getArg(0), Align(4));
+    HB.CreateRet(Dummy);
+  }
+  uint32_t Scope = 1u;  // Device
+  uint32_t MemSem = 0x40u; // UniformMemory
+  uint32_t EqSem = 0x8u /* AcquireRelease */ | MemSem;
+  uint32_t UneqSem = 0x2u /* Acquire */ | MemSem;
+  Value *Old = B.CreateCall(
+      HelperFn, {Ptr, B.getInt32(Scope), B.getInt32(EqSem),
+                 B.getInt32(UneqSem), Val, Cmp});
   CI->replaceAllUsesWith(Old);
   return Error::success();
-#endif
 }
 
 Error SPIRVLowerer::lowerBarrier(CallInst *CI) {
@@ -2767,10 +2777,128 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
   }
 }
 
+static Type *replaceFloatWithI32Type(Type *Ty, LLVMContext &Ctx) {
+  if (Ty->isFloatTy())
+    return Type::getInt32Ty(Ctx);
+  if (auto *AT = dyn_cast<ArrayType>(Ty)) {
+    Type *NewElem = replaceFloatWithI32Type(AT->getElementType(), Ctx);
+    if (NewElem != AT->getElementType())
+      return ArrayType::get(NewElem, AT->getNumElements());
+  }
+  return Ty;
+}
+
+static bool hasAtomicUse(Value *V) {
+  SmallVector<Value *, 16> Worklist = {V};
+  SmallPtrSet<Value *, 16> Visited;
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (!Visited.insert(Cur).second)
+      continue;
+    for (User *U : Cur->users()) {
+      if (isa<AtomicRMWInst>(U) || isa<AtomicCmpXchgInst>(U))
+        return true;
+      if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
+          isa<AddrSpaceCastInst>(U) || isa<GEPOperator>(U))
+        Worklist.push_back(U);
+    }
+  }
+  return false;
+}
+
+void SPIRVLowerer::rewriteFloatAtomicGlobals() {
+  SmallVector<GlobalVariable *, 8> FloatAtomics;
+  for (GlobalVariable &GV : M.globals()) {
+    if (GV.getAddressSpace() != 3)
+      continue;
+    Type *NewTy = replaceFloatWithI32Type(GV.getValueType(), Ctx);
+    if (NewTy != GV.getValueType() && hasAtomicUse(&GV))
+      FloatAtomics.push_back(&GV);
+  }
+  for (GlobalVariable *OldGV : FloatAtomics) {
+    Type *NewTy = replaceFloatWithI32Type(OldGV->getValueType(), Ctx);
+    auto *NewGV = new GlobalVariable(
+        M, NewTy, OldGV->isConstant(), OldGV->getLinkage(),
+        OldGV->hasInitializer() ? UndefValue::get(NewTy) : nullptr, "", OldGV,
+        OldGV->getThreadLocalMode(), OldGV->getAddressSpace());
+    NewGV->takeName(OldGV);
+    NewGV->setAlignment(OldGV->getAlign());
+
+    // Update GEPs and float loads/stores reachable from OldGV.
+    SmallVector<Value *, 16> Worklist = {OldGV};
+    SmallPtrSet<Value *, 16> Visited;
+    SmallVector<GetElementPtrInst *, 16> GEPs;
+    SmallVector<LoadInst *, 16> Loads;
+    SmallVector<StoreInst *, 16> Stores;
+    SmallVector<AtomicRMWInst *, 16> FloatRMWs;
+    while (!Worklist.empty()) {
+      Value *Cur = Worklist.pop_back_val();
+      if (!Visited.insert(Cur).second)
+        continue;
+      for (User *U : Cur->users()) {
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+          GEPs.push_back(GEP);
+          Worklist.push_back(GEP);
+        } else if (auto *LI = dyn_cast<LoadInst>(U)) {
+          if (LI->getType()->isFloatTy())
+            Loads.push_back(LI);
+        } else if (auto *SI = dyn_cast<StoreInst>(U)) {
+          if (SI->getPointerOperand() == Cur &&
+              SI->getValueOperand()->getType()->isFloatTy())
+            Stores.push_back(SI);
+        } else if (auto *RMW = dyn_cast<AtomicRMWInst>(U)) {
+          if (RMW->getValOperand()->getType()->isFloatTy())
+            FloatRMWs.push_back(RMW);
+        }
+      }
+    }
+    OldGV->replaceAllUsesWith(NewGV);
+    for (GetElementPtrInst *GEP : GEPs) {
+      Type *NewSrc = replaceFloatWithI32Type(GEP->getSourceElementType(), Ctx);
+      if (NewSrc != GEP->getSourceElementType()) {
+        IRBuilder<> B(GEP);
+        SmallVector<Value *, 4> Idxs(GEP->indices());
+        Value *NewGEP = GEP->isInBounds()
+                            ? B.CreateInBoundsGEP(NewSrc, GEP->getPointerOperand(), Idxs)
+                            : B.CreateGEP(NewSrc, GEP->getPointerOperand(), Idxs);
+        GEP->replaceAllUsesWith(NewGEP);
+        GEP->eraseFromParent();
+      }
+    }
+    for (LoadInst *LI : Loads) {
+      IRBuilder<> B(LI);
+      Value *IL = B.CreateAlignedLoad(B.getInt32Ty(), LI->getPointerOperand(),
+                                      LI->getAlign(), LI->isVolatile());
+      Value *FL = B.CreateBitCast(IL, B.getFloatTy());
+      LI->replaceAllUsesWith(FL);
+      LI->eraseFromParent();
+    }
+    for (StoreInst *SI : Stores) {
+      IRBuilder<> B(SI);
+      Value *IV = B.CreateBitCast(SI->getValueOperand(), B.getInt32Ty());
+      B.CreateAlignedStore(IV, SI->getPointerOperand(), SI->getAlign(),
+                           SI->isVolatile());
+      SI->eraseFromParent();
+    }
+    for (AtomicRMWInst *RMW : FloatRMWs) {
+      IRBuilder<> B(RMW);
+      Value *IV = B.CreateBitCast(RMW->getValOperand(), B.getInt32Ty());
+      auto *NewRMW = B.CreateAtomicRMW(
+          RMW->getOperation(), RMW->getPointerOperand(), IV, RMW->getAlign(),
+          RMW->getOrdering(), RMW->getSyncScopeID());
+      Value *FV = B.CreateBitCast(NewRMW, B.getFloatTy());
+      RMW->replaceAllUsesWith(FV);
+      RMW->eraseFromParent();
+    }
+    OldGV->eraseFromParent();
+  }
+}
+
 void SPIRVLowerer::fixupExistingAtomics(Function &F) {
   SyncScope::ID WorkgroupScope = Ctx.getOrInsertSyncScopeID("workgroup");
   SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
 
+  SmallVector<AtomicCmpXchgInst *, 16> CmpXchgs;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (auto *RMW = dyn_cast<AtomicRMWInst>(&I)) {
@@ -2780,16 +2908,45 @@ void SPIRVLowerer::fixupExistingAtomics(Function &F) {
             RMW->getOrdering() == AtomicOrdering::SequentiallyConsistent)
           RMW->setOrdering(AtomicOrdering::AcquireRelease);
       } else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I)) {
-        unsigned AS = CX->getPointerAddressSpace();
-        CX->setSyncScopeID(AS == 3 ? WorkgroupScope : DeviceScope);
-        if (CX->getSuccessOrdering() == AtomicOrdering::Monotonic ||
-            CX->getSuccessOrdering() == AtomicOrdering::SequentiallyConsistent)
-          CX->setSuccessOrdering(AtomicOrdering::AcquireRelease);
-        if (CX->getFailureOrdering() == AtomicOrdering::Monotonic ||
-            CX->getFailureOrdering() == AtomicOrdering::SequentiallyConsistent)
-          CX->setFailureOrdering(AtomicOrdering::Acquire);
+        if (CX->getCompareOperand()->getType()->isIntegerTy(32))
+          CmpXchgs.push_back(CX);
       }
     }
+  }
+
+  for (AtomicCmpXchgInst *CX : CmpXchgs) {
+    unsigned AS = CX->getPointerAddressSpace();
+    Function *&HelperFn = CmpXchgHelpers[AS];
+    if (!HelperFn) {
+      Type *I32Ty = Type::getInt32Ty(Ctx);
+      Type *PtrTy = PointerType::get(Ctx, AS);
+      FunctionType *FT = FunctionType::get(
+          I32Ty, {PtrTy, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty}, false);
+      std::string FnName = "__crucible_spv_cmpxchg." + std::to_string(AS);
+      HelperFn = Function::Create(FT, GlobalValue::InternalLinkage, FnName, M);
+      HelperFn->addFnAttr(Attribute::NoInline);
+      HelperFn->addFnAttr(Attribute::OptimizeNone);
+      BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", HelperFn);
+      IRBuilder<> HB(HBB);
+      Value *Dummy = HB.CreateAlignedLoad(I32Ty, HelperFn->getArg(0), Align(4));
+      HB.CreateRet(Dummy);
+    }
+    IRBuilder<> B(CX);
+    uint32_t Scope = (AS == 3) ? 2u /* Workgroup */ : 1u /* Device */;
+    uint32_t MemSem =
+        (AS == 3) ? 0x100u /* WorkgroupMemory */ : 0x40u /* UniformMemory */;
+    uint32_t EqSem = 0x8u /* AcquireRelease */ | MemSem;
+    uint32_t UneqSem = 0x2u /* Acquire */ | MemSem;
+    Value *Old = B.CreateCall(
+        HelperFn, {CX->getPointerOperand(), B.getInt32(Scope),
+                   B.getInt32(EqSem), B.getInt32(UneqSem),
+                   CX->getNewValOperand(), CX->getCompareOperand()});
+    Value *Ok = B.CreateICmpEQ(Old, CX->getCompareOperand());
+    Value *Res = PoisonValue::get(CX->getType());
+    Res = B.CreateInsertValue(Res, Old, {0});
+    Res = B.CreateInsertValue(Res, Ok, {1});
+    CX->replaceAllUsesWith(Res);
+    CX->eraseFromParent();
   }
 }
 
@@ -2972,6 +3129,7 @@ Error SPIRVLowerer::run() {
     return StageOrErr.takeError();
 
   prepareStageInterface();
+  rewriteFloatAtomicGlobals();
 
   SmallVector<CallInst *, 64> BridgeCalls;
   for (Function &F : M) {
@@ -3951,9 +4109,11 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
   CodeGenPM.run(M);
   std::string Result(OutBuf.data(), OutBuf.size());
 
-  // Rewrite sentinel __crucible_spv_arraylength.* calls into SPIR-V
-  // OpArrayLength instructions (opcode 268) and strip the stub functions.
-  if (!Opts.EmitSPIRVAsm && Lowerer.usedArrayLength() &&
+  // Rewrite sentinel __crucible_spv_arraylength.* and __crucible_spv_cmpxchg.*
+  // calls into SPIR-V OpArrayLength (68) / OpAtomicCompareExchange (230) and
+  // strip the stub functions.
+  if (!Opts.EmitSPIRVAsm &&
+      (Lowerer.usedArrayLength() || Lowerer.usedCmpXchg()) &&
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
@@ -3971,8 +4131,11 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       constexpr uint16_t OpMemberDecorate = 72;
       constexpr uint16_t OpCopyObject = 83;
       constexpr uint16_t OpBitcast = 124;
+      constexpr uint16_t OpAtomicCompareExchange = 230;
       constexpr uint16_t OpLabel = 248;
 
+      DenseSet<uint32_t> ArrayLenHelperIds;
+      DenseSet<uint32_t> CmpXchgHelperIds;
       DenseSet<uint32_t> HelperIds;
       DenseMap<uint32_t, uint32_t> CopyOf;
       DenseSet<uint32_t> RuntimeArrays;
@@ -3987,8 +4150,13 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
           const char *Str = reinterpret_cast<const char *>(&Words[I + 2]);
           size_t MaxLen = (WC - 2) * 4;
           StringRef Name(Str, strnlen(Str, MaxLen));
-          if (Name.starts_with("__crucible_spv_arraylength."))
+          if (Name.starts_with("__crucible_spv_arraylength.")) {
+            ArrayLenHelperIds.insert(Words[I + 1]);
             HelperIds.insert(Words[I + 1]);
+          } else if (Name.starts_with("__crucible_spv_cmpxchg.")) {
+            CmpXchgHelperIds.insert(Words[I + 1]);
+            HelperIds.insert(Words[I + 1]);
+          }
         } else if ((Op == OpCopyObject || Op == OpBitcast) && WC == 4) {
           CopyOf[Words[I + 2]] = Words[I + 3];
         } else if (Op == OpTypeRuntimeArray && WC >= 3) {
@@ -4032,7 +4200,7 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
                      RemovedIds.contains(Words[I + 3])) {
             RemovedIds.insert(Words[I + 1]);
           } else if (Op == OpFunctionCall && WC == 5 &&
-                     HelperIds.contains(Words[I + 3])) {
+                     ArrayLenHelperIds.contains(Words[I + 3])) {
             uint32_t Arg = Words[I + 4];
             if (CopyOf.contains(Arg))
               DeadBitcasts.insert(Arg);
@@ -4077,7 +4245,7 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             continue;
           }
           if (Op == OpFunctionCall && WC == 5 &&
-              HelperIds.contains(Words[I + 3])) {
+              ArrayLenHelperIds.contains(Words[I + 3])) {
             uint32_t StructPtr = Words[I + 4];
             for (auto It = CopyOf.find(StructPtr); It != CopyOf.end();
                  It = CopyOf.find(StructPtr))
@@ -4087,6 +4255,20 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             Patched.push_back(Words[I + 2]); // ResultId
             Patched.push_back(StructPtr);    // StructurePtr (OpVariable)
             Patched.push_back(0u);           // Member 0 (runtime array)
+            I += WC;
+            continue;
+          }
+          if (Op == OpFunctionCall && WC == 10 &&
+              CmpXchgHelperIds.contains(Words[I + 3])) {
+            Patched.push_back((9u << 16) | OpAtomicCompareExchange);
+            Patched.push_back(Words[I + 1]); // ResultType (uint)
+            Patched.push_back(Words[I + 2]); // ResultId
+            Patched.push_back(Words[I + 4]); // Pointer
+            Patched.push_back(Words[I + 5]); // MemoryScope
+            Patched.push_back(Words[I + 6]); // EqualSemantics
+            Patched.push_back(Words[I + 7]); // UnequalSemantics
+            Patched.push_back(Words[I + 8]); // Value
+            Patched.push_back(Words[I + 9]); // Comparator
             I += WC;
             continue;
           }
