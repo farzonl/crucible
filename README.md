@@ -104,10 +104,10 @@ xychart-beta
 
 `tools/crucible-offload` builds upstream `offloader` and `api-query` against a unified multi-runtime device provider (`MetalDevice` + `VulkanDevice`). Crucible advertises DirectX and Vulkan facades with the `Crucible` driver tag, so tests are selected using the frontend contract being exercised:
 
-- **macOS (`dxil-to-metal`)**: `CRUCIBLE_OFFLOAD_RUNTIME=metal` (default on macOS) compiles DXIL → MSL and dispatches on Metal.
-- **macOS (`spirv-to-metal`)**: `check-crucible-offload-vk` (`lit -Dspirv_frontend=1`) compiles HLSL via `dxc -spirv -fspv-target-env=vulkan1.3`, lowers SPIR-V → MLIR → MSL, and dispatches on Metal.
+- **macOS (`dxil-to-metal`)**: `check-crucible-offload-dx-to-metal` (`CRUCIBLE_OFFLOAD_RUNTIME=metal`, default on macOS) compiles DXIL → MSL and dispatches on Metal.
+- **macOS (`spirv-to-metal`)**: `check-crucible-offload-vk-to-metal` (`lit -Dspirv_frontend=1 -Doffload_runtime=metal`) compiles HLSL via `dxc -spirv -fspv-target-env=vulkan1.3`, lowers SPIR-V → MLIR → MSL, and dispatches on Metal.
 - **Native Vulkan drivers**: `check-crucible-offload-vk-molten` and `check-crucible-offload-vk-kosmickrisp` run the same SPIR-V tests directly on each advertised driver.
-- **Linux Lavapipe / macOS MoltenVK (`dxil-to-spirv`)**: `check-crucible-offload-dx-spirv` (`lit -Doffload_runtime=vulkan` / `CRUCIBLE_OFFLOAD_RUNTIME=vulkan`, default on Linux) compiles DXIL → SPIR-V and dispatches on Vulkan.
+- **Linux Lavapipe / macOS MoltenVK / KosmicKrisp (`dxil-to-spirv`)**: `check-crucible-offload-dx-to-vk` (`lit -Doffload_runtime=vulkan` / `CRUCIBLE_OFFLOAD_RUNTIME=vulkan`, default on Linux) compiles DXIL → SPIR-V and dispatches on Vulkan.
 
 ---
 
@@ -118,11 +118,11 @@ Requirements: **CMake ≥ 3.24**, **Ninja**, **LLVM + MLIR ≥ 16** (with the SP
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
-ninja -C build check-crucible                # FileCheck + Metal/Vulkan GPU E2E tests
-ninja -C build check-crucible-offload-d3d12  # llvm/offload-test-suite (D3D12/DXIL frontend)
-ninja -C build check-crucible-offload-dx-spirv # llvm/offload-test-suite (DXIL -> SPIR-V on Vulkan)
-ninja -C build check-crucible-offload-vk     # llvm/offload-test-suite (Vulkan/SPIR-V frontend)
-ninja -C build check-crucible-offload-vk-kosmickrisp  # Vulkan/SPIR-V on KosmicKrisp
+ninja -C build check-crucible                        # FileCheck + Metal/Vulkan GPU E2E tests
+ninja -C build check-crucible-offload-dx-to-metal    # llvm/offload-test-suite (DXIL -> MSL -> Metal)
+ninja -C build check-crucible-offload-dx-to-vk       # llvm/offload-test-suite (DXIL -> SPIR-V -> Vulkan)
+ninja -C build check-crucible-offload-vk-to-metal    # llvm/offload-test-suite (SPIR-V -> MSL -> Metal)
+ninja -C build check-crucible-offload-vk-kosmickrisp # Vulkan/SPIR-V on KosmicKrisp
 ninja -C build check-crucible-offload-vk-molten      # Vulkan/SPIR-V on MoltenVK
 ```
 

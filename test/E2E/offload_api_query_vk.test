@@ -6,4 +6,6 @@
 
 # CHECK: API: DirectX
 # CHECK: Driver: Crucible
+# CHECK: Driver Version: "{{.+}}"
 # CHECK: Backend: Vulkan
+# CHECK: VulkanDriver: {{.+}}

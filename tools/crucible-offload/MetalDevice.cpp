@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Capabilities.h"
 #include "Common.h"
 #include "API/Device.h"
 #include "API/FormatConversion.h"
@@ -2308,87 +2309,51 @@ public:
   explicit CrucibleDevice(NS::SharedPtr<MTL::Device> Metal, GPUAPI API,
                           offloadtest::Device *VulkanInfo)
       : Metal(std::move(Metal)), API(API) {
-    Description = this->Metal->name()->utf8String();
-    DriverName = "Crucible";
+    crucible_offload::MetalBackendCaps MetalCaps;
+    MetalCaps.DeviceName = this->Metal->name()->utf8String();
     const auto Version =
         NS::ProcessInfo::processInfo()->operatingSystemVersion();
-    DriverVersion = formatv("{0}.{1}.{2}", Version.majorVersion,
-                            Version.minorVersion, Version.patchVersion);
-    if (StringRef(Description).starts_with("Apple "))
-      GPUGeneration = StringRef(Description).split(' ').second.split(' ').first.str();
+    MetalCaps.OSVersion = formatv("{0}.{1}.{2}", Version.majorVersion,
+                                  Version.minorVersion, Version.patchVersion);
+    if (StringRef(MetalCaps.DeviceName).starts_with("Apple "))
+      MetalCaps.GPUGeneration =
+          StringRef(MetalCaps.DeviceName).split(' ').second.split(' ').first.str();
     else
-      GPUGeneration = "Unknown";
-    auto MakeStr = [](StringRef Name, std::string V) {
-      return Capability(
-          Name, std::make_shared<CapabilityValueString>(std::move(V)));
-    };
-    Caps.try_emplace("WaveOps", makeCapability("WaveOps", true));
-    Caps.try_emplace("WaveLaneCountMin",
-                     makeCapability("WaveLaneCountMin", uint32_t(32)));
-    Caps.try_emplace("WaveLaneCountMax",
-                     makeCapability("WaveLaneCountMax", uint32_t(32)));
-    Caps.try_emplace("TotalLaneCount",
-                     makeCapability("TotalLaneCount", uint32_t(32)));
-    Caps.try_emplace("HighestShaderModel",
-                     MakeStr("HighestShaderModel", "6.9"));
-    Caps.try_emplace("Native16BitShaderOpsSupported",
-                     makeCapability("Native16BitShaderOpsSupported", true));
-    Caps.try_emplace("Int64ShaderOps", makeCapability("Int64ShaderOps", true));
-    Caps.try_emplace("DoublePrecisionFloatShaderOps",
-                     makeCapability("DoublePrecisionFloatShaderOps", true));
-    Caps.try_emplace("AtomicInt64OnGroupSharedSupported",
-                     makeCapability("AtomicInt64OnGroupSharedSupported", false));
-    Caps.try_emplace("AtomicInt64OnTypedResourceSupported",
-                     makeCapability("AtomicInt64OnTypedResourceSupported", false));
-    Caps.try_emplace("ResourceBindingTier",
-                     makeCapability("ResourceBindingTier", uint32_t(3)));
-    Caps.try_emplace("TiledResourcesTier",
-                     makeCapability("TiledResourcesTier", uint32_t(2)));
-    Caps.try_emplace("MeshShaderTier",
-                     MakeStr("MeshShaderTier",
-                             this->Metal->supportsFamily(MTL::GPUFamilyMetal3)
-                                 ? "Tier1"
-                                 : "NotSupported"));
-    Caps.try_emplace("BarycentricsSupported",
-                     makeCapability("BarycentricsSupported", false));
-    Caps.try_emplace("PSSpecifiedStencilRefSupported",
-                     makeCapability("PSSpecifiedStencilRefSupported", true));
-    Caps.try_emplace(
-        "VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation",
-        makeCapability(
-            "VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation",
-            true));
-    Caps.try_emplace("RaytracingTier",
-                     MakeStr("RaytracingTier", this->Metal->supportsRaytracing()
-                                                   ? "1.1"
-                                                   : "NotSupported"));
+      MetalCaps.GPUGeneration = "Unknown";
+    MetalCaps.SupportsMetal3 =
+        this->Metal->supportsFamily(MTL::GPUFamilyMetal3);
+    MetalCaps.SupportsRaytracing = this->Metal->supportsRaytracing();
+    MetalCaps.HasUnifiedMemory = this->Metal->hasUnifiedMemory();
+    MetalCaps.RegistryID = this->Metal->registryID();
+
+    crucible_offload::CrucibleEmulationCaps Emul;
+    Emul.EmulateF64 = true;
+    Emul.EmulateInt64Atomics = false;
+    Emul.HighestShaderModel = "6.9";
+
+    Description = (API == GPUAPI::Vulkan)
+                      ? (MetalCaps.DeviceName + " (Crucible)")
+                      : MetalCaps.DeviceName;
+    DriverName = "Crucible";
+    DriverVersion = MetalCaps.OSVersion;
+    GPUGeneration = MetalCaps.GPUGeneration;
     if (API == GPUAPI::Vulkan) {
       if (VulkanInfo) {
-        Description = VulkanInfo->getDescription();
-        GPUGeneration = VulkanInfo->getGPUGeneration();
+        // Proxy the full Vulkan capability set, layers, and extensions from
+        // the active Vulkan ICD (e.g. selected via VK_DRIVER_FILES), then
+        // overlay only the features Crucible emulates.
         FamilyPrefix = VulkanInfo->getFamilyPrefix();
         Caps = VulkanInfo->getCapabilities();
+        crucible_offload::applyVulkanEmulationOverrides(Caps, Emul);
         raw_string_ostream OS(Extra);
         VulkanInfo->printExtra(OS);
         OS.flush();
       } else {
-        // Populate Vulkan feature capabilities from Metal when no native
-        // Vulkan ICD is present (e.g. macOS CI runners without MoltenVK).
-        Caps.clear();
-        Caps.try_emplace("shaderFloat16", makeCapability("shaderFloat16", true));
-        Caps.try_emplace("shaderInt16", makeCapability("shaderInt16", true));
-        Caps.try_emplace("shaderInt64", makeCapability("shaderInt64", true));
-        Caps.try_emplace("shaderFloat64", makeCapability("shaderFloat64", true));
-        Caps.try_emplace("shaderResourceMinLod",
-                         makeCapability("shaderResourceMinLod", true));
-        Caps.try_emplace("runtimeDescriptorArray",
-                         makeCapability("runtimeDescriptorArray", true));
-        Caps.try_emplace("descriptorBindingPartiallyBound",
-                         makeCapability("descriptorBindingPartiallyBound", true));
-        Caps.try_emplace("multiViewport", makeCapability("multiViewport", true));
-        Caps.try_emplace("shaderOutputViewportIndex",
-                         makeCapability("shaderOutputViewportIndex", true));
+        // Fallback when no Vulkan ICD is present (e.g. macOS CI runners).
+        Caps = crucible_offload::buildVulkanCapsFromMetal(MetalCaps, Emul);
       }
+    } else {
+      Caps = crucible_offload::buildDirectXCapsFromMetal(MetalCaps, Emul);
     }
   }
 

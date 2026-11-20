@@ -39,6 +39,7 @@ target_compile_options(offload-suite-support PRIVATE ${CRUCIBLE_COMMON_FLAGS})
 target_link_libraries(offload-suite-support PUBLIC ${CRUCIBLE_LLVM_LIBS})
 
 set(CRUCIBLE_OFFLOAD_SOURCES
+  Capabilities.cpp
   Common.cpp
   DeviceInit.cpp
 )

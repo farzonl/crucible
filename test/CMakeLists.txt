@@ -84,24 +84,24 @@ if(LLVM_EXTERNAL_LIT)
     file(GENERATE
       OUTPUT "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py"
       INPUT "${CMAKE_BINARY_DIR}/test-offload/lit.site.cfg.py.gen")
-    add_custom_target(check-crucible-offload-d3d12
-      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv
+    add_custom_target(check-crucible-offload-dx-to-metal
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Doffload_runtime=metal
               "${CMAKE_BINARY_DIR}/test-offload"
       DEPENDS offloader api-query
       USES_TERMINAL
-      COMMENT "Running llvm/offload-test-suite against Crucible (D3D12 frontend -> Metal/Vulkan)")
-    add_custom_target(check-crucible-offload-dx-spirv
+      COMMENT "Running llvm/offload-test-suite against Crucible (DXIL -> MSL -> Metal)")
+    add_custom_target(check-crucible-offload-dx-to-vk
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Doffload_runtime=vulkan
               "${CMAKE_BINARY_DIR}/test-offload"
       DEPENDS offloader api-query
       USES_TERMINAL
-      COMMENT "Running llvm/offload-test-suite against Crucible (D3D12/DXIL frontend -> SPIR-V/Vulkan)")
-    add_custom_target(check-crucible-offload-vk
-      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
+      COMMENT "Running llvm/offload-test-suite against Crucible (DXIL -> SPIR-V -> Vulkan)")
+    add_custom_target(check-crucible-offload-vk-to-metal
+      COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1 -Doffload_runtime=metal
               "${CMAKE_BINARY_DIR}/test-offload"
       DEPENDS offloader api-query
       USES_TERMINAL
-      COMMENT "Running llvm/offload-test-suite against Crucible (Vulkan frontend -> Metal)")
+      COMMENT "Running llvm/offload-test-suite against Crucible (SPIR-V -> MSL -> Metal)")
     add_custom_target(check-crucible-offload-vk-kosmickrisp
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
               -Dvulkan_driver=KosmicKrisp "${CMAKE_BINARY_DIR}/test-offload"
@@ -114,14 +114,10 @@ if(LLVM_EXTERNAL_LIT)
       DEPENDS offloader api-query
       USES_TERMINAL
       COMMENT "Running llvm/offload-test-suite against MoltenVK")
-    add_custom_target(check-crucible-offload-dx
-      DEPENDS check-crucible-offload-d3d12)
-    add_custom_target(check-crucible-offload-spirv
-      DEPENDS check-crucible-offload-vk)
     if(TARGET imgdiff)
-      add_dependencies(check-crucible-offload-d3d12 imgdiff)
-      add_dependencies(check-crucible-offload-dx-spirv imgdiff)
-      add_dependencies(check-crucible-offload-vk imgdiff)
+      add_dependencies(check-crucible-offload-dx-to-metal imgdiff)
+      add_dependencies(check-crucible-offload-dx-to-vk imgdiff)
+      add_dependencies(check-crucible-offload-vk-to-metal imgdiff)
       add_dependencies(check-crucible-offload-vk-kosmickrisp imgdiff)
       add_dependencies(check-crucible-offload-vk-molten imgdiff)
     endif()
