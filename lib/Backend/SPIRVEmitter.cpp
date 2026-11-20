@@ -398,8 +398,7 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
     uint32_t NumVec4 = std::max(1u, (RB.ElementStride + 15u) / 16u);
     Type *Vec4I32 = FixedVectorType::get(Type::getInt32Ty(Ctx), 4);
     Type *ArrTy = ArrayType::get(Vec4I32, NumVec4);
-    StructType *CBStruct = StructType::get(Ctx, ArrayRef<Type *>{ArrTy});
-    return TargetExtType::get(Ctx, "spirv.VulkanBuffer", {CBStruct},
+    return TargetExtType::get(Ctx, "spirv.VulkanBuffer", {ArrTy},
                               {2u /* Uniform */, 0u /* NonWritable */});
   }
   case ResourceKind::TypedBuffer:
@@ -868,19 +867,15 @@ Error SPIRVLowerer::lowerCBufferLoad(CallInst *CI) {
   if (!RetVecTy || RetVecTy->getNumElements() == 0)
     return makeError("SPIR-V backend: unexpected cbuffer_load return type");
 
-  auto *ExtTy = cast<TargetExtType>(RH.SpvHandleTy);
-  Type *CBStructTy = ExtTy->getTypeParameter(0);
   Type *Vec4I32 = FixedVectorType::get(Type::getInt32Ty(Ctx), 4);
 
   IRBuilder<> B(CI);
   Type *UniformPtrTy = PointerType::get(Ctx, 12); // Uniform address space
-  Function *GetBaseFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_resource_getbasepointer,
-      {UniformPtrTy, RH.SpvHandleTy});
-  Value *BasePtr = B.CreateCall(GetBaseFn, {RH.SpvHandle});
   Value *RowIdx = CI->getArgOperand(2);
-  Value *RowPtr =
-      B.CreateInBoundsGEP(CBStructTy, BasePtr, {B.getInt32(0), B.getInt32(0), RowIdx});
+  Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_resource_getpointer,
+      {UniformPtrTy, RH.SpvHandleTy, RowIdx->getType()});
+  Value *RowPtr = B.CreateCall(GetPtrFn, {RH.SpvHandle, RowIdx});
   Value *RawVec = B.CreateAlignedLoad(Vec4I32, RowPtr, Align(16));
 
   Value *CastVec =

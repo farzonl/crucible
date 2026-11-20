@@ -150,6 +150,29 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
     return Wildcard;
   };
 
+  // Remap huge/sparse HLSL register spaces (e.g. space4294967279) into compact
+  // dense Vulkan DescriptorSet indices so LLVM SPIR-V's binding legalizer and
+  // Vulkan vkCreatePipelineLayout don't OOM allocating 2^32 set slots.
+  // Keep small spaces (< 64) as identity to preserve explicit space0..N layouts.
+  bool HasLargeSpace = false;
+  for (const ResourceBinding *RB : Order) {
+    if (RB->Space >= 64u) {
+      HasLargeSpace = true;
+      break;
+    }
+  }
+  std::map<uint32_t, uint32_t> SpaceToSet;
+  if (HasLargeSpace) {
+    uint32_t NextSet = 0;
+    for (const ResourceBinding *RB : Order) {
+      if (SpaceToSet.find(RB->Space) == SpaceToSet.end())
+        SpaceToSet[RB->Space] = NextSet++;
+    }
+  }
+  auto mapSpaceToSet = [&](uint32_t Space) -> uint32_t {
+    return HasLargeSpace ? SpaceToSet[Space] : Space;
+  };
+
   if (Opts.VulkanRegisterShifts.empty()) {
     uint32_t CurrentSpace = UINT32_MAX;
     uint32_t NextBinding = 0;
@@ -170,7 +193,7 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
         CurrentSpace = RB->Space;
         NextBinding = 0;
       }
-      RB->SPIRVSet = RB->Space;
+      RB->SPIRVSet = mapSpaceToSet(RB->Space);
       RB->SPIRVBinding = NextBinding;
       uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
       NextBinding += SlotStep;
@@ -222,7 +245,7 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
     if (RB->RangeSize == 0)
       return makeError("resource '{0}': zero-sized descriptor array is invalid",
                        RB->Name);
-    RB->SPIRVSet = RB->Space;
+    RB->SPIRVSet = mapSpaceToSet(RB->Space);
     uint32_t SlotStep = (RB->RangeSize == 0xFFFFFFFFu) ? 1u : RB->RangeSize;
     if (auto Shift = findShift(RB->Class, RB->Space)) {
       RB->SPIRVBinding = RB->LowerBound + *Shift;
