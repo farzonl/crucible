@@ -1698,6 +1698,125 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
     Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
     break;
   }
+  case DXILOp::WaveMultiPrefixBitCount:
+  case DXILOp::WaveMultiPrefixOp: {
+    // Compute active-lane-masked prefix words wm[0..3] (active bits < lane).
+    Function *LaneFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_subgroup_local_invocation_id);
+    Value *Lane = B.CreateCall(LaneFn);
+    Function *BallotFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_subgroup_ballot);
+    Value *ActiveBallot = B.CreateCall(BallotFn, {B.getTrue()});
+    Value *WordMasks[4];
+    for (unsigned W = 0; W < 4; ++W) {
+      Value *ActiveW = B.CreateExtractElement(ActiveBallot, B.getInt32(W));
+      Value *RawMask = B.CreateAnd(CI->getArgOperand(2 + W), ActiveW);
+      Value *LoBound = B.getInt32(W * 32);
+      Value *HiBound = B.getInt32((W + 1) * 32);
+      Value *LocalBit = B.CreateSub(Lane, LoBound);
+      Value *Shifted = B.CreateShl(B.getInt32(1), LocalBit);
+      Value *PartialMask = B.CreateAnd(RawMask, B.CreateSub(Shifted, B.getInt32(1)));
+      Value *Below = B.CreateICmpULE(Lane, LoBound);
+      Value *Above = B.CreateICmpUGE(Lane, HiBound);
+      WordMasks[W] = B.CreateSelect(
+          Below, B.getInt32(0), B.CreateSelect(Above, RawMask, PartialMask));
+    }
+
+    DXILWaveMultiPrefixOpKind OpKind = DXILWaveMultiPrefixOpKind::Sum;
+    Value *Val = nullptr;
+    if (Op == DXILOp::WaveMultiPrefixBitCount) {
+      Val = B.CreateZExt(CI->getArgOperand(1), B.getInt32Ty());
+    } else {
+      auto *KindC = dyn_cast<ConstantInt>(CI->getArgOperand(6));
+      if (!KindC || KindC->getZExtValue() > 4)
+        return makeError("SPIR-V backend: unsupported waveMultiPrefixOp kind");
+      OpKind = static_cast<DXILWaveMultiPrefixOpKind>(KindC->getZExtValue());
+      Val = CI->getArgOperand(1);
+    }
+    Type *ValTy = Val->getType();
+
+    Value *Acc = nullptr;
+    switch (OpKind) {
+    case DXILWaveMultiPrefixOpKind::Sum:
+    case DXILWaveMultiPrefixOpKind::Or:
+    case DXILWaveMultiPrefixOpKind::Xor:
+      Acc = Constant::getNullValue(ValTy);
+      break;
+    case DXILWaveMultiPrefixOpKind::And:
+      Acc = ConstantInt::getAllOnesValue(ValTy);
+      break;
+    case DXILWaveMultiPrefixOpKind::Product:
+      Acc = ValTy->isFloatingPointTy() ? ConstantFP::get(ValTy, 1.0)
+                                       : ConstantInt::get(ValTy, 1);
+      break;
+    }
+
+    Function *ReduceOrFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_wave_reduce_or, {B.getInt32Ty()});
+    Function *FirstBitLowFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_firstbitlow, {B.getInt32Ty()});
+    Function *ReadLaneFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_wave_readlane, {ValTy});
+
+    for (unsigned W = 0; W < 4; ++W) {
+      Value *UniformMask = B.CreateCall(ReduceOrFn, {WordMasks[W]});
+      BasicBlock *CurBB = CI->getParent();
+      BasicBlock *ContBB = CurBB->splitBasicBlock(CI, "wmp.cont");
+      BasicBlock *LoopBB =
+          BasicBlock::Create(Ctx, "wmp.loop", CurBB->getParent(), ContBB);
+      CurBB->getTerminator()->eraseFromParent();
+      B.SetInsertPoint(CurBB);
+      B.CreateCondBr(B.CreateICmpNE(UniformMask, B.getInt32(0)), LoopBB, ContBB);
+
+      B.SetInsertPoint(LoopBB);
+      PHINode *RemPhi = B.CreatePHI(B.getInt32Ty(), 2, "wmp.rem");
+      PHINode *AccPhi = B.CreatePHI(ValTy, 2, "wmp.acc");
+      RemPhi->addIncoming(UniformMask, CurBB);
+      AccPhi->addIncoming(Acc, CurBB);
+
+      Value *BitIdx = B.CreateCall(FirstBitLowFn, {RemPhi});
+      Value *SrcLane =
+          (W == 0) ? BitIdx : B.CreateAdd(BitIdx, B.getInt32(W * 32));
+      Value *Other = B.CreateCall(ReadLaneFn, {Val, SrcLane});
+      Value *InGroup = B.CreateICmpNE(
+          B.CreateAnd(B.CreateLShr(WordMasks[W], BitIdx), B.getInt32(1)),
+          B.getInt32(0));
+
+      Value *Combined = nullptr;
+      switch (OpKind) {
+      case DXILWaveMultiPrefixOpKind::Sum:
+        Combined = ValTy->isFloatingPointTy() ? B.CreateFAdd(AccPhi, Other)
+                                              : B.CreateAdd(AccPhi, Other);
+        break;
+      case DXILWaveMultiPrefixOpKind::Product:
+        Combined = ValTy->isFloatingPointTy() ? B.CreateFMul(AccPhi, Other)
+                                              : B.CreateMul(AccPhi, Other);
+        break;
+      case DXILWaveMultiPrefixOpKind::And:
+        Combined = B.CreateAnd(AccPhi, Other);
+        break;
+      case DXILWaveMultiPrefixOpKind::Or:
+        Combined = B.CreateOr(AccPhi, Other);
+        break;
+      case DXILWaveMultiPrefixOpKind::Xor:
+        Combined = B.CreateXor(AccPhi, Other);
+        break;
+      }
+      Value *NextAcc = B.CreateSelect(InGroup, Combined, AccPhi);
+      Value *NextRem = B.CreateAnd(RemPhi, B.CreateSub(RemPhi, B.getInt32(1)));
+      RemPhi->addIncoming(NextRem, LoopBB);
+      AccPhi->addIncoming(NextAcc, LoopBB);
+      B.CreateCondBr(B.CreateICmpNE(NextRem, B.getInt32(0)), LoopBB, ContBB);
+
+      B.SetInsertPoint(CI);
+      PHINode *OutAcc = B.CreatePHI(ValTy, 2, "wmp.out");
+      OutAcc->addIncoming(Acc, CurBB);
+      OutAcc->addIncoming(NextAcc, LoopBB);
+      Acc = OutAcc;
+    }
+    Res = Acc;
+    break;
+  }
   case DXILOp::QuadOp: {
     Value *Val = CI->getArgOperand(1);
     auto *DirC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
@@ -2207,6 +2326,8 @@ Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
   case DXILOp::WavePrefixOp:
   case DXILOp::WaveAllBitCount:
   case DXILOp::WavePrefixBitCount:
+  case DXILOp::WaveMultiPrefixOp:
+  case DXILOp::WaveMultiPrefixBitCount:
   case DXILOp::QuadOp:
     return lowerWaveOp(CI, Op);
 
