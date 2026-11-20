@@ -1,10 +1,14 @@
 # REQUIRES: gpu, offload-runner
 # RUN: %api_query | FileCheck %s
 
-# CHECK-DAG: API: DirectX
-# CHECK-DAG: Backend: Metal
-# CHECK-DAG: Description: {{.+}}
-# CHECK-DAG: Driver: Crucible
-# CHECK-DAG: DoublePrecisionFloatShaderOps: true
-# CHECK-DAG: RegistryID: {{[1-9][0-9]*}}
-# CHECK-DAG: Architecture: "{{[^"]+}}"
+# CHECK: Architecture: "{{[^"]+}}"
+# CHECK: - API: DirectX
+# CHECK-NEXT: Description: {{.+}}
+# CHECK-NEXT: Driver: Crucible
+# CHECK: DoublePrecisionFloatShaderOps: true
+# CHECK: Backend: Metal
+# CHECK-NEXT: RegistryID: {{[1-9][0-9]*}}
+# CHECK: - API: Vulkan
+# CHECK-NEXT: Description: {{.+}} (Crucible)
+# CHECK-NEXT: Driver: Crucible
+# CHECK: shaderFloat64: true

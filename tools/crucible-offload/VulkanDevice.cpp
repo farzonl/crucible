@@ -8,17 +8,21 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Capabilities.h"
 #include "Common.h"
 #include "crucible/Compiler.h"
 
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Object/DXContainer.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -155,10 +159,7 @@ struct VkContext {
   VkQueue Queue = VK_NULL_HANDLE;
   uint32_t ComputeQF = UINT32_MAX;
   uint32_t GraphicsQF = UINT32_MAX;
-  std::string DeviceName;
-  uint32_t VendorID = 0;
-  uint32_t DeviceID = 0;
-  uint32_t DriverVersion = 0;
+  VulkanBackendCaps BackendCaps;
 
   ~VkContext() {
     if (Device)
@@ -1633,58 +1634,45 @@ class CrucibleVulkanDevice final : public offloadtest::Device {
 public:
   explicit CrucibleVulkanDevice(std::unique_ptr<VkContext> VK)
       : VK(std::move(VK)) {
-    Description = this->VK->DeviceName;
+    const VulkanBackendCaps &BC = this->VK->BackendCaps;
+    Description = formatVulkanDeviceDescription(BC.DeviceName, BC.DriverName);
     DriverName = "Crucible";
+    if (!BC.DriverInfo.empty()) {
+      DriverVersion = BC.DriverInfo;
+    } else {
+      DriverVersion =
+          formatv("{0}.{1}.{2}", VK_API_VERSION_MAJOR(BC.DriverVersion),
+                  VK_API_VERSION_MINOR(BC.DriverVersion),
+                  VK_API_VERSION_PATCH(BC.DriverVersion));
+    }
+    if (StringRef(BC.DeviceName).starts_with("Apple "))
+      GPUGeneration =
+          StringRef(BC.DeviceName).split(' ').second.split(' ').first.str();
+    else
+      GPUGeneration = "Unknown";
 
-    VkPhysicalDeviceSubgroupProperties SubgroupProps{};
-    SubgroupProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-    VkPhysicalDeviceProperties2 Props2{};
-    Props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-    Props2.pNext = &SubgroupProps;
-    vkGetPhysicalDeviceProperties2(this->VK->PhysDev, &Props2);
+    VulkanRuntimeCaps RuntimeCaps;
+    RuntimeCaps.SupportsMeshShader = false;
+    RuntimeCaps.SupportsRaytracing = false;
 
-    VkPhysicalDeviceFeatures2 Feats2{};
-    Feats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    vkGetPhysicalDeviceFeatures2(this->VK->PhysDev, &Feats2);
+    CrucibleEmulationCaps Emul;
+    Emul.EmulateF64 = false;
+    Emul.EmulateInt64Atomics = false;
+    Emul.HighestShaderModel = "6.6";
 
-    Caps.try_emplace("HighestShaderModel",
-                     makeStringCapability("HighestShaderModel", "6.6"));
-    Caps.try_emplace("DoublePrecisionFloatShaderOps",
-                     makeCapability("DoublePrecisionFloatShaderOps",
-                                    Feats2.features.shaderFloat64 != 0));
-    Caps.try_emplace("Int64ShaderOps",
-                     makeCapability("Int64ShaderOps",
-                                    Feats2.features.shaderInt64 != 0));
-    Caps.try_emplace("Native16BitShaderOpsSupported",
-                     makeCapability("Native16BitShaderOpsSupported",
-                                    Feats2.features.shaderInt16 != 0));
-    bool HasWave = (SubgroupProps.supportedStages &
-                    VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
-                   SubgroupProps.subgroupSize > 0;
-    Caps.try_emplace("WaveOps", makeCapability("WaveOps", HasWave));
-    Caps.try_emplace("WaveLaneCountMin",
-                     makeCapability<uint32_t>("WaveLaneCountMin",
-                                              SubgroupProps.subgroupSize));
-    Caps.try_emplace("WaveLaneCountMax",
-                     makeCapability<uint32_t>("WaveLaneCountMax",
-                                              SubgroupProps.subgroupSize));
-    Caps.try_emplace("ResourceBindingTier",
-                     makeCapability<uint32_t>("ResourceBindingTier", 3u));
-    Caps.try_emplace("TiledResourcesTier",
-                     makeCapability<uint32_t>("TiledResourcesTier", 0u));
-    Caps.try_emplace("MeshShaderTier",
-                     makeStringCapability("MeshShaderTier", "NotSupported"));
-    Caps.try_emplace("RaytracingTier",
-                     makeStringCapability("RaytracingTier", "NotSupported"));
+    Caps = buildDirectXCapsFromVulkan(BC, RuntimeCaps, Emul);
   }
 
   const Capabilities &getCapabilities() override { return Caps; }
   StringRef getAPIName() const override { return "DirectX"; }
   GPUAPI getAPI() const override { return GPUAPI::DirectX; }
   void printExtra(raw_ostream &OS) override {
-    OS << "  Backend: Vulkan\n"
-       << "  VendorID: 0x" << Twine::utohexstr(VK->VendorID) << '\n'
-       << "  DeviceID: 0x" << Twine::utohexstr(VK->DeviceID) << '\n';
+    OS << "  Backend: Vulkan\n";
+    if (!VK->BackendCaps.DriverName.empty())
+      OS << "  VulkanDriver: " << VK->BackendCaps.DriverName << '\n';
+    OS << "  VendorID: 0x" << Twine::utohexstr(VK->BackendCaps.VendorID) << '\n'
+       << "  DeviceID: 0x" << Twine::utohexstr(VK->BackendCaps.DeviceID)
+       << '\n';
   }
   Error executeProgram(Pipeline &P) override {
     if (auto Err = validateRootParameters(P))
@@ -1823,14 +1811,124 @@ createVulkanDevices(const DeviceConfig &Config) {
   if (VkResult R =
           vkEnumeratePhysicalDevices(VK->Instance, &DevCount, Devs.data()))
     return vkErr(R, "vkEnumeratePhysicalDevices");
-  VK->PhysDev = Devs[0];
 
-  VkPhysicalDeviceProperties Props{};
-  vkGetPhysicalDeviceProperties(VK->PhysDev, &Props);
-  VK->DeviceName = Props.deviceName;
-  VK->VendorID = Props.vendorID;
-  VK->DeviceID = Props.deviceID;
-  VK->DriverVersion = Props.driverVersion;
+  auto queryDriverName = [](VkPhysicalDevice PD,
+                            VkPhysicalDeviceProperties &BaseProps) -> std::string {
+    vkGetPhysicalDeviceProperties(PD, &BaseProps);
+    if (BaseProps.apiVersion >= VK_API_VERSION_1_2) {
+      VkPhysicalDeviceDriverProperties DriverProps{};
+      DriverProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+      VkPhysicalDeviceProperties2 Props2{};
+      Props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+      Props2.pNext = &DriverProps;
+      vkGetPhysicalDeviceProperties2(PD, &Props2);
+      return std::string(
+          DriverProps.driverName,
+          strnlen(DriverProps.driverName, VK_MAX_DRIVER_NAME_SIZE));
+    }
+    return {};
+  };
+
+  VK->PhysDev = Devs[0];
+  if (const char *WantedDriver = std::getenv("CRUCIBLE_OFFLOAD_VK_DRIVER")) {
+    StringRef Filter(WantedDriver);
+    bool Matched = false;
+    for (VkPhysicalDevice PD : Devs) {
+      VkPhysicalDeviceProperties BaseProps{};
+      std::string DrvName = queryDriverName(PD, BaseProps);
+      if (StringRef(DrvName).contains_insensitive(Filter) ||
+          StringRef(BaseProps.deviceName).contains_insensitive(Filter)) {
+        VK->PhysDev = PD;
+        Matched = true;
+        break;
+      }
+    }
+    if (!Matched)
+      return createStringError(
+          std::errc::no_such_device,
+          "no Vulkan physical device matched CRUCIBLE_OFFLOAD_VK_DRIVER='%s'",
+          WantedDriver);
+  }
+
+  uint32_t DevExtCount = 0;
+  vkEnumerateDeviceExtensionProperties(VK->PhysDev, nullptr, &DevExtCount,
+                                       nullptr);
+  std::vector<VkExtensionProperties> DevExts(DevExtCount);
+  if (DevExtCount > 0)
+    vkEnumerateDeviceExtensionProperties(VK->PhysDev, nullptr, &DevExtCount,
+                                         DevExts.data());
+  StringSet<> AvailDevExts;
+  for (const auto &E : DevExts)
+    AvailDevExts.insert(E.extensionName);
+
+  VkPhysicalDeviceProperties BaseProps{};
+  vkGetPhysicalDeviceProperties(VK->PhysDev, &BaseProps);
+  const bool HasVk12 = BaseProps.apiVersion >= VK_API_VERSION_1_2;
+
+  VkPhysicalDeviceSubgroupProperties SubgroupProps{};
+  SubgroupProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+  VkPhysicalDeviceDriverProperties DriverProps{};
+  DriverProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+  VkPhysicalDeviceProperties2 Props2{};
+  Props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  Props2.pNext = &SubgroupProps;
+  if (HasVk12 || AvailDevExts.contains(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+    SubgroupProps.pNext = &DriverProps;
+  vkGetPhysicalDeviceProperties2(VK->PhysDev, &Props2);
+
+  VkPhysicalDeviceVulkan11Features SupportedVk11{};
+  SupportedVk11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+  VkPhysicalDeviceVulkan12Features SupportedVk12{};
+  SupportedVk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  VkPhysicalDeviceFeatures2 SupportedFeats2{};
+  SupportedFeats2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  if (HasVk12) {
+    SupportedFeats2.pNext = &SupportedVk11;
+    SupportedVk11.pNext = &SupportedVk12;
+  }
+  vkGetPhysicalDeviceFeatures2(VK->PhysDev, &SupportedFeats2);
+
+  VulkanBackendCaps &BC = VK->BackendCaps;
+  BC.DeviceName = std::string(
+      BaseProps.deviceName,
+      strnlen(BaseProps.deviceName, VK_MAX_PHYSICAL_DEVICE_NAME_SIZE));
+  if (HasVk12 || AvailDevExts.contains(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+    BC.DriverName = std::string(
+        DriverProps.driverName,
+        strnlen(DriverProps.driverName, VK_MAX_DRIVER_NAME_SIZE));
+    BC.DriverInfo = std::string(
+        DriverProps.driverInfo,
+        strnlen(DriverProps.driverInfo, VK_MAX_DRIVER_INFO_SIZE));
+  }
+  BC.VendorID = BaseProps.vendorID;
+  BC.DeviceID = BaseProps.deviceID;
+  BC.ApiVersion = BaseProps.apiVersion;
+  BC.DriverVersion = BaseProps.driverVersion;
+  BC.SubgroupSize = SubgroupProps.subgroupSize;
+  BC.SubgroupCompute =
+      (SubgroupProps.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+  BC.ShaderFloat64 = SupportedFeats2.features.shaderFloat64 != 0;
+  BC.ShaderInt64 = SupportedFeats2.features.shaderInt64 != 0;
+  BC.ShaderInt16 = SupportedFeats2.features.shaderInt16 != 0;
+  BC.ShaderResourceMinLod = SupportedFeats2.features.shaderResourceMinLod != 0;
+  BC.MultiViewport = SupportedFeats2.features.multiViewport != 0;
+  if (HasVk12) {
+    BC.ShaderFloat16 = SupportedVk12.shaderFloat16 != 0;
+    BC.ShaderOutputViewportIndex = SupportedVk12.shaderOutputViewportIndex != 0;
+    BC.DescriptorIndexing = SupportedVk12.descriptorIndexing != 0 &&
+                            SupportedVk12.runtimeDescriptorArray != 0;
+    BC.ShaderBufferInt64Atomics = SupportedVk12.shaderBufferInt64Atomics != 0;
+    BC.ShaderSharedInt64Atomics = SupportedVk12.shaderSharedInt64Atomics != 0;
+  }
+  if (!BC.ShaderOutputViewportIndex &&
+      AvailDevExts.contains("VK_EXT_shader_viewport_index_layer"))
+    BC.ShaderOutputViewportIndex = true;
+  BC.ShaderStencilExport = AvailDevExts.contains("VK_EXT_shader_stencil_export");
+  BC.FragmentShaderBarycentric =
+      AvailDevExts.contains("VK_KHR_fragment_shader_barycentric") ||
+      AvailDevExts.contains("VK_NV_fragment_shader_barycentric");
+  BC.MeshShader = AvailDevExts.contains("VK_EXT_mesh_shader");
+  BC.RayTracing = AvailDevExts.contains("VK_KHR_ray_tracing_pipeline");
 
   uint32_t QFCount = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(VK->PhysDev, &QFCount, nullptr);
@@ -1856,12 +1954,51 @@ createVulkanDevices(const DeviceConfig &Config) {
     return createStringError(std::errc::no_such_device,
                              "no Vulkan compute queue family found");
 
-  VkPhysicalDeviceFeatures SupportedFeats{};
-  vkGetPhysicalDeviceFeatures(VK->PhysDev, &SupportedFeats);
+  std::vector<const char *> EnabledDevExts;
+  auto enableIfAvail = [&](const char *ExtName) {
+    if (AvailDevExts.contains(ExtName))
+      EnabledDevExts.push_back(ExtName);
+  };
+  enableIfAvail("VK_KHR_portability_subset");
+  enableIfAvail("VK_EXT_shader_stencil_export");
+  enableIfAvail("VK_EXT_shader_viewport_index_layer");
+  if (AvailDevExts.contains("VK_KHR_fragment_shader_barycentric"))
+    EnabledDevExts.push_back("VK_KHR_fragment_shader_barycentric");
+
   VkPhysicalDeviceFeatures EnabledFeats{};
-  EnabledFeats.shaderInt64 = SupportedFeats.shaderInt64;
-  EnabledFeats.shaderFloat64 = SupportedFeats.shaderFloat64;
-  EnabledFeats.shaderInt16 = SupportedFeats.shaderInt16;
+  EnabledFeats.shaderInt64 = SupportedFeats2.features.shaderInt64;
+  EnabledFeats.shaderFloat64 = SupportedFeats2.features.shaderFloat64;
+  EnabledFeats.shaderInt16 = SupportedFeats2.features.shaderInt16;
+  EnabledFeats.shaderResourceMinLod =
+      SupportedFeats2.features.shaderResourceMinLod;
+  EnabledFeats.multiViewport = SupportedFeats2.features.multiViewport;
+
+  VkPhysicalDeviceVulkan11Features EnabledVk11{};
+  EnabledVk11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+  VkPhysicalDeviceVulkan12Features EnabledVk12{};
+  EnabledVk12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  if (HasVk12) {
+    EnabledVk11.storageBuffer16BitAccess =
+        SupportedVk11.storageBuffer16BitAccess;
+    EnabledVk11.uniformAndStorageBuffer16BitAccess =
+        SupportedVk11.uniformAndStorageBuffer16BitAccess;
+    EnabledVk12.shaderFloat16 = SupportedVk12.shaderFloat16;
+    EnabledVk12.shaderInt8 = SupportedVk12.shaderInt8;
+    EnabledVk12.storageBuffer8BitAccess = SupportedVk12.storageBuffer8BitAccess;
+    EnabledVk12.uniformAndStorageBuffer8BitAccess =
+        SupportedVk12.uniformAndStorageBuffer8BitAccess;
+    EnabledVk12.shaderOutputViewportIndex =
+        SupportedVk12.shaderOutputViewportIndex;
+    EnabledVk12.descriptorIndexing = SupportedVk12.descriptorIndexing;
+    EnabledVk12.runtimeDescriptorArray = SupportedVk12.runtimeDescriptorArray;
+    EnabledVk12.descriptorBindingPartiallyBound =
+        SupportedVk12.descriptorBindingPartiallyBound;
+    EnabledVk12.shaderBufferInt64Atomics =
+        SupportedVk12.shaderBufferInt64Atomics;
+    EnabledVk12.shaderSharedInt64Atomics =
+        SupportedVk12.shaderSharedInt64Atomics;
+    EnabledVk11.pNext = &EnabledVk12;
+  }
 
   float Prio = 1.0f;
   VkDeviceQueueCreateInfo QCI{};
@@ -1872,8 +2009,11 @@ createVulkanDevices(const DeviceConfig &Config) {
 
   VkDeviceCreateInfo DCI{};
   DCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  DCI.pNext = HasVk12 ? &EnabledVk11 : nullptr;
   DCI.queueCreateInfoCount = 1;
   DCI.pQueueCreateInfos = &QCI;
+  DCI.enabledExtensionCount = static_cast<uint32_t>(EnabledDevExts.size());
+  DCI.ppEnabledExtensionNames = EnabledDevExts.data();
   DCI.pEnabledFeatures = &EnabledFeats;
 
   if (VkResult R = vkCreateDevice(VK->PhysDev, &DCI, nullptr, &VK->Device))
