@@ -71,12 +71,22 @@ struct Expr {
 std::string signedView(mlir::Type T, StringRef Value) {
   if (T.isInteger(1))
     return "(-int(" + Value.str() + "))";
-  StringRef Ty = T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
+  if (auto VT = mlir::dyn_cast<mlir::VectorType>(T)) {
+    mlir::Type E = VT.getElementType();
+    StringRef Base = E.isInteger(8) ? "char" : E.isInteger(16) ? "short" : E.isInteger(64) ? "long" : "int";
+    return ("as_type<" + Base + std::to_string(VT.getNumElements()) + ">(" + Value + ")").str();
+  }
+  StringRef Ty = T.isInteger(8) ? "char" : T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
   return ("as_type<" + Ty + ">(" + Value + ")").str();
 }
 
 std::string unsignedView(mlir::Type T, StringRef Value) {
-  StringRef Ty = T.isInteger(16) ? "ushort" : T.isInteger(64) ? "ulong" : "uint";
+  if (auto VT = mlir::dyn_cast<mlir::VectorType>(T)) {
+    mlir::Type E = VT.getElementType();
+    StringRef Base = E.isInteger(8) ? "uchar" : E.isInteger(16) ? "ushort" : E.isInteger(64) ? "ulong" : "uint";
+    return ("as_type<" + Base + std::to_string(VT.getNumElements()) + ">(" + Value + ")").str();
+  }
+  StringRef Ty = T.isInteger(8) ? "uchar" : T.isInteger(16) ? "ushort" : T.isInteger(64) ? "ulong" : "uint";
   return (Ty + "(" + Value + ")").str();
 }
 
@@ -1595,6 +1605,8 @@ Expected<std::string> Emitter::mslType(mlir::Type T) {
     switch (IT.getWidth()) {
     case 1:
       return std::string("bool");
+    case 8:
+      return std::string("uchar");
     case 16:
       return std::string("ushort");
     case 32:
@@ -1638,7 +1650,9 @@ Expected<Expr> Emitter::scalarConstant(mlir::Attribute ValAttr) {
       return Expr{IA.getValue().isZero() ? "false" : "true", PrecPrimary};
     std::string S = std::to_string(IA.getValue().getZExtValue());
     S += IA.getType().isInteger(64) ? "ul" : "u";
-    if (IA.getType().isInteger(16))
+    if (IA.getType().isInteger(8))
+      S = "uchar(" + S + ")";
+    else if (IA.getType().isInteger(16))
       S = "ushort(" + S + ")";
     return Expr{S, PrecPrimary};
   }
@@ -2748,6 +2762,21 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
         return makeError("unsupported f64 fcmp predicate");
       }
     }
+    if (Cmp.getPredicate() == FCmpPredicate::uno ||
+        Cmp.getPredicate() == FCmpPredicate::ord) {
+      auto L = exprFor(Cmp.getLhs(), PrecUnknown);
+      auto Rhs = exprFor(Cmp.getRhs(), PrecUnknown);
+      if (!L || !Rhs)
+        return makeError("invalid fcmp operand");
+      bool IsUno = Cmp.getPredicate() == FCmpPredicate::uno;
+      if (Cmp.getLhs() == Cmp.getRhs())
+        return Expr{(IsUno ? "isnan(" : "!isnan(") + L->Text + ")",
+                    IsUno ? PrecPrimary : PrecUnary};
+      return Expr{IsUno ? "(isnan(" + L->Text + ") || isnan(" + Rhs->Text + "))"
+                        : "(!isnan(" + L->Text + ") && !isnan(" + Rhs->Text +
+                              "))",
+                  PrecPrimary};
+    }
     const char *Sp = nullptr;
     switch (Cmp.getPredicate()) {
     case FCmpPredicate::oeq:
@@ -3063,6 +3092,36 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
       } else {
         ArgsText += *ElemName + "(0)";
       }
+    }
+    return Expr{*VecName + "(" + ArgsText + ")", PrecPrimary};
+  }
+
+  if (auto SV = mlir::dyn_cast<mlir::LLVM::ShuffleVectorOp>(Op)) {
+    auto ResVec = mlir::dyn_cast<mlir::VectorType>(SV.getType());
+    auto V1Ty = mlir::dyn_cast<mlir::VectorType>(SV.getV1().getType());
+    if (!ResVec || !V1Ty)
+      return makeError("unsupported shufflevector types");
+    auto VecName = mslType(ResVec);
+    auto ElemName = mslType(ResVec.getElementType());
+    if (!VecName || !ElemName)
+      return makeError("unsupported shufflevector element type");
+    auto E1 = exprFor(SV.getV1(), PrecPrimary);
+    auto E2 = exprFor(SV.getV2(), PrecPrimary);
+    if (!E1 || !E2)
+      return makeError("invalid shufflevector operand");
+    int64_t N1 = V1Ty.getNumElements();
+    std::string ArgsText;
+    auto Mask = SV.getMask();
+    for (size_t I = 0; I < Mask.size(); ++I) {
+      if (I)
+        ArgsText += ", ";
+      int32_t M = Mask[I];
+      if (M < 0)
+        ArgsText += *ElemName + "(0)";
+      else if (M < N1)
+        ArgsText += E1->Text + "[" + std::to_string(M) + "]";
+      else
+        ArgsText += E2->Text + "[" + std::to_string(M - N1) + "]";
     }
     return Expr{*VecName + "(" + ArgsText + ")", PrecPrimary};
   }
