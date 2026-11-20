@@ -6017,8 +6017,7 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
       N = Arr.getNumElements();
       T = Arr.getElementType();
       IsArray = true;
-    }
-    if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T)) {
+    } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T)) {
       if (Vec.isScalable() || Vec.getRank() != 1 ||
           constInt(AL.getArraySize()) != 1)
         return makeError("unsupported vector alloca shape");
