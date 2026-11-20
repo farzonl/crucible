@@ -175,6 +175,7 @@ struct ResolvedHandle {
   const ResourceBinding *RB = nullptr;
   Value *SpvHandle = nullptr;
   Type *SpvHandleTy = nullptr;
+  Value *ArrIdx = nullptr;
 };
 
 struct StageVar {
@@ -193,6 +194,7 @@ public:
       : M(M), Ctx(M.getContext()), Entry(Entry), Reflect(Reflect), Opts(Opts) {}
 
   Error run();
+  bool usedArrayLength() const { return !ArrayLengthHelpers.empty(); }
 
 private:
   Module &M;
@@ -202,6 +204,7 @@ private:
   const Options &Opts;
 
   DenseMap<const Value *, ResolvedHandle> HandleMap;
+  DenseMap<Type *, Function *> ArrayLengthHelpers;
   std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
@@ -417,6 +420,9 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
       SampledTy = Type::getFloatTy(Ctx);
     else if (SampledTy->isIntegerTy(16))
       SampledTy = Type::getInt32Ty(Ctx);
+    else if (RB.Kind == ResourceKind::TypedBuffer &&
+             (SampledTy->isIntegerTy(64) || SampledTy->isDoubleTy()))
+      SampledTy = Type::getInt32Ty(Ctx);
     unsigned Dim = getSPIRVImageDim(RB.Kind);
     unsigned Arrayed = isArrayedResource(RB.Kind) ? 1u : 0u;
     unsigned MS = isMSResource(RB.Kind) ? 1u : 0u;
@@ -613,7 +619,7 @@ Error SPIRVLowerer::lowerBindResource(CallInst *CI) {
       B.CreateCall(HandleFn, {B.getInt32(RB->SPIRVSet),
                               B.getInt32(RB->SPIRVBinding),
                               B.getInt32(RB->RangeSize), ArrIdx, NameGV});
-  HandleMap[CI] = ResolvedHandle{RB, SpvHandle, ResTy};
+  HandleMap[CI] = ResolvedHandle{RB, SpvHandle, ResTy, ArrIdx};
   return Error::success();
 }
 
@@ -736,26 +742,43 @@ Error SPIRVLowerer::lowerBufferLoad(CallInst *CI) {
 
   if (RH.RB->Kind == ResourceKind::TypedBuffer) {
     Type *SampledTy = getComponentLLVMType(RH.RB->ElementType);
+    bool Is64BitTyped =
+        SampledTy->isIntegerTy(64) || SampledTy->isDoubleTy() ||
+        ElemTy->isIntegerTy(64) || ElemTy->isDoubleTy();
     if (SampledTy->isHalfTy())
       SampledTy = Type::getFloatTy(Ctx);
-    else if (SampledTy->isIntegerTy(16))
+    else if (SampledTy->isIntegerTy(16) || Is64BitTyped)
       SampledTy = Type::getInt32Ty(Ctx);
     Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
     Function *LoadFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_load_typedbuffer, {Vec4Ty, RH.SpvHandleTy});
     Value *Vec = B.CreateCall(LoadFn, {RH.SpvHandle, CI->getArgOperand(2)});
     Value *Res = PoisonValue::get(RetVecTy);
-    for (unsigned C = 0; C < 4; ++C) {
-      Value *E = B.CreateExtractElement(Vec, B.getInt32(C));
-      if (E->getType() != ElemTy) {
-        if (E->getType()->isFloatTy() && ElemTy->isHalfTy())
-          E = B.CreateFPTrunc(E, ElemTy);
-        else if (E->getType()->isIntegerTy() && ElemTy->isIntegerTy())
-          E = B.CreateTruncOrBitCast(E, ElemTy);
-        else
-          E = B.CreateBitCast(E, ElemTy);
+    if (Is64BitTyped && (ElemTy->isIntegerTy(64) || ElemTy->isDoubleTy())) {
+      Type *I64Ty = B.getInt64Ty();
+      for (unsigned C = 0; C < 2; ++C) {
+        Value *Lo = B.CreateZExt(B.CreateExtractElement(Vec, B.getInt32(2 * C)), I64Ty);
+        Value *Hi = B.CreateZExt(B.CreateExtractElement(Vec, B.getInt32(2 * C + 1)), I64Ty);
+        Value *V64 = B.CreateOr(Lo, B.CreateShl(Hi, B.getInt64(32)));
+        if (ElemTy->isDoubleTy())
+          V64 = B.CreateBitCast(V64, ElemTy);
+        Res = B.CreateInsertElement(Res, V64, B.getInt32(C));
       }
-      Res = B.CreateInsertElement(Res, E, B.getInt32(C));
+      for (unsigned C = 2; C < 4; ++C)
+        Res = B.CreateInsertElement(Res, Constant::getNullValue(ElemTy), B.getInt32(C));
+    } else {
+      for (unsigned C = 0; C < 4; ++C) {
+        Value *E = B.CreateExtractElement(Vec, B.getInt32(C));
+        if (E->getType() != ElemTy) {
+          if (E->getType()->isFloatTy() && ElemTy->isHalfTy())
+            E = B.CreateFPTrunc(E, ElemTy);
+          else if (E->getType()->isIntegerTy() && ElemTy->isIntegerTy())
+            E = B.CreateTruncOrBitCast(E, ElemTy);
+          else
+            E = B.CreateBitCast(E, ElemTy);
+        }
+        Res = B.CreateInsertElement(Res, E, B.getInt32(C));
+      }
     }
     CI->replaceAllUsesWith(Res);
     return Error::success();
@@ -811,25 +834,45 @@ Error SPIRVLowerer::lowerBufferStore(CallInst *CI) {
   IRBuilder<> B(CI);
   if (RH.RB->Kind == ResourceKind::TypedBuffer) {
     Type *SampledTy = getComponentLLVMType(RH.RB->ElementType);
+    Type *ValTy = CI->getArgOperand(4)->getType();
+    bool Is64BitTyped =
+        SampledTy->isIntegerTy(64) || SampledTy->isDoubleTy() ||
+        ValTy->isIntegerTy(64) || ValTy->isDoubleTy();
     if (SampledTy->isHalfTy())
       SampledTy = Type::getFloatTy(Ctx);
-    else if (SampledTy->isIntegerTy(16))
+    else if (SampledTy->isIntegerTy(16) || Is64BitTyped)
       SampledTy = Type::getInt32Ty(Ctx);
     Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
     Value *Vec = PoisonValue::get(Vec4Ty);
-    for (unsigned C = 0; C < 4; ++C) {
-      Value *V = CI->getArgOperand(4 + C);
-      if (isa<UndefValue>(V) || isa<PoisonValue>(V))
-        V = Constant::getNullValue(SampledTy);
-      else if (V->getType() != SampledTy) {
-        if (V->getType()->isHalfTy() && SampledTy->isFloatTy())
-          V = B.CreateFPExt(V, SampledTy);
-        else if (V->getType()->isIntegerTy() && SampledTy->isIntegerTy())
-          V = B.CreateZExtOrTrunc(V, SampledTy);
-        else
-          V = B.CreateBitCast(V, SampledTy);
+    if (Is64BitTyped && (ValTy->isIntegerTy(64) || ValTy->isDoubleTy())) {
+      Type *I64Ty = B.getInt64Ty();
+      for (unsigned C = 0; C < 2; ++C) {
+        Value *V = CI->getArgOperand(4 + C);
+        Value *Lo = B.getInt32(0);
+        Value *Hi = B.getInt32(0);
+        if (!isa<UndefValue>(V) && !isa<PoisonValue>(V)) {
+          Value *V64 = V->getType()->isDoubleTy() ? B.CreateBitCast(V, I64Ty) : V;
+          Lo = B.CreateTrunc(V64, B.getInt32Ty());
+          Hi = B.CreateTrunc(B.CreateLShr(V64, B.getInt64(32)), B.getInt32Ty());
+        }
+        Vec = B.CreateInsertElement(Vec, Lo, B.getInt32(2 * C));
+        Vec = B.CreateInsertElement(Vec, Hi, B.getInt32(2 * C + 1));
       }
-      Vec = B.CreateInsertElement(Vec, V, B.getInt32(C));
+    } else {
+      for (unsigned C = 0; C < 4; ++C) {
+        Value *V = CI->getArgOperand(4 + C);
+        if (isa<UndefValue>(V) || isa<PoisonValue>(V))
+          V = Constant::getNullValue(SampledTy);
+        else if (V->getType() != SampledTy) {
+          if (V->getType()->isHalfTy() && SampledTy->isFloatTy())
+            V = B.CreateFPExt(V, SampledTy);
+          else if (V->getType()->isIntegerTy() && SampledTy->isIntegerTy())
+            V = B.CreateZExtOrTrunc(V, SampledTy);
+          else
+            V = B.CreateBitCast(V, SampledTy);
+        }
+        Vec = B.CreateInsertElement(Vec, V, B.getInt32(C));
+      }
     }
     Function *StoreFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_store_typedbuffer,
@@ -908,10 +951,11 @@ Error SPIRVLowerer::lowerBufferUpdateCounter(CallInst *CI) {
   NameGV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
   Function *HandleFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_resource_handlefrombinding, {CounterTy});
+  Value *CounterIdx = RH.ArrIdx ? RH.ArrIdx : B.getInt32(0);
   Value *CounterH = B.CreateCall(
       HandleFn,
       {B.getInt32(RH.RB->SPIRVSet), B.getInt32(RH.RB->CounterSPIRVBinding),
-       B.getInt32(RH.RB->RangeSize), B.getInt32(0), NameGV});
+       B.getInt32(RH.RB->RangeSize), CounterIdx, NameGV});
   PointerType *BufPtrTy = PointerType::get(Ctx, 11);
   Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_resource_getpointer,
@@ -1337,6 +1381,47 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
 
   IRBuilder<> B(CI);
   Value *Res = PoisonValue::get(RetVecTy);
+  if (RH.RB->Kind == ResourceKind::RawBuffer ||
+      RH.RB->Kind == ResourceKind::StructuredBuffer) {
+    // StorageBuffer is modeled as target("spirv.VulkanBuffer", [0 x i32], 12, ...).
+    // LLVM's SPIR-V backend does not have an OpArrayLength intrinsic yet, so
+    // emit a sentinel helper call rewritten to OpArrayLength in the SPIR-V
+    // binary post-pass.
+    Function *&HelperFn = ArrayLengthHelpers[RH.SpvHandleTy];
+    if (!HelperFn) {
+      std::string FnName = "__crucible_spv_arraylength." +
+                           std::to_string(ArrayLengthHelpers.size());
+      FunctionType *FT =
+          FunctionType::get(B.getInt32Ty(), {RH.SpvHandleTy}, false);
+      HelperFn = Function::Create(FT, GlobalValue::InternalLinkage, FnName, M);
+      HelperFn->addFnAttr(Attribute::NoInline);
+      HelperFn->addFnAttr(Attribute::OptimizeNone);
+      BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", HelperFn);
+      IRBuilder<> HB(HBB);
+      HB.CreateRet(HB.getInt32(0));
+    }
+    Value *WordCount = B.CreateCall(HelperFn, {RH.SpvHandle});
+    Value *ByteSize = B.CreateShl(WordCount, B.getInt32(2));
+    if (RH.RB->Kind == ResourceKind::RawBuffer) {
+      Res = B.CreateInsertElement(Res, ByteSize, B.getInt32(0));
+      for (unsigned I = 1; I < 4; ++I)
+        Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(I));
+    } else {
+      uint32_t Stride = RH.RB->ElementStride ? RH.RB->ElementStride : 4u;
+      Value *NumStructs =
+          (Stride == 4u)
+              ? WordCount
+              : ((Stride % 4u == 0u)
+                     ? B.CreateUDiv(WordCount, B.getInt32(Stride / 4u))
+                     : B.CreateUDiv(ByteSize, B.getInt32(Stride)));
+      Res = B.CreateInsertElement(Res, NumStructs, B.getInt32(0));
+      Res = B.CreateInsertElement(Res, B.getInt32(Stride), B.getInt32(1));
+      Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(2));
+      Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(3));
+    }
+    CI->replaceAllUsesWith(Res);
+    return Error::success();
+  }
   bool IsUAV = (RH.RB->Class == ResourceClass::UAV);
   bool IsMS = isMSResource(RH.RB->Kind);
   unsigned Coords = textureCoordDims(RH.RB->Kind);
@@ -3869,7 +3954,157 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
     return makeError("SPIR-V TargetMachine cannot emit requested file type");
 
   CodeGenPM.run(M);
-  return std::string(OutBuf.data(), OutBuf.size());
+  std::string Result(OutBuf.data(), OutBuf.size());
+
+  // Rewrite sentinel __crucible_spv_arraylength.* calls into SPIR-V
+  // OpArrayLength instructions (opcode 268) and strip the stub functions.
+  if (!Opts.EmitSPIRVAsm && Lowerer.usedArrayLength() &&
+      Result.size() >= 20 && (Result.size() % 4) == 0) {
+    const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
+    size_t NumWords = Result.size() / 4;
+    if (Words[0] == 0x07230203u) {
+      constexpr uint16_t OpName = 5;
+      constexpr uint16_t OpTypeRuntimeArray = 29;
+      constexpr uint16_t OpTypeStruct = 30;
+      constexpr uint16_t OpTypePointer = 32;
+      constexpr uint16_t OpFunction = 54;
+      constexpr uint16_t OpFunctionParameter = 55;
+      constexpr uint16_t OpFunctionEnd = 56;
+      constexpr uint16_t OpFunctionCall = 57;
+      constexpr uint16_t OpArrayLength = 68;
+      constexpr uint16_t OpDecorate = 71;
+      constexpr uint16_t OpMemberDecorate = 72;
+      constexpr uint16_t OpCopyObject = 83;
+      constexpr uint16_t OpBitcast = 124;
+      constexpr uint16_t OpLabel = 248;
+
+      DenseSet<uint32_t> HelperIds;
+      DenseMap<uint32_t, uint32_t> CopyOf;
+      DenseSet<uint32_t> RuntimeArrays;
+      DenseSet<uint32_t> BlockedStructs;
+      DenseSet<uint32_t> DeadBitcasts;
+      for (size_t I = 5; I < NumWords;) {
+        uint32_t WC = Words[I] >> 16;
+        uint16_t Op = Words[I] & 0xFFFFu;
+        if (WC == 0 || I + WC > NumWords)
+          break;
+        if (Op == OpName && WC >= 3) {
+          const char *Str = reinterpret_cast<const char *>(&Words[I + 2]);
+          size_t MaxLen = (WC - 2) * 4;
+          StringRef Name(Str, strnlen(Str, MaxLen));
+          if (Name.starts_with("__crucible_spv_arraylength."))
+            HelperIds.insert(Words[I + 1]);
+        } else if ((Op == OpCopyObject || Op == OpBitcast) && WC == 4) {
+          CopyOf[Words[I + 2]] = Words[I + 3];
+        } else if (Op == OpTypeRuntimeArray && WC >= 3) {
+          RuntimeArrays.insert(Words[I + 1]);
+        } else if (Op == OpDecorate && WC >= 3 && Words[I + 2] == 2u /*Block*/) {
+          BlockedStructs.insert(Words[I + 1]);
+        }
+        I += WC;
+      }
+
+      if (!HelperIds.empty()) {
+        // Collect all IDs defined inside the removed helper functions, plus
+        // any non-Block runtime-array helper structs and dead bitcasts.
+        DenseSet<uint32_t> RemovedIds = HelperIds;
+        bool InHelper = false;
+        for (size_t I = 5; I < NumWords;) {
+          uint32_t WC = Words[I] >> 16;
+          uint16_t Op = Words[I] & 0xFFFFu;
+          if (WC == 0 || I + WC > NumWords)
+            break;
+          if (InHelper) {
+            if (Op == OpFunctionEnd) {
+              InHelper = false;
+            } else if (Op == OpLabel && WC >= 2) {
+              RemovedIds.insert(Words[I + 1]);
+            } else if (Op == OpFunctionParameter && WC >= 3) {
+              RemovedIds.insert(Words[I + 2]);
+            }
+          } else if (Op == OpFunction && WC >= 3 &&
+                     HelperIds.contains(Words[I + 2])) {
+            InHelper = true;
+          } else if (Op == OpTypeStruct && WC >= 3 &&
+                     !BlockedStructs.contains(Words[I + 1])) {
+            for (uint32_t K = 2; K < WC; ++K) {
+              if (RuntimeArrays.contains(Words[I + K])) {
+                RemovedIds.insert(Words[I + 1]);
+                break;
+              }
+            }
+          } else if (Op == OpTypePointer && WC >= 4 &&
+                     RemovedIds.contains(Words[I + 3])) {
+            RemovedIds.insert(Words[I + 1]);
+          } else if (Op == OpFunctionCall && WC == 5 &&
+                     HelperIds.contains(Words[I + 3])) {
+            uint32_t Arg = Words[I + 4];
+            if (CopyOf.contains(Arg))
+              DeadBitcasts.insert(Arg);
+          }
+          I += WC;
+        }
+
+        std::vector<uint32_t> Patched;
+        Patched.reserve(NumWords);
+        for (size_t I = 0; I < 5; ++I)
+          Patched.push_back(Words[I]);
+
+        bool SkippingFn = false;
+        for (size_t I = 5; I < NumWords;) {
+          uint32_t WC = Words[I] >> 16;
+          uint16_t Op = Words[I] & 0xFFFFu;
+          if (WC == 0 || I + WC > NumWords)
+            break;
+          if (SkippingFn) {
+            if (Op == OpFunctionEnd)
+              SkippingFn = false;
+            I += WC;
+            continue;
+          }
+          if (Op == OpFunction && WC >= 3 && HelperIds.contains(Words[I + 2])) {
+            SkippingFn = true;
+            I += WC;
+            continue;
+          }
+          if ((Op == OpName || Op == OpDecorate || Op == OpMemberDecorate) &&
+              WC >= 2 && RemovedIds.contains(Words[I + 1])) {
+            I += WC;
+            continue;
+          }
+          if ((Op == OpTypeStruct || Op == OpTypePointer) && WC >= 2 &&
+              RemovedIds.contains(Words[I + 1])) {
+            I += WC;
+            continue;
+          }
+          if (Op == OpBitcast && WC == 4 && DeadBitcasts.contains(Words[I + 2])) {
+            I += WC;
+            continue;
+          }
+          if (Op == OpFunctionCall && WC == 5 &&
+              HelperIds.contains(Words[I + 3])) {
+            uint32_t StructPtr = Words[I + 4];
+            for (auto It = CopyOf.find(StructPtr); It != CopyOf.end();
+                 It = CopyOf.find(StructPtr))
+              StructPtr = It->second;
+            Patched.push_back((5u << 16) | OpArrayLength);
+            Patched.push_back(Words[I + 1]); // ResultType (uint)
+            Patched.push_back(Words[I + 2]); // ResultId
+            Patched.push_back(StructPtr);    // StructurePtr (OpVariable)
+            Patched.push_back(0u);           // Member 0 (runtime array)
+            I += WC;
+            continue;
+          }
+          for (uint32_t K = 0; K < WC; ++K)
+            Patched.push_back(Words[I + K]);
+          I += WC;
+        }
+        Result.assign(reinterpret_cast<const char *>(Patched.data()),
+                      Patched.size() * 4);
+      }
+    }
+  }
+  return Result;
 }
 
 } // namespace crucible

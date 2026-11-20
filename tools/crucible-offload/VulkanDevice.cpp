@@ -114,6 +114,12 @@ VkFormat vkFormatForBuffer(const CPUBuffer &Buf) {
     if (Ch == 1) return VK_FORMAT_R8_UINT;
     if (Ch == 2) return VK_FORMAT_R8G8_UINT;
     return VK_FORMAT_R8G8B8A8_UINT;
+  case DataFormat::Int64:
+  case DataFormat::UInt64:
+  case DataFormat::Hex64:
+  case DataFormat::Float64:
+    if (Ch == 1) return VK_FORMAT_R32G32_UINT;
+    return VK_FORMAT_R32G32B32A32_UINT;
   default:
     return VK_FORMAT_R32G32B32A32_SFLOAT;
   }
