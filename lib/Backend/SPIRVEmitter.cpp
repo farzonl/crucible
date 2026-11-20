@@ -1509,17 +1509,32 @@ Error SPIRVLowerer::lowerAtomicBinOp(CallInst *CI) {
                      OpC->getZExtValue());
   }
 
-  if (RH.RB->Kind != ResourceKind::RawBuffer &&
-      RH.RB->Kind != ResourceKind::StructuredBuffer)
-    return makeError("SPIR-V backend: atomicBinOp on non-storage buffer '{0}' "
-                     "is not yet supported",
-                     RH.RB->Name);
-
   IRBuilder<> B(CI);
-  Value *ByteOff = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(3),
-                                           CI->getArgOperand(4));
-  Value *WordIdx = B.CreateLShr(ByteOff, B.getInt32(2));
-  Value *Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+  Value *Ptr = nullptr;
+  if (RH.RB->Kind == ResourceKind::RawBuffer ||
+      RH.RB->Kind == ResourceKind::StructuredBuffer) {
+    Value *ByteOff = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(3),
+                                             CI->getArgOperand(4));
+    Value *WordIdx = B.CreateLShr(ByteOff, B.getInt32(2));
+    Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+  } else {
+#if LLVM_VERSION_MAJOR >= 24
+    unsigned Coords = textureCoordDims(RH.RB->Kind);
+    SmallVector<Value *, 3> CoordVals;
+    for (unsigned I = 0; I < Coords; ++I)
+      CoordVals.push_back(CI->getArgOperand(3 + I));
+    Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
+    Type *ImgPtrTy = PointerType::get(Ctx, 12); // Image storage class (OpImageTexelPointer)
+    Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_getpointer,
+        {ImgPtrTy, RH.SpvHandleTy, Coord->getType()});
+    Ptr = B.CreateCall(GetPtrFn, {RH.SpvHandle, Coord});
+#else
+    return makeError("SPIR-V backend: atomicBinOp on non-storage buffer '{0}' "
+                     "requires LLVM 24+",
+                     RH.RB->Name);
+#endif
+  }
   SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
   Value *Val = CI->getArgOperand(6);
   auto *RMW = B.CreateAtomicRMW(BinOp, Ptr, Val, Align(4),
@@ -1534,14 +1549,40 @@ Error SPIRVLowerer::lowerAtomicCompareExchange(CallInst *CI) {
     return RHOrErr.takeError();
   const ResolvedHandle &RH = *RHOrErr;
 
-  if (RH.RB->Kind != ResourceKind::RawBuffer &&
-      RH.RB->Kind != ResourceKind::StructuredBuffer)
-    return makeError("SPIR-V backend: atomicCompareExchange on non-storage "
-                     "buffer '{0}' is not yet supported",
-                     RH.RB->Name);
-
-  return makeError("SPIR-V backend: atomicCompareExchange is not yet supported "
-                   "on LLVM 23 (upstream SPIRVLegalizePointerCast bug on cmpxchg)");
+#if LLVM_VERSION_MAJOR < 24
+  return makeError("SPIR-V backend: atomicCompareExchange requires LLVM 24+ "
+                   "(upstream LLVM 23 SPIRVLegalizePointerCast bug on cmpxchg)");
+#else
+  IRBuilder<> B(CI);
+  Value *Ptr = nullptr;
+  if (RH.RB->Kind == ResourceKind::RawBuffer ||
+      RH.RB->Kind == ResourceKind::StructuredBuffer) {
+    Value *ByteOff = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(2),
+                                             CI->getArgOperand(3));
+    Value *WordIdx = B.CreateLShr(ByteOff, B.getInt32(2));
+    Ptr = getStorageBufferWordPtr(B, RH, WordIdx);
+  } else {
+    unsigned Coords = textureCoordDims(RH.RB->Kind);
+    SmallVector<Value *, 3> CoordVals;
+    for (unsigned I = 0; I < Coords; ++I)
+      CoordVals.push_back(CI->getArgOperand(2 + I));
+    Value *Coord = packVector(B, B.getInt32Ty(), CoordVals);
+    Type *ImgPtrTy = PointerType::get(Ctx, 12); // Image storage class (OpImageTexelPointer)
+    Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_getpointer,
+        {ImgPtrTy, RH.SpvHandleTy, Coord->getType()});
+    Ptr = B.CreateCall(GetPtrFn, {RH.SpvHandle, Coord});
+  }
+  SyncScope::ID DeviceScope = Ctx.getOrInsertSyncScopeID("device");
+  Value *Cmp = CI->getArgOperand(5);
+  Value *Val = CI->getArgOperand(6);
+  auto *CX = B.CreateAtomicCmpXchg(
+      Ptr, Cmp, Val, Align(4), AtomicOrdering::AcquireRelease,
+      AtomicOrdering::Acquire, DeviceScope);
+  Value *Old = B.CreateExtractValue(CX, {0});
+  CI->replaceAllUsesWith(Old);
+  return Error::success();
+#endif
 }
 
 Error SPIRVLowerer::lowerBarrier(CallInst *CI, DXILOp Op) {
