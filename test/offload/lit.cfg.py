@@ -57,11 +57,21 @@ _PARAVIRTUAL_METAL_XFAILS = frozenset({
 
 
 class _ParavirtualXFailShTest(lit.formats.ShTest):
-    def execute(self, test, litConfig):
-        if "/".join(test.path_in_suite) in _PARAVIRTUAL_METAL_XFAILS:
-            if "*" not in test.xfails:
-                test.xfails.append("*")
-        return super().execute(test, litConfig)
+    def getTestsInDirectory(self, testSuite, path_in_suite, litConfig, localConfig):
+        for test in super().getTestsInDirectory(
+            testSuite, path_in_suite, litConfig, localConfig
+        ):
+            if "/".join(test.path_in_suite) in _PARAVIRTUAL_METAL_XFAILS:
+                if "*" not in test.xfails:
+                    test.xfails.append("*")
+            yield test
+
+    def __reduce__(self):
+        # Worker processes spawned via multiprocessing (macOS/Windows) cannot
+        # unpickle classes defined dynamically inside lit.cfg.py. Because
+        # test.xfails is already populated during discovery in the parent
+        # process, workers only need a standard picklable ShTest instance.
+        return (lit.formats.ShTest, (self.execute_external,))
 
 
 if "paravirtual" in str(target.get("Description", "")).lower():
