@@ -57,6 +57,25 @@ std::optional<crucible::ResourceClass> classify(ResourceKind Kind) {
   return crucible_offload::classifyResource(Kind);
 }
 
+std::optional<uint32_t>
+resourceBindingOffset(const Resource &Res,
+                      const crucible::ResourceBinding &RB) {
+  auto OffsetInRange = [&](uint32_t Register) -> std::optional<uint32_t> {
+    if (Register < RB.LowerBound)
+      return std::nullopt;
+    uint32_t Offset = Register - RB.LowerBound;
+    if (RB.RangeSize != 0xFFFFFFFFu && Offset >= RB.RangeSize)
+      return std::nullopt;
+    return Offset;
+  };
+  if (Res.DXBinding && RB.Space == Res.DXBinding->Space)
+    if (auto Offset = OffsetInRange(Res.DXBinding->Register))
+      return Offset;
+  if (Res.VKBinding && RB.Space == 0)
+    return OffsetInRange(Res.VKBinding->Binding);
+  return std::nullopt;
+}
+
 MTL::SamplerMinMagFilter metalFilter(FilterMode F) {
   return F == FilterMode::Nearest ? MTL::SamplerMinMagFilterNearest
                                   : MTL::SamplerMinMagFilterLinear;
@@ -517,9 +536,8 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         YAMLSampler *Samp = nullptr;
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
-            if (Res.DXBinding && Res.Kind == ResourceKind::Sampler &&
-                !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
-                Res.DXBinding->Register == RB.LowerBound &&
+            if (Res.Kind == ResourceKind::Sampler && !Res.IsReserved &&
+                resourceBindingOffset(Res, RB) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
         if (!Samp)
@@ -537,10 +555,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         ResourceKind ResKind = ResourceKind::Texture2D;
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
-            if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+            if (classify(Res.Kind) == RB.Class &&
                 isTextureResource(Res.Kind) && !Res.HasCounter &&
-                !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
-                Res.DXBinding->Register == RB.LowerBound &&
+                !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
                 Res.getArraySize() == 1) {
               CPU = Res.BufferPtr;
               ResKind = Res.Kind;
@@ -575,10 +592,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
       CPUBuffer *CPU = nullptr;
       for (auto &Set : P.Sets)
         for (auto &Res : Set.Resources)
-          if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+          if (classify(Res.Kind) == RB.Class &&
               !isTextureResource(Res.Kind) && !Res.HasCounter &&
-              !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
-              Res.DXBinding->Register == RB.LowerBound &&
+              !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
               Res.getArraySize() == 1)
             CPU = Res.BufferPtr;
       if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
@@ -960,9 +976,8 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         YAMLSampler *Samp = nullptr;
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
-            if (Res.DXBinding && Res.Kind == ResourceKind::Sampler &&
-                !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
-                Res.DXBinding->Register == RB.LowerBound &&
+            if (Res.Kind == ResourceKind::Sampler && !Res.IsReserved &&
+                resourceBindingOffset(Res, RB) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
         if (!Samp)
@@ -980,10 +995,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         ResourceKind ResKind = ResourceKind::Texture2D;
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
-            if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+            if (classify(Res.Kind) == RB.Class &&
                 isTextureResource(Res.Kind) && !Res.HasCounter &&
-                !Res.IsReserved && Res.DXBinding->Space == RB.Space &&
-                Res.DXBinding->Register == RB.LowerBound &&
+                !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
                 Res.getArraySize() == 1) {
               CPU = Res.BufferPtr;
               ResKind = Res.Kind;
@@ -1020,11 +1034,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
       CPUBuffer *CPU = nullptr;
       for (auto &Set : P.Sets)
         for (auto &Res : Set.Resources)
-          if (Res.DXBinding && classify(Res.Kind) == RB.Class &&
+          if (classify(Res.Kind) == RB.Class &&
               !isTextureResource(Res.Kind) && !Res.HasCounter &&
-              !Res.IsReserved &&
-              Res.DXBinding->Space == RB.Space &&
-              Res.DXBinding->Register == RB.LowerBound &&
+              !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
               Res.getArraySize() == 1)
             CPU = Res.BufferPtr;
       if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
@@ -1533,12 +1545,10 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
   auto FindBinding = [](const Resource &Res, const crucible::Reflection &R)
       -> const crucible::ResourceBinding * {
     auto Class = classify(Res.Kind);
-    if (!Class || !Res.DXBinding)
+    if (!Class)
       return nullptr;
     for (const crucible::ResourceBinding &RB : R.Resources)
-      if (RB.Class == *Class && RB.Space == Res.DXBinding->Space &&
-          Res.DXBinding->Register >= RB.LowerBound &&
-          Res.DXBinding->Register - RB.LowerBound < RB.RangeSize)
+      if (RB.Class == *Class && resourceBindingOffset(Res, RB))
         return &RB;
     return nullptr;
   };
@@ -1919,15 +1929,13 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
               inconvertibleErrorCode(),
               "resource '%s': kind is not supported yet (accel)",
               Res.Name.c_str());
-        if (!Res.DXBinding)
-          return createStringError(inconvertibleErrorCode(),
-                                   "resource '%s' has no DirectXBinding",
-                                   Res.Name.c_str());
-
         const auto *Match = FindBinding(Res, R);
         if (!Match)
           continue; // not referenced by this shader
-        uint32_t RegOffset = Res.DXBinding->Register - Match->LowerBound;
+        auto RegOffsetOrErr = resourceBindingOffset(Res, *Match);
+        if (!RegOffsetOrErr)
+          continue;
+        uint32_t RegOffset = *RegOffsetOrErr;
         uint32_t BaseSlot = Match->MetalIndex + RegOffset;
         if (Res.Kind == ResourceKind::Sampler) {
           if (!Res.SamplerPtr)
@@ -2277,6 +2285,8 @@ using crucible_offload::validateRootParameters;
 class CrucibleDevice final : public offloadtest::Device {
   NS::SharedPtr<MTL::Device> Metal;
   Capabilities Caps;
+  GPUAPI API;
+  std::string Extra;
 
   static Error unsupported() {
     return createStringError(std::errc::not_supported,
@@ -2284,8 +2294,9 @@ class CrucibleDevice final : public offloadtest::Device {
   }
 
 public:
-  explicit CrucibleDevice(NS::SharedPtr<MTL::Device> Metal)
-      : Metal(std::move(Metal)) {
+  explicit CrucibleDevice(NS::SharedPtr<MTL::Device> Metal, GPUAPI API,
+                          offloadtest::Device *VulkanInfo)
+      : Metal(std::move(Metal)), API(API) {
     Description = this->Metal->name()->utf8String();
     DriverName = "Crucible";
     const auto Version =
@@ -2340,12 +2351,27 @@ public:
                      MakeStr("RaytracingTier", this->Metal->supportsRaytracing()
                                                    ? "1.1"
                                                    : "NotSupported"));
+    if (API == GPUAPI::Vulkan && VulkanInfo) {
+      Description = VulkanInfo->getDescription();
+      GPUGeneration = VulkanInfo->getGPUGeneration();
+      FamilyPrefix = VulkanInfo->getFamilyPrefix();
+      Caps = VulkanInfo->getCapabilities();
+      raw_string_ostream OS(Extra);
+      VulkanInfo->printExtra(OS);
+      OS.flush();
+    }
   }
 
   const Capabilities &getCapabilities() override { return Caps; }
-  StringRef getAPIName() const override { return "DirectX"; }
-  GPUAPI getAPI() const override { return GPUAPI::DirectX; }
+  StringRef getAPIName() const override {
+    return API == GPUAPI::Vulkan ? "Vulkan" : "DirectX";
+  }
+  GPUAPI getAPI() const override { return API; }
   void printExtra(raw_ostream &OS) override {
+    if (API == GPUAPI::Vulkan) {
+      OS << Extra;
+      return;
+    }
     OS << "  Backend: Metal\n"
        << "  RegistryID: " << Metal->registryID() << '\n'
        << "  UnifiedMemory: " << (Metal->hasUnifiedMemory() ? "true" : "false")
@@ -2440,7 +2466,8 @@ public:
 namespace crucible_offload {
 
 Expected<SmallVector<std::unique_ptr<offloadtest::Device>>>
-createMetalDevices(const DeviceConfig &Config) {
+createMetalDevices(const DeviceConfig &Config,
+                   offloadtest::Device *VulkanInfo) {
   if ((Config.EnableValidationLayer || Config.EnableDebugLayer) &&
       setenv("MTL_DEBUG_LAYER", "1", 1) != 0)
     return errorCodeToError(std::error_code(errno, std::generic_category()));
@@ -2450,7 +2477,11 @@ createMetalDevices(const DeviceConfig &Config) {
     return createStringError(std::errc::no_such_device,
                              "no Metal device available for Crucible");
   SmallVector<std::unique_ptr<offloadtest::Device>> Devices;
-  Devices.push_back(std::make_unique<CrucibleDevice>(std::move(Metal)));
+  Devices.push_back(
+      std::make_unique<CrucibleDevice>(Metal, GPUAPI::DirectX, nullptr));
+  if (VulkanInfo)
+    Devices.push_back(std::make_unique<CrucibleDevice>(
+        std::move(Metal), GPUAPI::Vulkan, VulkanInfo));
   return Devices;
 }
 

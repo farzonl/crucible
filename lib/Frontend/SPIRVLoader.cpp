@@ -155,16 +155,6 @@ uint32_t imageFormatComponents(mlir::spirv::ImageFormat Fmt) {
   }
 }
 
-uint32_t unshiftVulkanBinding(ResourceClass RC, uint32_t Binding) {
-  if (RC == ResourceClass::SRV && Binding >= 10000u && Binding < 20000u)
-    return Binding - 10000u;
-  if (RC == ResourceClass::UAV && Binding >= 20000u && Binding < 30000u)
-    return Binding - 20000u;
-  if (RC == ResourceClass::Sampler && Binding >= 30000u)
-    return Binding - 30000u;
-  return Binding;
-}
-
 mlir::Type convertSpirvDataType(mlir::Type T, mlir::OpBuilder &B) {
   if (auto IT = mlir::dyn_cast<mlir::IntegerType>(T))
     return B.getIntegerType(IT.getWidth());
@@ -606,7 +596,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         RB.RecordID = IsUAV ? NextUAVId++ : NextSRVId++;
         RB.Name = GV.getSymName().str();
         RB.Space = *DS;
-        RB.LowerBound = unshiftVulkanBinding(RB.Class, *Binding);
+        RB.LowerBound = *Binding;
         RB.RangeSize = 1;
         if (Kind == ResourceKind::TypedBuffer)
           RB.TypedComponents = imageFormatComponents(ImgTy.getImageFormat());
@@ -628,7 +618,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         RB.RecordID = NextSamplerId++;
         RB.Name = GV.getSymName().str();
         RB.Space = *DS;
-        RB.LowerBound = unshiftVulkanBinding(RB.Class, *Binding);
+        RB.LowerBound = *Binding;
         RB.RangeSize = 1;
         SamplerGlobals[GV.getSymName()] = Reflect.Resources.size();
         Reflect.Resources.push_back(std::move(RB));
@@ -669,7 +659,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       RB.RecordID = IsReadOnly ? NextSRVId++ : NextUAVId++;
       RB.Name = GV.getSymName().str();
       RB.Space = *DS;
-      RB.LowerBound = unshiftVulkanBinding(RB.Class, *Binding);
+      RB.LowerBound = *Binding;
       RB.RangeSize = 1;
       RB.ElementStride = Stride;
 
@@ -696,7 +686,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       RB.RecordID = NextCBVId++;
       RB.Name = GV.getSymName().str();
       RB.Space = *DS;
-      RB.LowerBound = unshiftVulkanBinding(RB.Class, *Binding);
+      RB.LowerBound = *Binding;
       RB.RangeSize = 1;
       RB.ElementStride = PaddedBytes;
 

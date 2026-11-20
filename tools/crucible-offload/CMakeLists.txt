@@ -22,10 +22,16 @@ endif()
 # directly from its sources.
 add_library(offload-suite-support STATIC
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/Capabilities.cpp"
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/Device.cpp"
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/Texture.cpp"
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/Util.cpp"
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/Pipeline.cpp"
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/Check.cpp"
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/Support/OffloadMigration.cpp"
 )
+set_source_files_properties(
+  "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/Device.cpp"
+  PROPERTIES COMPILE_DEFINITIONS initializeDevices=initializeUpstreamDevices)
 target_include_directories(offload-suite-support PUBLIC
   "${CRUCIBLE_OFFLOAD_SUITE_DIR}/include"
   "${CMAKE_CURRENT_BINARY_DIR}/suite-config")
@@ -36,6 +42,10 @@ set(CRUCIBLE_OFFLOAD_SOURCES
   Common.cpp
   DeviceInit.cpp
 )
+if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
+  list(APPEND CRUCIBLE_OFFLOAD_SOURCES
+    "${CRUCIBLE_OFFLOAD_SUITE_DIR}/lib/API/VK/Device.cpp")
+endif()
 if(APPLE)
   list(APPEND CRUCIBLE_OFFLOAD_SOURCES MetalDevice.cpp)
 endif()
