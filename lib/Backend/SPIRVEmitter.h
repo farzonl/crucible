@@ -10,19 +10,18 @@
 
 #include "crucible/Options.h"
 #include "crucible/Reflection.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/Module.h"
 #include "llvm/Support/Error.h"
+#include "mlir/IR/BuiltinOps.h"
 
 #include <string>
 
 namespace crucible {
 
-/// Lower an upgraded DXIL LLVM module to LLVM SPIR-V IR and emit Vulkan
-/// SPIR-V (binary words when Opts.EmitSPIRVAsm is false, or human-readable
-/// SPIR-V assembly when true) via LLVM's SPIR-V TargetMachine.
-llvm::Expected<std::string> emitSPIRV(llvm::Module &M, llvm::Function *Entry,
-                                      Reflection &Reflect,
+/// Lower a unified Crucible MLIR module (gpu.* + math.* + llvm.* + crucible.*,
+/// with zero DXILOp dependencies) to LLVM SPIR-V IR and emit Vulkan SPIR-V
+/// (binary words when Opts.EmitSPIRVAsm is false, or human-readable SPIR-V
+/// assembly when true) via LLVM's SPIR-V TargetMachine.
+llvm::Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
                                       const Options &Opts);
 
 } // namespace crucible

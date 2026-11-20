@@ -1,18 +1,27 @@
-//===- SPIRVEmitter.cpp - DXIL -> LLVM SPIR-V backend -----------*- C++ -*-===//
+//===- SPIRVEmitter.cpp - Crucible MLIR -> LLVM SPIR-V backend --*- C++ -*-===//
 //
-// Part of Crucible, an open-source DXIL compiler.
+// Part of Crucible, an open-source multi-frontend, multi-backend shader compiler.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Lowers upgraded DXIL LLVM IR (dx.op.* intrinsics, DXIL resource handles,
-// compute/wave/math/atomic/barrier ops) into LLVM's Vulkan SPIR-V IR
-// (target("spirv.*") types and llvm.spv.* / standard LLVM intrinsics), then
-// invokes LLVM's SPIR-V TargetMachine to emit validated Vulkan SPIR-V.
+// Lowers unified Crucible MLIR (gpu.* + math.* + llvm.* + crucible.*, with zero
+// DXILOp dependencies) into LLVM's Vulkan SPIR-V IR (target("spirv.*") types
+// and llvm.spv.* / standard LLVM intrinsics), then invokes LLVM's SPIR-V
+// TargetMachine to emit validated Vulkan SPIR-V.
 //
 //===----------------------------------------------------------------------===//
 
 #include "SPIRVEmitter.h"
-#include "IntrinsicMap.h"
 #include "crucible/Diagnostic.h"
+#include "crucible/Dialect/CrucibleDialect.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
+#include "mlir/Target/LLVMIR/Export.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
@@ -47,6 +56,88 @@ using namespace llvm;
 
 namespace crucible {
 namespace {
+
+/// Private internal bridge opcodes between Crucible MLIR (gpu/math/crucible)
+/// and LLVM SPIR-V lowering. Completely independent of DXIL.
+enum class SpvOp : uint32_t {
+  // Resources
+  BindResource = 1,
+  HeapResource,
+  // Buffers & CBuffers
+  BufferLoad,
+  BufferStore,
+  CBufferLoad,
+  BufferUpdateCounter,
+  BufferAtomic,
+  BufferAtomicCmpXchg,
+  // Textures & Sampling
+  TexLoad,
+  TexStore,
+  TexSample,
+  TexGather,
+  TexCalcLod,
+  TexGetDimensions,
+  // Barriers
+  Barrier,
+  // Compute / SysVal
+  ThreadId,
+  GroupId,
+  ThreadIdInGroup,
+  FlattenedThreadIdInGroup,
+  LaneId,
+  SubgroupSize,
+  // Stage I/O & Pixel
+  LoadInput,
+  StoreOutput,
+  Discard,
+  Deriv,
+  // Wave & Quad
+  WaveIsFirstLane,
+  WaveVote,
+  WaveBallot,
+  WaveBitCount,
+  WaveMultiPrefix,
+  WaveReadLaneFirst,
+  WaveReadLaneAt,
+  WaveReduce,
+  QuadReadLaneAt,
+  QuadOp,
+  // Math & Bit gaps
+  Saturate,
+  Frc,
+  IsNaN,
+  IsInf,
+  IsFinite,
+  Rsqrt,
+  Tan,
+  Asin,
+  Acos,
+  Atan,
+  Sinh,
+  Cosh,
+  Tanh,
+  FirstBit,
+  Bfe,
+  Bfi,
+  Dot,
+  DotPacked,
+  Pack4x8,
+  Unpack4x8,
+  LegacyF32ToF16,
+  LegacyF16ToF32,
+  MakeDouble,
+  SplitDouble,
+  UAddc,
+  // Raytracing & RayQuery
+  SysValRT,
+  TraceRay,
+  RayQueryAlloc,
+  RayQueryTraceInline,
+  RayQueryProceed,
+  RayQueryAbort,
+  RayQueryCommit,
+  RayQueryGet,
+};
 
 void initializeSPIRVTargetOnce() {
   static std::once_flag Once;
@@ -95,12 +186,6 @@ struct StageVar {
   bool Referenced = false;
 };
 
-struct PendingHeapHandle {
-  Value *Index = nullptr;
-  bool IsSamplerHeap = false;
-  bool NonUniform = false;
-};
-
 class SPIRVLowerer {
 public:
   SPIRVLowerer(Module &M, Function *Entry, Reflection &Reflect,
@@ -117,7 +202,6 @@ private:
   const Options &Opts;
 
   DenseMap<const Value *, ResolvedHandle> HandleMap;
-  DenseMap<const Value *, PendingHeapHandle> PendingHeapHandles;
   std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
@@ -161,39 +245,35 @@ private:
   void storeTypedValueToStorageBuffer(IRBuilder<> &B, const ResolvedHandle &RH,
                                       Value *ByteOffset, Value *Val);
 
-  Error lowerDXILCall(CallInst *CI);
-  Error lowerCreateHandle(CallInst *CI);
-  Error lowerCreateHandleFromBinding(CallInst *CI);
-  Error lowerCreateHandleFromHeap(CallInst *CI);
-  Error lowerAnnotateHandle(CallInst *CI);
-  Error lowerRawBufferLoad(CallInst *CI);
-  Error lowerRawBufferStore(CallInst *CI);
+  Error lowerBridgeCall(CallInst *CI);
+  Error lowerBindResource(CallInst *CI);
+  Error lowerHeapResource(CallInst *CI);
   Error lowerBufferLoad(CallInst *CI);
   Error lowerBufferStore(CallInst *CI);
-  Error lowerCBufferLoadLegacy(CallInst *CI);
+  Error lowerCBufferLoad(CallInst *CI);
   Error lowerBufferUpdateCounter(CallInst *CI);
   Error lowerTextureLoad(CallInst *CI);
   Error lowerTextureStore(CallInst *CI);
-  Error lowerTextureSample(CallInst *CI, DXILOp Op);
-  Error lowerTextureGather(CallInst *CI, DXILOp Op);
+  Error lowerTextureSample(CallInst *CI);
+  Error lowerTextureGather(CallInst *CI);
   Error lowerCalculateLOD(CallInst *CI);
   Error lowerGetDimensions(CallInst *CI);
   Error lowerAtomicBinOp(CallInst *CI);
   Error lowerAtomicCompareExchange(CallInst *CI);
-  Error lowerBarrier(CallInst *CI, DXILOp Op);
-  Error lowerWaveOp(CallInst *CI, DXILOp Op);
-  Error lowerMathOrBitOp(CallInst *CI, DXILOp Op);
-  Error lowerPixelOp(CallInst *CI, DXILOp Op);
+  Error lowerBarrier(CallInst *CI);
+  Error lowerWaveOp(CallInst *CI, SpvOp Op);
+  Error lowerMathOrBitOp(CallInst *CI, SpvOp Op);
+  Error lowerPixelOp(CallInst *CI, SpvOp Op);
   Error lowerLoadInput(CallInst *CI);
   Error lowerStoreOutput(CallInst *CI);
-  Error lowerRaytracingOp(CallInst *CI, DXILOp Op);
+  Error lowerRaytracingOp(CallInst *CI, SpvOp Op);
 
   void prepareStageInterface();
   void emitStageDecorations();
   void fixupExistingAtomics(Function &F);
   void normalizeArrayGlobalAccesses(Function &F);
   void configureEntryAndLinkage(StringRef StageName);
-  void cleanupDXILArtifacts();
+  void cleanupBridgeArtifacts();
 };
 
 const ResourceBinding *SPIRVLowerer::findResourceByID(ResourceClass Class,
@@ -489,18 +569,25 @@ void SPIRVLowerer::storeTypedValueToStorageBuffer(IRBuilder<> &B,
   B.CreateAlignedStore(Word, Ptr, Align(4));
 }
 
-Error SPIRVLowerer::lowerCreateHandle(CallInst *CI) {
+Error SPIRVLowerer::lowerBindResource(CallInst *CI) {
+  // (op, class, hasRecordId, recordId, space, binding, index, nonUniform)
   auto *ClassC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
-  auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-  if (!ClassC || !IdC)
-    return makeError("SPIR-V backend: non-constant dx.op.createHandle class/id");
+  auto *HasRecC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
+  auto *RecC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+  auto *SpaceC = dyn_cast<ConstantInt>(CI->getArgOperand(4));
+  auto *BindC = dyn_cast<ConstantInt>(CI->getArgOperand(5));
+  if (!ClassC || !HasRecC || !RecC || !SpaceC || !BindC)
+    return makeError("SPIR-V backend: non-constant bind_resource metadata");
 
   auto RC = static_cast<ResourceClass>(ClassC->getZExtValue());
-  uint32_t RecID = static_cast<uint32_t>(IdC->getZExtValue());
-  const ResourceBinding *RB = findResourceByID(RC, RecID);
+  const ResourceBinding *RB =
+      !HasRecC->isZero()
+          ? findResourceByID(RC, static_cast<uint32_t>(RecC->getZExtValue()))
+          : findResourceByBinding(
+                RC, static_cast<uint32_t>(SpaceC->getZExtValue()),
+                static_cast<uint32_t>(BindC->getZExtValue()));
   if (!RB)
-    return makeError("SPIR-V backend: unknown resource class={0} id={1}",
-                     static_cast<unsigned>(RC), RecID);
+    return makeError("SPIR-V backend: unknown resource binding");
 
   Type *ResTy = getSPIRVResourceType(*RB);
   if (!ResTy)
@@ -508,11 +595,11 @@ Error SPIRVLowerer::lowerCreateHandle(CallInst *CI) {
                      static_cast<unsigned>(RB->Kind), RB->Name);
 
   IRBuilder<> B(CI);
-  Value *RegIdx = CI->getArgOperand(3);
+  Value *RegIdx = CI->getArgOperand(6);
   Value *ArrIdx = (RB->LowerBound == 0)
                       ? RegIdx
                       : B.CreateSub(RegIdx, B.getInt32(RB->LowerBound));
-  if (auto *NUI = dyn_cast<ConstantInt>(CI->getArgOperand(4));
+  if (auto *NUI = dyn_cast<ConstantInt>(CI->getArgOperand(7));
       NUI && !NUI->isZero()) {
     Function *NuiFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_nonuniformindex);
@@ -530,91 +617,18 @@ Error SPIRVLowerer::lowerCreateHandle(CallInst *CI) {
   return Error::success();
 }
 
-static bool extractConstantAggregateU32(Value *V, unsigned Idx, uint32_t &Out) {
-  if (!V)
-    return false;
-  if (isa<ConstantAggregateZero>(V)) {
-    Out = 0;
-    return true;
-  }
-  if (auto *C = dyn_cast<Constant>(V)) {
-    if (Constant *Elem = C->getAggregateElement(Idx)) {
-      if (auto *CI = dyn_cast<ConstantInt>(Elem)) {
-        Out = static_cast<uint32_t>(CI->getZExtValue());
-        return true;
-      }
-      if (isa<UndefValue>(Elem)) {
-        Out = 0;
-        return true;
-      }
-    }
-    return false;
-  }
-  if (auto *IV = dyn_cast<InsertValueInst>(V)) {
-    if (IV->getNumIndices() == 1 && IV->getIndices()[0] == Idx) {
-      if (auto *CI = dyn_cast<ConstantInt>(IV->getInsertedValueOperand())) {
-        Out = static_cast<uint32_t>(CI->getZExtValue());
-        return true;
-      }
-      return false;
-    }
-    return extractConstantAggregateU32(IV->getAggregateOperand(), Idx, Out);
-  }
-  return false;
-}
-
-Error SPIRVLowerer::lowerCreateHandleFromBinding(CallInst *CI) {
-  Value *BindVal = CI->getArgOperand(1);
-  uint32_t LB = 0, Space = 0, RawRC = 0;
-  if (!extractConstantAggregateU32(BindVal, 0, LB) ||
-      !extractConstantAggregateU32(BindVal, 2, Space) ||
-      !extractConstantAggregateU32(BindVal, 3, RawRC))
-    return makeError(
-        "SPIR-V backend: non-constant ResBind in createHandleFromBinding");
-
-  auto RC = static_cast<ResourceClass>(RawRC);
-
-  const ResourceBinding *RB = findResourceByBinding(RC, Space, LB);
-  if (!RB)
-    return makeError(
-        "SPIR-V backend: unknown resource binding class={0} space={1} reg={2}",
-        static_cast<unsigned>(RC), Space, LB);
-
-  Type *ResTy = getSPIRVResourceType(*RB);
-  if (!ResTy)
-    return makeError("SPIR-V backend: unsupported resource kind {0} for '{1}'",
-                     static_cast<unsigned>(RB->Kind), RB->Name);
-
-  IRBuilder<> B(CI);
-  Value *RegIdx = CI->getArgOperand(2);
-  Value *ArrIdx = (RB->LowerBound == 0)
-                      ? RegIdx
-                      : B.CreateSub(RegIdx, B.getInt32(RB->LowerBound));
-  if (auto *NUI = dyn_cast<ConstantInt>(CI->getArgOperand(3));
-      NUI && !NUI->isZero()) {
-    Function *NuiFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_resource_nonuniformindex);
-    ArrIdx = B.CreateCall(NuiFn, {ArrIdx});
-  }
-
-  GlobalVariable *NameGV = getOrCreateResourceName(*RB);
-  Function *HandleFn = Intrinsic::getOrInsertDeclaration(
-      &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
-  Value *SpvHandle =
-      B.CreateCall(HandleFn, {B.getInt32(RB->SPIRVSet),
-                              B.getInt32(RB->SPIRVBinding),
-                              B.getInt32(RB->RangeSize), ArrIdx, NameGV});
-  HandleMap[CI] = ResolvedHandle{RB, SpvHandle, ResTy};
-  return Error::success();
-}
-
-Error SPIRVLowerer::lowerCreateHandleFromHeap(CallInst *CI) {
-  PendingHeapHandle PH;
-  PH.Index = CI->getArgOperand(1);
-  if (auto *SC = dyn_cast<ConstantInt>(CI->getArgOperand(2)))
-    PH.IsSamplerHeap = !SC->isZero();
-  if (auto *NC = dyn_cast<ConstantInt>(CI->getArgOperand(3)))
-    PH.NonUniform = !NC->isZero();
+Error SPIRVLowerer::lowerHeapResource(CallInst *CI) {
+  // (op, index, isSamplerHeap, nonUniform, class, kind, strideOrComp, hasCounter)
+  Value *Index = CI->getArgOperand(1);
+  bool IsSamplerHeap = !cast<ConstantInt>(CI->getArgOperand(2))->isZero();
+  bool NonUniform = !cast<ConstantInt>(CI->getArgOperand(3))->isZero();
+  auto RC = static_cast<ResourceClass>(
+      cast<ConstantInt>(CI->getArgOperand(4))->getZExtValue());
+  uint32_t RawKind =
+      static_cast<uint32_t>(cast<ConstantInt>(CI->getArgOperand(5))->getZExtValue());
+  uint32_t Prop1 =
+      static_cast<uint32_t>(cast<ConstantInt>(CI->getArgOperand(6))->getZExtValue());
+  bool HasCounter = !cast<ConstantInt>(CI->getArgOperand(7))->isZero();
 
   auto nextFreeSet = [&]() -> uint32_t {
     uint32_t MaxSet = 0;
@@ -629,7 +643,7 @@ Error SPIRVLowerer::lowerCreateHandleFromHeap(CallInst *CI) {
     return MaxSet;
   };
 
-  if (PH.IsSamplerHeap) {
+  if (IsSamplerHeap) {
     if (Reflect.SamplerHeapSPIRVBinding == UINT32_MAX) {
       Reflect.SamplerHeapSPIRVSet = nextFreeSet();
       Reflect.SamplerHeapSPIRVBinding = 0;
@@ -643,163 +657,81 @@ Error SPIRVLowerer::lowerCreateHandleFromHeap(CallInst *CI) {
     Reflect.HasResourceHeap = true;
   }
 
-  PendingHeapHandles[CI] = PH;
-  return Error::success();
-}
-
-Error SPIRVLowerer::lowerAnnotateHandle(CallInst *CI) {
-  Value *Base = CI->getArgOperand(1);
-  auto PendingIt = PendingHeapHandles.find(Base);
-  if (PendingIt != PendingHeapHandles.end()) {
-    const PendingHeapHandle &PH = PendingIt->second;
-    auto *PropsC = dyn_cast<ConstantStruct>(CI->getArgOperand(2));
-    if (!PropsC || PropsC->getNumOperands() < 2)
-      return makeError(
-          "SPIR-V backend: non-constant ResourceProperties in annotateHandle");
-
-    uint32_t Prop0 = static_cast<uint32_t>(
-        cast<ConstantInt>(PropsC->getOperand(0))->getZExtValue());
-    uint32_t Prop1 = static_cast<uint32_t>(
-        cast<ConstantInt>(PropsC->getOperand(1))->getZExtValue());
-
-    auto RB = std::make_unique<ResourceBinding>();
-    RB->Kind = static_cast<ResourceKind>(Prop0 & 0xFFu);
-    bool IsUAV = ((Prop0 >> 12) & 1u) != 0;
-    if (PH.IsSamplerHeap || RB->Kind == ResourceKind::Sampler) {
-      RB->Class = ResourceClass::Sampler;
-      RB->Kind = ResourceKind::Sampler;
-      RB->SPIRVSet = Reflect.SamplerHeapSPIRVSet;
-      RB->SPIRVBinding = (Reflect.SamplerHeapSPIRVBinding != UINT32_MAX)
-                             ? Reflect.SamplerHeapSPIRVBinding
-                             : 0u;
-      RB->Name = "sampler_heap";
-    } else if (RB->Kind == ResourceKind::CBuffer) {
-      RB->Class = ResourceClass::CBV;
+  auto RB = std::make_unique<ResourceBinding>();
+  RB->Kind = IsSamplerHeap ? ResourceKind::Sampler
+                           : static_cast<ResourceKind>(RawKind);
+  RB->HasCounter = HasCounter;
+  if (IsSamplerHeap || RB->Kind == ResourceKind::Sampler) {
+    RB->Class = ResourceClass::Sampler;
+    RB->Kind = ResourceKind::Sampler;
+    RB->SPIRVSet = Reflect.SamplerHeapSPIRVSet;
+    RB->SPIRVBinding = (Reflect.SamplerHeapSPIRVBinding != UINT32_MAX)
+                           ? Reflect.SamplerHeapSPIRVBinding
+                           : 0u;
+    RB->Name = "sampler_heap";
+  } else if (RB->Kind == ResourceKind::CBuffer) {
+    RB->Class = ResourceClass::CBV;
+    RB->ElementStride = Prop1;
+    RB->SPIRVSet = Reflect.ResourceHeapSPIRVSet;
+    RB->SPIRVBinding = (Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
+                           ? Reflect.ResourceHeapSPIRVBinding
+                           : 0u;
+    RB->Name = "resource_heap_cbv";
+  } else {
+    RB->Class = RC;
+    if (RB->Kind == ResourceKind::StructuredBuffer)
       RB->ElementStride = Prop1;
-      RB->SPIRVSet = Reflect.ResourceHeapSPIRVSet;
-      RB->SPIRVBinding = (Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
-                             ? Reflect.ResourceHeapSPIRVBinding
-                             : 0u;
-      RB->Name = "resource_heap_cbv";
-    } else {
-      RB->Class = IsUAV ? ResourceClass::UAV : ResourceClass::SRV;
-      if (RB->Kind == ResourceKind::StructuredBuffer)
-        RB->ElementStride = Prop1;
-      else
-        RB->ElementType = static_cast<ComponentType>(Prop1 & 0xFFu);
-      RB->SPIRVSet = Reflect.ResourceHeapSPIRVSet;
-      RB->SPIRVBinding = (Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
-                             ? Reflect.ResourceHeapSPIRVBinding
-                             : 0u;
-      RB->Name = IsUAV ? "resource_heap_uav" : "resource_heap_srv";
-    }
-    RB->RangeSize = 0xFFFFFFFFu;
-
-    Type *ResTy = getSPIRVResourceType(*RB);
-    if (!ResTy)
-      return makeError(
-          "SPIR-V backend: unsupported dynamic heap resource kind {0}",
-          static_cast<unsigned>(RB->Kind));
-
-    IRBuilder<> B(CI);
-    Value *Idx = PH.Index;
-    if (PH.NonUniform) {
-      Function *NuiFn = Intrinsic::getOrInsertDeclaration(
-          &M, Intrinsic::spv_resource_nonuniformindex);
-      Idx = B.CreateCall(NuiFn, {Idx});
-    }
-    const ResourceBinding *RBPtr = RB.get();
-    SyntheticBindings.push_back(std::move(RB));
-    GlobalVariable *NameGV = getOrCreateResourceName(*RBPtr);
-    Function *HandleFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
-    Value *SpvHandle =
-        B.CreateCall(HandleFn, {B.getInt32(RBPtr->SPIRVSet),
-                                B.getInt32(RBPtr->SPIRVBinding),
-                                B.getInt32(0xFFFFFFFFu), Idx, NameGV});
-    HandleMap[CI] = ResolvedHandle{RBPtr, SpvHandle, ResTy};
-    return Error::success();
+    else if (Prop1 != 0)
+      RB->ElementType = static_cast<ComponentType>(Prop1 & 0xFFu);
+    else
+      RB->ElementType = ComponentType::F32;
+    RB->SPIRVSet = Reflect.ResourceHeapSPIRVSet;
+    RB->SPIRVBinding = (Reflect.ResourceHeapSPIRVBinding != UINT32_MAX)
+                           ? Reflect.ResourceHeapSPIRVBinding
+                           : 0u;
+    RB->Name = RC == ResourceClass::UAV ? "resource_heap_uav"
+                                        : "resource_heap_srv";
   }
+  RB->RangeSize = 0xFFFFFFFFu;
 
-  auto RH = resolveHandle(Base);
-  if (!RH)
-    return RH.takeError();
-  HandleMap[CI] = *RH;
-  return Error::success();
-}
-
-Error SPIRVLowerer::lowerRawBufferLoad(CallInst *CI) {
-  auto RHOrErr = resolveHandle(CI->getArgOperand(1));
-  if (!RHOrErr)
-    return RHOrErr.takeError();
-  const ResolvedHandle &RH = *RHOrErr;
-
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() < 5)
-    return makeError("SPIR-V backend: unexpected RawBufferLoad return type");
-
-  Type *ElemTy = RetStructTy->getElementType(0);
-  uint32_t ElemBytes =
-      std::max<uint32_t>(1u, static_cast<uint32_t>(ElemTy->getPrimitiveSizeInBits() / 8u));
-  uint32_t Mask = 0xF;
-  if (auto *MC = dyn_cast<ConstantInt>(CI->getArgOperand(4)))
-    Mask = static_cast<uint32_t>(MC->getZExtValue());
+  Type *ResTy = getSPIRVResourceType(*RB);
+  if (!ResTy)
+    return makeError(
+        "SPIR-V backend: unsupported dynamic heap resource kind {0}",
+        static_cast<unsigned>(RB->Kind));
 
   IRBuilder<> B(CI);
-  Value *BaseByte = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(2),
-                                            CI->getArgOperand(3));
-  Value *Res = PoisonValue::get(RetStructTy);
-  for (unsigned C = 0; C < 4; ++C) {
-    if (!(Mask & (1u << C)))
-      continue;
-    Value *Off = (C == 0) ? BaseByte
-                          : B.CreateAdd(BaseByte, B.getInt32(C * ElemBytes));
-    Value *Loaded = loadTypedValueFromStorageBuffer(B, RH, Off, ElemTy);
-    Res = B.CreateInsertValue(Res, Loaded, {C});
+  Value *Idx = Index;
+  if (NonUniform) {
+    Function *NuiFn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::spv_resource_nonuniformindex);
+    Idx = B.CreateCall(NuiFn, {Idx});
   }
-  Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
-  CI->replaceAllUsesWith(Res);
-  return Error::success();
-}
-
-Error SPIRVLowerer::lowerRawBufferStore(CallInst *CI) {
-  auto RHOrErr = resolveHandle(CI->getArgOperand(1));
-  if (!RHOrErr)
-    return RHOrErr.takeError();
-  const ResolvedHandle &RH = *RHOrErr;
-
-  Value *V0 = CI->getArgOperand(4);
-  Type *ElemTy = V0->getType();
-  uint32_t ElemBytes =
-      std::max<uint32_t>(1u, static_cast<uint32_t>(ElemTy->getPrimitiveSizeInBits() / 8u));
-  uint32_t Mask = 0xF;
-  if (auto *MC = dyn_cast<ConstantInt>(CI->getArgOperand(8)))
-    Mask = static_cast<uint32_t>(MC->getZExtValue());
-
-  IRBuilder<> B(CI);
-  Value *BaseByte = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(2),
-                                            CI->getArgOperand(3));
-  for (unsigned C = 0; C < 4; ++C) {
-    if (!(Mask & (1u << C)))
-      continue;
-    Value *Off = (C == 0) ? BaseByte
-                          : B.CreateAdd(BaseByte, B.getInt32(C * ElemBytes));
-    storeTypedValueToStorageBuffer(B, RH, Off, CI->getArgOperand(4 + C));
-  }
+  const ResourceBinding *RBPtr = RB.get();
+  SyntheticBindings.push_back(std::move(RB));
+  GlobalVariable *NameGV = getOrCreateResourceName(*RBPtr);
+  Function *HandleFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
+  Value *SpvHandle =
+      B.CreateCall(HandleFn, {B.getInt32(RBPtr->SPIRVSet),
+                              B.getInt32(RBPtr->SPIRVBinding),
+                              B.getInt32(0xFFFFFFFFu), Idx, NameGV});
+  HandleMap[CI] = ResolvedHandle{RBPtr, SpvHandle, ResTy};
   return Error::success();
 }
 
 Error SPIRVLowerer::lowerBufferLoad(CallInst *CI) {
+  // (op, handle, index, elemOffset, mask) -> <4 x ElemTy>
   auto RHOrErr = resolveHandle(CI->getArgOperand(1));
   if (!RHOrErr)
     return RHOrErr.takeError();
   const ResolvedHandle &RH = *RHOrErr;
 
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() < 5)
-    return makeError("SPIR-V backend: unexpected BufferLoad return type");
+  auto *RetVecTy = dyn_cast<FixedVectorType>(CI->getType());
+  if (!RetVecTy || RetVecTy->getNumElements() != 4)
+    return makeError("SPIR-V backend: unexpected buffer_load return type");
 
-  Type *ElemTy = RetStructTy->getElementType(0);
+  Type *ElemTy = RetVecTy->getElementType();
   IRBuilder<> B(CI);
 
   if (RH.RB->Kind == ResourceKind::TypedBuffer) {
@@ -812,7 +744,7 @@ Error SPIRVLowerer::lowerBufferLoad(CallInst *CI) {
     Function *LoadFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_load_typedbuffer, {Vec4Ty, RH.SpvHandleTy});
     Value *Vec = B.CreateCall(LoadFn, {RH.SpvHandle, CI->getArgOperand(2)});
-    Value *Res = PoisonValue::get(RetStructTy);
+    Value *Res = PoisonValue::get(RetVecTy);
     for (unsigned C = 0; C < 4; ++C) {
       Value *E = B.CreateExtractElement(Vec, B.getInt32(C));
       if (E->getType() != ElemTy) {
@@ -823,45 +755,54 @@ Error SPIRVLowerer::lowerBufferLoad(CallInst *CI) {
         else
           E = B.CreateBitCast(E, ElemTy);
       }
-      Res = B.CreateInsertValue(Res, E, {C});
+      Res = B.CreateInsertElement(Res, E, B.getInt32(C));
     }
-    Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
     CI->replaceAllUsesWith(Res);
     return Error::success();
   }
 
-  uint32_t UsedMask = 0;
-  for (User *U : CI->users()) {
-    if (auto *EV = dyn_cast<ExtractValueInst>(U)) {
-      if (EV->getNumIndices() == 1 && EV->getIndices()[0] < 4)
-        UsedMask |= (1u << EV->getIndices()[0]);
-    } else {
-      UsedMask = 0xF;
-      break;
+  uint32_t Mask = 0;
+  if (auto *MC = dyn_cast<ConstantInt>(CI->getArgOperand(4));
+      MC && MC->getZExtValue() != 0) {
+    Mask = static_cast<uint32_t>(MC->getZExtValue());
+  } else {
+    for (User *U : CI->users()) {
+      if (auto *EE = dyn_cast<ExtractElementInst>(U)) {
+        if (auto *IC = dyn_cast<ConstantInt>(EE->getIndexOperand());
+            IC && IC->getZExtValue() < 4)
+          Mask |= (1u << IC->getZExtValue());
+        else {
+          Mask = 0xF;
+          break;
+        }
+      } else {
+        Mask = 0xF;
+        break;
+      }
     }
+    if (Mask == 0)
+      Mask = 0x1;
   }
-  if (UsedMask == 0)
-    UsedMask = 0x1;
 
   uint32_t ElemBytes =
       std::max<uint32_t>(1u, static_cast<uint32_t>(ElemTy->getPrimitiveSizeInBits() / 8u));
   Value *BaseByte = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(2),
                                             CI->getArgOperand(3));
-  Value *Res = PoisonValue::get(RetStructTy);
+  Value *Res = PoisonValue::get(RetVecTy);
   for (unsigned C = 0; C < 4; ++C) {
-    if (!(UsedMask & (1u << C)))
+    if (!(Mask & (1u << C)))
       continue;
     Value *Off = (C == 0) ? BaseByte
                           : B.CreateAdd(BaseByte, B.getInt32(C * ElemBytes));
     Value *Loaded = loadTypedValueFromStorageBuffer(B, RH, Off, ElemTy);
-    Res = B.CreateInsertValue(Res, Loaded, {C});
+    Res = B.CreateInsertElement(Res, Loaded, B.getInt32(C));
   }
-  Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
   CI->replaceAllUsesWith(Res);
   return Error::success();
 }
 
 Error SPIRVLowerer::lowerBufferStore(CallInst *CI) {
+  // (op, handle, index, elemOffset, v0, v1, v2, v3, mask)
   auto RHOrErr = resolveHandle(CI->getArgOperand(1));
   if (!RHOrErr)
     return RHOrErr.takeError();
@@ -917,15 +858,15 @@ Error SPIRVLowerer::lowerBufferStore(CallInst *CI) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerCBufferLoadLegacy(CallInst *CI) {
+Error SPIRVLowerer::lowerCBufferLoad(CallInst *CI) {
   auto RHOrErr = resolveHandle(CI->getArgOperand(1));
   if (!RHOrErr)
     return RHOrErr.takeError();
   const ResolvedHandle &RH = *RHOrErr;
 
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() == 0)
-    return makeError("SPIR-V backend: unexpected CBufferLoadLegacy return type");
+  auto *RetVecTy = dyn_cast<FixedVectorType>(CI->getType());
+  if (!RetVecTy || RetVecTy->getNumElements() == 0)
+    return makeError("SPIR-V backend: unexpected cbuffer_load return type");
 
   auto *ExtTy = cast<TargetExtType>(RH.SpvHandleTy);
   Type *CBStructTy = ExtTy->getTypeParameter(0);
@@ -942,18 +883,9 @@ Error SPIRVLowerer::lowerCBufferLoadLegacy(CallInst *CI) {
       B.CreateInBoundsGEP(CBStructTy, BasePtr, {B.getInt32(0), B.getInt32(0), RowIdx});
   Value *RawVec = B.CreateAlignedLoad(Vec4I32, RowPtr, Align(16));
 
-  unsigned NumElems = RetStructTy->getNumElements();
-  Type *ElemTy = RetStructTy->getElementType(0);
-  Type *TargetVecTy = FixedVectorType::get(ElemTy, NumElems);
   Value *CastVec =
-      (TargetVecTy == Vec4I32) ? RawVec : B.CreateBitCast(RawVec, TargetVecTy);
-
-  Value *Res = PoisonValue::get(RetStructTy);
-  for (unsigned I = 0; I < NumElems; ++I) {
-    Value *E = B.CreateExtractElement(CastVec, B.getInt32(I));
-    Res = B.CreateInsertValue(Res, E, {I});
-  }
-  CI->replaceAllUsesWith(Res);
+      (RetVecTy == Vec4I32) ? RawVec : B.CreateBitCast(RawVec, RetVecTy);
+  CI->replaceAllUsesWith(CastVec);
   return Error::success();
 }
 
@@ -1065,10 +997,12 @@ static Value *packConstOffset(IRBuilder<> &B, unsigned Dims, CallInst *CI,
   return ConstantVector::get(Vals);
 }
 
-static Value *packResRet(IRBuilder<> &B, StructType *RetStructTy,
-                         Value *Vec4) {
-  Type *ElemTy = RetStructTy->getElementType(0);
-  Value *Res = PoisonValue::get(RetStructTy);
+static Value *castResultVec4(IRBuilder<> &B, FixedVectorType *RetVecTy,
+                             Value *Vec4) {
+  if (Vec4->getType() == RetVecTy)
+    return Vec4;
+  Type *ElemTy = RetVecTy->getElementType();
+  Value *Res = PoisonValue::get(RetVecTy);
   for (unsigned C = 0; C < 4; ++C) {
     Value *E = B.CreateExtractElement(Vec4, B.getInt32(C));
     if (E->getType() != ElemTy) {
@@ -1079,9 +1013,8 @@ static Value *packResRet(IRBuilder<> &B, StructType *RetStructTy,
       else
         E = B.CreateBitCast(E, ElemTy);
     }
-    Res = B.CreateInsertValue(Res, E, {C});
+    Res = B.CreateInsertElement(Res, E, B.getInt32(C));
   }
-  Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
   return Res;
 }
 
@@ -1091,9 +1024,9 @@ Error SPIRVLowerer::lowerTextureLoad(CallInst *CI) {
     return RHOrErr.takeError();
   const ResolvedHandle &RH = *RHOrErr;
 
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() < 5)
-    return makeError("SPIR-V backend: unexpected TextureLoad return type");
+  auto *RetVecTy = dyn_cast<FixedVectorType>(CI->getType());
+  if (!RetVecTy || RetVecTy->getNumElements() != 4)
+    return makeError("SPIR-V backend: unexpected tex_load return type");
 
   IRBuilder<> B(CI);
   unsigned Coords = textureCoordDims(RH.RB->Kind);
@@ -1130,7 +1063,7 @@ Error SPIRVLowerer::lowerTextureLoad(CallInst *CI) {
     Vec = B.CreateCall(LoadFn, {RH.SpvHandle, Coord, Mip, Offset});
   }
 
-  CI->replaceAllUsesWith(packResRet(B, RetStructTy, Vec));
+  CI->replaceAllUsesWith(castResultVec4(B, RetVecTy, Vec));
   return Error::success();
 }
 
@@ -1179,27 +1112,30 @@ Error SPIRVLowerer::lowerTextureStore(CallInst *CI) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
-  auto TexRH = resolveHandle(CI->getArgOperand(1));
+Error SPIRVLowerer::lowerTextureSample(CallInst *CI) {
+  // (op, mode, tex, samp, c0..c3, o0..o2, lodOrBias, ddx0..2, ddy0..2, cmpVal, clamp)
+  auto Mode = static_cast<ir::SampleMode>(
+      cast<ConstantInt>(CI->getArgOperand(1))->getZExtValue());
+  auto TexRH = resolveHandle(CI->getArgOperand(2));
   if (!TexRH)
     return TexRH.takeError();
-  auto SampRH = resolveHandle(CI->getArgOperand(2));
+  auto SampRH = resolveHandle(CI->getArgOperand(3));
   if (!SampRH)
     return SampRH.takeError();
 
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() < 5)
-    return makeError("SPIR-V backend: unexpected Sample return type");
+  auto *RetVecTy = dyn_cast<FixedVectorType>(CI->getType());
+  if (!RetVecTy || RetVecTy->getNumElements() != 4)
+    return makeError("SPIR-V backend: unexpected tex_sample return type");
 
   IRBuilder<> B(CI);
   unsigned Coords = textureCoordDims(TexRH->RB->Kind);
   SmallVector<Value *, 4> CoordVals;
   for (unsigned I = 0; I < Coords; ++I)
-    CoordVals.push_back(CI->getArgOperand(3 + I));
+    CoordVals.push_back(CI->getArgOperand(4 + I));
   Value *Coord = packVector(B, B.getFloatTy(), CoordVals);
 
   unsigned OffDims = textureOffsetDims(TexRH->RB->Kind);
-  Value *Offset = OffDims ? packConstOffset(B, OffDims, CI, 7)
+  Value *Offset = OffDims ? packConstOffset(B, OffDims, CI, 8)
                           : ConstantVector::getSplat(ElementCount::getFixed(2),
                                                      B.getInt32(0));
 
@@ -1208,11 +1144,15 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
     SampledTy = Type::getFloatTy(Ctx);
   Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
 
+  Value *LodOrBias = CI->getArgOperand(11);
+  Value *CmpVal = CI->getArgOperand(18);
+  Value *Clamp = CI->getArgOperand(19);
+  bool HasClamp = !isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp);
+
   Value *ResVec = nullptr;
-  switch (Op) {
-  case DXILOp::Sample: {
-    Value *Clamp = CI->getArgOperand(10);
-    if (!isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp)) {
+  switch (Mode) {
+  case ir::SampleMode::Implicit: {
+    if (HasClamp) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_sample_clamp,
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
@@ -1229,47 +1169,43 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
     }
     break;
   }
-  case DXILOp::SampleLevel: {
-    Value *Lod = CI->getArgOperand(10);
+  case ir::SampleMode::Level: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_samplelevel,
         {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
          Offset->getType()});
     ResVec = B.CreateCall(
-        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Lod, Offset});
+        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, LodOrBias, Offset});
     break;
   }
-  case DXILOp::SampleBias: {
-    Value *Bias = CI->getArgOperand(10);
-    Value *Clamp = CI->getArgOperand(11);
-    if (!isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp)) {
+  case ir::SampleMode::Bias: {
+    if (HasClamp) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_samplebias_clamp,
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
            Offset->getType()});
       ResVec = B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord,
-                                 Bias, Clamp, Offset});
+                                 LodOrBias, Clamp, Offset});
     } else {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_samplebias,
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
            Offset->getType()});
       ResVec = B.CreateCall(
-          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Bias, Offset});
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, LodOrBias, Offset});
     }
     break;
   }
-  case DXILOp::SampleGrad: {
+  case ir::SampleMode::Grad: {
     unsigned GradDims = (OffDims > 0) ? OffDims : 3u;
     SmallVector<Value *, 3> DdxVals, DdyVals;
     for (unsigned I = 0; I < GradDims; ++I) {
-      DdxVals.push_back(CI->getArgOperand(10 + I));
-      DdyVals.push_back(CI->getArgOperand(13 + I));
+      DdxVals.push_back(CI->getArgOperand(12 + I));
+      DdyVals.push_back(CI->getArgOperand(15 + I));
     }
     Value *Ddx = packVector(B, B.getFloatTy(), DdxVals);
     Value *Ddy = packVector(B, B.getFloatTy(), DdyVals);
-    Value *Clamp = CI->getArgOperand(16);
-    if (!isa<UndefValue>(Clamp) && !isa<PoisonValue>(Clamp)) {
+    if (HasClamp) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_samplegrad_clamp,
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
@@ -1287,10 +1223,9 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
     }
     break;
   }
-  case DXILOp::SampleCmp:
-  case DXILOp::SampleCmpLevelZero: {
-    Value *CmpVal = CI->getArgOperand(10);
-    Intrinsic::ID ID = (Op == DXILOp::SampleCmpLevelZero)
+  case ir::SampleMode::Cmp:
+  case ir::SampleMode::CmpLevelZero: {
+    Intrinsic::ID ID = (Mode == ir::SampleMode::CmpLevelZero)
                            ? Intrinsic::spv_resource_samplecmplevelzero
                            : Intrinsic::spv_resource_samplecmp;
     Function *Fn = Intrinsic::getOrInsertDeclaration(
@@ -1299,22 +1234,19 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI, DXILOp Op) {
          Coord->getType(), Offset->getType()});
     Value *Scalar = B.CreateCall(
         Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
-    Value *Res = PoisonValue::get(RetStructTy);
-    Res = B.CreateInsertValue(Res, Scalar, {0});
-    Res = B.CreateInsertValue(Res, B.getInt32(0), {4});
+    Value *Res = PoisonValue::get(RetVecTy);
+    Res = B.CreateInsertElement(Res, Scalar, B.getInt32(0));
     CI->replaceAllUsesWith(Res);
     return Error::success();
   }
-  default:
-    return makeError("SPIR-V backend: unsupported sample op {0}",
-                     static_cast<unsigned>(Op));
   }
 
-  CI->replaceAllUsesWith(packResRet(B, RetStructTy, ResVec));
+  CI->replaceAllUsesWith(castResultVec4(B, RetVecTy, ResVec));
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerTextureGather(CallInst *CI) {
+  // (op, tex, samp, c0..c3, o0..o1, channel, cmpVal)
   auto TexRH = resolveHandle(CI->getArgOperand(1));
   if (!TexRH)
     return TexRH.takeError();
@@ -1322,9 +1254,9 @@ Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
   if (!SampRH)
     return SampRH.takeError();
 
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() < 5)
-    return makeError("SPIR-V backend: unexpected TextureGather return type");
+  auto *RetVecTy = dyn_cast<FixedVectorType>(CI->getType());
+  if (!RetVecTy || RetVecTy->getNumElements() != 4)
+    return makeError("SPIR-V backend: unexpected tex_gather return type");
 
   IRBuilder<> B(CI);
   unsigned Coords = textureCoordDims(TexRH->RB->Kind);
@@ -1339,9 +1271,10 @@ Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
     SampledTy = Type::getFloatTy(Ctx);
   Type *Vec4Ty = FixedVectorType::get(SampledTy, 4);
 
+  Value *CmpVal = CI->getArgOperand(10);
+  bool HasCmp = !isa<UndefValue>(CmpVal) && !isa<PoisonValue>(CmpVal);
   Value *ResVec = nullptr;
-  if (Op == DXILOp::TextureGatherCmp) {
-    Value *CmpVal = CI->getArgOperand(10);
+  if (HasCmp) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_resource_gather_cmp,
         {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
@@ -1358,7 +1291,7 @@ Error SPIRVLowerer::lowerTextureGather(CallInst *CI, DXILOp Op) {
         Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Channel, Offset});
   }
 
-  CI->replaceAllUsesWith(packResRet(B, RetStructTy, ResVec));
+  CI->replaceAllUsesWith(castResultVec4(B, RetVecTy, ResVec));
   return Error::success();
 }
 
@@ -1398,12 +1331,12 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
     return RHOrErr.takeError();
   const ResolvedHandle &RH = *RHOrErr;
 
-  auto *RetStructTy = dyn_cast<StructType>(CI->getType());
-  if (!RetStructTy || RetStructTy->getNumElements() < 4)
-    return makeError("SPIR-V backend: unexpected GetDimensions return type");
+  auto *RetVecTy = dyn_cast<FixedVectorType>(CI->getType());
+  if (!RetVecTy || RetVecTy->getNumElements() != 4)
+    return makeError("SPIR-V backend: unexpected tex_get_dimensions return type");
 
   IRBuilder<> B(CI);
-  Value *Res = PoisonValue::get(RetStructTy);
+  Value *Res = PoisonValue::get(RetVecTy);
   bool IsUAV = (RH.RB->Class == ResourceClass::UAV);
   bool IsMS = isMSResource(RH.RB->Kind);
   unsigned Coords = textureCoordDims(RH.RB->Kind);
@@ -1415,18 +1348,18 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {RH.SpvHandleTy});
     Value *Dims = B.CreateCall(Fn, {RH.SpvHandle});
     for (unsigned I = 0; I < RetElems; ++I)
-      Res = B.CreateInsertValue(Res, B.CreateExtractElement(Dims, B.getInt32(I)),
-                                {I});
+      Res = B.CreateInsertElement(Res, B.CreateExtractElement(Dims, B.getInt32(I)),
+                                  B.getInt32(I));
     for (unsigned I = RetElems; I < 4; ++I)
-      Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+      Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(I));
   } else if (IsUAV || RH.RB->Kind == ResourceKind::TypedBuffer) {
     if (Coords == 1) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_getdimensions_x, {RH.SpvHandleTy});
       Value *W = B.CreateCall(Fn, {RH.SpvHandle});
-      Res = B.CreateInsertValue(Res, W, {0});
+      Res = B.CreateInsertElement(Res, W, B.getInt32(0));
       for (unsigned I = 1; I < 4; ++I)
-        Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+        Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(I));
     } else {
       Intrinsic::ID ID = (Coords >= 3)
                              ? Intrinsic::spv_resource_getdimensions_xyz
@@ -1435,10 +1368,10 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {RH.SpvHandleTy});
       Value *Dims = B.CreateCall(Fn, {RH.SpvHandle});
       for (unsigned I = 0; I < RetElems; ++I)
-        Res = B.CreateInsertValue(
-            Res, B.CreateExtractElement(Dims, B.getInt32(I)), {I});
+        Res = B.CreateInsertElement(
+            Res, B.CreateExtractElement(Dims, B.getInt32(I)), B.getInt32(I));
       for (unsigned I = RetElems; I < 4; ++I)
-        Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
+        Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(I));
     }
   } else {
     Value *Mip = CI->getArgOperand(2);
@@ -1453,12 +1386,12 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {RH.SpvHandleTy});
     Value *Dims = B.CreateCall(Fn, {RH.SpvHandle, Mip});
     for (unsigned I = 0; I < DimCount; ++I)
-      Res = B.CreateInsertValue(
-          Res, B.CreateExtractElement(Dims, B.getInt32(I)), {I});
+      Res = B.CreateInsertElement(
+          Res, B.CreateExtractElement(Dims, B.getInt32(I)), B.getInt32(I));
     for (unsigned I = DimCount; I < 3; ++I)
-      Res = B.CreateInsertValue(Res, B.getInt32(0), {I});
-    Res = B.CreateInsertValue(
-        Res, B.CreateExtractElement(Dims, B.getInt32(DimCount)), {3});
+      Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(I));
+    Res = B.CreateInsertElement(
+        Res, B.CreateExtractElement(Dims, B.getInt32(DimCount)), B.getInt32(3));
   }
 
   CI->replaceAllUsesWith(Res);
@@ -1476,37 +1409,34 @@ Error SPIRVLowerer::lowerAtomicBinOp(CallInst *CI) {
     return makeError("SPIR-V backend: non-constant atomicBinOp opcode");
 
   AtomicRMWInst::BinOp BinOp = AtomicRMWInst::Add;
-  switch (static_cast<DXILAtomicBinOp>(OpC->getZExtValue())) {
-  case DXILAtomicBinOp::Add:
+  switch (static_cast<ir::AtomicOp>(OpC->getZExtValue())) {
+  case ir::AtomicOp::Add:
     BinOp = AtomicRMWInst::Add;
     break;
-  case DXILAtomicBinOp::And:
+  case ir::AtomicOp::And:
     BinOp = AtomicRMWInst::And;
     break;
-  case DXILAtomicBinOp::Or:
+  case ir::AtomicOp::Or:
     BinOp = AtomicRMWInst::Or;
     break;
-  case DXILAtomicBinOp::Xor:
+  case ir::AtomicOp::Xor:
     BinOp = AtomicRMWInst::Xor;
     break;
-  case DXILAtomicBinOp::IMin:
+  case ir::AtomicOp::SMin:
     BinOp = AtomicRMWInst::Min;
     break;
-  case DXILAtomicBinOp::IMax:
+  case ir::AtomicOp::SMax:
     BinOp = AtomicRMWInst::Max;
     break;
-  case DXILAtomicBinOp::UMin:
+  case ir::AtomicOp::UMin:
     BinOp = AtomicRMWInst::UMin;
     break;
-  case DXILAtomicBinOp::UMax:
+  case ir::AtomicOp::UMax:
     BinOp = AtomicRMWInst::UMax;
     break;
-  case DXILAtomicBinOp::Exchange:
+  case ir::AtomicOp::Xchg:
     BinOp = AtomicRMWInst::Xchg;
     break;
-  default:
-    return makeError("SPIR-V backend: unsupported atomicBinOp {0}",
-                     OpC->getZExtValue());
   }
 
   IRBuilder<> B(CI);
@@ -1585,46 +1515,23 @@ Error SPIRVLowerer::lowerAtomicCompareExchange(CallInst *CI) {
 #endif
 }
 
-Error SPIRVLowerer::lowerBarrier(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerBarrier(CallInst *CI) {
+  // (op, execSync, tgsmFence, deviceFence)
   IRBuilder<> B(CI);
-  Intrinsic::ID BarID = Intrinsic::spv_all_memory_barrier_with_group_sync;
+  bool Sync = !cast<ConstantInt>(CI->getArgOperand(1))->isZero();
+  bool Group = !cast<ConstantInt>(CI->getArgOperand(2))->isZero();
+  bool Device = !cast<ConstantInt>(CI->getArgOperand(3))->isZero();
 
-  if (Op == DXILOp::Barrier) {
-    uint32_t Mode = 0;
-    if (auto *MC = dyn_cast<ConstantInt>(CI->getArgOperand(1)))
-      Mode = static_cast<uint32_t>(MC->getZExtValue());
-    bool Sync = (Mode & 1u) != 0;
-    bool Device = (Mode & 2u) != 0 || (Mode & 4u) != 0;
-    bool Group = (Mode & 8u) != 0;
-    if (Device && Group) {
-      BarID = Sync ? Intrinsic::spv_all_memory_barrier_with_group_sync
-                   : Intrinsic::spv_all_memory_barrier;
-    } else if (Device) {
-      BarID = Sync ? Intrinsic::spv_device_memory_barrier_with_group_sync
-                   : Intrinsic::spv_device_memory_barrier;
-    } else {
-      BarID = Sync ? Intrinsic::spv_group_memory_barrier_with_group_sync
-                   : Intrinsic::spv_group_memory_barrier;
-    }
-  } else if (Op == DXILOp::BarrierByMemoryType) {
-    uint32_t MemFlags = 0;
-    uint32_t SemFlags = 0;
-    if (auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(1)))
-      MemFlags = static_cast<uint32_t>(C->getZExtValue());
-    if (auto *C = dyn_cast<ConstantInt>(CI->getArgOperand(2)))
-      SemFlags = static_cast<uint32_t>(C->getZExtValue());
-    bool Sync = (SemFlags & 1u) != 0;
-    bool Group = (MemFlags & 1u) != 0;
-    bool Device = (MemFlags & 2u) != 0;
-    if (Device && Group)
-      BarID = Sync ? Intrinsic::spv_all_memory_barrier_with_group_sync
-                   : Intrinsic::spv_all_memory_barrier;
-    else if (Device)
-      BarID = Sync ? Intrinsic::spv_device_memory_barrier_with_group_sync
-                   : Intrinsic::spv_device_memory_barrier;
-    else
-      BarID = Sync ? Intrinsic::spv_group_memory_barrier_with_group_sync
-                   : Intrinsic::spv_group_memory_barrier;
+  Intrinsic::ID BarID = Intrinsic::spv_all_memory_barrier_with_group_sync;
+  if (Device && Group) {
+    BarID = Sync ? Intrinsic::spv_all_memory_barrier_with_group_sync
+                 : Intrinsic::spv_all_memory_barrier;
+  } else if (Device) {
+    BarID = Sync ? Intrinsic::spv_device_memory_barrier_with_group_sync
+                 : Intrinsic::spv_device_memory_barrier;
+  } else {
+    BarID = Sync ? Intrinsic::spv_group_memory_barrier_with_group_sync
+                 : Intrinsic::spv_group_memory_barrier;
   }
 
   Function *BarFn = Intrinsic::getOrInsertDeclaration(&M, BarID);
@@ -1632,58 +1539,53 @@ Error SPIRVLowerer::lowerBarrier(CallInst *CI, DXILOp Op) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerWaveOp(CallInst *CI, SpvOp Op) {
   IRBuilder<> B(CI);
   Value *Res = nullptr;
 
   switch (Op) {
-  case DXILOp::WaveIsFirstLane: {
+  case SpvOp::WaveIsFirstLane: {
     Function *Fn =
         Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_wave_is_first_lane);
     Res = B.CreateCall(Fn);
     break;
   }
-  case DXILOp::WaveGetLaneIndex: {
+  case SpvOp::LaneId: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_subgroup_local_invocation_id);
     Res = B.CreateCall(Fn);
     break;
   }
-  case DXILOp::WaveGetLaneCount: {
+  case SpvOp::SubgroupSize: {
     Function *Fn =
         Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_subgroup_size);
     Res = B.CreateCall(Fn);
     break;
   }
-  case DXILOp::WaveAnyTrue: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_wave_any);
-    Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
-    break;
-  }
-  case DXILOp::WaveAllTrue: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_wave_all);
-    Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
-    break;
-  }
-  case DXILOp::WaveActiveAllEqual: {
+  case SpvOp::WaveVote: {
+    auto Kind = static_cast<ir::WaveVoteKind>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
     Value *Val = CI->getArgOperand(1);
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_wave_all_equal, {Val->getType()});
-    Res = B.CreateCall(Fn, {Val});
+    if (Kind == ir::WaveVoteKind::Any) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_wave_any);
+      Res = B.CreateCall(Fn, {Val});
+    } else if (Kind == ir::WaveVoteKind::All) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::spv_wave_all);
+      Res = B.CreateCall(Fn, {Val});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_wave_all_equal, {Val->getType()});
+      Res = B.CreateCall(Fn, {Val});
+    }
     break;
   }
-  case DXILOp::WaveActiveBallot: {
+  case SpvOp::WaveBallot: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_subgroup_ballot);
-    Value *Vec4 = B.CreateCall(Fn, {CI->getArgOperand(1)});
-    auto *RetTy = cast<StructType>(CI->getType());
-    Res = PoisonValue::get(RetTy);
-    for (unsigned I = 0; I < 4; ++I)
-      Res = B.CreateInsertValue(Res, B.CreateExtractElement(Vec4, B.getInt32(I)),
-                                {I});
+    Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
     break;
   }
-  case DXILOp::WaveReadLaneAt: {
+  case SpvOp::WaveReadLaneAt: {
     Value *Val = CI->getArgOperand(1);
     Value *Lane = CI->getArgOperand(2);
     Function *Fn = Intrinsic::getOrInsertDeclaration(
@@ -1691,7 +1593,7 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
     Res = B.CreateCall(Fn, {Val, Lane});
     break;
   }
-  case DXILOp::WaveReadLaneFirst: {
+  case SpvOp::WaveReadLaneFirst: {
     Value *Val = CI->getArgOperand(1);
     Function *BallotFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_subgroup_ballot);
@@ -1716,87 +1618,78 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
     Res = B.CreateCall(Fn, {Val, FirstLane});
     break;
   }
-  case DXILOp::WaveActiveOp: {
+  case SpvOp::WaveReduce: {
+    // (op, val, allReduceOp, isExclusive)
     Value *Val = CI->getArgOperand(1);
-    auto *KindC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    auto *SopC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
-    if (!KindC || !SopC)
-      return makeError("SPIR-V backend: non-constant waveActiveOp kind");
-    bool IsUnsigned = (SopC->getZExtValue() == 1);
+    auto RedOp = static_cast<mlir::gpu::AllReduceOperation>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+    bool IsPrefix = !cast<ConstantInt>(CI->getArgOperand(3))->isZero();
     Intrinsic::ID ID = Intrinsic::spv_wave_reduce_sum;
-    switch (static_cast<DXILWaveOpKind>(KindC->getZExtValue())) {
-    case DXILWaveOpKind::Sum:
-      ID = Intrinsic::spv_wave_reduce_sum;
-      break;
-    case DXILWaveOpKind::Product:
-      ID = Intrinsic::spv_wave_product;
-      break;
-    case DXILWaveOpKind::Min:
-      ID = IsUnsigned ? Intrinsic::spv_wave_reduce_umin
-                      : Intrinsic::spv_wave_reduce_min;
-      break;
-    case DXILWaveOpKind::Max:
-      ID = IsUnsigned ? Intrinsic::spv_wave_reduce_umax
-                      : Intrinsic::spv_wave_reduce_max;
-      break;
+    if (IsPrefix) {
+      ID = (RedOp == mlir::gpu::AllReduceOperation::MUL)
+               ? Intrinsic::spv_wave_prefix_product
+               : Intrinsic::spv_wave_prefix_sum;
+    } else {
+      switch (RedOp) {
+      case mlir::gpu::AllReduceOperation::ADD:
+        ID = Intrinsic::spv_wave_reduce_sum;
+        break;
+      case mlir::gpu::AllReduceOperation::MUL:
+        ID = Intrinsic::spv_wave_product;
+        break;
+      case mlir::gpu::AllReduceOperation::MINUI:
+        ID = Intrinsic::spv_wave_reduce_umin;
+        break;
+      case mlir::gpu::AllReduceOperation::MINSI:
+      case mlir::gpu::AllReduceOperation::MINNUMF:
+      case mlir::gpu::AllReduceOperation::MINIMUMF:
+        ID = Intrinsic::spv_wave_reduce_min;
+        break;
+      case mlir::gpu::AllReduceOperation::MAXUI:
+        ID = Intrinsic::spv_wave_reduce_umax;
+        break;
+      case mlir::gpu::AllReduceOperation::MAXSI:
+      case mlir::gpu::AllReduceOperation::MAXNUMF:
+      case mlir::gpu::AllReduceOperation::MAXIMUMF:
+        ID = Intrinsic::spv_wave_reduce_max;
+        break;
+      case mlir::gpu::AllReduceOperation::AND:
+        ID = Intrinsic::spv_wave_reduce_and;
+        break;
+      case mlir::gpu::AllReduceOperation::OR:
+        ID = Intrinsic::spv_wave_reduce_or;
+        break;
+      case mlir::gpu::AllReduceOperation::XOR:
+        ID = Intrinsic::spv_wave_reduce_xor;
+        break;
+      }
     }
     Function *Fn =
         Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
     Res = B.CreateCall(Fn, {Val});
     break;
   }
-  case DXILOp::WaveActiveBit: {
-    Value *Val = CI->getArgOperand(1);
-    auto *KindC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    if (!KindC)
-      return makeError("SPIR-V backend: non-constant waveActiveBit kind");
-    Intrinsic::ID ID = Intrinsic::spv_wave_reduce_and;
-    switch (static_cast<DXILWaveBitOpKind>(KindC->getZExtValue())) {
-    case DXILWaveBitOpKind::And:
-      ID = Intrinsic::spv_wave_reduce_and;
-      break;
-    case DXILWaveBitOpKind::Or:
-      ID = Intrinsic::spv_wave_reduce_or;
-      break;
-    case DXILWaveBitOpKind::Xor:
-      ID = Intrinsic::spv_wave_reduce_xor;
-      break;
+  case SpvOp::WaveBitCount:
+  case SpvOp::WaveMultiPrefix: {
+    if (Op == SpvOp::WaveBitCount) {
+      auto Kind = static_cast<ir::WaveBitCountKind>(
+          cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+      if (Kind == ir::WaveBitCountKind::All) {
+        Function *Fn = Intrinsic::getOrInsertDeclaration(
+            &M, Intrinsic::spv_wave_active_countbits);
+        Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
+        break;
+      }
+      if (Kind == ir::WaveBitCountKind::Prefix) {
+        Function *Fn = Intrinsic::getOrInsertDeclaration(
+            &M, Intrinsic::spv_subgroup_prefix_bit_count);
+        Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
+        break;
+      }
     }
-    Function *Fn =
-        Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
-    Res = B.CreateCall(Fn, {Val});
-    break;
-  }
-  case DXILOp::WavePrefixOp: {
-    Value *Val = CI->getArgOperand(1);
-    auto *KindC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    if (!KindC)
-      return makeError("SPIR-V backend: non-constant wavePrefixOp kind");
-    Intrinsic::ID ID =
-        (static_cast<DXILWaveOpKind>(KindC->getZExtValue()) ==
-         DXILWaveOpKind::Product)
-            ? Intrinsic::spv_wave_prefix_product
-            : Intrinsic::spv_wave_prefix_sum;
-    Function *Fn =
-        Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
-    Res = B.CreateCall(Fn, {Val});
-    break;
-  }
-  case DXILOp::WaveAllBitCount: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_wave_active_countbits);
-    Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
-    break;
-  }
-  case DXILOp::WavePrefixBitCount: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_subgroup_prefix_bit_count);
-    Res = B.CreateCall(Fn, {CI->getArgOperand(1)});
-    break;
-  }
-  case DXILOp::WaveMultiPrefixBitCount:
-  case DXILOp::WaveMultiPrefixOp: {
-    // Compute active-lane-masked prefix words wm[0..3] (active bits < lane).
+    // Multi-prefix (bit count or general op):
+    // WaveBitCount(MultiPrefix): (op, cond, kind, m0, m1, m2, m3)
+    // WaveMultiPrefix:           (op, val, opKind, m0, m1, m2, m3)
     Function *LaneFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_subgroup_local_invocation_id);
     Value *Lane = B.CreateCall(LaneFn);
@@ -1806,7 +1699,7 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
     Value *WordMasks[4];
     for (unsigned W = 0; W < 4; ++W) {
       Value *ActiveW = B.CreateExtractElement(ActiveBallot, B.getInt32(W));
-      Value *RawMask = B.CreateAnd(CI->getArgOperand(2 + W), ActiveW);
+      Value *RawMask = B.CreateAnd(CI->getArgOperand(3 + W), ActiveW);
       Value *LoBound = B.getInt32(W * 32);
       Value *HiBound = B.getInt32((W + 1) * 32);
       Value *LocalBit = B.CreateSub(Lane, LoBound);
@@ -1818,30 +1711,28 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
           Below, B.getInt32(0), B.CreateSelect(Above, RawMask, PartialMask));
     }
 
-    DXILWaveMultiPrefixOpKind OpKind = DXILWaveMultiPrefixOpKind::Sum;
+    ir::WaveMultiPrefixOpKind OpKind = ir::WaveMultiPrefixOpKind::Sum;
     Value *Val = nullptr;
-    if (Op == DXILOp::WaveMultiPrefixBitCount) {
+    if (Op == SpvOp::WaveBitCount) {
       Val = B.CreateZExt(CI->getArgOperand(1), B.getInt32Ty());
     } else {
-      auto *KindC = dyn_cast<ConstantInt>(CI->getArgOperand(6));
-      if (!KindC || KindC->getZExtValue() > 4)
-        return makeError("SPIR-V backend: unsupported waveMultiPrefixOp kind");
-      OpKind = static_cast<DXILWaveMultiPrefixOpKind>(KindC->getZExtValue());
+      OpKind = static_cast<ir::WaveMultiPrefixOpKind>(
+          cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
       Val = CI->getArgOperand(1);
     }
     Type *ValTy = Val->getType();
 
     Value *Acc = nullptr;
     switch (OpKind) {
-    case DXILWaveMultiPrefixOpKind::Sum:
-    case DXILWaveMultiPrefixOpKind::Or:
-    case DXILWaveMultiPrefixOpKind::Xor:
+    case ir::WaveMultiPrefixOpKind::Sum:
+    case ir::WaveMultiPrefixOpKind::Or:
+    case ir::WaveMultiPrefixOpKind::Xor:
       Acc = Constant::getNullValue(ValTy);
       break;
-    case DXILWaveMultiPrefixOpKind::And:
+    case ir::WaveMultiPrefixOpKind::And:
       Acc = ConstantInt::getAllOnesValue(ValTy);
       break;
-    case DXILWaveMultiPrefixOpKind::Product:
+    case ir::WaveMultiPrefixOpKind::Product:
       Acc = ValTy->isFloatingPointTy() ? ConstantFP::get(ValTy, 1.0)
                                        : ConstantInt::get(ValTy, 1);
       break;
@@ -1880,21 +1771,21 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
 
       Value *Combined = nullptr;
       switch (OpKind) {
-      case DXILWaveMultiPrefixOpKind::Sum:
+      case ir::WaveMultiPrefixOpKind::Sum:
         Combined = ValTy->isFloatingPointTy() ? B.CreateFAdd(AccPhi, Other)
                                               : B.CreateAdd(AccPhi, Other);
         break;
-      case DXILWaveMultiPrefixOpKind::Product:
+      case ir::WaveMultiPrefixOpKind::Product:
         Combined = ValTy->isFloatingPointTy() ? B.CreateFMul(AccPhi, Other)
                                               : B.CreateMul(AccPhi, Other);
         break;
-      case DXILWaveMultiPrefixOpKind::And:
+      case ir::WaveMultiPrefixOpKind::And:
         Combined = B.CreateAnd(AccPhi, Other);
         break;
-      case DXILWaveMultiPrefixOpKind::Or:
+      case ir::WaveMultiPrefixOpKind::Or:
         Combined = B.CreateOr(AccPhi, Other);
         break;
-      case DXILWaveMultiPrefixOpKind::Xor:
+      case ir::WaveMultiPrefixOpKind::Xor:
         Combined = B.CreateXor(AccPhi, Other);
         break;
       }
@@ -1913,15 +1804,14 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
     Res = Acc;
     break;
   }
-  case DXILOp::QuadOp: {
+  case SpvOp::QuadOp: {
     Value *Val = CI->getArgOperand(1);
-    auto *DirC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    if (!DirC)
-      return makeError("SPIR-V backend: non-constant quadOp direction");
+    auto Dir = static_cast<ir::QuadOpKind>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
     Intrinsic::ID ID = Intrinsic::spv_quad_read_across_x;
-    if (DirC->getZExtValue() == 1)
+    if (Dir == ir::QuadOpKind::ReadAcrossY)
       ID = Intrinsic::spv_quad_read_across_y;
-    else if (DirC->getZExtValue() == 2)
+    else if (Dir == ir::QuadOpKind::ReadAcrossDiagonal)
       ID = Intrinsic::spv_quad_read_across_diagonal;
     Function *Fn =
         Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
@@ -1937,7 +1827,7 @@ Error SPIRVLowerer::lowerWaveOp(CallInst *CI, DXILOp Op) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, SpvOp Op) {
   IRBuilder<> B(CI);
   Value *Res = nullptr;
 
@@ -1946,189 +1836,96 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {X->getType()});
     return B.CreateCall(Fn, {X});
   };
-  auto CallBinary = [&](Intrinsic::ID ID) {
-    Value *X = CI->getArgOperand(1);
-    Value *Y = CI->getArgOperand(2);
-    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {X->getType()});
-    return B.CreateCall(Fn, {X, Y});
-  };
 
   switch (Op) {
-  case DXILOp::FAbs:
-    Res = CallUnary(Intrinsic::fabs);
-    break;
-  case DXILOp::Saturate:
+  case SpvOp::Saturate:
     Res = CallUnary(Intrinsic::spv_saturate);
     break;
-  case DXILOp::IsNaN: {
+  case SpvOp::IsNaN: {
     Value *X = CI->getArgOperand(1);
     Res = B.CreateFCmpUNO(X, X);
     break;
   }
-  case DXILOp::IsInf: {
+  case SpvOp::IsInf: {
     Value *X = CI->getArgOperand(1);
     Value *Abs = CallUnary(Intrinsic::fabs);
     Res = B.CreateFCmpOEQ(Abs, ConstantFP::getInfinity(X->getType()));
     break;
   }
-  case DXILOp::IsFinite: {
+  case SpvOp::IsFinite: {
     Value *X = CI->getArgOperand(1);
     Value *Abs = CallUnary(Intrinsic::fabs);
     Res = B.CreateFCmpOLT(Abs, ConstantFP::getInfinity(X->getType()));
     break;
   }
-  case DXILOp::Cos:
-    Res = CallUnary(Intrinsic::cos);
-    break;
-  case DXILOp::Sin:
-    Res = CallUnary(Intrinsic::sin);
-    break;
-  case DXILOp::Tan:
+  case SpvOp::Tan:
     Res = CallUnary(Intrinsic::tan);
     break;
-  case DXILOp::Acos:
+  case SpvOp::Acos:
     Res = CallUnary(Intrinsic::acos);
     break;
-  case DXILOp::Asin:
+  case SpvOp::Asin:
     Res = CallUnary(Intrinsic::asin);
     break;
-  case DXILOp::Atan:
+  case SpvOp::Atan:
     Res = CallUnary(Intrinsic::atan);
     break;
-  case DXILOp::Hcos:
+  case SpvOp::Cosh:
     Res = CallUnary(Intrinsic::cosh);
     break;
-  case DXILOp::Hsin:
+  case SpvOp::Sinh:
     Res = CallUnary(Intrinsic::sinh);
     break;
-  case DXILOp::Htan:
+  case SpvOp::Tanh:
     Res = CallUnary(Intrinsic::tanh);
     break;
-  case DXILOp::Exp:
-    Res = CallUnary(Intrinsic::exp2);
-    break;
-  case DXILOp::Frc:
+  case SpvOp::Frc:
     Res = CallUnary(Intrinsic::spv_frac);
     break;
-  case DXILOp::Log:
-    Res = CallUnary(Intrinsic::log2);
-    break;
-  case DXILOp::Sqrt:
-    Res = CallUnary(Intrinsic::sqrt);
-    break;
-  case DXILOp::Rsqrt:
+  case SpvOp::Rsqrt:
     Res = CallUnary(Intrinsic::spv_rsqrt);
     break;
-  case DXILOp::RoundNE:
-    Res = CallUnary(Intrinsic::roundeven);
-    break;
-  case DXILOp::RoundNI:
-    Res = CallUnary(Intrinsic::floor);
-    break;
-  case DXILOp::RoundPI:
-    Res = CallUnary(Intrinsic::ceil);
-    break;
-  case DXILOp::RoundZ:
-    Res = CallUnary(Intrinsic::trunc);
-    break;
-  case DXILOp::Bfrev:
-    Res = CallUnary(Intrinsic::bitreverse);
-    break;
-  case DXILOp::Countbits: {
+  case SpvOp::FirstBit: {
     Value *X = CI->getArgOperand(1);
-    unsigned Bits = X->getType()->getIntegerBitWidth();
-    Function *Ctpop32 =
-        Intrinsic::getOrInsertDeclaration(&M, Intrinsic::ctpop, {B.getInt32Ty()});
-    if (Bits == 32) {
-      Res = B.CreateCall(Ctpop32, {X});
-    } else if (Bits < 32) {
-      Res = B.CreateCall(Ctpop32, {B.CreateZExt(X, B.getInt32Ty())});
-    } else if (Bits == 64) {
-      Value *Lo = B.CreateTrunc(X, B.getInt32Ty());
-      Value *Hi = B.CreateTrunc(B.CreateLShr(X, B.getInt64(32)), B.getInt32Ty());
-      Res = B.CreateAdd(B.CreateCall(Ctpop32, {Lo}), B.CreateCall(Ctpop32, {Hi}));
+    auto Kind = static_cast<ir::FirstBitKind>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+    if (Kind == ir::FirstBitKind::Lo) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_firstbitlow, {X->getType()});
+      Res = B.CreateCall(Fn, {X});
     } else {
-      Res = CallUnary(Intrinsic::ctpop);
+      unsigned Bits = X->getType()->getIntegerBitWidth();
+      if (Kind == ir::FirstBitKind::SHi) {
+        Value *IsNeg = B.CreateICmpSLT(X, ConstantInt::get(X->getType(), 0));
+        X = B.CreateSelect(IsNeg, B.CreateNot(X), X);
+      }
+      Function *UMsb32 = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_firstbituhigh, {B.getInt32Ty()});
+      Value *Neg1 = B.getInt32(-1);
+      if (Bits == 64) {
+        Value *Lo = B.CreateTrunc(X, B.getInt32Ty());
+        Value *Hi =
+            B.CreateTrunc(B.CreateLShr(X, B.getInt64(32)), B.getInt32Ty());
+        Value *HiMsb = B.CreateCall(UMsb32, {Hi});
+        Value *LoMsb = B.CreateCall(UMsb32, {Lo});
+        Value *LoRes = B.CreateSelect(B.CreateICmpEQ(LoMsb, Neg1), Neg1,
+                                      B.CreateSub(B.getInt32(63), LoMsb));
+        Res = B.CreateSelect(B.CreateICmpEQ(HiMsb, Neg1), LoRes,
+                             B.CreateSub(B.getInt32(31), HiMsb));
+      } else {
+        Value *X32 = (Bits < 32) ? B.CreateZExt(X, B.getInt32Ty()) : X;
+        Value *Msb = B.CreateCall(UMsb32, {X32});
+        Res = B.CreateSelect(B.CreateICmpEQ(Msb, Neg1), Neg1,
+                             B.CreateSub(B.getInt32(Bits - 1), Msb));
+      }
     }
     break;
   }
-  case DXILOp::FirstbitLo: {
-    Value *X = CI->getArgOperand(1);
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_firstbitlow, {X->getType()});
-    Res = B.CreateCall(Fn, {X});
-    break;
-  }
-  case DXILOp::FirstbitHi:
-  case DXILOp::FirstbitSHi: {
-    Value *X = CI->getArgOperand(1);
-    unsigned Bits = X->getType()->getIntegerBitWidth();
-    bool IsSigned = (Op == DXILOp::FirstbitSHi);
-    if (IsSigned) {
-      Value *IsNeg = B.CreateICmpSLT(X, ConstantInt::get(X->getType(), 0));
-      X = B.CreateSelect(IsNeg, B.CreateNot(X), X);
-    }
-    Function *UMsb32 = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_firstbituhigh, {B.getInt32Ty()});
-    Value *Neg1 = B.getInt32(-1);
-    if (Bits == 64) {
-      Value *Lo = B.CreateTrunc(X, B.getInt32Ty());
-      Value *Hi = B.CreateTrunc(B.CreateLShr(X, B.getInt64(32)), B.getInt32Ty());
-      Value *HiMsb = B.CreateCall(UMsb32, {Hi});
-      Value *LoMsb = B.CreateCall(UMsb32, {Lo});
-      Value *LoRes = B.CreateSelect(B.CreateICmpEQ(LoMsb, Neg1), Neg1,
-                                    B.CreateSub(B.getInt32(63), LoMsb));
-      Res = B.CreateSelect(B.CreateICmpEQ(HiMsb, Neg1), LoRes,
-                           B.CreateSub(B.getInt32(31), HiMsb));
-    } else {
-      Value *X32 = (Bits < 32) ? B.CreateZExt(X, B.getInt32Ty()) : X;
-      Value *Msb = B.CreateCall(UMsb32, {X32});
-      Res = B.CreateSelect(B.CreateICmpEQ(Msb, Neg1), Neg1,
-                           B.CreateSub(B.getInt32(Bits - 1), Msb));
-    }
-    break;
-  }
-  case DXILOp::FMax:
-    Res = CallBinary(Intrinsic::maxnum);
-    break;
-  case DXILOp::FMin:
-    Res = CallBinary(Intrinsic::minnum);
-    break;
-  case DXILOp::IMax:
-    Res = CallBinary(Intrinsic::smax);
-    break;
-  case DXILOp::IMin:
-    Res = CallBinary(Intrinsic::smin);
-    break;
-  case DXILOp::UMax:
-    Res = CallBinary(Intrinsic::umax);
-    break;
-  case DXILOp::UMin:
-    Res = CallBinary(Intrinsic::umin);
-    break;
-  case DXILOp::FMad:
-  case DXILOp::Fma: {
-    Value *A = CI->getArgOperand(1);
-    Value *Bv = CI->getArgOperand(2);
-    Value *C = CI->getArgOperand(3);
-    Function *Fn =
-        Intrinsic::getOrInsertDeclaration(&M, Intrinsic::fma, {A->getType()});
-    Res = B.CreateCall(Fn, {A, Bv, C});
-    break;
-  }
-  case DXILOp::IMad:
-  case DXILOp::UMad: {
-    Value *A = CI->getArgOperand(1);
-    Value *Bv = CI->getArgOperand(2);
-    Value *C = CI->getArgOperand(3);
-    Res = B.CreateAdd(B.CreateMul(A, Bv), C);
-    break;
-  }
-  case DXILOp::Ibfe:
-  case DXILOp::Ubfe: {
+  case SpvOp::Bfe: {
     Value *Width = CI->getArgOperand(1);
     Value *Offset = CI->getArgOperand(2);
     Value *Val = CI->getArgOperand(3);
+    bool IsSigned = !cast<ConstantInt>(CI->getArgOperand(4))->isZero();
     Type *Ty = Val->getType();
     unsigned BitWidth = Ty->getIntegerBitWidth();
     Value *W = B.CreateAnd(Width, ConstantInt::get(Ty, BitWidth - 1));
@@ -2138,12 +1935,12 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
                                 B.CreateAdd(W, O));
     Value *ShrAmt = B.CreateSub(ConstantInt::get(Ty, BitWidth), W);
     Value *Left = B.CreateShl(Val, ShlAmt);
-    Value *Extracted = (Op == DXILOp::Ibfe) ? B.CreateAShr(Left, ShrAmt)
-                                            : B.CreateLShr(Left, ShrAmt);
+    Value *Extracted = IsSigned ? B.CreateAShr(Left, ShrAmt)
+                                : B.CreateLShr(Left, ShrAmt);
     Res = B.CreateSelect(IsZeroW, ConstantInt::get(Ty, 0), Extracted);
     break;
   }
-  case DXILOp::Bfi: {
+  case SpvOp::Bfi: {
     Value *Width = CI->getArgOperand(1);
     Value *Offset = CI->getArgOperand(2);
     Value *NewBits = CI->getArgOperand(3);
@@ -2160,10 +1957,8 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = B.CreateOr(Inserted, Kept);
     break;
   }
-  case DXILOp::Dot2:
-  case DXILOp::Dot3:
-  case DXILOp::Dot4: {
-    unsigned N = (Op == DXILOp::Dot2) ? 2 : (Op == DXILOp::Dot3 ? 3 : 4);
+  case SpvOp::Dot: {
+    unsigned N = (CI->arg_size() - 1) / 2;
     Type *ScalarTy = CI->getArgOperand(1)->getType();
     Type *VecTy = FixedVectorType::get(ScalarTy, N);
     Value *VA = PoisonValue::get(VecTy);
@@ -2178,33 +1973,41 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = B.CreateCall(Fn, {VA, VB});
     break;
   }
-  case DXILOp::LegacyF32ToF16: {
+  case SpvOp::LegacyF32ToF16: {
     Value *H = B.CreateFPTrunc(CI->getArgOperand(1), Type::getHalfTy(Ctx));
     Value *I16 = B.CreateBitCast(H, B.getInt16Ty());
     Res = B.CreateZExt(I16, B.getInt32Ty());
     break;
   }
-  case DXILOp::LegacyF16ToF32: {
+  case SpvOp::LegacyF16ToF32: {
     Value *I16 = B.CreateTrunc(CI->getArgOperand(1), B.getInt16Ty());
     Value *H = B.CreateBitCast(I16, Type::getHalfTy(Ctx));
     Res = B.CreateFPExt(H, Type::getFloatTy(Ctx));
     break;
   }
-  case DXILOp::Dot4AddI8Packed: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_dot4add_i8packed);
-    Res = B.CreateCall(Fn, {CI->getArgOperand(1), CI->getArgOperand(2),
-                            CI->getArgOperand(3)});
+  case SpvOp::DotPacked: {
+    auto Kind = static_cast<ir::DotPackedKind>(
+        cast<ConstantInt>(CI->getArgOperand(1))->getZExtValue());
+    if (Kind == ir::DotPackedKind::F16x2) {
+      Type *F32 = Type::getFloatTy(Ctx);
+      Value *Acc = CI->getArgOperand(2);
+      Value *A0 = B.CreateFPExt(CI->getArgOperand(3), F32);
+      Value *A1 = B.CreateFPExt(CI->getArgOperand(4), F32);
+      Value *B0 = B.CreateFPExt(CI->getArgOperand(5), F32);
+      Value *B1 = B.CreateFPExt(CI->getArgOperand(6), F32);
+      Value *Prod = B.CreateFAdd(B.CreateFMul(A0, B0), B.CreateFMul(A1, B1));
+      Res = B.CreateFAdd(Acc, Prod);
+    } else {
+      Intrinsic::ID ID = Kind == ir::DotPackedKind::I8x4
+                             ? Intrinsic::spv_dot4add_i8packed
+                             : Intrinsic::spv_dot4add_u8packed;
+      Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID);
+      Res = B.CreateCall(
+          Fn, {CI->getArgOperand(2), CI->getArgOperand(3), CI->getArgOperand(4)});
+    }
     break;
   }
-  case DXILOp::Dot4AddU8Packed: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_dot4add_u8packed);
-    Res = B.CreateCall(Fn, {CI->getArgOperand(1), CI->getArgOperand(2),
-                            CI->getArgOperand(3)});
-    break;
-  }
-  case DXILOp::Pack4x8: {
+  case SpvOp::Pack4x8: {
     auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
     uint64_t Mode = ModeC ? ModeC->getZExtValue() : 0;
     Value *Acc = B.getInt32(0);
@@ -2212,13 +2015,11 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
       Value *V = CI->getArgOperand(2 + I);
       Type *ElemTy = V->getType();
       if (Mode == 1) {
-        // UClamp: signed clamp [0, 255]
         Value *Lo = ConstantInt::get(ElemTy, 0);
         Value *Hi = ConstantInt::get(ElemTy, 255);
         V = B.CreateSelect(B.CreateICmpSLT(V, Lo), Lo, V);
         V = B.CreateSelect(B.CreateICmpSGT(V, Hi), Hi, V);
       } else if (Mode == 2) {
-        // SClamp: signed clamp [-128, 127]
         Value *Lo = ConstantInt::getSigned(ElemTy, -128);
         Value *Hi = ConstantInt::getSigned(ElemTy, 127);
         V = B.CreateSelect(B.CreateICmpSLT(V, Lo), Lo, V);
@@ -2232,31 +2033,31 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = Acc;
     break;
   }
-  case DXILOp::Unpack4x8: {
+  case SpvOp::Unpack4x8: {
     auto *ModeC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
     uint64_t Mode = ModeC ? ModeC->getZExtValue() : 0;
     Value *Pk = CI->getArgOperand(2);
-    auto *ST = cast<StructType>(CI->getType());
-    Type *ElemTy = ST->getElementType(0);
-    Value *Ret = PoisonValue::get(ST);
+    auto *VT = cast<FixedVectorType>(CI->getType());
+    Type *ElemTy = VT->getElementType();
+    Value *Ret = PoisonValue::get(VT);
     for (unsigned I = 0; I < 4; ++I) {
       Value *Shifted = (I == 0) ? Pk : B.CreateLShr(Pk, B.getInt32(I * 8));
       Value *Byte = B.CreateTrunc(Shifted, B.getInt8Ty());
       Value *Ext = (Mode == 1) ? B.CreateSExt(Byte, ElemTy)
                                : B.CreateZExt(Byte, ElemTy);
-      Ret = B.CreateInsertValue(Ret, Ext, {I});
+      Ret = B.CreateInsertElement(Ret, Ext, B.getInt32(I));
     }
     Res = Ret;
     break;
   }
-  case DXILOp::MakeDouble: {
+  case SpvOp::MakeDouble: {
     Value *Lo = B.CreateZExt(CI->getArgOperand(1), B.getInt64Ty());
     Value *Hi = B.CreateShl(B.CreateZExt(CI->getArgOperand(2), B.getInt64Ty()),
                             B.getInt64(32));
     Res = B.CreateBitCast(B.CreateOr(Lo, Hi), Type::getDoubleTy(Ctx));
     break;
   }
-  case DXILOp::SplitDouble: {
+  case SpvOp::SplitDouble: {
     Value *Bits = B.CreateBitCast(CI->getArgOperand(1), B.getInt64Ty());
     Value *Lo = B.CreateTrunc(Bits, B.getInt32Ty());
     Value *Hi = B.CreateTrunc(B.CreateLShr(Bits, B.getInt64(32)), B.getInt32Ty());
@@ -2266,7 +2067,7 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = Ret;
     break;
   }
-  case DXILOp::UAddc: {
+  case SpvOp::UAddc: {
     Value *A = CI->getArgOperand(1);
     Value *BV = CI->getArgOperand(2);
     Value *Sum = B.CreateAdd(A, BV);
@@ -2281,23 +2082,6 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
     Res = Ret;
     break;
   }
-  case DXILOp::Dot2AddHalf: {
-    Type *F32 = Type::getFloatTy(Ctx);
-    Value *Acc = CI->getArgOperand(1);
-    Value *A0 = B.CreateFPExt(CI->getArgOperand(2), F32);
-    Value *A1 = B.CreateFPExt(CI->getArgOperand(3), F32);
-    Value *B0 = B.CreateFPExt(CI->getArgOperand(4), F32);
-    Value *B1 = B.CreateFPExt(CI->getArgOperand(5), F32);
-    Value *Prod = B.CreateFAdd(B.CreateFMul(A0, B0), B.CreateFMul(A1, B1));
-    Res = B.CreateFAdd(Acc, Prod);
-    break;
-  }
-  case DXILOp::CheckAccessFullyMapped: {
-    // Non-sparse resources are always fully mapped; return status != 0.
-    Res = B.CreateICmpNE(CI->getArgOperand(1),
-                         ConstantInt::get(CI->getArgOperand(1)->getType(), 0));
-    break;
-  }
   default:
     return makeError("SPIR-V backend: unsupported math/bit op {0}",
                      static_cast<unsigned>(Op));
@@ -2307,10 +2091,10 @@ Error SPIRVLowerer::lowerMathOrBitOp(CallInst *CI, DXILOp Op) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerPixelOp(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerPixelOp(CallInst *CI, SpvOp Op) {
   IRBuilder<> B(CI);
   switch (Op) {
-  case DXILOp::Discard: {
+  case SpvOp::Discard: {
     Value *Cond = CI->getArgOperand(1);
     if (auto *C = dyn_cast<ConstantInt>(Cond)) {
       if (!C->isZero()) {
@@ -2334,17 +2118,17 @@ Error SPIRVLowerer::lowerPixelOp(CallInst *CI, DXILOp Op) {
     B.CreateBr(ContBB);
     return Error::success();
   }
-  case DXILOp::DerivCoarseX:
-  case DXILOp::DerivCoarseY:
-  case DXILOp::DerivFineX:
-  case DXILOp::DerivFineY: {
-    Intrinsic::ID ID = Intrinsic::spv_ddx_coarse;
-    if (Op == DXILOp::DerivCoarseY)
-      ID = Intrinsic::spv_ddy_coarse;
-    else if (Op == DXILOp::DerivFineX)
-      ID = Intrinsic::spv_ddx_fine;
-    else if (Op == DXILOp::DerivFineY)
-      ID = Intrinsic::spv_ddy_fine;
+  case SpvOp::Deriv: {
+    auto Axis = static_cast<ir::DerivAxis>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+    auto Qual = static_cast<ir::DerivQuality>(
+        cast<ConstantInt>(CI->getArgOperand(3))->getZExtValue());
+    Intrinsic::ID ID =
+        (Qual == ir::DerivQuality::Coarse)
+            ? (Axis == ir::DerivAxis::X ? Intrinsic::spv_ddx_coarse
+                                        : Intrinsic::spv_ddy_coarse)
+            : (Axis == ir::DerivAxis::X ? Intrinsic::spv_ddx_fine
+                                        : Intrinsic::spv_ddy_fine);
     Value *X = CI->getArgOperand(1);
     Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {X->getType()});
     CI->replaceAllUsesWith(B.CreateCall(Fn, {X}));
@@ -2356,207 +2140,133 @@ Error SPIRVLowerer::lowerPixelOp(CallInst *CI, DXILOp Op) {
   }
 }
 
-Error SPIRVLowerer::lowerDXILCall(CallInst *CI) {
+Error SPIRVLowerer::lowerBridgeCall(CallInst *CI) {
   auto *OpC = dyn_cast<ConstantInt>(CI->getArgOperand(0));
   if (!OpC)
-    return makeError("SPIR-V backend: non-constant DXIL opcode in call to '{0}'",
+    return makeError("SPIR-V backend: non-constant bridge opcode in call to '{0}'",
                      CI->getCalledFunction()->getName());
 
-  auto Op = static_cast<DXILOp>(OpC->getZExtValue());
+  auto Op = static_cast<SpvOp>(OpC->getZExtValue());
   IRBuilder<> B(CI);
 
   switch (Op) {
-  case DXILOp::CreateHandle:
-    return lowerCreateHandle(CI);
-  case DXILOp::CreateHandleFromBinding:
-    return lowerCreateHandleFromBinding(CI);
-  case DXILOp::CreateHandleFromHeap:
-    return lowerCreateHandleFromHeap(CI);
-  case DXILOp::AnnotateHandle:
-    return lowerAnnotateHandle(CI);
-  case DXILOp::RawBufferLoad:
-    return lowerRawBufferLoad(CI);
-  case DXILOp::RawBufferStore:
-    return lowerRawBufferStore(CI);
-  case DXILOp::BufferLoad:
+  case SpvOp::BindResource:
+    return lowerBindResource(CI);
+  case SpvOp::HeapResource:
+    return lowerHeapResource(CI);
+  case SpvOp::BufferLoad:
     return lowerBufferLoad(CI);
-  case DXILOp::BufferStore:
+  case SpvOp::BufferStore:
     return lowerBufferStore(CI);
-  case DXILOp::CBufferLoadLegacy:
-    return lowerCBufferLoadLegacy(CI);
-  case DXILOp::BufferUpdateCounter:
+  case SpvOp::CBufferLoad:
+    return lowerCBufferLoad(CI);
+  case SpvOp::BufferUpdateCounter:
     return lowerBufferUpdateCounter(CI);
-  case DXILOp::TextureLoad:
+  case SpvOp::TexLoad:
     return lowerTextureLoad(CI);
-  case DXILOp::TextureStore:
+  case SpvOp::TexStore:
     return lowerTextureStore(CI);
-  case DXILOp::Sample:
-  case DXILOp::SampleBias:
-  case DXILOp::SampleLevel:
-  case DXILOp::SampleGrad:
-  case DXILOp::SampleCmp:
-  case DXILOp::SampleCmpLevelZero:
-    return lowerTextureSample(CI, Op);
-  case DXILOp::TextureGather:
-  case DXILOp::TextureGatherCmp:
-    return lowerTextureGather(CI, Op);
-  case DXILOp::CalculateLOD:
+  case SpvOp::TexSample:
+    return lowerTextureSample(CI);
+  case SpvOp::TexGather:
+    return lowerTextureGather(CI);
+  case SpvOp::TexCalcLod:
     return lowerCalculateLOD(CI);
-  case DXILOp::GetDimensions:
+  case SpvOp::TexGetDimensions:
     return lowerGetDimensions(CI);
-  case DXILOp::AtomicBinOp:
+  case SpvOp::BufferAtomic:
     return lowerAtomicBinOp(CI);
-  case DXILOp::AtomicCompareExchange:
+  case SpvOp::BufferAtomicCmpXchg:
     return lowerAtomicCompareExchange(CI);
-  case DXILOp::Barrier:
-  case DXILOp::BarrierByMemoryType:
-  case DXILOp::BarrierByMemoryHandle:
-    return lowerBarrier(CI, Op);
+  case SpvOp::Barrier:
+    return lowerBarrier(CI);
 
-  case DXILOp::ThreadId: {
+  case SpvOp::ThreadId: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
     CI->replaceAllUsesWith(B.CreateCall(Fn, {CI->getArgOperand(1)}));
     return Error::success();
   }
-  case DXILOp::GroupId: {
+  case SpvOp::GroupId: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_group_id, {B.getInt32Ty()});
     CI->replaceAllUsesWith(B.CreateCall(Fn, {CI->getArgOperand(1)}));
     return Error::success();
   }
-  case DXILOp::ThreadIdInGroup: {
+  case SpvOp::ThreadIdInGroup: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_thread_id_in_group, {B.getInt32Ty()});
     CI->replaceAllUsesWith(B.CreateCall(Fn, {CI->getArgOperand(1)}));
     return Error::success();
   }
-  case DXILOp::FlattenedThreadIdInGroup: {
+  case SpvOp::FlattenedThreadIdInGroup: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::spv_flattened_thread_id_in_group);
     CI->replaceAllUsesWith(B.CreateCall(Fn));
     return Error::success();
   }
 
-  case DXILOp::WaveIsFirstLane:
-  case DXILOp::WaveGetLaneIndex:
-  case DXILOp::WaveGetLaneCount:
-  case DXILOp::WaveAnyTrue:
-  case DXILOp::WaveAllTrue:
-  case DXILOp::WaveActiveAllEqual:
-  case DXILOp::WaveActiveBallot:
-  case DXILOp::WaveReadLaneAt:
-  case DXILOp::WaveReadLaneFirst:
-  case DXILOp::WaveActiveOp:
-  case DXILOp::WaveActiveBit:
-  case DXILOp::WavePrefixOp:
-  case DXILOp::WaveAllBitCount:
-  case DXILOp::WavePrefixBitCount:
-  case DXILOp::WaveMultiPrefixOp:
-  case DXILOp::WaveMultiPrefixBitCount:
-  case DXILOp::QuadOp:
+  case SpvOp::WaveIsFirstLane:
+  case SpvOp::LaneId:
+  case SpvOp::SubgroupSize:
+  case SpvOp::WaveVote:
+  case SpvOp::WaveBallot:
+  case SpvOp::WaveReadLaneAt:
+  case SpvOp::WaveReadLaneFirst:
+  case SpvOp::WaveReduce:
+  case SpvOp::WaveBitCount:
+  case SpvOp::WaveMultiPrefix:
+  case SpvOp::QuadOp:
     return lowerWaveOp(CI, Op);
 
-  case DXILOp::FAbs:
-  case DXILOp::Saturate:
-  case DXILOp::IsNaN:
-  case DXILOp::IsInf:
-  case DXILOp::IsFinite:
-  case DXILOp::Cos:
-  case DXILOp::Sin:
-  case DXILOp::Tan:
-  case DXILOp::Acos:
-  case DXILOp::Asin:
-  case DXILOp::Atan:
-  case DXILOp::Hcos:
-  case DXILOp::Hsin:
-  case DXILOp::Htan:
-  case DXILOp::Exp:
-  case DXILOp::Frc:
-  case DXILOp::Log:
-  case DXILOp::Sqrt:
-  case DXILOp::Rsqrt:
-  case DXILOp::RoundNE:
-  case DXILOp::RoundNI:
-  case DXILOp::RoundPI:
-  case DXILOp::RoundZ:
-  case DXILOp::Bfrev:
-  case DXILOp::Countbits:
-  case DXILOp::FirstbitLo:
-  case DXILOp::FirstbitHi:
-  case DXILOp::FirstbitSHi:
-  case DXILOp::FMax:
-  case DXILOp::FMin:
-  case DXILOp::IMax:
-  case DXILOp::IMin:
-  case DXILOp::UMax:
-  case DXILOp::UMin:
-  case DXILOp::FMad:
-  case DXILOp::Fma:
-  case DXILOp::IMad:
-  case DXILOp::UMad:
-  case DXILOp::Ibfe:
-  case DXILOp::Ubfe:
-  case DXILOp::Bfi:
-  case DXILOp::Dot2:
-  case DXILOp::Dot3:
-  case DXILOp::Dot4:
-  case DXILOp::LegacyF32ToF16:
-  case DXILOp::LegacyF16ToF32:
-  case DXILOp::Dot4AddI8Packed:
-  case DXILOp::Dot4AddU8Packed:
-  case DXILOp::Pack4x8:
-  case DXILOp::Unpack4x8:
-  case DXILOp::MakeDouble:
-  case DXILOp::SplitDouble:
-  case DXILOp::UAddc:
-  case DXILOp::Dot2AddHalf:
-  case DXILOp::CheckAccessFullyMapped:
+  case SpvOp::Saturate:
+  case SpvOp::IsNaN:
+  case SpvOp::IsInf:
+  case SpvOp::IsFinite:
+  case SpvOp::Tan:
+  case SpvOp::Acos:
+  case SpvOp::Asin:
+  case SpvOp::Atan:
+  case SpvOp::Cosh:
+  case SpvOp::Sinh:
+  case SpvOp::Tanh:
+  case SpvOp::Frc:
+  case SpvOp::Rsqrt:
+  case SpvOp::FirstBit:
+  case SpvOp::Bfe:
+  case SpvOp::Bfi:
+  case SpvOp::Dot:
+  case SpvOp::LegacyF32ToF16:
+  case SpvOp::LegacyF16ToF32:
+  case SpvOp::DotPacked:
+  case SpvOp::Pack4x8:
+  case SpvOp::Unpack4x8:
+  case SpvOp::MakeDouble:
+  case SpvOp::SplitDouble:
+  case SpvOp::UAddc:
     return lowerMathOrBitOp(CI, Op);
 
-  case DXILOp::Discard:
-  case DXILOp::DerivCoarseX:
-  case DXILOp::DerivCoarseY:
-  case DXILOp::DerivFineX:
-  case DXILOp::DerivFineY:
+  case SpvOp::Discard:
+  case SpvOp::Deriv:
     return lowerPixelOp(CI, Op);
 
-  case DXILOp::LoadInput:
+  case SpvOp::LoadInput:
     return lowerLoadInput(CI);
-  case DXILOp::StoreOutput:
+  case SpvOp::StoreOutput:
     return lowerStoreOutput(CI);
 
-  case DXILOp::AllocateRayQuery:
-  case DXILOp::RayQuery_TraceRayInline:
-  case DXILOp::RayQuery_Proceed:
-  case DXILOp::RayQuery_Abort:
-  case DXILOp::RayQuery_CommitNonOpaqueTriangleHit:
-  case DXILOp::RayQuery_CommitProceduralPrimitiveHit:
-  case DXILOp::RayQuery_CommittedStatus:
-  case DXILOp::RayQuery_CandidateType:
-  case DXILOp::RayQuery_CommittedTriangleFrontFace:
-  case DXILOp::RayQuery_CommittedTriangleBarycentrics:
-  case DXILOp::RayQuery_RayFlags:
-  case DXILOp::RayQuery_WorldRayOrigin:
-  case DXILOp::RayQuery_WorldRayDirection:
-  case DXILOp::RayQuery_RayTMin:
-  case DXILOp::RayQuery_CommittedRayT:
-  case DXILOp::RayQuery_CommittedInstanceID:
-  case DXILOp::RayQuery_CommittedInstanceIndex:
-  case DXILOp::RayQuery_CommittedPrimitiveIndex:
-  case DXILOp::RayQuery_CommittedGeometryIndex:
-  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
-  case DXILOp::DispatchRaysIndex:
-  case DXILOp::DispatchRaysDimensions:
-  case DXILOp::WorldRayOrigin:
-  case DXILOp::WorldRayDirection:
-  case DXILOp::RayTCurrent:
-  case DXILOp::PrimitiveIndex:
-  case DXILOp::TraceRay:
+  case SpvOp::RayQueryAlloc:
+  case SpvOp::RayQueryTraceInline:
+  case SpvOp::RayQueryProceed:
+  case SpvOp::RayQueryAbort:
+  case SpvOp::RayQueryCommit:
+  case SpvOp::RayQueryGet:
+  case SpvOp::SysValRT:
+  case SpvOp::TraceRay:
     return lowerRaytracingOp(CI, Op);
 
   default:
-    return makeError("SPIR-V backend: unsupported DXIL op '{0}' (opcode {1})",
+    return makeError("SPIR-V backend: unsupported bridge op '{0}' (opcode {1})",
                      CI->getCalledFunction()->getName(),
                      static_cast<unsigned>(Op));
   }
@@ -2782,7 +2492,7 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   return Error::success();
 }
 
-Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, DXILOp Op) {
+Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
   IRBuilder<> B(CI);
   auto &EntryBB = Entry->getEntryBlock();
 
@@ -2830,13 +2540,14 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, DXILOp Op) {
   };
 
   switch (Op) {
-  case DXILOp::AllocateRayQuery: {
+  case SpvOp::RayQueryAlloc: {
     RayQueryState &S = getOrCreateRQ(CI);
     B.CreateStore(CI->getArgOperand(1), S.Flags);
-    CI->replaceAllUsesWith(B.getInt32(0));
+    RayQueries[S.Flags] = S;
+    CI->replaceAllUsesWith(S.Flags);
     return Error::success();
   }
-  case DXILOp::RayQuery_TraceRayInline: {
+  case SpvOp::RayQueryTraceInline: {
     // (op, rqHandle, accelHandle, rayFlags, mask, ox, oy, oz, tmin, dx, dy, dz, tmax)
     RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
     auto AccelOrErr = resolveHandle(CI->getArgOperand(2));
@@ -2858,109 +2569,111 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, DXILOp Op) {
                   S.CommittedStatus);
     return Error::success();
   }
-  case DXILOp::RayQuery_Proceed: {
+  case SpvOp::RayQueryProceed: {
     CI->replaceAllUsesWith(B.getFalse());
     return Error::success();
   }
-  case DXILOp::RayQuery_Abort:
+  case SpvOp::RayQueryAbort:
     return Error::success();
-  case DXILOp::RayQuery_CommitNonOpaqueTriangleHit: {
+  case SpvOp::RayQueryCommit: {
     RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
-    B.CreateStore(B.getInt32(1), S.CommittedStatus);
+    auto Kind = static_cast<ir::RayQueryCommitKind>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+    if (Kind == ir::RayQueryCommitKind::Triangle) {
+      B.CreateStore(B.getInt32(1), S.CommittedStatus);
+    } else {
+      B.CreateStore(B.getInt32(2), S.CommittedStatus);
+      B.CreateStore(CI->getArgOperand(3), S.CommittedT);
+    }
     return Error::success();
   }
-  case DXILOp::RayQuery_CommitProceduralPrimitiveHit: {
+  case SpvOp::RayQueryGet: {
     RayQueryState &S = getOrCreateRQ(CI->getArgOperand(1));
-    B.CreateStore(B.getInt32(2), S.CommittedStatus);
-    B.CreateStore(CI->getArgOperand(2), S.CommittedT);
-    return Error::success();
+    auto Field = static_cast<ir::RayQueryField>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(3));
+    switch (Field) {
+    case ir::RayQueryField::CommittedStatus:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.CommittedStatus));
+      return Error::success();
+    case ir::RayQueryField::CandidateType:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.CandidateType));
+      return Error::success();
+    case ir::RayQueryField::CommittedTriangleFrontFace:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt1Ty(), S.FrontFace));
+      return Error::success();
+    case ir::RayQueryField::CommittedTriangleBarycentrics: {
+      unsigned Comp = (CompC && CompC->getZExtValue() == 1) ? 1u : 0u;
+      CI->replaceAllUsesWith(B.CreateLoad(B.getFloatTy(), S.Bary[Comp]));
+      return Error::success();
+    }
+    case ir::RayQueryField::RayFlags:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.Flags));
+      return Error::success();
+    case ir::RayQueryField::WorldRayOrigin: {
+      unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
+      CI->replaceAllUsesWith(B.CreateLoad(B.getFloatTy(), S.Origin[Comp]));
+      return Error::success();
+    }
+    case ir::RayQueryField::WorldRayDirection: {
+      unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
+      CI->replaceAllUsesWith(B.CreateLoad(B.getFloatTy(), S.Dir[Comp]));
+      return Error::success();
+    }
+    case ir::RayQueryField::RayTMin:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getFloatTy(), S.TMin));
+      return Error::success();
+    case ir::RayQueryField::CommittedRayT:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getFloatTy(), S.CommittedT));
+      return Error::success();
+    case ir::RayQueryField::CommittedInstanceId:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.InstanceID));
+      return Error::success();
+    case ir::RayQueryField::CommittedInstanceIndex:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.InstanceIndex));
+      return Error::success();
+    case ir::RayQueryField::CommittedPrimitiveIndex:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.PrimitiveIndex));
+      return Error::success();
+    case ir::RayQueryField::CommittedGeometryIndex:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.GeometryIndex));
+      return Error::success();
+    case ir::RayQueryField::CommittedInstanceContrib:
+      CI->replaceAllUsesWith(B.CreateLoad(B.getInt32Ty(), S.InstanceContrib));
+      return Error::success();
+    }
+    return makeError("SPIR-V backend: unsupported RayQueryField");
   }
-  case DXILOp::RayQuery_CommittedStatus:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).CommittedStatus));
-    return Error::success();
-  case DXILOp::RayQuery_CandidateType:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).CandidateType));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedTriangleFrontFace:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt1Ty(), getOrCreateRQ(CI->getArgOperand(1)).FrontFace));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedTriangleBarycentrics: {
-    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    unsigned Comp = (CompC && CompC->getZExtValue() == 1) ? 1u : 0u;
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Bary[Comp]));
-    return Error::success();
+  case SpvOp::SysValRT: {
+    auto Kind = static_cast<ir::SysValKind>(
+        cast<ConstantInt>(CI->getArgOperand(1))->getZExtValue());
+    switch (Kind) {
+    case ir::SysValKind::DispatchRaysIndex: {
+      Function *TidFn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
+      CI->replaceAllUsesWith(B.CreateCall(TidFn, {CI->getArgOperand(2)}));
+      return Error::success();
+    }
+    case ir::SysValKind::DispatchRaysDimensions: {
+      Function *NwgFn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_num_workgroups, {B.getInt32Ty()});
+      CI->replaceAllUsesWith(B.CreateCall(NwgFn, {CI->getArgOperand(2)}));
+      return Error::success();
+    }
+    case ir::SysValKind::WorldRayOrigin:
+    case ir::SysValKind::WorldRayDirection:
+    case ir::SysValKind::RayTCurrent:
+      CI->replaceAllUsesWith(ConstantFP::get(CI->getType(), 0.0));
+      return Error::success();
+    case ir::SysValKind::PrimitiveIndex:
+      CI->replaceAllUsesWith(B.getInt32(0));
+      return Error::success();
+    default:
+      return makeError("SPIR-V backend: unsupported SysValKind {0}",
+                       static_cast<unsigned>(Kind));
+    }
   }
-  case DXILOp::RayQuery_RayFlags:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).Flags));
-    return Error::success();
-  case DXILOp::RayQuery_WorldRayOrigin: {
-    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Origin[Comp]));
-    return Error::success();
-  }
-  case DXILOp::RayQuery_WorldRayDirection: {
-    auto *CompC = dyn_cast<ConstantInt>(CI->getArgOperand(2));
-    unsigned Comp = CompC ? std::min<unsigned>(CompC->getZExtValue(), 2u) : 0u;
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).Dir[Comp]));
-    return Error::success();
-  }
-  case DXILOp::RayQuery_RayTMin:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).TMin));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedRayT:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getFloatTy(), getOrCreateRQ(CI->getArgOperand(1)).CommittedT));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedInstanceID:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceID));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedInstanceIndex:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceIndex));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedPrimitiveIndex:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).PrimitiveIndex));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedGeometryIndex:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).GeometryIndex));
-    return Error::success();
-  case DXILOp::RayQuery_CommittedInstanceContributionToHitGroupIndex:
-    CI->replaceAllUsesWith(
-        B.CreateLoad(B.getInt32Ty(), getOrCreateRQ(CI->getArgOperand(1)).InstanceContrib));
-    return Error::success();
-  case DXILOp::DispatchRaysIndex: {
-    Function *TidFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_thread_id, {B.getInt32Ty()});
-    CI->replaceAllUsesWith(B.CreateCall(TidFn, {CI->getArgOperand(1)}));
-    return Error::success();
-  }
-  case DXILOp::DispatchRaysDimensions: {
-    Function *NwgFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::spv_num_workgroups, {B.getInt32Ty()});
-    CI->replaceAllUsesWith(B.CreateCall(NwgFn, {CI->getArgOperand(1)}));
-    return Error::success();
-  }
-  case DXILOp::WorldRayOrigin:
-  case DXILOp::WorldRayDirection:
-  case DXILOp::RayTCurrent:
-    CI->replaceAllUsesWith(ConstantFP::get(CI->getType(), 0.0));
-    return Error::success();
-  case DXILOp::PrimitiveIndex:
-    CI->replaceAllUsesWith(B.getInt32(0));
-    return Error::success();
-  case DXILOp::TraceRay: {
+  case SpvOp::TraceRay: {
     auto AccelOrErr = resolveHandle(CI->getArgOperand(1));
     if (!AccelOrErr)
       return AccelOrErr.takeError();
@@ -3144,7 +2857,7 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
   }
 }
 
-void SPIRVLowerer::cleanupDXILArtifacts() {
+void SPIRVLowerer::cleanupBridgeArtifacts() {
   SmallVector<NamedMDNode *, 8> ToEraseMD;
   for (NamedMDNode &NMD : M.named_metadata()) {
     if (NMD.getName().starts_with("dx."))
@@ -3155,7 +2868,7 @@ void SPIRVLowerer::cleanupDXILArtifacts() {
 
   SmallVector<Function *, 16> DeadDecls;
   for (Function &F : M) {
-    if (F.isDeclaration() && F.getName().starts_with("dx.op.") &&
+    if (F.isDeclaration() && F.getName().starts_with("__crucible_spv.") &&
         F.use_empty())
       DeadDecls.push_back(&F);
   }
@@ -3180,7 +2893,7 @@ Error SPIRVLowerer::run() {
 
   prepareStageInterface();
 
-  SmallVector<CallInst *, 64> DXILCalls;
+  SmallVector<CallInst *, 64> BridgeCalls;
   for (Function &F : M) {
     if (F.isDeclaration())
       continue;
@@ -3189,20 +2902,21 @@ Error SPIRVLowerer::run() {
       for (Instruction &I : BB) {
         if (auto *CI = dyn_cast<CallInst>(&I)) {
           if (Function *Callee = CI->getCalledFunction()) {
-            if (Callee->getName().starts_with("dx.op."))
-              DXILCalls.push_back(CI);
+            if (Callee->getName().starts_with("__crucible_spv."))
+              BridgeCalls.push_back(CI);
           }
         }
       }
     }
   }
 
-  for (CallInst *CI : DXILCalls) {
-    if (Error E = lowerDXILCall(CI))
+  for (CallInst *CI : BridgeCalls) {
+    if (Error E = lowerBridgeCall(CI))
       return E;
   }
 
-  for (auto It = DXILCalls.rbegin(), End = DXILCalls.rend(); It != End; ++It) {
+  for (auto It = BridgeCalls.rbegin(), End = BridgeCalls.rend(); It != End;
+       ++It) {
     CallInst *CI = *It;
     if (!CI->use_empty())
       CI->replaceAllUsesWith(PoisonValue::get(CI->getType()));
@@ -3210,7 +2924,7 @@ Error SPIRVLowerer::run() {
   }
 
   configureEntryAndLinkage(*StageOrErr);
-  cleanupDXILArtifacts();
+  cleanupBridgeArtifacts();
 
 #if LLVM_VERSION_MAJOR >= 24
   PassBuilder PB(Ctx);
@@ -3245,15 +2959,874 @@ Error SPIRVLowerer::run() {
   return Error::success();
 }
 
+/// Lowers `crucible.*`, `gpu.*`, `math.*`, and `arith.*` ops in `Mod` to pure
+/// `llvm.*` dialect ops (using `@__crucible_spv.<N>` bridge declarations for
+/// SPIR-V backend operations) and exports the result to an `llvm::Module`.
+Expected<std::unique_ptr<Module>>
+lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
+  mlir::MLIRContext *MCtx = Mod.getContext();
+  auto PtrTy = mlir::LLVM::LLVMPointerType::get(MCtx);
+  auto I1Ty = mlir::IntegerType::get(MCtx, 1);
+  auto I8Ty = mlir::IntegerType::get(MCtx, 8);
+  auto I32Ty = mlir::IntegerType::get(MCtx, 32);
+  auto F32Ty = mlir::Float32Type::get(MCtx);
+  auto VoidTy = mlir::LLVM::LLVMVoidType::get(MCtx);
+
+  auto convertType = [&](mlir::Type T) -> mlir::Type {
+    if (mlir::isa<ir::ResourceType, ir::RayQueryType>(T))
+      return PtrTy;
+    if (mlir::isa<mlir::IndexType>(T))
+      return I32Ty;
+    return T;
+  };
+
+  unsigned BridgeCounter = 0;
+  auto makeBridgeCall = [&](mlir::OpBuilder &B, mlir::Location Loc, SpvOp Op,
+                            mlir::Type RetTy,
+                            ArrayRef<mlir::Value> Args) -> mlir::Value {
+    SmallVector<mlir::Value, 16> CallArgs;
+    CallArgs.push_back(mlir::LLVM::ConstantOp::create(
+        B, Loc, I32Ty, B.getI32IntegerAttr(static_cast<int32_t>(Op))));
+    CallArgs.append(Args.begin(), Args.end());
+
+    SmallVector<mlir::Type, 16> ArgTypes;
+    for (mlir::Value V : CallArgs)
+      ArgTypes.push_back(V.getType());
+
+    mlir::Type FuncRet = RetTy ? RetTy : mlir::Type(VoidTy);
+    auto FuncTy = mlir::LLVM::LLVMFunctionType::get(FuncRet, ArgTypes);
+    std::string FnName = "__crucible_spv." + std::to_string(BridgeCounter++);
+    {
+      mlir::OpBuilder::InsertionGuard G(B);
+      B.setInsertionPointToEnd(Mod.getBody());
+      auto Decl = mlir::LLVM::LLVMFuncOp::create(B, Loc, FnName, FuncTy);
+      Decl.setLinkage(mlir::LLVM::Linkage::External);
+    }
+    SmallVector<mlir::Type, 1> ResTypes;
+    if (RetTy)
+      ResTypes.push_back(RetTy);
+    auto Call = mlir::LLVM::CallOp::create(
+        B, Loc, ResTypes, mlir::SymbolRefAttr::get(MCtx, FnName), CallArgs);
+    return RetTy ? Call.getResult() : mlir::Value();
+  };
+
+  auto i32C = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                  int32_t V) -> mlir::Value {
+    return mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                          B.getI32IntegerAttr(V));
+  };
+  auto i8C = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                 int8_t V) -> mlir::Value {
+    return mlir::LLVM::ConstantOp::create(B, Loc, I8Ty, B.getI8IntegerAttr(V));
+  };
+  auto undefV = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                    mlir::Type T) -> mlir::Value {
+    return mlir::LLVM::UndefOp::create(B, Loc, T);
+  };
+  auto gpuDimToI32 = [](mlir::gpu::Dimension D) -> int32_t {
+    switch (D) {
+    case mlir::gpu::Dimension::x:
+      return 0;
+    case mlir::gpu::Dimension::y:
+      return 1;
+    case mlir::gpu::Dimension::z:
+      return 2;
+    }
+    return 0;
+  };
+
+  // Pass 1: convert any block arguments with custom/index types to LLVM types.
+  Mod.walk([&](mlir::LLVM::LLVMFuncOp F) {
+    if (F.isExternal())
+      return;
+    for (mlir::Block &BB : F.getBody()) {
+      for (mlir::BlockArgument Arg : BB.getArguments()) {
+        mlir::Type NewT = convertType(Arg.getType());
+        if (NewT != Arg.getType())
+          Arg.setType(NewT);
+      }
+    }
+  });
+
+  // Pass 2: lower all non-LLVM ops in each function body.
+  SmallVector<mlir::Operation *, 128> OpsToLower;
+  Mod.walk([&](mlir::LLVM::LLVMFuncOp F) {
+    if (F.isExternal())
+      return;
+    for (mlir::Block &BB : F.getBody()) {
+      for (mlir::Operation &Op : BB) {
+        if (!mlir::isa<mlir::LLVM::LLVMDialect>(Op.getDialect()))
+          OpsToLower.push_back(&Op);
+        else {
+          for (mlir::Value Res : Op.getResults()) {
+            mlir::Type NewT = convertType(Res.getType());
+            if (NewT != Res.getType())
+              Res.setType(NewT);
+          }
+        }
+      }
+    }
+  });
+
+  for (mlir::Operation *Op : OpsToLower) {
+    mlir::OpBuilder B(Op);
+    mlir::Location Loc = Op->getLoc();
+
+    // --- arith dialect ---
+    if (auto C = mlir::dyn_cast<mlir::arith::ConstantOp>(Op)) {
+      mlir::Type NewT = convertType(C.getType());
+      mlir::TypedAttr ValAttr = C.getValue();
+      if (mlir::isa<mlir::IndexType>(C.getType())) {
+        auto IA = mlir::cast<mlir::IntegerAttr>(ValAttr);
+        ValAttr = B.getI32IntegerAttr(static_cast<int32_t>(IA.getInt()));
+      }
+      mlir::Value Rep = mlir::LLVM::ConstantOp::create(B, Loc, NewT, ValAttr);
+      C.getResult().replaceAllUsesWith(Rep);
+      C.erase();
+      continue;
+    }
+    if (auto Cast = mlir::dyn_cast<mlir::arith::IndexCastUIOp>(Op)) {
+      mlir::Value In = Cast.getIn();
+      mlir::Type OutT = convertType(Cast.getType());
+      mlir::Value Rep = In;
+      if (In.getType() != OutT) {
+        unsigned InW = In.getType().getIntOrFloatBitWidth();
+        unsigned OutW = OutT.getIntOrFloatBitWidth();
+        if (InW < OutW)
+          Rep = mlir::LLVM::ZExtOp::create(B, Loc, OutT, In);
+        else if (InW > OutW)
+          Rep = mlir::LLVM::TruncOp::create(B, Loc, OutT, In);
+      }
+      Cast.getResult().replaceAllUsesWith(Rep);
+      Cast.erase();
+      continue;
+    }
+
+    // --- gpu dialect ---
+    if (auto Tid = mlir::dyn_cast<mlir::gpu::ThreadIdOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::ThreadIdInGroup, I32Ty,
+          {i32C(B, Loc, gpuDimToI32(Tid.getDimension()))});
+      Tid.getResult().replaceAllUsesWith(Rep);
+      Tid.erase();
+      continue;
+    }
+    if (auto Bid = mlir::dyn_cast<mlir::gpu::BlockIdOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::GroupId, I32Ty,
+          {i32C(B, Loc, gpuDimToI32(Bid.getDimension()))});
+      Bid.getResult().replaceAllUsesWith(Rep);
+      Bid.erase();
+      continue;
+    }
+    if (auto Gid = mlir::dyn_cast<mlir::gpu::GlobalIdOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::ThreadId, I32Ty,
+          {i32C(B, Loc, gpuDimToI32(Gid.getDimension()))});
+      Gid.getResult().replaceAllUsesWith(Rep);
+      Gid.erase();
+      continue;
+    }
+    if (auto Lid = mlir::dyn_cast<mlir::gpu::LaneIdOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::LaneId, I32Ty, {});
+      Lid.getResult().replaceAllUsesWith(Rep);
+      Lid.erase();
+      continue;
+    }
+    if (auto Sgs = mlir::dyn_cast<mlir::gpu::SubgroupSizeOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::SubgroupSize, I32Ty, {});
+      Sgs.getResult().replaceAllUsesWith(Rep);
+      Sgs.erase();
+      continue;
+    }
+    if (auto Bar = mlir::dyn_cast<mlir::gpu::BarrierOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::Barrier, mlir::Type(),
+                     {i32C(B, Loc, 1), i32C(B, Loc, 1), i32C(B, Loc, 0)});
+      Bar.erase();
+      continue;
+    }
+    if (auto BC = mlir::dyn_cast<mlir::gpu::SubgroupBroadcastOp>(Op)) {
+      mlir::Value Rep;
+      if (BC.getBroadcastType() ==
+          mlir::gpu::BroadcastType::first_active_lane) {
+        Rep = makeBridgeCall(B, Loc, SpvOp::WaveReadLaneFirst, BC.getType(),
+                             {BC.getSrc()});
+      } else {
+        Rep = makeBridgeCall(B, Loc, SpvOp::WaveReadLaneAt, BC.getType(),
+                             {BC.getSrc(), BC.getOperand(1)});
+      }
+      BC.getResult().replaceAllUsesWith(Rep);
+      BC.erase();
+      continue;
+    }
+    if (auto Shuf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::WaveReadLaneAt, Shuf.getShuffleResult().getType(),
+          {Shuf.getValue(), Shuf.getOffset()});
+      Shuf.getShuffleResult().replaceAllUsesWith(Rep);
+      if (!Shuf.getValid().use_empty()) {
+        mlir::Value TrueV = mlir::LLVM::ConstantOp::create(
+            B, Loc, I1Ty, B.getBoolAttr(true));
+        Shuf.getValid().replaceAllUsesWith(TrueV);
+      }
+      Shuf.erase();
+      continue;
+    }
+    if (auto Red = mlir::dyn_cast<mlir::gpu::SubgroupReduceOp>(Op)) {
+      int32_t IsExclusive = 0;
+      if (auto SA = Red->getAttrOfType<mlir::StringAttr>("crucible.scan_kind"))
+        if (SA.getValue() == "exclusive")
+          IsExclusive = 1;
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::WaveReduce, Red.getType(),
+          {Red.getValue(), i32C(B, Loc, static_cast<int32_t>(Red.getOp())),
+           i32C(B, Loc, IsExclusive)});
+      Red.getResult().replaceAllUsesWith(Rep);
+      Red.erase();
+      continue;
+    }
+
+    // --- math dialect ---
+    if (auto MOp = mlir::dyn_cast<mlir::math::AbsFOp>(Op)) {
+      auto Rep = mlir::LLVM::FAbsOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::CosOp>(Op)) {
+      auto Rep = mlir::LLVM::CosOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::SinOp>(Op)) {
+      auto Rep = mlir::LLVM::SinOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::Exp2Op>(Op)) {
+      auto Rep = mlir::LLVM::Exp2Op::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::Log2Op>(Op)) {
+      auto Rep = mlir::LLVM::Log2Op::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::SqrtOp>(Op)) {
+      auto Rep = mlir::LLVM::SqrtOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::FloorOp>(Op)) {
+      auto Rep = mlir::LLVM::FFloorOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::CeilOp>(Op)) {
+      auto Rep = mlir::LLVM::FCeilOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::TruncOp>(Op)) {
+      auto Rep = mlir::LLVM::FTruncOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::RoundEvenOp>(Op)) {
+      auto Rep = mlir::LLVM::RoundEvenOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::FmaOp>(Op)) {
+      auto Rep = mlir::LLVM::FMAOp::create(B, Loc, MOp.getA(), MOp.getB(),
+                                           MOp.getC());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    if (auto MOp = mlir::dyn_cast<mlir::math::CtPopOp>(Op)) {
+      auto Rep = mlir::LLVM::CtPopOp::create(B, Loc, MOp.getOperand());
+      MOp.getResult().replaceAllUsesWith(Rep);
+      MOp.erase();
+      continue;
+    }
+    auto lowerUnaryBridge = [&](SpvOp SOp) -> bool {
+      mlir::Value Rep =
+          makeBridgeCall(B, Loc, SOp, Op->getResult(0).getType(),
+                         {Op->getOperand(0)});
+      Op->getResult(0).replaceAllUsesWith(Rep);
+      Op->erase();
+      return true;
+    };
+    if (mlir::isa<mlir::math::TanOp>(Op) && lowerUnaryBridge(SpvOp::Tan))
+      continue;
+    if (mlir::isa<mlir::math::AcosOp>(Op) && lowerUnaryBridge(SpvOp::Acos))
+      continue;
+    if (mlir::isa<mlir::math::AsinOp>(Op) && lowerUnaryBridge(SpvOp::Asin))
+      continue;
+    if (mlir::isa<mlir::math::AtanOp>(Op) && lowerUnaryBridge(SpvOp::Atan))
+      continue;
+    if (mlir::isa<mlir::math::CoshOp>(Op) && lowerUnaryBridge(SpvOp::Cosh))
+      continue;
+    if (mlir::isa<mlir::math::SinhOp>(Op) && lowerUnaryBridge(SpvOp::Sinh))
+      continue;
+    if (mlir::isa<mlir::math::TanhOp>(Op) && lowerUnaryBridge(SpvOp::Tanh))
+      continue;
+    if (mlir::isa<mlir::math::RsqrtOp>(Op) && lowerUnaryBridge(SpvOp::Rsqrt))
+      continue;
+    if (mlir::isa<mlir::math::IsNaNOp>(Op) && lowerUnaryBridge(SpvOp::IsNaN))
+      continue;
+    if (mlir::isa<mlir::math::IsInfOp>(Op) && lowerUnaryBridge(SpvOp::IsInf))
+      continue;
+    if (mlir::isa<mlir::math::IsFiniteOp>(Op) &&
+        lowerUnaryBridge(SpvOp::IsFinite))
+      continue;
+
+    // --- crucible dialect ---
+    if (auto COp = mlir::dyn_cast<ir::BindResourceOp>(Op)) {
+      int32_t HasRec = COp.getRecordId().has_value() ? 1 : 0;
+      int32_t RecId = COp.getRecordId().value_or(0);
+      int32_t Space = COp.getSpace().value_or(0);
+      int32_t Binding = COp.getBinding().value_or(0);
+      mlir::Value Idx = COp.getIndex() ? COp.getIndex() : i32C(B, Loc, 0);
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::BindResource, PtrTy,
+          {i32C(B, Loc, static_cast<int32_t>(COp.getResourceClass())),
+           i32C(B, Loc, HasRec), i32C(B, Loc, RecId), i32C(B, Loc, Space),
+           i32C(B, Loc, Binding), Idx,
+           i32C(B, Loc, COp.getNonUniform() ? 1 : 0)});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::HeapResourceOp>(Op)) {
+      int32_t ResCls = COp.getResourceClass().has_value()
+                           ? static_cast<int32_t>(*COp.getResourceClass())
+                           : (COp.getIsSamplerHeap() ? 3 : 0);
+      int32_t Kind = COp.getResourceKind().value_or(0);
+      int32_t Prop1 = COp.getElementStride().value_or(0);
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::HeapResource, PtrTy,
+          {COp.getIndex(), i32C(B, Loc, COp.getIsSamplerHeap() ? 1 : 0),
+           i32C(B, Loc, COp.getNonUniform() ? 1 : 0), i32C(B, Loc, ResCls),
+           i32C(B, Loc, Kind), i32C(B, Loc, Prop1),
+           i32C(B, Loc, COp.getHasCounter() ? 1 : 0)});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::CBufferLoadOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::CBufferLoad, COp.getResult().getType(),
+          {COp.getHandle(), COp.getRegIndex()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BufferLoadOp>(Op)) {
+      mlir::Value ElemOff = COp.getElementOffset()
+                                ? COp.getElementOffset()
+                                : undefV(B, Loc, I32Ty);
+      int32_t Mask = COp.getMask().value_or(0xF);
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::BufferLoad, COp.getResult().getType(),
+          {COp.getHandle(), COp.getIndex(), ElemOff, i32C(B, Loc, Mask)});
+      COp.getResult().replaceAllUsesWith(Rep);
+      if (COp.getStatus())
+        COp.getStatus().replaceAllUsesWith(i32C(B, Loc, 1));
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BufferStoreOp>(Op)) {
+      mlir::Value ElemOff = COp.getElementOffset()
+                                ? COp.getElementOffset()
+                                : undefV(B, Loc, I32Ty);
+      SmallVector<mlir::Value, 8> Args = {COp.getHandle(), COp.getIndex(),
+                                          ElemOff};
+      mlir::Type ValTy =
+          COp.getValues().empty() ? mlir::Type(I32Ty) : COp.getValues()[0].getType();
+      for (unsigned I = 0; I < 4; ++I)
+        Args.push_back(I < COp.getValues().size() ? COp.getValues()[I]
+                                                  : undefV(B, Loc, ValTy));
+      Args.push_back(i32C(B, Loc, COp.getMask()));
+      makeBridgeCall(B, Loc, SpvOp::BufferStore, mlir::Type(), Args);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BufferAtomicOp>(Op)) {
+      SmallVector<mlir::Value, 7> Args = {
+          COp.getHandle(),
+          i32C(B, Loc, static_cast<int32_t>(COp.getOp()))};
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, I32Ty));
+      Args.push_back(COp.getValue());
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::BufferAtomic,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BufferAtomicCmpXchgOp>(Op)) {
+      SmallVector<mlir::Value, 7> Args = {COp.getHandle()};
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, I32Ty));
+      Args.push_back(COp.getCompare());
+      Args.push_back(COp.getValue());
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::BufferAtomicCmpXchg,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BufferUpdateCounterOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::BufferUpdateCounter, I32Ty,
+          {COp.getHandle(), i8C(B, Loc, COp.getInc())});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TexLoadOp>(Op)) {
+      mlir::Value Mip = COp.getMipOrSample() ? COp.getMipOrSample()
+                                             : undefV(B, Loc, I32Ty);
+      SmallVector<mlir::Value, 8> Args = {COp.getHandle(), Mip};
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, I32Ty));
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getOffsets().size() ? COp.getOffsets()[I]
+                                                   : undefV(B, Loc, I32Ty));
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::TexLoad,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      if (COp.getStatus())
+        COp.getStatus().replaceAllUsesWith(i32C(B, Loc, 1));
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TexStoreOp>(Op)) {
+      SmallVector<mlir::Value, 9> Args = {COp.getHandle()};
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, I32Ty));
+      mlir::Type ValTy =
+          COp.getValues().empty() ? mlir::Type(F32Ty) : COp.getValues()[0].getType();
+      for (unsigned I = 0; I < 4; ++I)
+        Args.push_back(I < COp.getValues().size() ? COp.getValues()[I]
+                                                  : undefV(B, Loc, ValTy));
+      Args.push_back(i32C(B, Loc, COp.getMask()));
+      makeBridgeCall(B, Loc, SpvOp::TexStore, mlir::Type(), Args);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TexSampleOp>(Op)) {
+      SmallVector<mlir::Value, 20> Args = {
+          i32C(B, Loc, static_cast<int32_t>(COp.getMode())),
+          COp.getTex(), COp.getSampler()};
+      for (unsigned I = 0; I < 4; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, F32Ty));
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getOffsets().size() ? COp.getOffsets()[I]
+                                                   : undefV(B, Loc, I32Ty));
+      Args.push_back(COp.getLodOrBias() ? COp.getLodOrBias()
+                                        : undefV(B, Loc, F32Ty));
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getDdx().size() ? COp.getDdx()[I]
+                                               : undefV(B, Loc, F32Ty));
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getDdy().size() ? COp.getDdy()[I]
+                                               : undefV(B, Loc, F32Ty));
+      Args.push_back(COp.getCmpVal() ? COp.getCmpVal() : undefV(B, Loc, F32Ty));
+      Args.push_back(COp.getClamp() ? COp.getClamp() : undefV(B, Loc, F32Ty));
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::TexSample,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      if (COp.getStatus())
+        COp.getStatus().replaceAllUsesWith(i32C(B, Loc, 1));
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TexGatherOp>(Op)) {
+      SmallVector<mlir::Value, 12> Args = {COp.getTex(), COp.getSampler()};
+      for (unsigned I = 0; I < 4; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, F32Ty));
+      for (unsigned I = 0; I < 2; ++I)
+        Args.push_back(I < COp.getOffsets().size() ? COp.getOffsets()[I]
+                                                   : undefV(B, Loc, I32Ty));
+      Args.push_back(i32C(B, Loc, COp.getChannel()));
+      Args.push_back(COp.getCmpVal() ? COp.getCmpVal() : undefV(B, Loc, F32Ty));
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::TexGather,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      if (COp.getStatus())
+        COp.getStatus().replaceAllUsesWith(i32C(B, Loc, 1));
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TexCalcLodOp>(Op)) {
+      SmallVector<mlir::Value, 6> Args = {COp.getTex(), COp.getSampler()};
+      for (unsigned I = 0; I < 3; ++I)
+        Args.push_back(I < COp.getCoords().size() ? COp.getCoords()[I]
+                                                  : undefV(B, Loc, F32Ty));
+      Args.push_back(i32C(B, Loc, COp.getClamped() ? 1 : 0));
+      mlir::Value Rep =
+          makeBridgeCall(B, Loc, SpvOp::TexCalcLod, F32Ty, Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TexGetDimensionsOp>(Op)) {
+      mlir::Value Mip = COp.getMipLevel() ? COp.getMipLevel()
+                                          : undefV(B, Loc, I32Ty);
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::TexGetDimensions,
+                                       COp.getResult().getType(),
+                                       {COp.getHandle(), Mip});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::LoadInputOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::LoadInput, COp.getResult().getType(),
+          {i32C(B, Loc, COp.getInputId()), COp.getRow(),
+           i8C(B, Loc, COp.getCol())});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::StoreOutputOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::StoreOutput, mlir::Type(),
+                     {i32C(B, Loc, COp.getOutputId()), COp.getRow(),
+                      i8C(B, Loc, COp.getCol()), COp.getValue()});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::DiscardOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::Discard, mlir::Type(), {COp.getCond()});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::DerivOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::Deriv, COp.getResult().getType(),
+          {COp.getValue(),
+           i32C(B, Loc, static_cast<int32_t>(COp.getAxis())),
+           i32C(B, Loc, static_cast<int32_t>(COp.getQuality()))});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::SysValOp>(Op)) {
+      mlir::Value Rep;
+      if (COp.getKind() == ir::SysValKind::FlattenedThreadIdInGroup) {
+        Rep = makeBridgeCall(B, Loc, SpvOp::FlattenedThreadIdInGroup,
+                             COp.getResult().getType(), {});
+      } else {
+        Rep = makeBridgeCall(
+            B, Loc, SpvOp::SysValRT, COp.getResult().getType(),
+            {i32C(B, Loc, static_cast<int32_t>(COp.getKind())),
+             i32C(B, Loc, COp.getComponent().value_or(0))});
+      }
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BarrierOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::Barrier, mlir::Type(),
+                     {i32C(B, Loc, COp.getExecSync() ? 1 : 0),
+                      i32C(B, Loc, COp.getTgsmFence() ? 1 : 0),
+                      i32C(B, Loc, COp.getDeviceFence() ? 1 : 0)});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::WaveIsFirstLaneOp>(Op)) {
+      mlir::Value Rep =
+          makeBridgeCall(B, Loc, SpvOp::WaveIsFirstLane, I1Ty, {});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::WaveVoteOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::WaveVote, I1Ty,
+          {COp.getValue(), i32C(B, Loc, static_cast<int32_t>(COp.getKind()))});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::WaveBallotOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::WaveBallot,
+                                       COp.getResult().getType(),
+                                       {COp.getCond()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::WaveBitCountOp>(Op)) {
+      SmallVector<mlir::Value, 6> Args = {
+          COp.getCond(), i32C(B, Loc, static_cast<int32_t>(COp.getKind()))};
+      for (mlir::Value Mv : COp.getMask())
+        Args.push_back(Mv);
+      mlir::Value Rep =
+          makeBridgeCall(B, Loc, SpvOp::WaveBitCount, I32Ty, Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::WaveMultiPrefixOp>(Op)) {
+      SmallVector<mlir::Value, 6> Args = {
+          COp.getValue(), i32C(B, Loc, static_cast<int32_t>(COp.getOp()))};
+      for (mlir::Value Mv : COp.getMask())
+        Args.push_back(Mv);
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::WaveMultiPrefix,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::QuadReadLaneAtOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::QuadReadLaneAt, COp.getResult().getType(),
+          {COp.getValue(), COp.getQuadLane()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::QuadOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::QuadOp, COp.getResult().getType(),
+          {COp.getValue(), i32C(B, Loc, static_cast<int32_t>(COp.getKind()))});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (mlir::isa<ir::SaturateOp>(Op) && lowerUnaryBridge(SpvOp::Saturate))
+      continue;
+    if (mlir::isa<ir::FrcOp>(Op) && lowerUnaryBridge(SpvOp::Frc))
+      continue;
+    if (auto COp = mlir::dyn_cast<ir::FirstBitOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::FirstBit, I32Ty,
+          {COp.getValue(), i32C(B, Loc, static_cast<int32_t>(COp.getKind()))});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BfeOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::Bfe, COp.getResult().getType(),
+          {COp.getWidth(), COp.getOffset(), COp.getValue(),
+           i32C(B, Loc, COp.getIsSigned() ? 1 : 0)});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::BfiOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::Bfi, COp.getResult().getType(),
+          {COp.getWidth(), COp.getOffset(), COp.getInsert(), COp.getBase()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::DotOp>(Op)) {
+      SmallVector<mlir::Value, 8> Args;
+      Args.append(COp.getLhs().begin(), COp.getLhs().end());
+      Args.append(COp.getRhs().begin(), COp.getRhs().end());
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::Dot,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::DotPackedOp>(Op)) {
+      SmallVector<mlir::Value, 8> Args = {
+          i32C(B, Loc, static_cast<int32_t>(COp.getKind())), COp.getAcc()};
+      Args.append(COp.getInputs().begin(), COp.getInputs().end());
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::DotPacked,
+                                       COp.getResult().getType(), Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::Pack4x8Op>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::Pack4x8, I32Ty,
+          {i32C(B, Loc, COp.getMode()), COp.getV0(), COp.getV1(), COp.getV2(),
+           COp.getV3()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::Unpack4x8Op>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::Unpack4x8, COp.getResult().getType(),
+          {i32C(B, Loc, COp.getMode()), COp.getPacked()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (mlir::isa<ir::LegacyF32ToF16Op>(Op) &&
+        lowerUnaryBridge(SpvOp::LegacyF32ToF16))
+      continue;
+    if (mlir::isa<ir::LegacyF16ToF32Op>(Op) &&
+        lowerUnaryBridge(SpvOp::LegacyF16ToF32))
+      continue;
+    if (auto COp = mlir::dyn_cast<ir::MakeDoubleOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::MakeDouble, COp.getResult().getType(),
+          {COp.getLo(), COp.getHi()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::SplitDoubleOp>(Op)) {
+      auto RetTy = mlir::LLVM::LLVMStructType::getLiteral(MCtx, {I32Ty, I32Ty});
+      mlir::Value Pair = makeBridgeCall(B, Loc, SpvOp::SplitDouble, RetTy,
+                                        {COp.getValue()});
+      mlir::Value Lo = mlir::LLVM::ExtractValueOp::create(B, Loc, Pair, 0);
+      mlir::Value Hi = mlir::LLVM::ExtractValueOp::create(B, Loc, Pair, 1);
+      COp.getLo().replaceAllUsesWith(Lo);
+      COp.getHi().replaceAllUsesWith(Hi);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::UAddcOp>(Op)) {
+      mlir::Type SumTy = COp.getSum().getType();
+      auto RetTy = mlir::LLVM::LLVMStructType::getLiteral(MCtx, {SumTy, I1Ty});
+      mlir::Value Pair = makeBridgeCall(B, Loc, SpvOp::UAddc, RetTy,
+                                        {COp.getLhs(), COp.getRhs()});
+      mlir::Value Sum = mlir::LLVM::ExtractValueOp::create(B, Loc, Pair, 0);
+      mlir::Value Carry = mlir::LLVM::ExtractValueOp::create(B, Loc, Pair, 1);
+      COp.getSum().replaceAllUsesWith(Sum);
+      COp.getCarry().replaceAllUsesWith(Carry);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::TraceRayOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::TraceRay, mlir::Type(), {COp.getAccel()});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::RayQueryAllocOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::RayQueryAlloc, PtrTy,
+                                       {COp.getConstRayFlags()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::RayQueryTraceInlineOp>(Op)) {
+      makeBridgeCall(
+          B, Loc, SpvOp::RayQueryTraceInline, mlir::Type(),
+          {COp.getQuery(), COp.getAccel(), COp.getRayFlags(),
+           COp.getInstanceMask(), COp.getOriginX(), COp.getOriginY(),
+           COp.getOriginZ(), COp.getTMin(), COp.getDirX(), COp.getDirY(),
+           COp.getDirZ(), COp.getTMax()});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::RayQueryProceedOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(B, Loc, SpvOp::RayQueryProceed, I1Ty,
+                                       {COp.getQuery()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::RayQueryAbortOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::RayQueryAbort, mlir::Type(),
+                     {COp.getQuery()});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::RayQueryCommitOp>(Op)) {
+      mlir::Value THit = COp.getTHit() ? COp.getTHit() : undefV(B, Loc, F32Ty);
+      makeBridgeCall(B, Loc, SpvOp::RayQueryCommit, mlir::Type(),
+                     {COp.getQuery(),
+                      i32C(B, Loc, static_cast<int32_t>(COp.getKind())), THit});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::RayQueryGetOp>(Op)) {
+      mlir::Value Comp =
+          COp.getComponent() ? COp.getComponent() : i32C(B, Loc, 0);
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::RayQueryGet, COp.getResult().getType(),
+          {COp.getQuery(),
+           i32C(B, Loc, static_cast<int32_t>(COp.getField())), Comp});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+
+    return makeError("SPIR-V backend: unsupported MLIR op '{0}'",
+                     Op->getName().getStringRef());
+  }
+
+  // Erase any unused external function declarations left over from frontend
+  // import (e.g. unreferenced runtime stubs) so they do not pollute LLVM IR.
+  SmallVector<mlir::LLVM::LLVMFuncOp, 16> UnusedDecls;
+  for (auto F : Mod.getOps<mlir::LLVM::LLVMFuncOp>()) {
+    if (F.isExternal() && !F.getName().starts_with("__crucible_spv.") &&
+        mlir::SymbolTable::symbolKnownUseEmpty(F, Mod))
+      UnusedDecls.push_back(F);
+  }
+  for (auto F : UnusedDecls)
+    F.erase();
+
+  mlir::DialectRegistry Reg;
+  mlir::registerBuiltinDialectTranslation(Reg);
+  mlir::registerLLVMDialectTranslation(Reg);
+  MCtx->appendDialectRegistry(Reg);
+
+  auto LLVMMod = mlir::translateModuleToLLVMIR(Mod, LLVMCtx);
+  if (!LLVMMod)
+    return makeError("SPIR-V backend: failed to export MLIR module to LLVM IR");
+  return LLVMMod;
+}
+
 } // namespace
 
-Expected<std::string> emitSPIRV(Module &M, Function *Entry, Reflection &Reflect,
+Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
                                 const Options &Opts) {
   initializeSPIRVTargetOnce();
 
   auto StageOrErr = stageTripleSuffix(Reflect.Stage, Opts.StageAsCompute);
   if (!StageOrErr)
     return StageOrErr.takeError();
+
+  LLVMContext LLVMCtx;
+  auto MOrErr = lowerMLIRToSPIRVLLVM(Mod, LLVMCtx);
+  if (!MOrErr)
+    return MOrErr.takeError();
+  Module &M = **MOrErr;
+
+  Function *Entry = nullptr;
+  if (!Reflect.EntryName.empty())
+    Entry = M.getFunction(Reflect.EntryName);
+  if (!Entry) {
+    for (Function &F : M) {
+      if (!F.isDeclaration()) {
+        Entry = &F;
+        break;
+      }
+    }
+  }
+  if (!Entry)
+    return makeError("SPIR-V backend: no entry function found in module");
 
   std::string VulkanVer =
       Opts.VulkanVersion.empty() ? "vulkan1.3" : Opts.VulkanVersion;

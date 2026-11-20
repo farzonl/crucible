@@ -39,6 +39,12 @@ struct StructurizedShader {
   mlir::func::FuncOp Entry;
 };
 
+/// Import the upgraded DXIL LLVM module into MLIR and lower all dx.op.* calls
+/// onto Crucible's frontend-agnostic MLIR contract (gpu.*, math.*, llvm.*,
+/// crucible.*). Consumes Shader.M; Ctx must outlive the result.
+llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>>
+importDXILToMLIR(LoadedShader &Shader, mlir::MLIRContext &Ctx);
+
 /// Import the upgraded LLVM module into MLIR and lift its unstructured CFG to
 /// structured SCF control flow (MLIR's LiftControlFlowToSCF implements the
 /// "perfect reconstructability" algorithm, so arbitrary CFGs become goto-free

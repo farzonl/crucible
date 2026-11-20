@@ -37,6 +37,12 @@ endif()
 find_package(MLIR REQUIRED CONFIG)
 message(STATUS "Found MLIR at ${MLIR_DIR}")
 
+find_program(CRUCIBLE_MLIR_TBLGEN
+  NAMES mlir-tblgen mlir-tblgen-24 mlir-tblgen-23 mlir-tblgen-22 mlir-tblgen-21
+  HINTS "${LLVM_TOOLS_BINARY_DIR}" "${MLIR_TOOLS_DIR}" "${CRUCIBLE_LLVM_PREFIX}/bin"
+  REQUIRED)
+message(STATUS "Found mlir-tblgen at ${CRUCIBLE_MLIR_TBLGEN}")
+
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS_LIST})
@@ -57,6 +63,9 @@ endif()
 # scf.while regions (via LiftControlFlowToSCF) that the MSL emitter walks.
 set(CRUCIBLE_MLIR_LIBS
   MLIRTargetLLVMIRImport
+  MLIRTargetLLVMIRExport
+  MLIRBuiltinToLLVMIRTranslation
+  MLIRLLVMToLLVMIRTranslation
   MLIRLLVMIRToLLVMTranslation
   MLIRSPIRVDeserialization
   MLIRSPIRVToLLVM

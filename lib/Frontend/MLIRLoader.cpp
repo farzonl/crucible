@@ -11,6 +11,7 @@
 
 #include "Frontend.h"
 #include "crucible/Diagnostic.h"
+#include "crucible/Dialect/CrucibleDialect.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -46,7 +47,7 @@ Expected<LoadedMLIRShader> loadMLIR(MemoryBufferRef Buf,
                   mlir::func::FuncDialect, mlir::cf::ControlFlowDialect,
                   mlir::scf::SCFDialect, mlir::arith::ArithDialect,
                   mlir::gpu::GPUDialect, mlir::math::MathDialect,
-                  mlir::ub::UBDialect>();
+                  mlir::ub::UBDialect, crucible::ir::CrucibleDialect>();
   Ctx.appendDialectRegistry(Registry);
   Ctx.loadAllAvailableDialects();
 

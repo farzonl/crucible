@@ -59,7 +59,8 @@ std::optional<crucible::ResourceClass> classify(ResourceKind Kind) {
 
 std::optional<uint32_t>
 resourceBindingOffset(const Resource &Res,
-                      const crucible::ResourceBinding &RB) {
+                      const crucible::ResourceBinding &RB,
+                      bool UseVulkanBinding) {
   auto OffsetInRange = [&](uint32_t Register) -> std::optional<uint32_t> {
     if (Register < RB.LowerBound)
       return std::nullopt;
@@ -68,9 +69,18 @@ resourceBindingOffset(const Resource &Res,
       return std::nullopt;
     return Offset;
   };
-  if (Res.DXBinding && RB.Space == Res.DXBinding->Space)
-    if (auto Offset = OffsetInRange(Res.DXBinding->Register))
-      return Offset;
+  if (UseVulkanBinding) {
+    if (Res.VKBinding)
+      return RB.Space == 0 ? OffsetInRange(Res.VKBinding->Binding)
+                           : std::nullopt;
+    if (Res.DXBinding && RB.Space == Res.DXBinding->Space)
+      return OffsetInRange(Res.DXBinding->Register);
+    return std::nullopt;
+  }
+  if (Res.DXBinding)
+    return RB.Space == Res.DXBinding->Space
+               ? OffsetInRange(Res.DXBinding->Register)
+               : std::nullopt;
   if (Res.VKBinding && RB.Space == 0)
     return OffsetInRange(Res.VKBinding->Binding);
   return std::nullopt;
@@ -461,7 +471,7 @@ static std::string buildPassThroughVS(ArrayRef<crucible::StageParameter> Outputs
   return Out;
 }
 
-Error executeRaster(Pipeline &P, MTL::Device *Device) {
+Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
   auto Fail = [](const char *Message) {
     return createStringError(inconvertibleErrorCode(), "%s", Message);
   };
@@ -537,7 +547,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
             if (Res.Kind == ResourceKind::Sampler && !Res.IsReserved &&
-                resourceBindingOffset(Res, RB) == 0u &&
+                resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
         if (!Samp)
@@ -557,7 +567,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
           for (auto &Res : Set.Resources)
             if (classify(Res.Kind) == RB.Class &&
                 isTextureResource(Res.Kind) && !Res.HasCounter &&
-                !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
+                !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
                 Res.getArraySize() == 1) {
               CPU = Res.BufferPtr;
               ResKind = Res.Kind;
@@ -594,7 +604,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         for (auto &Res : Set.Resources)
           if (classify(Res.Kind) == RB.Class &&
               !isTextureResource(Res.Kind) && !Res.HasCounter &&
-              !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
+              !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
               Res.getArraySize() == 1)
             CPU = Res.BufferPtr;
       if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
@@ -977,7 +987,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
             if (Res.Kind == ResourceKind::Sampler && !Res.IsReserved &&
-                resourceBindingOffset(Res, RB) == 0u &&
+                resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
         if (!Samp)
@@ -997,7 +1007,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
           for (auto &Res : Set.Resources)
             if (classify(Res.Kind) == RB.Class &&
                 isTextureResource(Res.Kind) && !Res.HasCounter &&
-                !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
+                !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
                 Res.getArraySize() == 1) {
               CPU = Res.BufferPtr;
               ResKind = Res.Kind;
@@ -1036,7 +1046,7 @@ Error executeRaster(Pipeline &P, MTL::Device *Device) {
         for (auto &Res : Set.Resources)
           if (classify(Res.Kind) == RB.Class &&
               !isTextureResource(Res.Kind) && !Res.HasCounter &&
-              !Res.IsReserved && resourceBindingOffset(Res, RB) == 0u &&
+              !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
               Res.getArraySize() == 1)
             CPU = Res.BufferPtr;
       if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
@@ -1500,7 +1510,7 @@ Error executeMeshRaster(Pipeline &P, MTL::Device *Device) {
   return Error::success();
 }
 
-Error executeCompute(Pipeline &P, MTL::Device *Device) {
+Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
   if (!P.isCompute() && !P.isRayTracing())
     return createStringError(
         inconvertibleErrorCode(),
@@ -1542,13 +1552,14 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
     GPUSamplers[S] = Samp;
     return Samp;
   };
-  auto FindBinding = [](const Resource &Res, const crucible::Reflection &R)
+  auto FindBinding = [UseVulkanBinding](const Resource &Res,
+                                        const crucible::Reflection &R)
       -> const crucible::ResourceBinding * {
     auto Class = classify(Res.Kind);
     if (!Class)
       return nullptr;
     for (const crucible::ResourceBinding &RB : R.Resources)
-      if (RB.Class == *Class && resourceBindingOffset(Res, RB))
+      if (RB.Class == *Class && resourceBindingOffset(Res, RB, UseVulkanBinding))
         return &RB;
     return nullptr;
   };
@@ -1932,7 +1943,7 @@ Error executeCompute(Pipeline &P, MTL::Device *Device) {
         const auto *Match = FindBinding(Res, R);
         if (!Match)
           continue; // not referenced by this shader
-        auto RegOffsetOrErr = resourceBindingOffset(Res, *Match);
+        auto RegOffsetOrErr = resourceBindingOffset(Res, *Match, UseVulkanBinding);
         if (!RegOffsetOrErr)
           continue;
         uint32_t RegOffset = *RegOffsetOrErr;
@@ -2381,9 +2392,12 @@ public:
     auto Pool = NS::TransferPtr(NS::AutoreleasePool::alloc()->init());
     if (auto Err = validateRootParameters(P))
       return Err;
-    return P.isTraditionalRaster()  ? executeRaster(P, Metal.get())
-           : P.isMeshShaderRaster() ? executeMeshRaster(P, Metal.get())
-                                    : executeCompute(P, Metal.get());
+    bool UseVulkanBinding = (API == GPUAPI::Vulkan);
+    return P.isTraditionalRaster()
+               ? executeRaster(P, Metal.get(), UseVulkanBinding)
+           : P.isMeshShaderRaster()
+               ? executeMeshRaster(P, Metal.get())
+               : executeCompute(P, Metal.get(), UseVulkanBinding);
   }
 
   Queue &getGraphicsQueue() override {

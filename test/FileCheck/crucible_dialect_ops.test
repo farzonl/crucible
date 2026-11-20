@@ -1,0 +1,17 @@
+# Verify standalone Crucible dialect MLIR round-trips through --dump-mlir
+# and lowers cleanly to MSL with zero DXILOp dependencies.
+
+# RUN: %cruciblec %S/../Inputs/crucible_dialect_ops.mlir --dump-mlir -o %t.metal 2>&1 | FileCheck %s --check-prefix=MLIR
+# RUN: FileCheck %s --check-prefix=MSL --input-file=%t.metal
+
+# MLIR: "crucible.saturate"
+# MLIR: "crucible.frc"
+# MLIR: "crucible.wave_is_first_lane"
+# MLIR: "crucible.wave_vote"
+# MLIR: "crucible.barrier"
+
+# MSL: kernel void crucible_ops(
+# MSL: simd_prefix_exclusive_sum(1u) == 0u
+# MSL: simd_any(
+# MSL: threadgroup_barrier(mem_flags::mem_threadgroup);
+# MSL: saturate({{.*}}) - floor(saturate(

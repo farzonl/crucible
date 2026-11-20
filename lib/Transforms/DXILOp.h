@@ -1,22 +1,20 @@
-//===- IntrinsicMap.h - DXIL opcode -> MSL mapping ---------------*- C++ -*-===//
+//===- DXILOp.h - DXIL opcode constants for DXIL-to-MLIR lowering -*- C++ -*-===//
 //
-// Part of Crucible, an open-source DXIL-to-MSL compiler.
+// Part of Crucible, an open-source multi-frontend, multi-backend shader compiler.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef CRUCIBLE_LIB_BACKEND_INTRINSICMAP_H
-#define CRUCIBLE_LIB_BACKEND_INTRINSICMAP_H
-
-#include "llvm/ADT/StringRef.h"
+#ifndef CRUCIBLE_LIB_TRANSFORMS_DXILOP_H
+#define CRUCIBLE_LIB_TRANSFORMS_DXILOP_H
 
 #include <cstdint>
 
 namespace crucible {
 
 /// DXIL operation opcodes (matches hlsl::DXIL::OpCode in
-/// DirectXShaderCompiler's DxilConstants.h). Only the subset the backend
-/// currently understands is listed; extend alongside IntrinsicMap.cpp.
+/// DirectXShaderCompiler's DxilConstants.h). Consumed only by the DXIL
+/// frontend lowering pass (`DXILToLayer1.cpp`); backends never see DXIL ops.
 enum class DXILOp : uint32_t {
   LoadInput = 4,
   StoreOutput = 5,
@@ -221,14 +219,6 @@ enum class DXILWaveMultiPrefixOpKind : uint32_t {
   Product = 4,
 };
 
-/// Returns the metal_stdlib function implementing a unary DXIL op on the
-/// given operand class, or empty if unmapped.
-llvm::StringRef mslUnaryFunction(DXILOp Op, bool IsFloat);
-
-/// Returns the metal_stdlib function implementing a binary DXIL op
-/// (min/max family), or empty if unmapped.
-llvm::StringRef mslBinaryFunction(DXILOp Op);
-
 } // namespace crucible
 
-#endif // CRUCIBLE_LIB_BACKEND_INTRINSICMAP_H
+#endif // CRUCIBLE_LIB_TRANSFORMS_DXILOP_H

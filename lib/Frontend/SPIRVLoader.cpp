@@ -11,8 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "Frontend.h"
-#include "../Backend/IntrinsicMap.h"
 #include "crucible/Diagnostic.h"
+#include "crucible/Dialect/CrucibleDialect.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -369,7 +369,8 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                   mlir::DLTIDialect, mlir::func::FuncDialect,
                   mlir::cf::ControlFlowDialect, mlir::scf::SCFDialect,
                   mlir::arith::ArithDialect, mlir::gpu::GPUDialect,
-                  mlir::math::MathDialect, mlir::ub::UBDialect>();
+                  mlir::math::MathDialect, mlir::ub::UBDialect,
+                  crucible::ir::CrucibleDialect>();
   Ctx.appendDialectRegistry(Registry);
   Ctx.loadAllAvailableDialects();
 
@@ -722,26 +723,18 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
 
     EntryBuilder.setInsertionPointToStart(&EntryFn.getBody().front());
     const ResourceBinding &RB = Reflect.Resources[ReflectIndex];
-    auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-        HandleTy, {I32Ty, I8Ty, I32Ty, I32Ty, I1Ty});
-    getOrCreateDecl(SpvModule, "dx.op.createHandle", FnTy);
-
-    auto OpC = mlir::LLVM::ConstantOp::create(
-        EntryBuilder, FnLoc, I32Ty, static_cast<int32_t>(DXILOp::CreateHandle));
-    auto ClassC = mlir::LLVM::ConstantOp::create(
-        EntryBuilder, FnLoc, I8Ty, static_cast<int8_t>(RB.Class));
-    auto IdC = mlir::LLVM::ConstantOp::create(
-        EntryBuilder, FnLoc, I32Ty, static_cast<int32_t>(RB.RecordID));
+    auto ResTy = ir::ResourceType::get(&Ctx);
     auto IdxC = mlir::LLVM::ConstantOp::create(
         EntryBuilder, FnLoc, I32Ty, static_cast<int32_t>(RB.LowerBound));
-    auto NonUnifC =
-        mlir::LLVM::ConstantOp::create(EntryBuilder, FnLoc, I1Ty, false);
-
-    auto Call = mlir::LLVM::CallOp::create(
-        EntryBuilder, FnLoc, mlir::TypeRange{HandleTy}, "dx.op.createHandle",
-        mlir::ValueRange{OpC, ClassC, IdC, IdxC, NonUnifC});
-    HandleCache[ReflectIndex] = Call.getResult();
-    return Call.getResult();
+    auto H = ir::BindResourceOp::create(
+        EntryBuilder, FnLoc, ResTy,
+        ir::ResourceClassAttr::get(
+            &Ctx, static_cast<ir::ResourceClass>(RB.Class)),
+        EntryBuilder.getI32IntegerAttr(static_cast<int32_t>(RB.RecordID)),
+        /*space=*/nullptr, /*binding=*/nullptr,
+        EntryBuilder.getBoolAttr(false), IdxC);
+    HandleCache[ReflectIndex] = H.getResult();
+    return H.getResult();
   };
 
   SmallVector<mlir::spirv::AddressOfOp, 8> AddrOps;
@@ -806,15 +799,12 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         if (BI == mlir::spirv::BuiltIn::LocalInvocationIndex) {
           mlir::OpBuilder B(Load);
           mlir::Location Loc = Load.getLoc();
-          auto FnTy = mlir::LLVM::LLVMFunctionType::get(I32Ty, {I32Ty});
-          getOrCreateDecl(SpvModule, "dx.op.flattenedThreadIdInGroup.i32", FnTy);
-          auto OpC = mlir::LLVM::ConstantOp::create(
+          auto SV = ir::SysValOp::create(
               B, Loc, I32Ty,
-              static_cast<int32_t>(DXILOp::FlattenedThreadIdInGroup));
-          auto Call = mlir::LLVM::CallOp::create(
-              B, Loc, mlir::TypeRange{I32Ty},
-              "dx.op.flattenedThreadIdInGroup.i32", mlir::ValueRange{OpC});
-          Load.replaceAllUsesWith(Call.getResult());
+              ir::SysValKindAttr::get(B.getContext(),
+                                      ir::SysValKind::FlattenedThreadIdInGroup),
+              /*component=*/nullptr);
+          Load.replaceAllUsesWith(SV.getResult());
           Load.erase();
           continue;
         }
@@ -842,7 +832,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       continue;
     }
 
-    // 3b. Descriptor-bound structured buffers -> dx.op.rawBufferLoad / Store.
+    // 3b. Descriptor-bound structured buffers -> crucible.buffer_load / store.
     auto BufIt = BufferGlobals.find(Sym);
     if (BufIt != BufferGlobals.end()) {
       const BoundBufferInfo &Info = BufIt->second;
@@ -935,35 +925,27 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             unsigned NumComps =
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
             uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
-            auto ResRetTy = getOrInitResRetType(&Ctx, ScalarTy);
-            std::string Callee = "dx.op.rawBufferLoad." + typeSuffix(ScalarTy);
-            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                ResRetTy, {I32Ty, HandleTy, I32Ty, I32Ty, I8Ty, I32Ty});
-            getOrCreateDecl(SpvModule, Callee, FnTy);
-
+            auto RetVecTy = mlir::VectorType::get({4}, ScalarTy);
             mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
-            auto OpC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::RawBufferLoad));
-            auto MaskC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I8Ty, static_cast<int8_t>(Mask));
-            auto AlignC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(scalarTypeBytes(ScalarTy)));
-
-            auto Call = mlir::LLVM::CallOp::create(
-                B, Loc, mlir::TypeRange{ResRetTy}, Callee,
-                mlir::ValueRange{OpC, Handle, IdxVal, OffC, MaskC, AlignC});
+            auto LoadOp = ir::BufferLoadOp::create(
+                B, Loc, RetVecTy, mlir::Type(), Handle,
+                ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                OffC, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
+                B.getI32IntegerAttr(
+                    static_cast<int32_t>(scalarTypeBytes(ScalarTy))));
             mlir::Value ResultVal;
             if (!VecTy) {
-              ResultVal = mlir::LLVM::ExtractValueOp::create(
-                  B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              ResultVal = mlir::LLVM::ExtractElementOp::create(
+                  B, Loc, LoadOp.getResult(), ZeroC);
             } else {
               mlir::Type SignlessVecTy = makeSignless(VecTy, B);
               mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
               for (unsigned C = 0; C < NumComps && C < 4; ++C) {
-                auto VC = mlir::LLVM::ExtractValueOp::create(
-                    B, Loc, Call.getResult(), ArrayRef<int64_t>{C});
                 auto IdxC = mlir::LLVM::ConstantOp::create(
                     B, Loc, I32Ty, static_cast<int32_t>(C));
+                auto VC = mlir::LLVM::ExtractElementOp::create(
+                    B, Loc, LoadOp.getResult(), IdxC);
                 Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
               }
               ResultVal = Vec;
@@ -985,15 +967,8 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             unsigned NumComps =
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
             uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
-            std::string Callee = "dx.op.rawBufferStore." + typeSuffix(ScalarTy);
-            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                VoidTy, {I32Ty, HandleTy, I32Ty, I32Ty, ScalarTy, ScalarTy,
-                         ScalarTy, ScalarTy, I8Ty, I32Ty});
-            getOrCreateDecl(SpvModule, Callee, FnTy);
 
             mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
-            auto OpC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::RawBufferStore));
             auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ScalarTy);
             SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
             if (!VecTy) {
@@ -1006,47 +981,44 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                                                IdxC);
               }
             }
-            auto MaskC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I8Ty, static_cast<int8_t>(Mask));
-            auto AlignC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(scalarTypeBytes(ScalarTy)));
-
-            mlir::LLVM::CallOp::create(
-                B, Loc, mlir::TypeRange{}, Callee,
-                mlir::ValueRange{OpC, Handle, IdxVal, OffC, Vals[0], Vals[1],
-                                 Vals[2], Vals[3], MaskC, AlignC});
+            ir::BufferStoreOp::create(
+                B, Loc, Handle,
+                ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                OffC, Vals, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
+                B.getI32IntegerAttr(
+                    static_cast<int32_t>(scalarTypeBytes(ScalarTy))));
             Store.erase();
           } else {
-            // Structured buffer atomics -> dx.op.atomicBinOp.
-            std::optional<DXILAtomicBinOp> ABinOp;
+            // Structured buffer atomics -> crucible.buffer_atomic.
+            std::optional<ir::AtomicOp> ABinOp;
             mlir::Value AVal;
             if (auto A = mlir::dyn_cast<mlir::spirv::AtomicIAddOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::Add;
+              ABinOp = ir::AtomicOp::Add;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicAndOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::And;
+              ABinOp = ir::AtomicOp::And;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicOrOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::Or;
+              ABinOp = ir::AtomicOp::Or;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicXorOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::Xor;
+              ABinOp = ir::AtomicOp::Xor;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicSMinOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::IMin;
+              ABinOp = ir::AtomicOp::SMin;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicSMaxOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::IMax;
+              ABinOp = ir::AtomicOp::SMax;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicUMinOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::UMin;
+              ABinOp = ir::AtomicOp::UMin;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicUMaxOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::UMax;
+              ABinOp = ir::AtomicOp::UMax;
               AVal = A.getValue();
             } else if (auto A =
                            mlir::dyn_cast<mlir::spirv::AtomicExchangeOp>(MU)) {
-              ABinOp = DXILAtomicBinOp::Exchange;
+              ABinOp = ir::AtomicOp::Xchg;
               AVal = A.getValue();
             }
             if (!ABinOp)
@@ -1059,25 +1031,14 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             mlir::Value SignlessVal = castToSignless(B, Loc, AVal);
             mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
             mlir::Type ValTy = SignlessVal.getType();
-            std::string Callee = "dx.op.atomicBinOp." + typeSuffix(ValTy);
-            auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                ValTy,
-                {I32Ty, HandleTy, I32Ty, I32Ty, I32Ty, I32Ty, ValTy});
-            getOrCreateDecl(SpvModule, Callee, FnTy);
-
-            auto OpC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(DXILOp::AtomicBinOp));
-            auto BinC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(*ABinOp));
             auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
             auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
-
-            auto Call = mlir::LLVM::CallOp::create(
-                B, Loc, mlir::TypeRange{ValTy}, Callee,
-                mlir::ValueRange{OpC, Handle, BinC, IdxVal, ZeroC, UndefI32,
-                                 SignlessVal});
+            SmallVector<mlir::Value, 3> Coords = {IdxVal, ZeroC, UndefI32};
+            auto Atomic = ir::BufferAtomicOp::create(
+                B, Loc, ValTy, Handle, ir::AtomicOpAttr::get(&Ctx, *ABinOp),
+                Coords, SignlessVal);
             MU->getResult(0).replaceAllUsesWith(
-                castFromSignless(B, Loc, Call.getResult(), OrigTy));
+                castFromSignless(B, Loc, Atomic.getResult(), OrigTy));
             MU->erase();
           }
         }
@@ -1087,7 +1048,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       continue;
     }
 
-    // 3c. Constant buffers (Uniform Block) -> dx.op.cbufferLoadLegacy.
+    // 3c. Constant buffers (Uniform Block) -> crucible.cbuffer_load.
     auto CBIt = CBufferGlobals.find(Sym);
     if (CBIt != CBufferGlobals.end()) {
       const BoundCBufferInfo &Info = CBIt->second;
@@ -1142,21 +1103,15 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           mlir::Type ValTy = makeSignless(Load.getType(), B);
           uint32_t ElemBytes = scalarTypeBytes(ValTy);
           uint32_t Comp = (ByteOffset % 16u) / ElemBytes;
-          auto RetTy = getOrInitCBufRetType(&Ctx, ValTy);
-          std::string Callee = "dx.op.cbufferLoadLegacy." + typeSuffix(ValTy);
-          auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-              RetTy, {I32Ty, HandleTy, I32Ty});
-          getOrCreateDecl(SpvModule, Callee, FnTy);
-
-          auto OpC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(DXILOp::CBufferLoadLegacy));
+          int64_t Lanes = 16 / ElemBytes;
+          auto RetVecTy = mlir::VectorType::get({Lanes}, ValTy);
           auto RowC = mlir::LLVM::ConstantOp::create(
               B, Loc, I32Ty, static_cast<int32_t>(Row));
-          auto Call = mlir::LLVM::CallOp::create(
-              B, Loc, mlir::TypeRange{RetTy}, Callee,
-              mlir::ValueRange{OpC, Handle, RowC});
-          auto Val = mlir::LLVM::ExtractValueOp::create(
-              B, Loc, Call.getResult(), ArrayRef<int64_t>{Comp});
+          auto CBLoad = ir::CBufferLoadOp::create(B, Loc, RetVecTy, Handle, RowC);
+          auto CompC = mlir::LLVM::ConstantOp::create(
+              B, Loc, I32Ty, static_cast<int32_t>(Comp));
+          auto Val = mlir::LLVM::ExtractElementOp::create(
+              B, Loc, CBLoad.getResult(), CompC);
           Load.replaceAllUsesWith(Val.getResult());
           Load.erase();
         }
@@ -1306,7 +1261,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       continue;
     }
 
-    // 3c3. Graphics stage I/O globals -> dx.op.loadInput / dx.op.storeOutput.
+    // 3c3. Graphics stage I/O globals -> crucible.load_input / crucible.store_output.
     auto IOIt = StageIOGlobals.find(Sym);
     if (IOIt != StageIOGlobals.end()) {
       const StageIOInfo &Info = IOIt->second;
@@ -1320,34 +1275,20 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           auto VecTy = mlir::dyn_cast<mlir::VectorType>(ValTy);
           mlir::Type ElemTy =
               makeSignless(VecTy ? VecTy.getElementType() : ValTy, B);
-          std::string Callee = "dx.op.loadInput." + typeSuffix(ElemTy);
-          auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-              ElemTy, {I32Ty, I32Ty, I32Ty, I8Ty, I32Ty});
-          getOrCreateDecl(SpvModule, Callee, FnTy);
-
-          auto OpC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(DXILOp::LoadInput));
-          auto IdC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(Info.ID));
           auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
-          auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
 
           if (!VecTy) {
-            auto ColC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I8Ty, static_cast<int8_t>(0));
-            auto Call = mlir::LLVM::CallOp::create(
-                B, Loc, mlir::TypeRange{ElemTy}, Callee,
-                mlir::ValueRange{OpC, IdC, RowC, ColC, UndefI32});
-            Load.replaceAllUsesWith(Call.getResult());
+            auto LI = ir::LoadInputOp::create(
+                B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                static_cast<int8_t>(0), /*vertex_id=*/mlir::Value());
+            Load.replaceAllUsesWith(LI.getResult());
           } else {
             SmallVector<mlir::Value, 4> Comps;
             for (unsigned C = 0; C < Info.Columns; ++C) {
-              auto ColC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I8Ty, static_cast<int8_t>(C));
-              auto Call = mlir::LLVM::CallOp::create(
-                  B, Loc, mlir::TypeRange{ElemTy}, Callee,
-                  mlir::ValueRange{OpC, IdC, RowC, ColC, UndefI32});
-              Comps.push_back(Call.getResult());
+              auto LI = ir::LoadInputOp::create(
+                  B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                  static_cast<int8_t>(C), /*vertex_id=*/mlir::Value());
+              Comps.push_back(LI.getResult());
             }
             auto Vec = mlir::spirv::CompositeConstructOp::create(
                 B, Loc, ValTy, Comps);
@@ -1361,32 +1302,18 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           auto VecTy = mlir::dyn_cast<mlir::VectorType>(Val.getType());
           mlir::Type ElemTy =
               makeSignless(VecTy ? VecTy.getElementType() : Val.getType(), B);
-          std::string Callee = "dx.op.storeOutput." + typeSuffix(ElemTy);
-          auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-              VoidTy, {I32Ty, I32Ty, I32Ty, I8Ty, ElemTy});
-          getOrCreateDecl(SpvModule, Callee, FnTy);
-
-          auto OpC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(DXILOp::StoreOutput));
-          auto IdC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(Info.ID));
           auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
 
           if (!VecTy) {
-            auto ColC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I8Ty, static_cast<int8_t>(0));
-            mlir::LLVM::CallOp::create(
-                B, Loc, mlir::TypeRange{}, Callee,
-                mlir::ValueRange{OpC, IdC, RowC, ColC, Val});
+            ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
+                                      RowC, static_cast<int8_t>(0), Val);
           } else {
             for (unsigned C = 0; C < Info.Columns; ++C) {
-              auto ColC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I8Ty, static_cast<int8_t>(C));
               auto Lane = mlir::spirv::CompositeExtractOp::create(
                   B, Loc, ElemTy, Val, B.getI32ArrayAttr({static_cast<int32_t>(C)}));
-              mlir::LLVM::CallOp::create(
-                  B, Loc, mlir::TypeRange{}, Callee,
-                  mlir::ValueRange{OpC, IdC, RowC, ColC, Lane.getResult()});
+              ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
+                                        RowC, static_cast<int8_t>(C),
+                                        Lane.getResult());
             }
           }
           Store.erase();
@@ -1441,44 +1368,27 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             }
 
             if (Info.Kind == ResourceKind::TypedBuffer) {
-              std::string Callee = "dx.op.bufferStore." + typeSuffix(ElemTy);
-              auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                  VoidTy, {I32Ty, HandleTy, I32Ty, I32Ty, ElemTy, ElemTy,
-                           ElemTy, ElemTy, I8Ty});
-              getOrCreateDecl(SpvModule, Callee, FnTy);
-              auto OpC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I32Ty, static_cast<int32_t>(DXILOp::BufferStore));
-              auto MaskC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I8Ty, static_cast<int8_t>(Mask));
-              mlir::LLVM::CallOp::create(
-                  B, Loc, mlir::TypeRange{}, Callee,
-                  mlir::ValueRange{OpC, Handle, Coord, UndefI32, Vals[0],
-                                   Vals[1], Vals[2], Vals[3], MaskC});
+              ir::BufferStoreOp::create(
+                  B, Loc, Handle,
+                  ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Typed), Coord,
+                  /*element_offset=*/mlir::Value(), Vals,
+                  B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
+                  /*alignment=*/nullptr);
             } else {
-              std::string Callee = "dx.op.textureStore." + typeSuffix(ElemTy);
-              auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                  VoidTy, {I32Ty, HandleTy, I32Ty, I32Ty, I32Ty, ElemTy, ElemTy,
-                           ElemTy, ElemTy, I8Ty});
-              getOrCreateDecl(SpvModule, Callee, FnTy);
-              auto OpC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I32Ty, static_cast<int32_t>(DXILOp::TextureStore));
-              auto MaskC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I8Ty, static_cast<int8_t>(Mask));
-              SmallVector<mlir::Value, 3> Coords(3, UndefI32.getResult());
+              SmallVector<mlir::Value, 3> Coords;
               if (auto CVec =
                       mlir::dyn_cast<mlir::VectorType>(Coord.getType())) {
                 for (unsigned C = 0; C < CVec.getNumElements() && C < 3; ++C) {
-                  Coords[C] = mlir::spirv::CompositeExtractOp::create(
+                  Coords.push_back(mlir::spirv::CompositeExtractOp::create(
                       B, Loc, I32Ty, Coord,
-                      B.getI32ArrayAttr({static_cast<int32_t>(C)}));
+                      B.getI32ArrayAttr({static_cast<int32_t>(C)})));
                 }
               } else {
-                Coords[0] = Coord;
+                Coords.push_back(Coord);
               }
-              mlir::LLVM::CallOp::create(
-                  B, Loc, mlir::TypeRange{}, Callee,
-                  mlir::ValueRange{OpC, Handle, Coords[0], Coords[1], Coords[2],
-                                   Vals[0], Vals[1], Vals[2], Vals[3], MaskC});
+              ir::TexStoreOp::create(
+                  B, Loc, Handle, Coords, Vals,
+                  B.getI32IntegerAttr(static_cast<int32_t>(Mask)));
             }
             IW.erase();
           } else if (mlir::isa<mlir::spirv::ImageFetchOp,
@@ -1494,40 +1404,29 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             auto ResVec = mlir::dyn_cast<mlir::VectorType>(OrigResTy);
             mlir::Type ElemTy = makeSignless(
                 ResVec ? ResVec.getElementType() : OrigResTy, B);
-            auto ResRetTy = getOrInitResRetType(&Ctx, ElemTy);
-            auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
+            auto RetVecTy = mlir::VectorType::get({4}, ElemTy);
             auto ZeroI32 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
 
-            mlir::LLVM::CallOp Call;
+            mlir::Value LoadVec;
             if (Info.Kind == ResourceKind::TypedBuffer) {
-              std::string Callee = "dx.op.bufferLoad." + typeSuffix(ElemTy);
-              auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                  ResRetTy, {I32Ty, HandleTy, I32Ty, I32Ty});
-              getOrCreateDecl(SpvModule, Callee, FnTy);
-              auto OpC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I32Ty, static_cast<int32_t>(DXILOp::BufferLoad));
-              Call = mlir::LLVM::CallOp::create(
-                  B, Loc, mlir::TypeRange{ResRetTy}, Callee,
-                  mlir::ValueRange{OpC, Handle, Coord, UndefI32});
+              auto L = ir::BufferLoadOp::create(
+                  B, Loc, RetVecTy, mlir::Type(), Handle,
+                  ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Typed), Coord,
+                  /*element_offset=*/mlir::Value(), /*mask=*/nullptr,
+                  /*alignment=*/nullptr);
+              LoadVec = L.getResult();
             } else {
-              std::string Callee = "dx.op.textureLoad." + typeSuffix(ElemTy);
-              auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                  ResRetTy, {I32Ty, HandleTy, I32Ty, I32Ty, I32Ty, I32Ty, I32Ty,
-                             I32Ty, I32Ty});
-              getOrCreateDecl(SpvModule, Callee, FnTy);
-              auto OpC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I32Ty, static_cast<int32_t>(DXILOp::TextureLoad));
-              SmallVector<mlir::Value, 3> Coords(3, UndefI32.getResult());
+              SmallVector<mlir::Value, 3> Coords;
               if (auto CVec =
                       mlir::dyn_cast<mlir::VectorType>(Coord.getType())) {
                 for (unsigned C = 0; C < CVec.getNumElements() && C < 3; ++C) {
                   auto IdxC = mlir::LLVM::ConstantOp::create(
                       B, Loc, I32Ty, static_cast<int32_t>(C));
-                  Coords[C] = mlir::LLVM::ExtractElementOp::create(
-                      B, Loc, Coord, IdxC);
+                  Coords.push_back(mlir::LLVM::ExtractElementOp::create(
+                      B, Loc, Coord, IdxC));
                 }
               } else {
-                Coords[0] = Coord;
+                Coords.push_back(Coord);
               }
               mlir::Value MipVal = ZeroI32;
               if (auto FetchOp = mlir::dyn_cast<mlir::spirv::ImageFetchOp>(IU)) {
@@ -1539,25 +1438,26 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                           FetchOp.getOperandArguments()[0]);
                 }
               }
-              Call = mlir::LLVM::CallOp::create(
-                  B, Loc, mlir::TypeRange{ResRetTy}, Callee,
-                  mlir::ValueRange{OpC, Handle, MipVal, Coords[0], Coords[1],
-                                   Coords[2], UndefI32, UndefI32, UndefI32});
+              auto L = ir::TexLoadOp::create(
+                  B, Loc, RetVecTy, mlir::Type(), Handle, MipVal, Coords,
+                  /*offsets=*/mlir::ValueRange{});
+              LoadVec = L.getResult();
             }
             mlir::Value ResultVal;
             if (!ResVec) {
-              ResultVal = mlir::LLVM::ExtractValueOp::create(
-                  B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              ResultVal =
+                  mlir::LLVM::ExtractElementOp::create(B, Loc, LoadVec, ZeroC);
             } else {
               mlir::Type SignlessVecTy = makeSignless(ResVec, B);
               unsigned N = static_cast<unsigned>(ResVec.getNumElements());
               mlir::Value Vec =
                   mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
               for (unsigned C = 0; C < N && C < 4; ++C) {
-                auto VC = mlir::LLVM::ExtractValueOp::create(
-                    B, Loc, Call.getResult(), ArrayRef<int64_t>{C});
                 auto IdxC = mlir::LLVM::ConstantOp::create(
                     B, Loc, I32Ty, static_cast<int32_t>(C));
+                auto VC = mlir::LLVM::ExtractElementOp::create(B, Loc, LoadVec,
+                                                               IdxC);
                 Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
               }
               ResultVal = Vec;
@@ -1587,64 +1487,44 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               auto ResVec = mlir::dyn_cast<mlir::VectorType>(ResTy);
               mlir::Type ElemTy = makeSignless(
                   ResVec ? ResVec.getElementType() : ResTy, B);
-              auto ResRetTy = getOrInitResRetType(&Ctx, ElemTy);
+              auto RetVecTy = mlir::VectorType::get({4}, ElemTy);
               auto F32Ty = B.getF32Type();
-              auto UndefF32 = mlir::LLVM::UndefOp::create(B, Loc, F32Ty);
-              auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
 
-              SmallVector<mlir::Value, 4> Coords(4, UndefF32.getResult());
+              SmallVector<mlir::Value, 4> Coords;
               if (auto CVec =
                       mlir::dyn_cast<mlir::VectorType>(Coord.getType())) {
                 for (unsigned C = 0; C < CVec.getNumElements() && C < 4; ++C) {
-                  Coords[C] = mlir::spirv::CompositeExtractOp::create(
+                  Coords.push_back(mlir::spirv::CompositeExtractOp::create(
                       B, Loc, F32Ty, Coord,
-                      B.getI32ArrayAttr({static_cast<int32_t>(C)}));
+                      B.getI32ArrayAttr({static_cast<int32_t>(C)})));
                 }
               } else {
-                Coords[0] = Coord;
+                Coords.push_back(Coord);
               }
 
-              mlir::LLVM::CallOp Call;
-              if (IsExplicit) {
-                std::string Callee = "dx.op.sampleLevel." + typeSuffix(ElemTy);
-                auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                    ResRetTy, {I32Ty, HandleTy, HandleTy, F32Ty, F32Ty, F32Ty,
-                               F32Ty, I32Ty, I32Ty, I32Ty, F32Ty});
-                getOrCreateDecl(SpvModule, Callee, FnTy);
-                auto OpC = mlir::LLVM::ConstantOp::create(
-                    B, Loc, I32Ty, static_cast<int32_t>(DXILOp::SampleLevel));
-                Call = mlir::LLVM::CallOp::create(
-                    B, Loc, mlir::TypeRange{ResRetTy}, Callee,
-                    mlir::ValueRange{OpC, Handle, SampHandle, Coords[0],
-                                     Coords[1], Coords[2], Coords[3], UndefI32,
-                                     UndefI32, UndefI32, LodVal});
-              } else {
-                std::string Callee = "dx.op.sample." + typeSuffix(ElemTy);
-                auto FnTy = mlir::LLVM::LLVMFunctionType::get(
-                    ResRetTy, {I32Ty, HandleTy, HandleTy, F32Ty, F32Ty, F32Ty,
-                               F32Ty, I32Ty, I32Ty, I32Ty, F32Ty});
-                getOrCreateDecl(SpvModule, Callee, FnTy);
-                auto OpC = mlir::LLVM::ConstantOp::create(
-                    B, Loc, I32Ty, static_cast<int32_t>(DXILOp::Sample));
-                Call = mlir::LLVM::CallOp::create(
-                    B, Loc, mlir::TypeRange{ResRetTy}, Callee,
-                    mlir::ValueRange{OpC, Handle, SampHandle, Coords[0],
-                                     Coords[1], Coords[2], Coords[3], UndefI32,
-                                     UndefI32, UndefI32, UndefF32});
-              }
+              auto Mode = IsExplicit ? ir::SampleMode::Level
+                                     : ir::SampleMode::Implicit;
+              auto SampOp = ir::TexSampleOp::create(
+                  B, Loc, RetVecTy, mlir::Type(), Handle, SampHandle,
+                  ir::SampleModeAttr::get(&Ctx, Mode), Coords,
+                  /*offsets=*/mlir::ValueRange{},
+                  IsExplicit ? LodVal : mlir::Value(),
+                  /*ddx=*/mlir::ValueRange{}, /*ddy=*/mlir::ValueRange{},
+                  /*cmp_val=*/mlir::Value(), /*clamp=*/mlir::Value());
 
               if (!ResVec) {
-                auto V0 = mlir::LLVM::ExtractValueOp::create(
-                    B, Loc, Call.getResult(), ArrayRef<int64_t>{0});
+                auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+                auto V0 = mlir::LLVM::ExtractElementOp::create(
+                    B, Loc, SampOp.getResult(), ZeroC);
                 SampleOp->getResult(0).replaceAllUsesWith(V0.getResult());
               } else {
                 unsigned N = static_cast<unsigned>(ResVec.getNumElements());
                 mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, ResTy);
                 for (unsigned C = 0; C < N; ++C) {
-                  auto VC = mlir::LLVM::ExtractValueOp::create(
-                      B, Loc, Call.getResult(), ArrayRef<int64_t>{C});
                   auto IdxC = mlir::LLVM::ConstantOp::create(
                       B, Loc, I32Ty, static_cast<int32_t>(C));
+                  auto VC = mlir::LLVM::ExtractElementOp::create(
+                      B, Loc, SampOp.getResult(), IdxC);
                   Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC,
                                                             IdxC);
                 }
@@ -1872,15 +1752,10 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformAllEqualOp>(
                    Op)) {
       mlir::Value Val = castToSignless(B, Loc, G.getValue());
-      mlir::Type ValTy = Val.getType();
-      std::string Callee = "dx.op.waveActiveAllEqual." + typeSuffix(ValTy);
-      auto FnTy = mlir::LLVM::LLVMFunctionType::get(I1Ty, {I32Ty, ValTy});
-      getOrCreateDecl(SpvModule, Callee, FnTy);
-      auto OpC = mlir::LLVM::ConstantOp::create(
-          B, Loc, I32Ty, static_cast<int32_t>(DXILOp::WaveActiveAllEqual));
-      auto Call = mlir::LLVM::CallOp::create(
-          B, Loc, mlir::TypeRange{I1Ty}, Callee, mlir::ValueRange{OpC, Val});
-      G.replaceAllUsesWith(Call.getResult());
+      auto W = ir::WaveVoteOp::create(
+          B, Loc, I1Ty, Val,
+          ir::WaveVoteKindAttr::get(B.getContext(), ir::WaveVoteKind::AllEqual));
+      G.replaceAllUsesWith(W.getResult());
       G.erase();
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformElectOp>(Op)) {
@@ -2003,19 +1878,14 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     CC.erase();
   }
 
-  // 3g. Lower spirv.Kill -> dx.op.discard(true).
+  // 3g. Lower spirv.Kill -> crucible.discard(true).
   SmallVector<mlir::spirv::KillOp, 4> KillOps;
   EntryFn.walk([&](mlir::spirv::KillOp K) { KillOps.push_back(K); });
   for (auto K : KillOps) {
     mlir::OpBuilder B(K);
     mlir::Location Loc = K.getLoc();
-    auto FnTy = mlir::LLVM::LLVMFunctionType::get(VoidTy, {I32Ty, I1Ty});
-    getOrCreateDecl(SpvModule, "dx.op.discard", FnTy);
-    auto OpC = mlir::LLVM::ConstantOp::create(
-        B, Loc, I32Ty, static_cast<int32_t>(DXILOp::Discard));
     auto TrueC = mlir::LLVM::ConstantOp::create(B, Loc, I1Ty, true);
-    mlir::LLVM::CallOp::create(B, Loc, mlir::TypeRange{}, "dx.op.discard",
-                               mlir::ValueRange{OpC, TrueC});
+    ir::DiscardOp::create(B, Loc, TrueC);
     mlir::spirv::ReturnOp::create(B, Loc);
     K.erase();
   }
