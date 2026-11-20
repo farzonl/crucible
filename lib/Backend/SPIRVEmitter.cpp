@@ -2726,7 +2726,9 @@ void SPIRVLowerer::cleanupDXILArtifacts() {
 
   SmallVector<GlobalVariable *, 16> DeadGVs;
   for (GlobalVariable &GV : M.globals()) {
-    if (GV.use_empty() && !GV.getName().starts_with(".spv.name."))
+    unsigned AS = GV.getAddressSpace();
+    if (GV.use_empty() && !GV.getName().starts_with(".spv.name.") &&
+        AS != 7 && AS != 8)
       DeadGVs.push_back(&GV);
   }
   for (GlobalVariable *GV : DeadGVs)
