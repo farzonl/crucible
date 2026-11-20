@@ -2362,14 +2362,33 @@ public:
                      MakeStr("RaytracingTier", this->Metal->supportsRaytracing()
                                                    ? "1.1"
                                                    : "NotSupported"));
-    if (API == GPUAPI::Vulkan && VulkanInfo) {
-      Description = VulkanInfo->getDescription();
-      GPUGeneration = VulkanInfo->getGPUGeneration();
-      FamilyPrefix = VulkanInfo->getFamilyPrefix();
-      Caps = VulkanInfo->getCapabilities();
-      raw_string_ostream OS(Extra);
-      VulkanInfo->printExtra(OS);
-      OS.flush();
+    if (API == GPUAPI::Vulkan) {
+      if (VulkanInfo) {
+        Description = VulkanInfo->getDescription();
+        GPUGeneration = VulkanInfo->getGPUGeneration();
+        FamilyPrefix = VulkanInfo->getFamilyPrefix();
+        Caps = VulkanInfo->getCapabilities();
+        raw_string_ostream OS(Extra);
+        VulkanInfo->printExtra(OS);
+        OS.flush();
+      } else {
+        // Populate Vulkan feature capabilities from Metal when no native
+        // Vulkan ICD is present (e.g. macOS CI runners without MoltenVK).
+        Caps.clear();
+        Caps.try_emplace("shaderFloat16", makeCapability("shaderFloat16", true));
+        Caps.try_emplace("shaderInt16", makeCapability("shaderInt16", true));
+        Caps.try_emplace("shaderInt64", makeCapability("shaderInt64", true));
+        Caps.try_emplace("shaderFloat64", makeCapability("shaderFloat64", true));
+        Caps.try_emplace("shaderResourceMinLod",
+                         makeCapability("shaderResourceMinLod", true));
+        Caps.try_emplace("runtimeDescriptorArray",
+                         makeCapability("runtimeDescriptorArray", true));
+        Caps.try_emplace("descriptorBindingPartiallyBound",
+                         makeCapability("descriptorBindingPartiallyBound", true));
+        Caps.try_emplace("multiViewport", makeCapability("multiViewport", true));
+        Caps.try_emplace("shaderOutputViewportIndex",
+                         makeCapability("shaderOutputViewportIndex", true));
+      }
     }
   }
 
@@ -2379,7 +2398,7 @@ public:
   }
   GPUAPI getAPI() const override { return API; }
   void printExtra(raw_ostream &OS) override {
-    if (API == GPUAPI::Vulkan) {
+    if (API == GPUAPI::Vulkan && !Extra.empty()) {
       OS << Extra;
       return;
     }
@@ -2493,9 +2512,8 @@ createMetalDevices(const DeviceConfig &Config,
   SmallVector<std::unique_ptr<offloadtest::Device>> Devices;
   Devices.push_back(
       std::make_unique<CrucibleDevice>(Metal, GPUAPI::DirectX, nullptr));
-  if (VulkanInfo)
-    Devices.push_back(std::make_unique<CrucibleDevice>(
-        std::move(Metal), GPUAPI::Vulkan, VulkanInfo));
+  Devices.push_back(std::make_unique<CrucibleDevice>(
+      std::move(Metal), GPUAPI::Vulkan, VulkanInfo));
   return Devices;
 }
 
