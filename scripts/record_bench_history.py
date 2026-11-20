@@ -82,6 +82,7 @@ def main() -> None:
     parser.add_argument("--run-url", default="")
     parser.add_argument("--pages-url", default="")
     parser.add_argument("--history-cache", type=Path, default=None)
+    parser.add_argument("--compliance-cache-dir", type=Path, default=None)
     parser.add_argument("--os", dest="os_name", default="Windows")
     parser.add_argument("--history-filename", default="bench-history.json")
     args = parser.parse_args()
@@ -141,7 +142,8 @@ def main() -> None:
     with open(data_dir / args.history_filename, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
 
-    # Preserve other OS benchmark history, compliance history.json, latest.json, and badge.json from live Pages
+    # Preserve other OS benchmark history and the complete multi-track compliance
+    # report, regardless of which workflow deploys Pages next.
     if args.pages_url:
         base_url = args.pages_url.rstrip("/")
         for fname in ("bench-history.json", "bench-history-macos.json", "history.json"):
@@ -156,6 +158,105 @@ def main() -> None:
                 if isinstance(obj, dict):
                     with open(data_dir / fname, "w", encoding="utf-8") as f:
                         json.dump(obj, f, indent=2)
+
+    preserved_tracks = {}
+    if args.pages_url:
+        tracks = fetch_json_url(
+            args.pages_url.rstrip("/") + "/data/tracks.json"
+        )
+        if isinstance(tracks, list):
+            for track in tracks:
+                if isinstance(track, dict) and track.get("id"):
+                    preserved_tracks[track["id"]] = track
+                    track_dir = data_dir / track["id"]
+                    track_dir.mkdir(parents=True, exist_ok=True)
+                    for fname in ("history.json", "latest.json", "badge.json"):
+                        obj = fetch_json_url(
+                            args.pages_url.rstrip("/")
+                            + f"/data/{track['id']}/{fname}"
+                        )
+                        if obj is not None:
+                            with open(
+                                track_dir / fname, "w", encoding="utf-8"
+                            ) as f:
+                                json.dump(obj, f, indent=2)
+
+    if args.compliance_cache_dir:
+        for cache_file in sorted(args.compliance_cache_dir.glob("*.json")):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                print(
+                    f"Warning: failed to read compliance cache "
+                    f"{cache_file}: {exc}"
+                )
+                continue
+            if not isinstance(history, list) or not history:
+                continue
+            latest = history[-1]
+            track_id = cache_file.stem
+            track_dir = data_dir / track_id
+            track_dir.mkdir(parents=True, exist_ok=True)
+            if not (track_dir / "history.json").exists():
+                with open(track_dir / "history.json", "w", encoding="utf-8") as f:
+                    json.dump(history, f, indent=2)
+            if not (track_dir / "latest.json").exists():
+                with open(track_dir / "latest.json", "w", encoding="utf-8") as f:
+                    json.dump({**latest, "failures": []}, f, indent=2)
+            label = latest.get("trackLabel", track_id)
+            if not (track_dir / "badge.json").exists():
+                with open(track_dir / "badge.json", "w", encoding="utf-8") as f:
+                    badge = {
+                        "schemaVersion": 1,
+                        "label": label,
+                        "message": (
+                            f"{latest.get('passed', 0)} Passed "
+                            f"({latest.get('passRate', 0)}%)"
+                        ),
+                        "color": (
+                            "brightgreen"
+                            if latest.get("passRate", 0) >= 85.0
+                            else "green"
+                        ),
+                    }
+                    json.dump(badge, f, indent=2)
+            if track_id == "dxil-to-metal":
+                for fname, value in (
+                    ("history.json", history),
+                    ("latest.json", {**latest, "failures": []}),
+                    ("badge.json", {
+                        "schemaVersion": 1,
+                        "label": label,
+                        "message": (
+                            f"{latest.get('passed', 0)} Passed "
+                            f"({latest.get('passRate', 0)}%)"
+                        ),
+                        "color": (
+                            "brightgreen"
+                            if latest.get("passRate", 0) >= 85.0
+                            else "green"
+                        ),
+                    }),
+                ):
+                    if not (data_dir / fname).exists():
+                        with open(
+                            data_dir / fname, "w", encoding="utf-8"
+                        ) as f:
+                            json.dump(value, f, indent=2)
+            preserved_tracks.setdefault(track_id, {
+                "id": track_id,
+                "label": label,
+                "passed": latest.get("passed", 0),
+                "total": latest.get("total", 0),
+                "passRate": latest.get("passRate", 0),
+                "historyUrl": f"data/{track_id}/history.json",
+                "latestUrl": f"data/{track_id}/latest.json",
+            })
+
+    if preserved_tracks:
+        with open(data_dir / "tracks.json", "w", encoding="utf-8") as f:
+            json.dump(list(preserved_tracks.values()), f, indent=2)
 
     ran_backends = [f"{r['backend']}={r['medianMs']}ms" for r in entry["results"] if r["ran"]]
     print(f"Recorded benchmark {entry['shortSha']}: {', '.join(ran_backends)}. Suites: {len(entry['suites'])}. History length: {len(history)}")

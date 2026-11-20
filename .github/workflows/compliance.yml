@@ -18,12 +18,12 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages-compliance
+  group: pages-publish
   cancel-in-progress: false
 
 jobs:
   compliance-dxil-to-metal:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -98,7 +98,7 @@ jobs:
           if-no-files-found: error
 
   compliance-spirv-to-metal:
-    runs-on: macos-15
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -284,18 +284,10 @@ jobs:
           COMMIT_MSG=$(git log -1 --pretty=%s)
           COMMIT_AUTHOR=$(git log -1 --pretty=%an)
           COMMIT_TS=$(git log -1 --pretty=%cI)
-          TRACK_ARGS=()
-          if [ -f artifacts/offload-results-dxil-to-metal.json ]; then
-            TRACK_ARGS+=(--track-lit "dxil-to-metal=DXIL -> Metal (macOS)=artifacts/offload-results-dxil-to-metal.json")
-          fi
-          if [ -f artifacts/offload-results-dxil-to-spirv.json ]; then
-            TRACK_ARGS+=(--track-lit "dxil-to-spirv=DXIL -> SPIR-V (Linux Vulkan)=artifacts/offload-results-dxil-to-spirv.json")
-          fi
-          if [ -f artifacts/offload-results-spirv-to-metal.json ]; then
-            TRACK_ARGS+=(--track-lit "spirv-to-metal=SPIR-V -> Metal (macOS)=artifacts/offload-results-spirv-to-metal.json")
-          fi
           python3 scripts/record_offload_compliance.py \
-            "${TRACK_ARGS[@]}" \
+            --track-lit "dxil-to-metal=DXIL -> Metal (macOS)=artifacts/offload-results-dxil-to-metal.json" \
+            --track-lit "dxil-to-spirv=DXIL -> SPIR-V (Linux Vulkan)=artifacts/offload-results-dxil-to-spirv.json" \
+            --track-lit "spirv-to-metal=SPIR-V -> Metal (macOS)=artifacts/offload-results-spirv-to-metal.json" \
             --site-src pages \
             --out-dir _site \
             --sha "${{ github.sha }}" \

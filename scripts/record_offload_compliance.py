@@ -84,16 +84,19 @@ def parse_lit_json(path: Path) -> dict:
     }
 
 
-def fetch_json_list(url: str) -> list | None:
+def fetch_json(url: str):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Crucible-Compliance-CI"})
         with urllib.request.urlopen(req, timeout=15) as resp:
-            loaded = json.loads(resp.read().decode("utf-8"))
-            if isinstance(loaded, list):
-                return loaded
+            return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        print(f"Info: no prior history fetched from {url} ({exc}).")
+        print(f"Info: no prior data fetched from {url} ({exc}).")
     return None
+
+
+def fetch_json_list(url: str) -> list | None:
+    loaded = fetch_json(url)
+    return loaded if isinstance(loaded, list) else None
 
 
 def load_existing_history(
@@ -122,6 +125,20 @@ def load_existing_history(
                 return loaded
 
     return []
+
+
+def load_track_latest(
+    pages_url: str | None, track_id: str, history: list
+) -> dict | None:
+    if pages_url:
+        latest = fetch_json(
+            f"{pages_url.rstrip('/')}/data/{track_id}/latest.json"
+        )
+        if isinstance(latest, dict):
+            return latest
+    if history:
+        return {**history[-1], "failures": []}
+    return None
 
 
 def parse_track_spec(spec: str) -> tuple[str, str, Path]:
@@ -174,32 +191,22 @@ def main() -> None:
     data_dir = args.out_dir / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    tracks_manifest = []
-    for idx, (track_id, label, lit_path) in enumerate(tracks_in):
-        if not lit_path.exists():
-            print(f"Warning: skipping track '{track_id}'; missing {lit_path}")
-            continue
-        summary = parse_lit_json(lit_path)
-        entry = {
-            "sha": args.sha,
-            "shortSha": args.sha[:7],
-            "message": args.message.splitlines()[0][:120] if args.message else "",
-            "author": args.author,
-            "timestamp": ts,
-            "runUrl": args.run_url,
-            "track": track_id,
-            "trackLabel": label,
-            "total": summary["total"],
-            "executed": summary["executed"],
-            "passed": summary["passed"],
-            "failed": summary["failed"],
-            "xfail": summary["xfail"],
-            "unsupported": summary["unsupported"],
-            "passRate": summary["passRate"],
-            "elapsed": summary["elapsed"],
-            "categories": summary["categories"],
-        }
+    previous_tracks = {}
+    if args.pages_url:
+        loaded_tracks = fetch_json(
+            f"{args.pages_url.rstrip('/')}/data/tracks.json"
+        )
+        if isinstance(loaded_tracks, list):
+            previous_tracks = {
+                track.get("id"): track
+                for track in loaded_tracks
+                if isinstance(track, dict) and track.get("id")
+            }
 
+    tracks_manifest = []
+    processed_tracks = set()
+    for idx, (track_id, label, lit_path) in enumerate(tracks_in):
+        processed_tracks.add(track_id)
         cache_file = None
         if args.history_cache_dir:
             cache_file = args.history_cache_dir / f"{track_id}.json"
@@ -212,9 +219,37 @@ def main() -> None:
             track_id,
             allow_legacy_fallback=(track_id == "dxil-to-metal"),
         )
-        history = [h for h in history if h.get("sha") != args.sha]
-        history.append(entry)
-        history.sort(key=lambda h: h.get("timestamp", ""))
+        did_run = lit_path.exists()
+        if not did_run:
+            print(f"Warning: preserving prior track '{track_id}'; missing {lit_path}")
+            entry = load_track_latest(args.pages_url, track_id, history)
+            if not entry:
+                continue
+        else:
+            summary = parse_lit_json(lit_path)
+            entry = {
+                "sha": args.sha,
+                "shortSha": args.sha[:7],
+                "message": args.message.splitlines()[0][:120] if args.message else "",
+                "author": args.author,
+                "timestamp": ts,
+                "runUrl": args.run_url,
+                "track": track_id,
+                "trackLabel": label,
+                "total": summary["total"],
+                "executed": summary["executed"],
+                "passed": summary["passed"],
+                "failed": summary["failed"],
+                "xfail": summary["xfail"],
+                "unsupported": summary["unsupported"],
+                "passRate": summary["passRate"],
+                "elapsed": summary["elapsed"],
+                "categories": summary["categories"],
+            }
+            history = [h for h in history if h.get("sha") != args.sha]
+            history.append(entry)
+            history.sort(key=lambda h: h.get("timestamp", ""))
+            entry = {**entry, "failures": summary["failures"]}
 
         if cache_file:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +261,7 @@ def main() -> None:
         with open(track_dir / "history.json", "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
         with open(track_dir / "latest.json", "w", encoding="utf-8") as f:
-            json.dump({**entry, "failures": summary["failures"]}, f, indent=2)
+            json.dump(entry, f, indent=2)
         badge_obj = {
             "schemaVersion": 1,
             "label": label,
@@ -236,11 +271,13 @@ def main() -> None:
         with open(track_dir / "badge.json", "w", encoding="utf-8") as f:
             json.dump(badge_obj, f, indent=2)
 
-        if track_id == "dxil-to-metal" or (idx == 0 and not (data_dir / "history.json").exists()):
+        if track_id == "dxil-to-metal" or (
+            idx == 0 and not (data_dir / "history.json").exists()
+        ):
             with open(data_dir / "history.json", "w", encoding="utf-8") as f:
                 json.dump(history, f, indent=2)
             with open(data_dir / "latest.json", "w", encoding="utf-8") as f:
-                json.dump({**entry, "failures": summary["failures"]}, f, indent=2)
+                json.dump(entry, f, indent=2)
             with open(data_dir / "badge.json", "w", encoding="utf-8") as f:
                 json.dump(badge_obj, f, indent=2)
 
@@ -253,14 +290,58 @@ def main() -> None:
             "historyUrl": f"data/{track_id}/history.json",
             "latestUrl": f"data/{track_id}/latest.json",
         })
-        print(
-            f"[{track_id}] Recorded {entry['shortSha']}: {entry['passed']}/{entry['total']} passed "
-            f"({entry['passRate']}%, {entry['executed']} executed), {entry['failed']} failed, "
-            f"{entry['xfail']} xfail, {entry['unsupported']} unsupported. History length: {len(history)}"
+        if did_run:
+            print(
+                f"[{track_id}] Recorded {entry['shortSha']}: "
+                f"{entry['passed']}/{entry['total']} passed ({entry['passRate']}%, "
+                f"{entry['executed']} executed), {entry['failed']} failed, "
+                f"{entry['xfail']} xfail, {entry['unsupported']} unsupported. "
+                f"History length: {len(history)}"
+            )
+
+    for track_id, track in previous_tracks.items():
+        if track_id in processed_tracks:
+            continue
+        cache_file = (
+            args.history_cache_dir / f"{track_id}.json"
+            if args.history_cache_dir
+            else None
         )
+        history = load_existing_history(
+            args.pages_url, cache_file, track_id, allow_legacy_fallback=False
+        )
+        entry = load_track_latest(args.pages_url, track_id, history)
+        if not history or not entry:
+            continue
+        track_dir = data_dir / track_id
+        track_dir.mkdir(parents=True, exist_ok=True)
+        with open(track_dir / "history.json", "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+        with open(track_dir / "latest.json", "w", encoding="utf-8") as f:
+            json.dump(entry, f, indent=2)
+        badge_obj = {
+            "schemaVersion": 1,
+            "label": track.get("label", track_id),
+            "message": f"{entry['passed']} Passed ({entry['passRate']}%)",
+            "color": "brightgreen" if entry["passRate"] >= 85.0 else "green",
+        }
+        with open(track_dir / "badge.json", "w", encoding="utf-8") as f:
+            json.dump(badge_obj, f, indent=2)
+        tracks_manifest.append(track)
 
     with open(data_dir / "tracks.json", "w", encoding="utf-8") as f:
         json.dump(tracks_manifest, f, indent=2)
+
+    if args.pages_url:
+        for fname in ("history.json", "latest.json", "badge.json"):
+            if (data_dir / fname).exists():
+                continue
+            previous = fetch_json(
+                f"{args.pages_url.rstrip('/')}/data/{fname}"
+            )
+            if previous is not None:
+                with open(data_dir / fname, "w", encoding="utf-8") as f:
+                    json.dump(previous, f, indent=2)
 
     # Preserve benchmark histories if already deployed on Pages
     if args.pages_url:

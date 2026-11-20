@@ -469,41 +469,31 @@
 
     .track-switcher {
       display: flex;
-      gap: 0.5rem;
+      align-items: center;
+      gap: 0.65rem;
       flex-wrap: wrap;
       margin-bottom: 1.25rem;
     }
 
-    .track-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.45rem;
-      padding: 0.45rem 0.9rem;
-      border-radius: 999px;
-      border: 1px solid var(--border);
-      background: var(--surface);
+    .track-switcher label {
       color: var(--muted);
       font-size: 0.85rem;
       font-weight: 600;
-      cursor: pointer;
-      transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
     }
 
-    .track-pill:hover {
-      border-color: var(--accent);
+    .track-switcher select {
+      min-width: min(100%, 24rem);
+      padding: 0.55rem 2.25rem 0.55rem 0.8rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
       color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 600;
     }
 
-    .track-pill.active {
-      background: var(--accent);
+    .track-switcher select:hover {
       border-color: var(--accent);
-      color: #fff;
-    }
-
-    .track-pill .track-rate {
-      font-family: var(--font-mono);
-      font-size: 0.78rem;
-      opacity: 0.85;
     }
   </style>
 </head>
@@ -522,7 +512,10 @@
         </a>
       </div>
     </header>
-    <nav id="track-switcher" class="track-switcher" aria-label="Compliance track" hidden></nav>
+    <nav id="track-switcher" class="track-switcher" aria-label="Compliance report selector" hidden>
+      <label for="track-select">Compliance report</label>
+      <select id="track-select"></select>
+    </nav>
 
     <section class="kpi-grid" aria-label="Latest compliance summary">
       <article class="card">
@@ -1016,9 +1009,8 @@
         }
       }
 
-      document.querySelectorAll(".track-pill").forEach(btn => {
-        btn.classList.toggle("active", btn.dataset.trackId === trackId);
-      });
+      const select = document.getElementById("track-select");
+      if (select) select.value = trackId;
 
       try {
         const u = new URL(window.location.href);
@@ -1032,17 +1024,15 @@
 
     function renderTrackSwitcher() {
       const nav = document.getElementById("track-switcher");
-      if (!nav || availableTracks.length <= 1) return;
+      const select = document.getElementById("track-select");
+      if (!nav || !select || availableTracks.length <= 1) return;
       nav.hidden = false;
-      nav.innerHTML = availableTracks.map(t => `
-        <button type="button" class="track-pill${t.id === currentTrackId ? " active" : ""}" data-track-id="${escapeHtml(t.id)}">
-          <span>${escapeHtml(t.label)}</span>
-          <span class="track-rate">${Number(t.passRate || 0).toFixed(1)}%</span>
-        </button>
+      select.innerHTML = availableTracks.map(t => `
+        <option value="${escapeHtml(t.id)}"${t.id === currentTrackId ? " selected" : ""}>
+          ${escapeHtml(t.label)} — ${Number(t.passRate || 0).toFixed(1)}%
+        </option>
       `).join("");
-      nav.querySelectorAll(".track-pill").forEach(btn => {
-        btn.addEventListener("click", () => loadTrack(btn.dataset.trackId));
-      });
+      select.addEventListener("change", () => loadTrack(select.value));
     }
 
     async function init() {
