@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   benchmark:
-    runs-on: macos-15
+    runs-on: macos-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -33,13 +33,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0-msc
+          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1-msc
 
       - name: Install DXC and metal-shaderconverter
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
           mkdir -p .sdk/bin .sdk/lib
-          VULKAN_VER="1.4.357.0"
+          VULKAN_VER="1.4.363.1"
           curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
           unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
           INSTALLER_APP="$(find /tmp/vulkansdk-installer -maxdepth 2 -name '*.app' | head -n 1)"
@@ -61,7 +61,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.357.0-msc
+          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1-msc
 
       - name: Install build dependencies
         run: brew install llvm ninja
