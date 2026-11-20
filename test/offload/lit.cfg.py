@@ -43,6 +43,31 @@ if len(targets) != 1:
     lit_config.fatal(f"Expected one DirectX/Crucible adapter, found {len(targets)}")
 target = targets[0]
 host = report["Host"]
+# Known Apple Paravirtual GPU driver bugs on virtualized macOS runners
+# (e.g. GitHub Actions macOS VMs) that do not reproduce on bare-metal Apple Silicon:
+# - simd_min(half) / simd_max(half) fails MTLComputePipelineState compilation.
+# - Direct-bound array<texture*<..., access::read_write>, N> returns zeros for
+#   elements [1..N-1].
+_PARAVIRTUAL_METAL_XFAILS = frozenset({
+    "Feature/Textures/Array.SRVToUAV.array.test",
+    "Feature/Textures/SRVToUAV.array.test",
+    "WaveOps/WaveActiveMax.fp16.test",
+    "WaveOps/WaveActiveMin.fp16.test",
+})
+
+
+class _ParavirtualXFailShTest(lit.formats.ShTest):
+    def execute(self, test, litConfig):
+        if "/".join(test.path_in_suite) in _PARAVIRTUAL_METAL_XFAILS:
+            if "*" not in test.xfails:
+                test.xfails.append("*")
+        return super().execute(test, litConfig)
+
+
+if "paravirtual" in str(target.get("Description", "")).lower():
+    config.available_features.add("apple-paravirtual")
+    config.test_format = _ParavirtualXFailShTest()
+
 # Use the DirectX contract for test annotations, not the Metal backend.
 config.available_features.update(
     [target["API"], target["Driver"], "DXC", host["Operating System"]]
