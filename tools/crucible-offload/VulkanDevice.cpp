@@ -492,7 +492,9 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     }
 
     VkFormat Fmt = vkFormatForBuffer(*CPU);
-    uint32_t TexelBytes = std::max<uint32_t>(1u, CPU->getSingleElementSize());
+    uint32_t TexelBytes = std::max<uint32_t>(
+        1u, static_cast<uint32_t>(CPU->getSingleElementSize()) *
+                std::max<uint32_t>(1u, CPU->Channels));
 
     VkImgAlloc A;
     A.Format = Fmt;

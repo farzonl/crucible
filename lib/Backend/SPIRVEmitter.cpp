@@ -1195,9 +1195,9 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_sample_clamp,
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
-           Clamp->getType(), Offset->getType()});
+           Offset->getType()});
       ResVec = B.CreateCall(
-          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Clamp, Offset});
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, Offset, Clamp});
     } else {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_sample,
@@ -1224,7 +1224,7 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI) {
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
            Offset->getType()});
       ResVec = B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord,
-                                 LodOrBias, Clamp, Offset});
+                                 LodOrBias, Offset, Clamp});
     } else {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_samplebias,
@@ -1248,10 +1248,9 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI) {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_samplegrad_clamp,
           {Vec4Ty, TexRH->SpvHandleTy, SampRH->SpvHandleTy, Coord->getType(),
-           Ddx->getType(), Ddy->getType(), Clamp->getType(),
-           Offset->getType()});
+           Ddx->getType(), Ddy->getType(), Offset->getType()});
       ResVec = B.CreateCall(Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord,
-                                 Ddx, Ddy, Clamp, Offset});
+                                 Ddx, Ddy, Offset, Clamp});
     } else {
       Function *Fn = Intrinsic::getOrInsertDeclaration(
           &M, Intrinsic::spv_resource_samplegrad,
@@ -1264,15 +1263,25 @@ Error SPIRVLowerer::lowerTextureSample(CallInst *CI) {
   }
   case ir::SampleMode::Cmp:
   case ir::SampleMode::CmpLevelZero: {
-    Intrinsic::ID ID = (Mode == ir::SampleMode::CmpLevelZero)
-                           ? Intrinsic::spv_resource_samplecmplevelzero
-                           : Intrinsic::spv_resource_samplecmp;
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, ID,
-        {B.getFloatTy(), TexRH->SpvHandleTy, SampRH->SpvHandleTy,
-         Coord->getType(), Offset->getType()});
-    Value *Scalar = B.CreateCall(
-        Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
+    Value *Scalar = nullptr;
+    if (Mode == ir::SampleMode::Cmp && HasClamp) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::spv_resource_samplecmp_clamp,
+          {B.getFloatTy(), TexRH->SpvHandleTy, SampRH->SpvHandleTy,
+           Coord->getType(), Offset->getType()});
+      Scalar = B.CreateCall(
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset, Clamp});
+    } else {
+      Intrinsic::ID ID = (Mode == ir::SampleMode::CmpLevelZero)
+                             ? Intrinsic::spv_resource_samplecmplevelzero
+                             : Intrinsic::spv_resource_samplecmp;
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, ID,
+          {B.getFloatTy(), TexRH->SpvHandleTy, SampRH->SpvHandleTy,
+           Coord->getType(), Offset->getType()});
+      Scalar = B.CreateCall(
+          Fn, {TexRH->SpvHandle, SampRH->SpvHandle, Coord, CmpVal, Offset});
+    }
     Value *Res = PoisonValue::get(RetVecTy);
     Res = B.CreateInsertElement(Res, Scalar, B.getInt32(0));
     CI->replaceAllUsesWith(Res);
