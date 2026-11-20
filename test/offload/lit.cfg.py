@@ -26,12 +26,17 @@ config.test_exec_root = config.crucible_offload_exec_root
 
 # Propagate explicit runtime selection (metal|vulkan) to both api-query and
 # offloader child processes.
-if "CRUCIBLE_OFFLOAD_RUNTIME" in os.environ:
-    config.environment["CRUCIBLE_OFFLOAD_RUNTIME"] = os.environ["CRUCIBLE_OFFLOAD_RUNTIME"]
+offload_runtime = lit_config.params.get(
+    "offload_runtime", os.environ.get("CRUCIBLE_OFFLOAD_RUNTIME")
+)
+api_query_env = os.environ.copy()
+if offload_runtime:
+    config.environment["CRUCIBLE_OFFLOAD_RUNTIME"] = offload_runtime
+    api_query_env["CRUCIBLE_OFFLOAD_RUNTIME"] = offload_runtime
 
 try:
     report = yaml.safe_load(subprocess.check_output(
-        [config.crucible_api_query], text=True
+        [config.crucible_api_query], text=True, env=api_query_env
     ))
 except (OSError, subprocess.CalledProcessError, yaml.YAMLError) as error:
     lit_config.fatal(f"Crucible device discovery failed: {error}")
