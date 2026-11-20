@@ -17,6 +17,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
@@ -577,7 +578,11 @@ static Expected<Function *> parseEntryPoints(Module &M, Reflection &R,
 //===----------------------------------------------------------------------===//
 
 namespace {
+#if LLVM_VERSION_MAJOR >= 24
+class LowerLongVectorsPass : public RequiredPassInfoMixin<LowerLongVectorsPass> {
+#else
 class LowerLongVectorsPass : public PassInfoMixin<LowerLongVectorsPass> {
+#endif
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM) {
     auto IsLongVector = [](Type *T) {
@@ -1002,7 +1007,11 @@ Expected<LoadedShader> loadDXIL(MemoryBufferRef Buf, LLVMContext &Ctx,
   // Cleanup pipeline: upgrade dx.* constructs, promote allocas, scalarize
   // aggregates, remove switches, and canonicalize the CFG so the emitter sees
   // tidy SSA.
+#if LLVM_VERSION_MAJOR >= 24
+  PassBuilder PB(Ctx);
+#else
   PassBuilder PB;
+#endif
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;

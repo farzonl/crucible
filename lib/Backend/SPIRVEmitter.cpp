@@ -27,6 +27,7 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CodeGen.h"
 #include "llvm/Support/TargetSelect.h"
@@ -3170,7 +3171,11 @@ Error SPIRVLowerer::run() {
   configureEntryAndLinkage(*StageOrErr);
   cleanupDXILArtifacts();
 
+#if LLVM_VERSION_MAJOR >= 24
+  PassBuilder PB(Ctx);
+#else
   PassBuilder PB;
+#endif
   LoopAnalysisManager LAM;
   FunctionAnalysisManager FAM;
   CGSCCAnalysisManager CGAM;
