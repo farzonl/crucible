@@ -137,6 +137,8 @@ uint32_t imageFormatComponents(mlir::spirv::ImageFormat Fmt) {
   case mlir::spirv::ImageFormat::R16:
   case mlir::spirv::ImageFormat::R8Snorm:
   case mlir::spirv::ImageFormat::R16Snorm:
+  case mlir::spirv::ImageFormat::R64i:
+  case mlir::spirv::ImageFormat::R64ui:
     return 1;
   case mlir::spirv::ImageFormat::Rg32f:
   case mlir::spirv::ImageFormat::Rg16f:
@@ -3092,6 +3094,18 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           }
         }
         Chain.erase();
+      } else if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(U)) {
+        mlir::OpBuilder LB(Load);
+        auto LLVMLoad =
+            mlir::LLVM::LoadOp::create(LB, Load.getLoc(), LLVMArrTy, Alloca);
+        mlir::Value Repl = LLVMLoad.getResult();
+        if (Repl.getType() != Load.getType()) {
+          Repl = mlir::UnrealizedConversionCastOp::create(
+                     LB, Load.getLoc(), Load.getType(), Repl)
+                     .getResult(0);
+        }
+        Load.replaceAllUsesWith(Repl);
+        Load.erase();
       }
     }
     if (V->use_empty())

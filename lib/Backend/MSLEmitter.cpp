@@ -2139,6 +2139,12 @@ Error Emitter::collectGroupshared() {
       N = Arr.getNumElements();
       Elem = Arr.getElementType();
       IsArray = true;
+    } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T)) {
+      if (!Vec.isScalable() && Vec.getRank() == 1) {
+        N = Vec.getNumElements();
+        Elem = Vec.getElementType();
+        IsArray = true;
+      }
     }
     auto ETy = mslType(Elem);
     if (!ETy)
@@ -2187,7 +2193,9 @@ Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
     if (It == GlobalNames.end())
       return makeError("reference to unsupported global '{0}'",
                        AO.getGlobalName());
-    bool IsArray = mlir::isa<mlir::LLVM::LLVMArrayType>(G.getGlobalType());
+    bool IsArray = mlir::isa<mlir::LLVM::LLVMArrayType>(G.getGlobalType()) ||
+                   (G.getAddrSpace() == 3 &&
+                    mlir::isa<mlir::VectorType>(G.getGlobalType()));
     return Expr{It->second + (IsArray && DecayArray ? "[0]" : ""),
                 PrecPrimary};
   }
@@ -2955,8 +2963,37 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   if (auto Freeze = mlir::dyn_cast<FreezeOp>(Op))
     return exprFor(Freeze.getOperand(), PrecUnknown);
 
-  if (auto Load = mlir::dyn_cast<LoadOp>(Op))
+  if (auto Load = mlir::dyn_cast<LoadOp>(Op)) {
+    if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(Load.getType())) {
+      std::string BaseName;
+      if (auto AO = Load.getAddr().getDefiningOp<mlir::LLVM::AddressOfOp>()) {
+        auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+        if (auto G =
+                Mod.lookupSymbol<mlir::LLVM::GlobalOp>(AO.getGlobalNameAttr());
+            G && G.getAddrSpace() == 3 &&
+            mlir::isa<mlir::VectorType>(G.getGlobalType())) {
+          BaseName = GlobalNames.lookup(G);
+        }
+      } else if (auto AL = Load.getAddr().getDefiningOp<mlir::LLVM::AllocaOp>();
+                 AL && mlir::isa<mlir::VectorType>(AL.getElemType())) {
+        BaseName = ValueNames.lookup(AL.getResult());
+      }
+      if (!BaseName.empty()) {
+        auto VTy = mslType(VecTy);
+        if (!VTy)
+          return VTy.takeError();
+        std::string S = *VTy + "(";
+        for (int64_t I = 0; I < VecTy.getNumElements(); ++I) {
+          if (I)
+            S += ", ";
+          S += BaseName + "[" + std::to_string(I) + "]";
+        }
+        S += ")";
+        return Expr{std::move(S), PrecPrimary};
+      }
+    }
     return lvalueFor(Load.getAddr());
+  }
 
   if (auto EE = mlir::dyn_cast<ExtractElementOp>(Op)) {
     if (auto *Prod = EE.getVector().getDefiningOp()) {
@@ -5783,8 +5820,21 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     mlir::Type PointeeTy;
     if (auto AO = Store.getAddr().getDefiningOp<mlir::LLVM::AddressOfOp>()) {
       auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
-      if (auto G = Mod.lookupSymbol<mlir::LLVM::GlobalOp>(AO.getGlobalNameAttr()))
+      if (auto G =
+              Mod.lookupSymbol<mlir::LLVM::GlobalOp>(AO.getGlobalNameAttr())) {
         PointeeTy = G.getGlobalType();
+        if (G.getAddrSpace() == 3) {
+          if (auto ValVec =
+                  mlir::dyn_cast<mlir::VectorType>(Store.getValue().getType());
+              ValVec && mlir::isa<mlir::VectorType>(PointeeTy)) {
+            std::string BaseName = GlobalNames.lookup(G);
+            for (int64_t I = 0; I < ValVec.getNumElements(); ++I)
+              line(Ind, BaseName + "[" + std::to_string(I) + "] = (" + V->Text +
+                            ")[" + std::to_string(I) + "];");
+            return Error::success();
+          }
+        }
+      }
     } else if (auto AL = Store.getAddr().getDefiningOp<mlir::LLVM::AllocaOp>()) {
       PointeeTy = AL.getElemType();
       if (auto ValVec =
