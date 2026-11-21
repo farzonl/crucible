@@ -554,12 +554,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
         return Fail("unsupported raster shader resource array or counter");
       if (RB.Class == crucible::ResourceClass::Sampler) {
         YAMLSampler *Samp = nullptr;
-        for (auto &Set : P.Sets)
-          for (auto &Res : Set.Resources)
+        for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx)
+          for (auto &Res : P.Sets[SetIdx].Resources)
             if ((Res.Kind == ResourceKind::Sampler ||
                  Res.Kind == ResourceKind::SampledTexture2D) &&
                 Res.SamplerPtr && !Res.IsReserved &&
-                resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
+                resourceBindingOffset(Res, RB, UseVulkanBinding, SetIdx) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
         if (!Samp)
@@ -575,11 +575,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
       if (isCrucibleTextureKind(RB.Kind)) {
         CPUBuffer *CPU = nullptr;
         ResourceKind ResKind = ResourceKind::Texture2D;
-        for (auto &Set : P.Sets)
-          for (auto &Res : Set.Resources)
+        for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx)
+          for (auto &Res : P.Sets[SetIdx].Resources)
             if (classify(Res.Kind) == RB.Class &&
                 isTextureResource(Res.Kind) && !Res.HasCounter &&
-                !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
+                !Res.IsReserved &&
+                resourceBindingOffset(Res, RB, UseVulkanBinding, SetIdx) == 0u &&
                 Res.getArraySize() == 1) {
               CPU = Res.BufferPtr;
               ResKind = Res.Kind;
@@ -612,11 +613,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
       if (RB.MetalIndex >= 28)
         return Fail("raster buffer binding exceeds the available slots");
       CPUBuffer *CPU = nullptr;
-      for (auto &Set : P.Sets)
-        for (auto &Res : Set.Resources)
+      for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx)
+        for (auto &Res : P.Sets[SetIdx].Resources)
           if (classify(Res.Kind) == RB.Class &&
               !isTextureResource(Res.Kind) && !Res.HasCounter &&
-              !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
+              !Res.IsReserved &&
+              resourceBindingOffset(Res, RB, UseVulkanBinding, SetIdx) == 0u &&
               Res.getArraySize() == 1)
             CPU = Res.BufferPtr;
       if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
@@ -996,12 +998,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
         return Fail("unsupported raster shader resource array or counter");
       if (RB.Class == crucible::ResourceClass::Sampler) {
         YAMLSampler *Samp = nullptr;
-        for (auto &Set : P.Sets)
-          for (auto &Res : Set.Resources)
+        for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx)
+          for (auto &Res : P.Sets[SetIdx].Resources)
             if ((Res.Kind == ResourceKind::Sampler ||
                  Res.Kind == ResourceKind::SampledTexture2D) &&
                 Res.SamplerPtr && !Res.IsReserved &&
-                resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
+                resourceBindingOffset(Res, RB, UseVulkanBinding, SetIdx) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
         if (!Samp)
@@ -1017,11 +1019,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
       if (isCrucibleTextureKind(RB.Kind)) {
         CPUBuffer *CPU = nullptr;
         ResourceKind ResKind = ResourceKind::Texture2D;
-        for (auto &Set : P.Sets)
-          for (auto &Res : Set.Resources)
+        for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx)
+          for (auto &Res : P.Sets[SetIdx].Resources)
             if (classify(Res.Kind) == RB.Class &&
                 isTextureResource(Res.Kind) && !Res.HasCounter &&
-                !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
+                !Res.IsReserved &&
+                resourceBindingOffset(Res, RB, UseVulkanBinding, SetIdx) == 0u &&
                 Res.getArraySize() == 1) {
               CPU = Res.BufferPtr;
               ResKind = Res.Kind;
@@ -1056,11 +1059,12 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
       if (RB.MetalIndex >= VertexDataSlot)
         return Fail("raster buffer binding exceeds the available slots");
       CPUBuffer *CPU = nullptr;
-      for (auto &Set : P.Sets)
-        for (auto &Res : Set.Resources)
+      for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx)
+        for (auto &Res : P.Sets[SetIdx].Resources)
           if (classify(Res.Kind) == RB.Class &&
               !isTextureResource(Res.Kind) && !Res.HasCounter &&
-              !Res.IsReserved && resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
+              !Res.IsReserved &&
+              resourceBindingOffset(Res, RB, UseVulkanBinding, SetIdx) == 0u &&
               Res.getArraySize() == 1)
             CPU = Res.BufferPtr;
       if (!CPU || CPU == Output || !CPU->Size || CPU->Data.size() != 1 ||
