@@ -22,6 +22,7 @@ std::optional<crucible::ResourceClass> classifyResource(ResourceKind Kind) {
   case ResourceKind::Texture1D:
   case ResourceKind::Texture1DArray:
   case ResourceKind::Texture2D:
+  case ResourceKind::SampledTexture2D:
   case ResourceKind::Texture2DArray:
   case ResourceKind::Texture3D:
   case ResourceKind::TextureCube:
