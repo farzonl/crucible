@@ -22,7 +22,7 @@ namespace crucible {
 Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
                                        const Options &Opts) {
   if (isSPIRVBinary(Input) || isMLIRText(Input)) {
-    mlir::MLIRContext MCtx;
+    mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
     auto Loaded = isSPIRVBinary(Input)
                       ? loadSPIRV(Input, MCtx, Opts.EntryPoint)
                       : loadMLIR(Input, MCtx, Opts.EntryPoint);
@@ -60,7 +60,7 @@ Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
   if (Error E = assignMetalBindings(Shader->Reflect, Opts))
     return std::move(E);
 
-  mlir::MLIRContext MCtx;
+  mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
   auto Structured = structurizeCFG(*Shader, MCtx);
   if (!Structured)
     return Structured.takeError();
@@ -90,7 +90,7 @@ Expected<SPIRVCompileResult> compileDXILToSPIRV(MemoryBufferRef DXIL,
   if (Error E = assignSPIRVBindings(Shader->Reflect, Opts))
     return std::move(E);
 
-  mlir::MLIRContext MCtx;
+  mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
   auto Mod = importDXILToMLIR(*Shader, MCtx);
   if (!Mod)
     return Mod.takeError();

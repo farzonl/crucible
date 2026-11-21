@@ -2354,12 +2354,25 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
 
   mlir::Operation *User = *Op->getResult(0).getUsers().begin();
 
+  // Ops whose MSL emission expands their operand more than once (e.g.
+  // `crucible.frc` -> `x - floor(x)`) would duplicate the entire inlined
+  // subexpression (and blow up exponentially when nested). Materialize the
+  // operand into a temporary instead.
+  if (mlir::isa<ir::FrcOp>(User))
+    return false;
+
   // A memory read must not be folded forward across a write or barrier,
-  // since the inlined load would observe the mutation.
+  // since the inlined load would observe the mutation. Walk through any
+  // chain of inlined single-use consumers to find the actual emission sink.
   auto PinAgainstWrites = [&]() {
-    if (User->getBlock() != Op->getBlock())
+    mlir::Operation *Sink = User;
+    while (Sink && Sink->getBlock() == Op->getBlock() && shouldInline(Sink) &&
+           Sink->getNumResults() == 1 && Sink->getResult(0).hasOneUse()) {
+      Sink = *Sink->getResult(0).getUsers().begin();
+    }
+    if (!Sink || Sink->getBlock() != Op->getBlock())
       return false; // conservative across region boundaries
-    for (mlir::Operation *P = Op->getNextNode(); P && P != User;
+    for (mlir::Operation *P = Op->getNextNode(); P && P != Sink;
          P = P->getNextNode())
       if (mayWriteMemory(P))
         return false;
@@ -5940,8 +5953,15 @@ Expected<std::string> Emitter::kernelSignature() {
     OS << "[[mesh]] void ";
   else if (R.Stage == ShaderStage::Amplification)
     OS << "[[object]] void ";
-  else if (IsComputeKernel)
+  else if (IsComputeKernel) {
+    if (R.Stage == ShaderStage::Compute) {
+      uint32_t TotalThreads =
+          R.NumThreads[0] * R.NumThreads[1] * R.NumThreads[2];
+      if (TotalThreads > 1 && TotalThreads <= 1024)
+        OS << "[[max_total_threads_per_threadgroup(" << TotalThreads << ")]]\n";
+    }
     OS << "kernel void ";
+  }
   else {
     if (R.Domain)
       OS << "[[patch("
@@ -6177,15 +6197,20 @@ Expected<std::string> Emitter::kernelSignature() {
     const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
                             : RB.Class == ResourceClass::UAV ? "device "
                                                              : "constant ";
+    const char *RestrictQual =
+        (RB.Class != ResourceClass::CBV && !RB.GloballyCoherent)
+            ? "__restrict "
+            : "";
     if (RB.RangeSize == 1) {
-      OS << "    " << PtrPrefix << RS->ElemType << "* " << RS->ParamName
-         << " [[buffer(" << RB.MetalIndex << ")]]";
+      OS << "    " << PtrPrefix << RS->ElemType << "* " << RestrictQual
+         << RS->ParamName << " [[buffer(" << RB.MetalIndex << ")]]";
     } else {
       for (uint32_t I = 0; I < RB.RangeSize; ++I) {
         if (I)
           OS << ",\n";
-        OS << "    " << PtrPrefix << RS->ElemType << "* " << RS->ParamName
-           << "_" << I << " [[buffer(" << (RB.MetalIndex + I) << ")]]";
+        OS << "    " << PtrPrefix << RS->ElemType << "* " << RestrictQual
+           << RS->ParamName << "_" << I << " [[buffer(" << (RB.MetalIndex + I)
+           << ")]]";
       }
     }
     if (RB.HasCounter) {
@@ -6537,7 +6562,7 @@ Expected<std::string> Emitter::run() {
   OS << ConstantGlobalDecls << Input << Output << *Sig << " {\n"
      << ArrayDecls << GroupsharedDecls;
   if (Graphics && Opts.StageAsCompute) {
-    if (R.Stage == ShaderStage::Vertex) {
+    if (R.Stage == ShaderStage::Vertex && !Input.empty()) {
       OS << "  CrucibleStageIn stageIn = {};\n";
       for (const StageParameter &P : R.Inputs) {
         if (P.Kind == VertexID) {

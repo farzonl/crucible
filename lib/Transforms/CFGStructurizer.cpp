@@ -139,10 +139,19 @@ structurizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp> Mod,
       return std::move(E);
   }
 
+  bool NeedsStructurization = false;
+  Mod->walk([&](mlir::func::FuncOp F) {
+    if (F.getBody().getBlocks().size() > 1)
+      NeedsStructurization = true;
+  });
+
   mlir::PassManager PM(&Ctx);
-  PM.addPass(mlir::createLiftControlFlowToSCFPass());
-  PM.addPass(mlir::createCanonicalizerPass());
-  PM.addPass(mlir::createLoopInvariantCodeMotionPass());
+  PM.enableVerifier(false);
+  if (NeedsStructurization) {
+    PM.addPass(mlir::createLiftControlFlowToSCFPass());
+    PM.addPass(mlir::createCanonicalizerPass());
+    PM.addPass(mlir::createLoopInvariantCodeMotionPass());
+  }
   PM.addPass(mlir::createCanonicalizerPass());
   if (mlir::failed(PM.run(*Mod)))
     return makeError("CFG structurization (LiftControlFlowToSCF) failed");
