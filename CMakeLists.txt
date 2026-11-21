@@ -101,6 +101,7 @@ add_subdirectory(lib)
 add_subdirectory(tools/cruciblec)
 if(APPLE)
   add_subdirectory(tools/crucible-run)
+  add_subdirectory(tools/crucible-bench)
 endif()
 
 # Optional Vulkan / MoltenVK E2E compute runner (crucible-vk-run).

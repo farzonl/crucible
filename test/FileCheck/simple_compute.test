@@ -8,7 +8,7 @@
 # CHECK: #include <metal_stdlib>
 # CHECK: using namespace metal;
 # CHECK: kernel void main0(
-# CHECK-NEXT: device float* [[BUF:(Out|uav0)]] {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: device float* __restrict [[BUF:(Out|uav0)]] {{\[\[}}buffer(0){{\]\]}},
 # CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
 # CHECK-NEXT: [[BUF]][dtid.x] = [[BUF]][dtid.x] * 2.0f + 1.0f;
 # CHECK-NEXT: }

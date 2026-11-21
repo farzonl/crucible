@@ -50,8 +50,10 @@ jobs:
 
           git clone --depth 1 https://github.com/MethanePowered/MetalShaderConverterBinary.git /tmp/msc
           unzip -q /tmp/msc/binaries/MacOS.zip -d /tmp/msc-bins
+          mkdir -p .sdk/include
           cp -a /tmp/msc-bins/bin/metal-shaderconverter .sdk/bin/
           cp -a /tmp/msc-bins/lib/libmetalirconverter.dylib .sdk/lib/ 2>/dev/null || true
+          cp -a /tmp/msc-bins/include/* .sdk/include/ 2>/dev/null || true
           chmod +x .sdk/bin/metal-shaderconverter
           rm -rf /tmp/msc /tmp/msc-bins
 
@@ -71,7 +73,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
             -DCRUCIBLE_ENABLE_TESTS=OFF
-          cmake --build build --target cruciblec crucible-run --parallel
+          cmake --build build --target cruciblec crucible-run crucible-bench --parallel
 
       - name: Run benchmarks
         env:

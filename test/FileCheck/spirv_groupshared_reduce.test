@@ -5,7 +5,7 @@
 # RUN: FileCheck %s --input-file=%t.metal
 
 # CHECK: kernel void main0(
-# CHECK-NEXT: device uint* Out {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: device uint* __restrict Out {{\[\[}}buffer(0){{\]\]}},
 # CHECK-NEXT: uint gidx {{\[\[}}thread_index_in_threadgroup{{\]\]}}) {
 # CHECK: threadgroup uint gsSum[1];
 # CHECK: gsSum[0u] = 0u;
