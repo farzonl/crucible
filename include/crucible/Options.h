@@ -111,6 +111,12 @@ struct Options {
   };
   uint32_t VertexInputStride = 0;
   std::vector<VertexInputAttribute> VertexInputLayout;
+
+  /// Optional tessellation partitioning (1=Integer, 2=Pow2, 3=FractionalOdd,
+  /// 4=FractionalEven) and output primitive (1=Point, 2=Line, 3=TriangleCW,
+  /// 4=TriangleCCW) forwarded from Hull to Domain shader compilation for SPIR-V.
+  uint8_t TessPartitioning = 0;
+  uint8_t TessOutputPrimitive = 0;
 };
 
 } // namespace crucible

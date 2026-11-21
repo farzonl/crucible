@@ -1298,19 +1298,25 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   if (!P.isTraditionalRaster() || P.Shaders.size() < 2)
     return Fail("raster execution requires one vertex and one pixel shader");
 
-  const Shader *VS = nullptr, *GS = nullptr, *PS = nullptr;
+  const Shader *VS = nullptr, *HS = nullptr, *DS = nullptr, *GS = nullptr,
+               *PS = nullptr;
   for (const Shader &S : P.Shaders) {
     if (S.Stage == Stages::Vertex)
       VS = &S;
+    else if (S.Stage == Stages::Hull)
+      HS = &S;
+    else if (S.Stage == Stages::Domain)
+      DS = &S;
     else if (S.Stage == Stages::Geometry)
       GS = &S;
     else if (S.Stage == Stages::Pixel)
       PS = &S;
     else
-      return Fail("Vulkan raster currently supports VS + [GS] + PS pipelines only");
+      return Fail("Vulkan raster encountered an unsupported shader stage");
   }
-  if (!VS || !PS)
-    return Fail("raster execution requires one vertex and one pixel shader");
+  if (!VS || !PS || (HS != nullptr) != (DS != nullptr))
+    return Fail("raster execution requires VS + PS (and paired HS + DS when "
+                "tessellating)");
 
   auto &B = P.Bindings;
   CPUBuffer *Output = B.RTargetBufferPtr;
@@ -1347,6 +1353,34 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     GSCompiled = std::move(*GSRes);
   }
 
+  std::optional<crucible::SPIRVCompileResult> HSCompiled, DSCompiled;
+  if (HS) {
+    crucible::Options HSOpts;
+    HSOpts.Target = crucible::TargetBackend::SPIRV;
+    HSOpts.EntryPoint = HS->Entry;
+    auto HSRes =
+        crucible::compileDXILToSPIRV(HS->Shader->getMemBufferRef(), HSOpts);
+    if (!HSRes)
+      return HSRes.takeError();
+    HSCompiled = std::move(*HSRes);
+  }
+  if (DS) {
+    crucible::Options DSOpts;
+    DSOpts.Target = crucible::TargetBackend::SPIRV;
+    DSOpts.EntryPoint = DS->Entry;
+    if (HSCompiled && HSCompiled->Reflect.Hull) {
+      DSOpts.TessPartitioning =
+          static_cast<uint8_t>(HSCompiled->Reflect.Hull->Partitioning);
+      DSOpts.TessOutputPrimitive =
+          static_cast<uint8_t>(HSCompiled->Reflect.Hull->OutputPrimitive);
+    }
+    auto DSRes =
+        crucible::compileDXILToSPIRV(DS->Shader->getMemBufferRef(), DSOpts);
+    if (!DSRes)
+      return DSRes.takeError();
+    DSCompiled = std::move(*DSRes);
+  }
+
   crucible::Options PSOpts;
   PSOpts.Target = crucible::TargetBackend::SPIRV;
   PSOpts.EntryPoint = PS->Entry;
@@ -1355,7 +1389,8 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   if (!PSCompiled)
     return PSCompiled.takeError();
 
-  VkShaderModule VSMod = VK_NULL_HANDLE, GSMod = VK_NULL_HANDLE,
+  VkShaderModule VSMod = VK_NULL_HANDLE, HSMod = VK_NULL_HANDLE,
+                 DSMod = VK_NULL_HANDLE, GSMod = VK_NULL_HANDLE,
                  PSMod = VK_NULL_HANDLE;
   auto createMod = [&](const std::string &Bytes,
                        VkShaderModule &Out) -> Error {
@@ -1375,7 +1410,25 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
       return std::move(E);
     }
   }
+  if (HSCompiled) {
+    if (Error E = createMod(HSCompiled->Output, HSMod)) {
+      if (GSMod)
+        vkDestroyShaderModule(VK.Device, GSMod, nullptr);
+      vkDestroyShaderModule(VK.Device, VSMod, nullptr);
+      return std::move(E);
+    }
+  }
+  if (DSCompiled) {
+    if (Error E = createMod(DSCompiled->Output, DSMod)) {
+      if (HSMod) vkDestroyShaderModule(VK.Device, HSMod, nullptr);
+      if (GSMod) vkDestroyShaderModule(VK.Device, GSMod, nullptr);
+      vkDestroyShaderModule(VK.Device, VSMod, nullptr);
+      return std::move(E);
+    }
+  }
   if (Error E = createMod(PSCompiled->Output, PSMod)) {
+    if (DSMod) vkDestroyShaderModule(VK.Device, DSMod, nullptr);
+    if (HSMod) vkDestroyShaderModule(VK.Device, HSMod, nullptr);
     if (GSMod) vkDestroyShaderModule(VK.Device, GSMod, nullptr);
     vkDestroyShaderModule(VK.Device, VSMod, nullptr);
     return E;
@@ -1461,6 +1514,8 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     if (ColorImg) vkDestroyImage(VK.Device, ColorImg, nullptr);
     if (ColorMem) vkFreeMemory(VK.Device, ColorMem, nullptr);
     if (PSMod) vkDestroyShaderModule(VK.Device, PSMod, nullptr);
+    if (DSMod) vkDestroyShaderModule(VK.Device, DSMod, nullptr);
+    if (HSMod) vkDestroyShaderModule(VK.Device, HSMod, nullptr);
     if (GSMod) vkDestroyShaderModule(VK.Device, GSMod, nullptr);
     if (VSMod) vkDestroyShaderModule(VK.Device, VSMod, nullptr);
   };
@@ -1847,7 +1902,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
       auto Class = classifyResource(Res.Kind);
       if (!Class || !Res.DXBinding)
         continue;
-      SmallVector<const crucible::ResourceBinding *, 3> Matches;
+      SmallVector<const crucible::ResourceBinding *, 5> Matches;
       auto addStageMatch = [&](const crucible::Reflection &Ref) {
         if (const auto *M = findStageReg(Ref, *Class, Res.DXBinding->Space,
                                          Res.DXBinding->Register)) {
@@ -1859,6 +1914,10 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
         }
       };
       addStageMatch(VSCompiled->Reflect);
+      if (HSCompiled)
+        addStageMatch(HSCompiled->Reflect);
+      if (DSCompiled)
+        addStageMatch(DSCompiled->Reflect);
       if (GSCompiled)
         addStageMatch(GSCompiled->Reflect);
       addStageMatch(PSCompiled->Reflect);
@@ -2335,6 +2394,26 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
                      : VSCompiled->Reflect.EntryName.c_str();
     StagesCI.push_back(VSCI);
   }
+  if (HSCompiled && HSMod) {
+    VkPipelineShaderStageCreateInfo HSCI{};
+    HSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    HSCI.stage = VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    HSCI.module = HSMod;
+    HSCI.pName = HSCompiled->Reflect.EntryName.empty()
+                     ? "main"
+                     : HSCompiled->Reflect.EntryName.c_str();
+    StagesCI.push_back(HSCI);
+  }
+  if (DSCompiled && DSMod) {
+    VkPipelineShaderStageCreateInfo DSCI{};
+    DSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    DSCI.stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    DSCI.module = DSMod;
+    DSCI.pName = DSCompiled->Reflect.EntryName.empty()
+                     ? "main"
+                     : DSCompiled->Reflect.EntryName.c_str();
+    StagesCI.push_back(DSCI);
+  }
   if (GSCompiled && GSMod) {
     VkPipelineShaderStageCreateInfo GSCI{};
     GSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -2365,8 +2444,11 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
 
   VkPipelineInputAssemblyStateCreateInfo IASCI{};
   IASCI.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-  IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-  if (GSCompiled && GSCompiled->Reflect.Geometry) {
+  IASCI.topology = (HSCompiled && DSCompiled)
+                       ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST
+                       : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  if (!(HSCompiled && DSCompiled) && GSCompiled &&
+      GSCompiled->Reflect.Geometry) {
     switch (GSCompiled->Reflect.Geometry->InputPrimitive) {
     case 1: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
     case 2: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
@@ -2375,6 +2457,14 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     default: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
     }
   }
+
+  VkPipelineTessellationStateCreateInfo TSCI{};
+  TSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+  if (HSCompiled && HSCompiled->Reflect.Hull)
+    TSCI.patchControlPoints =
+        std::max(1u, HSCompiled->Reflect.Hull->InputControlPointCount);
+  else
+    TSCI.patchControlPoints = 3u;
 
   // Flip Vulkan viewport Y to match DirectX top-left clip-space convention.
   std::vector<VkViewport> VPs;
@@ -2453,6 +2543,8 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   GPCI.pStages = StagesCI.data();
   GPCI.pVertexInputState = &VISCI;
   GPCI.pInputAssemblyState = &IASCI;
+  if (HSCompiled && DSCompiled)
+    GPCI.pTessellationState = &TSCI;
   GPCI.pViewportState = &VPSCI;
   GPCI.pRasterizationState = &RSCI;
   GPCI.pMultisampleState = &MSSCI;
@@ -2901,6 +2993,7 @@ createVulkanDevices(const DeviceConfig &Config) {
   VkPhysicalDeviceFeatures EnabledFeats{};
   EnabledFeats.robustBufferAccess = SupportedFeats2.features.robustBufferAccess;
   EnabledFeats.geometryShader = SupportedFeats2.features.geometryShader;
+  EnabledFeats.tessellationShader = SupportedFeats2.features.tessellationShader;
   EnabledFeats.shaderInt64 = SupportedFeats2.features.shaderInt64;
   EnabledFeats.shaderFloat64 = SupportedFeats2.features.shaderFloat64;
   EnabledFeats.shaderInt16 = SupportedFeats2.features.shaderInt16;
