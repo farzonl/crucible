@@ -10,7 +10,7 @@ module {
     %sat = "crucible.saturate"(%val) : (f32) -> f32
     %frc = "crucible.frc"(%sat) : (f32) -> f32
     %first = "crucible.wave_is_first_lane"() : () -> i1
-    %any = "crucible.wave_vote"(%first) <{kind = #crucible<wave_vote_kind any>}> : (i1) -> i1
+    %any = "crucible.wave_vote"(%first) <{kind = #crucible.wave_vote_kind<any>}> : (i1) -> i1
     "crucible.barrier"() <{device_fence = false, exec_sync = true, tgsm_fence = true}> : () -> ()
     %res = llvm.select %any, %frc, %val : i1, f32
     %ptr_out = llvm.getelementptr %out[%idx] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
