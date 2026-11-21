@@ -184,6 +184,7 @@ struct StageVar {
   Type *VarTy = nullptr;
   SmallVector<SmallVector<uint32_t, 2>, 3> Decorations;
   bool IsBoolBuiltIn = false;
+  bool IsFlatFloatArray = false;
   bool Referenced = false;
 };
 
@@ -200,8 +201,12 @@ public:
     return !ImgAtomicHelpers.empty() || !ImgCmpXchgHelpers.empty();
   }
   uint32_t getDepthOutputMode() const { return DepthOutputMode; }
+  bool usedClipDistance() const { return UsedClipDistance; }
+  bool usedCullDistance() const { return UsedCullDistance; }
 
 private:
+  bool UsedClipDistance = false;
+  bool UsedCullDistance = false;
   Module &M;
   LLVMContext &Ctx;
   Function *Entry;
@@ -2556,14 +2561,24 @@ void SPIRVLowerer::prepareStageInterface() {
       }
 
       SV.IsBoolBuiltIn = IsBoolBI;
+      SV.IsFlatFloatArray = (P.Kind == 6 || P.Kind == 7); // Clip/CullDistance
+      if (P.Kind == 6)
+        UsedClipDistance = true;
+      else if (P.Kind == 7)
+        UsedCullDistance = true;
       Type *ScalarTy =
           IsBoolBI ? static_cast<Type *>(Type::getInt1Ty(Ctx))
                    : getComponentLLVMType(P.Type);
       unsigned Cols = std::max(1u, P.Columns);
       unsigned Rows = std::max(1u, P.Rows);
-      Type *RowTy =
-          (Cols == 1) ? ScalarTy : FixedVectorType::get(ScalarTy, Cols);
-      Type *VarTy = (Rows == 1) ? RowTy : ArrayType::get(RowTy, Rows);
+      Type *VarTy = nullptr;
+      if (SV.IsFlatFloatArray) {
+        VarTy = ArrayType::get(ScalarTy, Rows * Cols);
+      } else {
+        Type *RowTy =
+            (Cols == 1) ? ScalarTy : FixedVectorType::get(ScalarTy, Cols);
+        VarTy = (Rows == 1) ? RowTy : ArrayType::get(RowTy, Rows);
+      }
       SV.VarTy = VarTy;
 
       std::string Name =
@@ -2656,7 +2671,19 @@ Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
   IRBuilder<> B(CI);
   Value *Ptr = SV.GV;
   Type *RowTy = SV.VarTy;
-  if (auto *AT = dyn_cast<ArrayType>(SV.VarTy)) {
+  if (SV.IsFlatFloatArray) {
+    unsigned Cols = std::max(1u, SV.Param->Columns);
+    unsigned Rows = std::max(1u, SV.Param->Rows);
+    Value *RowIdx = CI->getArgOperand(2);
+    Value *ColIdx = CI->getArgOperand(3);
+    if (ColIdx->getType() != B.getInt32Ty())
+      ColIdx = B.CreateZExtOrTrunc(ColIdx, B.getInt32Ty());
+    Value *FlatIdx =
+        (Rows == 1) ? ColIdx
+                    : B.CreateAdd(B.CreateMul(RowIdx, B.getInt32(Cols)), ColIdx);
+    Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, {B.getInt32(0), FlatIdx});
+    RowTy = cast<ArrayType>(SV.VarTy)->getElementType();
+  } else if (auto *AT = dyn_cast<ArrayType>(SV.VarTy)) {
     Value *RowIdx = CI->getArgOperand(2);
     Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, {B.getInt32(0), RowIdx});
     RowTy = AT->getElementType();
@@ -2696,13 +2723,27 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   Type *ElemTy = SV.VarTy;
   SmallVector<Value *, 3> Indices;
   Indices.push_back(B.getInt32(0));
-  if (auto *AT = dyn_cast<ArrayType>(ElemTy)) {
-    Indices.push_back(CI->getArgOperand(2));
-    ElemTy = AT->getElementType();
-  }
-  if (auto *VT = dyn_cast<FixedVectorType>(ElemTy)) {
-    Indices.push_back(CI->getArgOperand(3));
-    ElemTy = VT->getElementType();
+  if (SV.IsFlatFloatArray) {
+    unsigned Cols = std::max(1u, SV.Param->Columns);
+    unsigned Rows = std::max(1u, SV.Param->Rows);
+    Value *RowIdx = CI->getArgOperand(2);
+    Value *ColIdx = CI->getArgOperand(3);
+    if (ColIdx->getType() != B.getInt32Ty())
+      ColIdx = B.CreateZExtOrTrunc(ColIdx, B.getInt32Ty());
+    Value *FlatIdx =
+        (Rows == 1) ? ColIdx
+                    : B.CreateAdd(B.CreateMul(RowIdx, B.getInt32(Cols)), ColIdx);
+    Indices.push_back(FlatIdx);
+    ElemTy = cast<ArrayType>(ElemTy)->getElementType();
+  } else {
+    if (auto *AT = dyn_cast<ArrayType>(ElemTy)) {
+      Indices.push_back(CI->getArgOperand(2));
+      ElemTy = AT->getElementType();
+    }
+    if (auto *VT = dyn_cast<FixedVectorType>(ElemTy)) {
+      Indices.push_back(CI->getArgOperand(3));
+      ElemTy = VT->getElementType();
+    }
   }
   if (Indices.size() > 1)
     Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, Indices);
@@ -4359,6 +4400,57 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
 
   CodeGenPM.run(M);
   std::string Result(OutBuf.data(), OutBuf.size());
+
+  // Emit OpCapability ClipDistance (32) / CullDistance (33) when referenced
+  // by BuiltIn ClipDistance / CullDistance variables, as the LLVM SPIR-V
+  // backend does not always emit these capabilities automatically.
+  if (!Opts.EmitSPIRVAsm &&
+      (Lowerer.usedClipDistance() || Lowerer.usedCullDistance()) &&
+      Result.size() >= 20 && (Result.size() % 4) == 0) {
+    const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
+    size_t NumWords = Result.size() / 4;
+    if (Words[0] == 0x07230203u) {
+      constexpr uint16_t OpCapability = 17;
+      constexpr uint32_t CapClipDistance = 32;
+      constexpr uint32_t CapCullDistance = 33;
+      bool HasClip = false, HasCull = false;
+      size_t InsertPos = 5;
+      for (size_t I = 5; I < NumWords;) {
+        uint32_t WC = Words[I] >> 16;
+        uint16_t Op = Words[I] & 0xFFFFu;
+        if (WC == 0 || I + WC > NumWords)
+          break;
+        if (Op == OpCapability && WC == 2) {
+          if (Words[I + 1] == CapClipDistance)
+            HasClip = true;
+          if (Words[I + 1] == CapCullDistance)
+            HasCull = true;
+          InsertPos = I + WC;
+        } else {
+          break;
+        }
+        I += WC;
+      }
+      SmallVector<uint32_t, 4> ExtraCaps;
+      if (Lowerer.usedClipDistance() && !HasClip) {
+        ExtraCaps.push_back((2u << 16) | OpCapability);
+        ExtraCaps.push_back(CapClipDistance);
+      }
+      if (Lowerer.usedCullDistance() && !HasCull) {
+        ExtraCaps.push_back((2u << 16) | OpCapability);
+        ExtraCaps.push_back(CapCullDistance);
+      }
+      if (!ExtraCaps.empty()) {
+        std::vector<uint32_t> Patched;
+        Patched.reserve(NumWords + ExtraCaps.size());
+        Patched.insert(Patched.end(), Words, Words + InsertPos);
+        Patched.insert(Patched.end(), ExtraCaps.begin(), ExtraCaps.end());
+        Patched.insert(Patched.end(), Words + InsertPos, Words + NumWords);
+        Result.assign(reinterpret_cast<const char *>(Patched.data()),
+                      Patched.size() * 4);
+      }
+    }
+  }
 
   // Rewrite sentinel __crucible_spv_arraylength.*, __crucible_spv_cmpxchg.*,
   // and __crucible_spv_img_{atomic,cmpxchg}.* calls into native SPIR-V
