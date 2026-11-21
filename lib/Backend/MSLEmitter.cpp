@@ -6664,8 +6664,83 @@ Expected<std::string> Emitter::run() {
 
 } // namespace
 
+static void scalarizeEmulatedF64Vectors(mlir::func::FuncOp Entry) {
+  auto isF64Vec = [](mlir::Type T) {
+    auto VT = mlir::dyn_cast<mlir::VectorType>(T);
+    return VT && !VT.isScalable() && VT.getRank() == 1 &&
+           VT.getElementType().isF64();
+  };
+  SmallVector<mlir::Operation *, 32> Worklist;
+  Entry.walk([&](mlir::Operation *Op) {
+    if (Op->getNumResults() != 1 || Op->getNumRegions() != 0)
+      return;
+    auto ResVT = mlir::dyn_cast<mlir::VectorType>(Op->getResult(0).getType());
+    if (!ResVT || ResVT.isScalable() || ResVT.getRank() != 1)
+      return;
+    bool TouchesF64 = isF64Vec(ResVT);
+    if (!TouchesF64) {
+      for (mlir::Value V : Op->getOperands())
+        if (isF64Vec(V.getType()))
+          TouchesF64 = true;
+    }
+    if (!TouchesF64)
+      return;
+    if (mlir::isa<mlir::LLVM::FAddOp, mlir::LLVM::FSubOp, mlir::LLVM::FMulOp,
+                  mlir::LLVM::FDivOp, mlir::LLVM::FNegOp, mlir::LLVM::FCmpOp,
+                  mlir::LLVM::FAbsOp, mlir::math::AbsFOp, mlir::LLVM::SqrtOp,
+                  mlir::math::SqrtOp, mlir::LLVM::FFloorOp, mlir::math::FloorOp,
+                  mlir::LLVM::FCeilOp, mlir::math::CeilOp, mlir::LLVM::FTruncOp,
+                  mlir::math::TruncOp, mlir::LLVM::RoundEvenOp,
+                  mlir::LLVM::RintOp, mlir::math::RoundEvenOp,
+                  mlir::LLVM::MinNumOp, mlir::LLVM::MinimumOp,
+                  mlir::LLVM::MaxNumOp, mlir::LLVM::MaximumOp,
+                  mlir::LLVM::FMAOp, mlir::LLVM::FMulAddOp, mlir::math::FmaOp,
+                  mlir::math::IsNaNOp, mlir::math::IsInfOp,
+                  mlir::math::IsFiniteOp, mlir::LLVM::FPExtOp,
+                  mlir::LLVM::FPTruncOp, mlir::LLVM::SIToFPOp,
+                  mlir::LLVM::UIToFPOp, mlir::LLVM::FPToSIOp,
+                  mlir::LLVM::FPToUIOp, ir::FrcOp>(Op))
+      Worklist.push_back(Op);
+  });
+
+  mlir::Type I32Ty = mlir::IntegerType::get(Entry.getContext(), 32);
+  for (mlir::Operation *Op : Worklist) {
+    mlir::OpBuilder B(Op);
+    mlir::Location Loc = Op->getLoc();
+    auto ResVT = mlir::cast<mlir::VectorType>(Op->getResult(0).getType());
+    int64_t N = ResVT.getNumElements();
+    mlir::Type ScalarResTy = ResVT.getElementType();
+    mlir::Value Acc = mlir::LLVM::UndefOp::create(B, Loc, ResVT);
+    for (int64_t I = 0; I < N; ++I) {
+      auto IdxC = mlir::LLVM::ConstantOp::create(
+          B, Loc, I32Ty, static_cast<int32_t>(I));
+      SmallVector<mlir::Value, 4> ScalarOperands;
+      for (mlir::Value Operand : Op->getOperands()) {
+        if (auto OVT = mlir::dyn_cast<mlir::VectorType>(Operand.getType());
+            OVT && OVT.getNumElements() == N) {
+          ScalarOperands.push_back(
+              mlir::LLVM::ExtractElementOp::create(B, Loc, Operand, IdxC));
+        } else {
+          ScalarOperands.push_back(Operand);
+        }
+      }
+      mlir::OperationState State(Loc, Op->getName());
+      State.addOperands(ScalarOperands);
+      State.addTypes(ScalarResTy);
+      State.addAttributes(Op->getAttrs());
+      mlir::Operation *ScalarOp = B.create(State);
+      Acc = mlir::LLVM::InsertElementOp::create(
+          B, Loc, Acc, ScalarOp->getResult(0), IdxC);
+    }
+    Op->getResult(0).replaceAllUsesWith(Acc);
+    Op->erase();
+  }
+}
+
 Expected<std::string> emitMSL(mlir::func::FuncOp Entry, Reflection &R,
                               const Options &Opts) {
+  if (Opts.EmulateF64)
+    scalarizeEmulatedF64Vectors(Entry);
   return Emitter(Entry, R, Opts).run();
 }
 
