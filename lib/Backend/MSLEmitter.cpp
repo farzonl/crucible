@@ -2133,12 +2133,18 @@ Error Emitter::collectGroupshared() {
       continue;
     mlir::Type T = G.getGlobalType();
     uint64_t N = 1;
+    uint64_t VecN = 0;
     mlir::Type Elem = T;
     bool IsArray = false;
     if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(T)) {
       N = Arr.getNumElements();
       Elem = Arr.getElementType();
       IsArray = true;
+      if (auto Vec = mlir::dyn_cast<mlir::VectorType>(Elem);
+          Vec && !Vec.isScalable() && Vec.getRank() == 1) {
+        VecN = Vec.getNumElements();
+        Elem = Vec.getElementType();
+      }
     } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(T)) {
       if (!Vec.isScalable() && Vec.getRank() == 1) {
         N = Vec.getNumElements();
@@ -2157,7 +2163,8 @@ Error Emitter::collectGroupshared() {
     GlobalNames[G] = Name;
     GlobalTypes[G] = *ETy;
     GroupsharedDecls += "  threadgroup " + *ETy + " " + Name +
-                        (IsArray ? "[" + std::to_string(N) + "]" : "") + ";\n";
+                        (IsArray ? "[" + std::to_string(N) + "]" : "") +
+                        (VecN ? "[" + std::to_string(VecN) + "]" : "") + ";\n";
   }
   return Error::success();
 }
@@ -2977,6 +2984,22 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
       } else if (auto AL = Load.getAddr().getDefiningOp<mlir::LLVM::AllocaOp>();
                  AL && mlir::isa<mlir::VectorType>(AL.getElemType())) {
         BaseName = ValueNames.lookup(AL.getResult());
+      } else if (auto GEP = Load.getAddr().getDefiningOp<mlir::LLVM::GEPOp>()) {
+        if (auto AO = GEP.getBase().getDefiningOp<mlir::LLVM::AddressOfOp>()) {
+          auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+          if (auto G = Mod.lookupSymbol<mlir::LLVM::GlobalOp>(
+                  AO.getGlobalNameAttr());
+              G && G.getAddrSpace() == 3) {
+            if (auto Arr =
+                    mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(G.getGlobalType());
+                Arr && mlir::isa<mlir::VectorType>(Arr.getElementType())) {
+              auto LV = lvalueFor(Load.getAddr());
+              if (!LV)
+                return LV.takeError();
+              BaseName = LV->Text;
+            }
+          }
+        }
       }
       if (!BaseName.empty()) {
         auto VTy = mslType(VecTy);
@@ -5832,6 +5855,25 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
               line(Ind, BaseName + "[" + std::to_string(I) + "] = (" + V->Text +
                             ")[" + std::to_string(I) + "];");
             return Error::success();
+          }
+        }
+      }
+    } else if (auto GEP = Store.getAddr().getDefiningOp<mlir::LLVM::GEPOp>()) {
+      if (auto AO = GEP.getBase().getDefiningOp<mlir::LLVM::AddressOfOp>()) {
+        auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
+        if (auto G = Mod.lookupSymbol<mlir::LLVM::GlobalOp>(
+                AO.getGlobalNameAttr());
+            G && G.getAddrSpace() == 3) {
+          if (auto Arr =
+                  mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(G.getGlobalType());
+              Arr && mlir::isa<mlir::VectorType>(Arr.getElementType())) {
+            if (auto ValVec = mlir::dyn_cast<mlir::VectorType>(
+                    Store.getValue().getType())) {
+              for (int64_t I = 0; I < ValVec.getNumElements(); ++I)
+                line(Ind, LV->Text + "[" + std::to_string(I) + "] = (" +
+                              V->Text + ")[" + std::to_string(I) + "];");
+              return Error::success();
+            }
           }
         }
       }
