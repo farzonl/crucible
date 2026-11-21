@@ -1096,6 +1096,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
                (Input.SemanticIndex == 0 &&
                 StringRef(A.Name).equals_insensitive(Input.Semantic));
       });
+      if (Attr == B.VertexAttributes.end() && UseVulkanBinding &&
+          Input.ID < B.VertexAttributes.size())
+        Attr = B.VertexAttributes.begin() + Input.ID;
       if (Attr == B.VertexAttributes.end() || Input.ID >= 31 ||
           Attr->Channels < 1 || Attr->Channels > 4 || Attr->Offset < 0 ||
           static_cast<size_t>(Attr->Offset) + Attr->size() > Stride)

@@ -1220,7 +1220,10 @@ Expected<std::string> Emitter::stageStruct(bool Input) {
             "sample_perspective", "sample_no_perspective"};
         if (P.Interpolation >= std::size(Modes))
           return makeError("unsupported interpolation for '{0}'", P.Semantic);
-        if (P.Interpolation != 0)
+        if (Type == "int" || Type == "uint" || Type == "short" ||
+            Type == "ushort")
+          RowAttr += ", flat";
+        else if (P.Interpolation != 0)
           RowAttr += std::string(", ") + Modes[P.Interpolation];
       }
       OS << "  " << Type;

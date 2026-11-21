@@ -810,19 +810,45 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         }
         SmallVector<mlir::Operation *, 4> Extracts(Load->getUsers().begin(),
                                                    Load->getUsers().end());
+        bool AllSingleExtracts = !Extracts.empty();
         for (mlir::Operation *EU : Extracts) {
           auto Extract = mlir::dyn_cast<mlir::spirv::CompositeExtractOp>(EU);
-          if (!Extract || Extract.getIndices().size() != 1)
-            return makeError("unsupported extract on built-in '{0}'", Sym);
-          uint32_t Comp = static_cast<uint32_t>(
-              mlir::cast<mlir::IntegerAttr>(Extract.getIndices()[0]).getInt());
-          mlir::OpBuilder B(Extract);
-          mlir::Value Rep =
-              emitGPUIdComponent(B, Extract.getLoc(), BI, Comp, Extract.getType());
-          if (!Rep)
-            return makeError("unsupported SPIR-V built-in '{0}'", Sym);
-          Extract.replaceAllUsesWith(Rep);
-          Extract.erase();
+          if (!Extract || Extract.getIndices().size() != 1) {
+            AllSingleExtracts = false;
+            break;
+          }
+        }
+        if (AllSingleExtracts) {
+          for (mlir::Operation *EU : Extracts) {
+            auto Extract = mlir::cast<mlir::spirv::CompositeExtractOp>(EU);
+            uint32_t Comp = static_cast<uint32_t>(
+                mlir::cast<mlir::IntegerAttr>(Extract.getIndices()[0]).getInt());
+            mlir::OpBuilder B(Extract);
+            mlir::Value Rep = emitGPUIdComponent(B, Extract.getLoc(), BI, Comp,
+                                                 Extract.getType());
+            if (!Rep)
+              return makeError("unsupported SPIR-V built-in '{0}'", Sym);
+            Extract.replaceAllUsesWith(Rep);
+            Extract.erase();
+          }
+        } else if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(Load.getType())) {
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          mlir::Type SignlessVecTy = makeSignless(VecTy, B);
+          mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+          for (int64_t C = 0; C < VecTy.getNumElements(); ++C) {
+            mlir::Value CompVal = emitGPUIdComponent(
+                B, Loc, BI, static_cast<uint32_t>(C), VecTy.getElementType());
+            if (!CompVal)
+              return makeError("unsupported SPIR-V built-in '{0}'", Sym);
+            CompVal = castToSignless(B, Loc, CompVal);
+            auto IdxC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(C));
+            Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, CompVal, IdxC);
+          }
+          Load.replaceAllUsesWith(castFromSignless(B, Loc, Vec, Load.getType()));
+        } else {
+          return makeError("unsupported extract on built-in '{0}'", Sym);
         }
         if (!Load->use_empty())
           return makeError("unhandled vector use of built-in '{0}'", Sym);
@@ -1313,10 +1339,10 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
         } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(U)) {
           mlir::OpBuilder B(Store);
           mlir::Location Loc = Store.getLoc();
-          mlir::Value Val = Store.getValue();
+          mlir::Value Val = castToSignless(B, Loc, Store.getValue());
           auto VecTy = mlir::dyn_cast<mlir::VectorType>(Val.getType());
           mlir::Type ElemTy =
-              makeSignless(VecTy ? VecTy.getElementType() : Val.getType(), B);
+              VecTy ? VecTy.getElementType() : Val.getType();
           auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
 
           if (!VecTy) {
@@ -1324,8 +1350,10 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                       RowC, static_cast<int8_t>(0), Val);
           } else {
             for (unsigned C = 0; C < Info.Columns; ++C) {
-              auto Lane = mlir::spirv::CompositeExtractOp::create(
-                  B, Loc, ElemTy, Val, B.getI32ArrayAttr({static_cast<int32_t>(C)}));
+              auto IdxC = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(C));
+              auto Lane = mlir::LLVM::ExtractElementOp::create(
+                  B, Loc, Val, IdxC);
               ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
                                         RowC, static_cast<int8_t>(C),
                                         Lane.getResult());
