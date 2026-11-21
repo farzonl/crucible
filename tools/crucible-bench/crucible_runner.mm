@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bench_types.h"
+#include "metal_helpers.h"
 #include "crucible/Compiler.h"
 
 #include "llvm/Support/Error.h"
@@ -26,22 +27,6 @@
 namespace crucible_bench {
 
 namespace {
-
-inline double measureCmdMs(id<MTLCommandBuffer> cmdBuf,
-                           std::chrono::steady_clock::time_point s0,
-                           std::chrono::steady_clock::time_point s1) {
-  double gpuMs = (cmdBuf.GPUEndTime - cmdBuf.GPUStartTime) * 1000.0;
-  if (gpuMs > 0.0)
-    return gpuMs;
-  return std::chrono::duration<double, std::milli>(s1 - s0).count();
-}
-
-template <typename Fn>
-inline void runWarmup(uint32_t minIters, Fn &&fn) {
-  double elapsedMs = 0.0;
-  for (uint32_t i = 0; i < minIters || (elapsedMs < 8.0 && i < 64); ++i)
-    elapsedMs += fn();
-}
 
 struct CompiledCrucibleStage {
   id<MTLLibrary> lib = nil;
@@ -709,9 +694,8 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
     }
     res.backend =
         std::string("Metal (crucible): ") + [[device name] UTF8String];
-    if (![device respondsToSelector:@selector
-                 (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)]) {
-      res.status = "UNSUPPORTED (no Metal Mesh Shader)";
+    if (!deviceSupportsMeshShaders(device)) {
+      res.status = "SKIPPED (no Metal Mesh Shader support on this GPU)";
       return res;
     }
 
@@ -800,6 +784,10 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
 
       id<MTLRenderCommandEncoder> enc =
           [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+      if (!encoderSupportsMeshShaders(enc)) {
+        [enc endEncoding];
+        return -1.0;
+      }
       [enc setRenderPipelineState:pso];
       [enc setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(rw),
                                      static_cast<double>(rh), 0.0, 1.0}];
@@ -820,6 +808,11 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
     };
 
     res.firstDispatchMs = drawOnce(128);
+    if (res.firstDispatchMs < 0.0) {
+      res.firstDispatchMs = 0.0;
+      res.status = "SKIPPED (no Metal Mesh Shader encoder on this GPU)";
+      return res;
+    }
     runWarmup(warmup, [&]() { return drawOnce(128); });
     std::vector<double> samples;
     samples.reserve(iters);

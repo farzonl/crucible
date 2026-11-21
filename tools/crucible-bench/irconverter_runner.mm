@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bench_types.h"
+#include "metal_helpers.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -26,22 +27,6 @@
 namespace crucible_bench {
 
 namespace {
-
-inline double measureCmdMs(id<MTLCommandBuffer> cmdBuf,
-                           std::chrono::steady_clock::time_point s0,
-                           std::chrono::steady_clock::time_point s1) {
-  double gpuMs = (cmdBuf.GPUEndTime - cmdBuf.GPUStartTime) * 1000.0;
-  if (gpuMs > 0.0)
-    return gpuMs;
-  return std::chrono::duration<double, std::milli>(s1 - s0).count();
-}
-
-template <typename Fn>
-inline void runWarmup(uint32_t minIters, Fn &&fn) {
-  double elapsedMs = 0.0;
-  for (uint32_t i = 0; i < minIters || (elapsedMs < 8.0 && i < 64); ++i)
-    elapsedMs += fn();
-}
 
 #if defined(CRUCIBLE_HAS_METAL_IRCONVERTER)
 struct CompiledIRStage {
@@ -479,6 +464,10 @@ MetalBenchResult runIRConverterGraphicsBench(
     const bool hasTess = (!hsDxil.empty() && !dsDxil.empty());
     const bool hasGS = !gsDxil.empty();
     const bool useEmulation = hasTess || hasGS;
+    if (useEmulation && !deviceSupportsMeshShaders(device)) {
+      res.status = "SKIPPED (no Metal Mesh Shader support on this GPU)";
+      return res;
+    }
 #if !defined(IR_VERSION_MAJOR) || (IR_VERSION_MAJOR < 3)
     if (useEmulation) {
       res.status = "SKIPPED (Metal IRConverter < 3.0)";
@@ -963,6 +952,10 @@ MetalBenchResult runIRConverterGraphicsBench(
         }
       } else {
 #if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
+        if (!encoderSupportsMeshShaders(enc)) {
+          [enc endEncoding];
+          return -1.0;
+        }
         [enc useResource:cbBuf
                    usage:MTLResourceUsageRead
                   stages:MTLRenderStageObject | MTLRenderStageMesh |
@@ -1000,6 +993,11 @@ MetalBenchResult runIRConverterGraphicsBench(
     getGfxParams(1, rw, rh, vc);
 
     res.firstDispatchMs = drawOnce(1, rw, rh, vc);
+    if (res.firstDispatchMs < 0.0) {
+      res.firstDispatchMs = 0.0;
+      res.status = "SKIPPED (no Metal Mesh Shader encoder on this GPU)";
+      return res;
+    }
     runWarmup(warmup, [&]() { return drawOnce(1, rw, rh, vc); });
 
     std::vector<double> samples;
@@ -1056,9 +1054,8 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
     }
     res.backend =
         std::string("Metal (IRConverter): ") + [[device name] UTF8String];
-    if (![device respondsToSelector:@selector
-                 (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)]) {
-      res.status = "UNSUPPORTED (no Metal Mesh Shader)";
+    if (!deviceSupportsMeshShaders(device)) {
+      res.status = "SKIPPED (no Metal Mesh Shader support on this GPU)";
       return res;
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -1155,6 +1152,10 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
 
       id<MTLRenderCommandEncoder> enc =
           [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+      if (!encoderSupportsMeshShaders(enc)) {
+        [enc endEncoding];
+        return -1.0;
+      }
       [enc setRenderPipelineState:pso];
       MTLViewport vp{0.0, 0.0, static_cast<double>(rw),
                      static_cast<double>(rh), 0.0, 1.0};
@@ -1175,6 +1176,11 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
     };
 
     res.firstDispatchMs = drawOnce(128);
+    if (res.firstDispatchMs < 0.0) {
+      res.firstDispatchMs = 0.0;
+      res.status = "SKIPPED (no Metal Mesh Shader encoder on this GPU)";
+      return res;
+    }
     runWarmup(warmup, [&]() { return drawOnce(128); });
     std::vector<double> samples;
     samples.reserve(iters);
