@@ -26,8 +26,10 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
@@ -204,11 +206,19 @@ public:
   bool usedClipDistance() const { return UsedClipDistance; }
   bool usedCullDistance() const { return UsedCullDistance; }
   bool usedCubeArray() const { return UsedCubeArray; }
+  bool usedViewportIndex() const { return UsedViewportIndex; }
+  bool usedShaderViewportIndex() const { return UsedShaderViewportIndex; }
+  bool usedStencilExport() const { return UsedStencilExport; }
+  bool usedRuntimeDescriptorArray() const { return UsedRuntimeDescriptorArray; }
 
 private:
   bool UsedClipDistance = false;
   bool UsedCullDistance = false;
   bool UsedCubeArray = false;
+  bool UsedViewportIndex = false;
+  bool UsedShaderViewportIndex = false;
+  bool UsedStencilExport = false;
+  bool UsedRuntimeDescriptorArray = false;
   Module &M;
   LLVMContext &Ctx;
   Function *Entry;
@@ -646,10 +656,13 @@ Error SPIRVLowerer::lowerBindResource(CallInst *CI) {
   GlobalVariable *NameGV = getOrCreateResourceName(*RB);
   Function *HandleFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
+  uint32_t SpvRangeSize = (RB->RangeSize == 0xFFFFFFFFu) ? 0u : RB->RangeSize;
+  if (SpvRangeSize == 0u)
+    UsedRuntimeDescriptorArray = true;
   Value *SpvHandle =
       B.CreateCall(HandleFn, {B.getInt32(RB->SPIRVSet),
                               B.getInt32(RB->SPIRVBinding),
-                              B.getInt32(RB->RangeSize), ArrIdx, NameGV});
+                              B.getInt32(SpvRangeSize), ArrIdx, NameGV});
   HandleMap[CI] = ResolvedHandle{RB, SpvHandle, ResTy, ArrIdx};
   return Error::success();
 }
@@ -749,10 +762,11 @@ Error SPIRVLowerer::lowerHeapResource(CallInst *CI) {
   GlobalVariable *NameGV = getOrCreateResourceName(*RBPtr);
   Function *HandleFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_resource_handlefrombinding, {ResTy});
+  UsedRuntimeDescriptorArray = true;
   Value *SpvHandle =
       B.CreateCall(HandleFn, {B.getInt32(RBPtr->SPIRVSet),
                               B.getInt32(RBPtr->SPIRVBinding),
-                              B.getInt32(0xFFFFFFFFu), Idx, NameGV});
+                              B.getInt32(0u), Idx, NameGV});
   HandleMap[CI] = ResolvedHandle{RBPtr, SpvHandle, ResTy};
   return Error::success();
 }
@@ -983,10 +997,12 @@ Error SPIRVLowerer::lowerBufferUpdateCounter(CallInst *CI) {
   Function *HandleFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_resource_handlefrombinding, {CounterTy});
   Value *CounterIdx = RH.ArrIdx ? RH.ArrIdx : B.getInt32(0);
+  uint32_t SpvCounterRange =
+      (RH.RB->RangeSize == 0xFFFFFFFFu) ? 0u : RH.RB->RangeSize;
   Value *CounterH = B.CreateCall(
       HandleFn,
       {B.getInt32(RH.RB->SPIRVSet), B.getInt32(RH.RB->CounterSPIRVBinding),
-       B.getInt32(RH.RB->RangeSize), CounterIdx, NameGV});
+       B.getInt32(SpvCounterRange), CounterIdx, NameGV});
   PointerType *BufPtrTy = PointerType::get(Ctx, 11);
   Function *GetPtrFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_resource_getpointer,
@@ -2534,6 +2550,10 @@ void SPIRVLowerer::prepareStageInterface() {
         break;
       case 5: // ViewPortArrayIndex
         BuiltIn = 10; // ViewportIndex
+        UsedViewportIndex = true;
+        if (IsOutput && (Reflect.Stage == ShaderStage::Vertex ||
+                         Reflect.Stage == ShaderStage::Domain))
+          UsedShaderViewportIndex = true;
         break;
       case 6: // ClipDistance
         BuiltIn = 3;
@@ -2568,6 +2588,11 @@ void SPIRVLowerer::prepareStageInterface() {
         BuiltIn = 22; // FragDepth
         if (IsOutput)
           DepthOutputMode = 2u;
+        break;
+      case 20: // StencilRef
+        BuiltIn = 5014; // FragStencilRefEXT
+        if (IsOutput)
+          UsedStencilExport = true;
         break;
       default:
         break;
@@ -2606,6 +2631,9 @@ void SPIRVLowerer::prepareStageInterface() {
 
       if (BuiltIn) {
         SV.Decorations.push_back({11u /* BuiltIn */, *BuiltIn});
+        if (Reflect.Stage == ShaderStage::Pixel && !IsOutput &&
+            (*BuiltIn == 9u /* Layer */ || *BuiltIn == 10u /* ViewportIndex */))
+          SV.Decorations.push_back({14u /* Flat */});
       } else if (P.Kind == 16 /* Target */) {
         SV.Decorations.push_back({30u /* Location */, P.SemanticIndex});
       } else {
@@ -3444,8 +3472,10 @@ Error SPIRVLowerer::run() {
                         RC, static_cast<uint32_t>(SpaceC->getZExtValue()),
                         static_cast<uint32_t>(BindC->getZExtValue()));
           if (RB && RB->Kind != ResourceKind::RawBuffer &&
-              RB->Kind != ResourceKind::StructuredBuffer)
+              RB->Kind != ResourceKind::StructuredBuffer) {
             AtomicImageBindings.insert(RB);
+            const_cast<ResourceBinding *>(RB)->RequiresTextureAtomics = true;
+          }
         }
       }
     }
@@ -4397,6 +4427,90 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
   if (Error E = Lowerer.run())
     return std::move(E);
 
+  // Nest multi-way shared merge blocks (e.g., if/else-if/else chains whose
+  // arms all branch directly to a common outer merge block). LLVM's
+  // SPIRVStructurizer can otherwise produce invalid selection exits
+  // (%_new_exit* escaping an enclosing OpSelectionMerge).
+  auto nestSharedMergeBlocks = [](Function &F) {
+    bool Changed = true;
+    unsigned MergeCounter = 0;
+    while (Changed) {
+      Changed = false;
+      DominatorTree DT(F);
+      for (BasicBlock &M : F) {
+        if (pred_size(&M) <= 2)
+          continue;
+        DomTreeNode *MN = DT.getNode(&M);
+        if (!MN || !MN->getIDom())
+          continue;
+        BasicBlock *DomM = MN->getIDom()->getBlock();
+
+        // Collect predecessors that unconditionally branch to M and are
+        // dominated by DomM (excluding backedges from M's own subtree).
+        SmallVector<BasicBlock *, 8> UncondPreds;
+        for (BasicBlock *P : predecessors(&M)) {
+          auto *BI = dyn_cast<UncondBrInst>(P->getTerminator());
+          if (!BI || BI->getSuccessor(0) != &M)
+            continue;
+          if (!DT.isReachableFromEntry(P) || DT.dominates(&M, P))
+            continue;
+          UncondPreds.push_back(P);
+        }
+        if (UncondPreds.size() < 2)
+          continue;
+
+        // Pick a pair (P1, P2) whose nearest common dominator NCD is strictly
+        // dominated by DomM, preferring the deepest NCD in the domtree.
+        BasicBlock *BestP1 = nullptr, *BestP2 = nullptr;
+        unsigned BestDepth = 0;
+        for (size_t I = 0; I < UncondPreds.size(); ++I) {
+          for (size_t J = I + 1; J < UncondPreds.size(); ++J) {
+            BasicBlock *P1 = UncondPreds[I];
+            BasicBlock *P2 = UncondPreds[J];
+            if (P1 == P2)
+              continue;
+            BasicBlock *NCD = DT.findNearestCommonDominator(P1, P2);
+            if (!NCD || NCD == DomM || !DT.dominates(DomM, NCD))
+              continue;
+            unsigned Depth = DT.getNode(NCD)->getLevel();
+            if (!BestP1 || Depth > BestDepth) {
+              BestP1 = P1;
+              BestP2 = P2;
+              BestDepth = Depth;
+            }
+          }
+        }
+        if (!BestP1)
+          continue;
+
+        BasicBlock *Mid = BasicBlock::Create(
+            F.getContext(), "spv.merge." + std::to_string(MergeCounter++), &F,
+            &M);
+        IRBuilder<> MB(Mid);
+        for (PHINode &PN : M.phis()) {
+          int I1 = PN.getBasicBlockIndex(BestP1);
+          int I2 = PN.getBasicBlockIndex(BestP2);
+          if (I1 < 0 || I2 < 0)
+            continue;
+          Value *V1 = PN.getIncomingValue(I1);
+          Value *V2 = PN.getIncomingValue(I2);
+          PHINode *MidPN = MB.CreatePHI(PN.getType(), 2, PN.getName() + ".m");
+          MidPN->addIncoming(V1, BestP1);
+          MidPN->addIncoming(V2, BestP2);
+          PN.removeIncomingValue(BestP1, false);
+          PN.removeIncomingValue(BestP2, false);
+          PN.addIncoming(MidPN, Mid);
+        }
+        MB.CreateBr(&M);
+        cast<UncondBrInst>(BestP1->getTerminator())->setSuccessor(0, Mid);
+        cast<UncondBrInst>(BestP2->getTerminator())->setSuccessor(0, Mid);
+        Changed = true;
+        break;
+      }
+    }
+  };
+  nestSharedMergeBlocks(*Entry);
+
   std::string VerifyErr;
   raw_string_ostream VerifyOS(VerifyErr);
   if (verifyModule(M, &VerifyOS))
@@ -4414,51 +4528,88 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
   CodeGenPM.run(M);
   std::string Result(OutBuf.data(), OutBuf.size());
 
-  // Emit OpCapability ClipDistance (32) / CullDistance (33) when referenced
-  // by BuiltIn ClipDistance / CullDistance variables, as the LLVM SPIR-V
-  // backend does not always emit these capabilities automatically.
+  // Emit missing SPIR-V capabilities and extensions when referenced by BuiltIn
+  // variables (ClipDistance, CullDistance, ViewportIndex, FragStencilRefEXT),
+  // as the LLVM SPIR-V backend does not always emit them automatically.
   if (!Opts.EmitSPIRVAsm &&
-      (Lowerer.usedClipDistance() || Lowerer.usedCullDistance()) &&
+      (Lowerer.usedClipDistance() || Lowerer.usedCullDistance() ||
+       Lowerer.usedViewportIndex() || Lowerer.usedShaderViewportIndex() ||
+       Lowerer.usedStencilExport() || Lowerer.usedRuntimeDescriptorArray()) &&
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
     if (Words[0] == 0x07230203u) {
+      constexpr uint16_t OpExtension = 10;
       constexpr uint16_t OpCapability = 17;
       constexpr uint32_t CapClipDistance = 32;
       constexpr uint32_t CapCullDistance = 33;
-      bool HasClip = false, HasCull = false;
-      size_t InsertPos = 5;
+      constexpr uint32_t CapMultiViewport = 57;
+      constexpr uint32_t CapStencilExportEXT = 5013;
+      constexpr uint32_t CapShaderViewportIndex = 70;
+      constexpr uint32_t CapRuntimeDescriptorArray = 5302;
+      bool HasClip = false, HasCull = false, HasMultiVP = false,
+           HasShaderVP = false, HasStencilExp = false, HasRuntimeDescArr = false;
+      size_t CapInsertPos = 5;
       for (size_t I = 5; I < NumWords;) {
         uint32_t WC = Words[I] >> 16;
         uint16_t Op = Words[I] & 0xFFFFu;
         if (WC == 0 || I + WC > NumWords)
           break;
         if (Op == OpCapability && WC == 2) {
-          if (Words[I + 1] == CapClipDistance)
-            HasClip = true;
-          if (Words[I + 1] == CapCullDistance)
-            HasCull = true;
-          InsertPos = I + WC;
+          uint32_t Cap = Words[I + 1];
+          if (Cap == CapClipDistance) HasClip = true;
+          if (Cap == CapCullDistance) HasCull = true;
+          if (Cap == CapMultiViewport) HasMultiVP = true;
+          if (Cap == CapShaderViewportIndex) HasShaderVP = true;
+          if (Cap == CapStencilExportEXT) HasStencilExp = true;
+          if (Cap == CapRuntimeDescriptorArray) HasRuntimeDescArr = true;
+          CapInsertPos = I + WC;
         } else {
           break;
         }
         I += WC;
       }
-      SmallVector<uint32_t, 4> ExtraCaps;
-      if (Lowerer.usedClipDistance() && !HasClip) {
+      SmallVector<uint32_t, 16> ExtraCaps;
+      auto pushCap = [&](uint32_t Cap) {
         ExtraCaps.push_back((2u << 16) | OpCapability);
-        ExtraCaps.push_back(CapClipDistance);
-      }
-      if (Lowerer.usedCullDistance() && !HasCull) {
-        ExtraCaps.push_back((2u << 16) | OpCapability);
-        ExtraCaps.push_back(CapCullDistance);
-      }
-      if (!ExtraCaps.empty()) {
+        ExtraCaps.push_back(Cap);
+      };
+      if (Lowerer.usedClipDistance() && !HasClip) pushCap(CapClipDistance);
+      if (Lowerer.usedCullDistance() && !HasCull) pushCap(CapCullDistance);
+      if (Lowerer.usedViewportIndex() && !HasMultiVP) pushCap(CapMultiViewport);
+      if (Lowerer.usedShaderViewportIndex() && !HasShaderVP)
+        pushCap(CapShaderViewportIndex);
+      if (Lowerer.usedStencilExport() && !HasStencilExp)
+        pushCap(CapStencilExportEXT);
+      if (Lowerer.usedRuntimeDescriptorArray() && !HasRuntimeDescArr)
+        pushCap(CapRuntimeDescriptorArray);
+
+      SmallVector<uint32_t, 16> ExtraExts;
+      auto pushExt = [&](StringRef Name) {
+        size_t StrBytes = Name.size() + 1;
+        size_t StrWords = (StrBytes + 3) / 4;
+        ExtraExts.push_back(
+            (static_cast<uint32_t>(1 + StrWords) << 16) | OpExtension);
+        for (size_t W = 0; W < StrWords; ++W) {
+          uint32_t Word = 0;
+          for (size_t B = 0; B < 4; ++B) {
+            size_t Idx = W * 4 + B;
+            uint8_t Ch = (Idx < Name.size()) ? static_cast<uint8_t>(Name[Idx]) : 0;
+            Word |= static_cast<uint32_t>(Ch) << (B * 8);
+          }
+          ExtraExts.push_back(Word);
+        }
+      };
+      if (Lowerer.usedStencilExport() && !HasStencilExp)
+        pushExt("SPV_EXT_shader_stencil_export");
+
+      if (!ExtraCaps.empty() || !ExtraExts.empty()) {
         std::vector<uint32_t> Patched;
-        Patched.reserve(NumWords + ExtraCaps.size());
-        Patched.insert(Patched.end(), Words, Words + InsertPos);
+        Patched.reserve(NumWords + ExtraCaps.size() + ExtraExts.size());
+        Patched.insert(Patched.end(), Words, Words + CapInsertPos);
         Patched.insert(Patched.end(), ExtraCaps.begin(), ExtraCaps.end());
-        Patched.insert(Patched.end(), Words + InsertPos, Words + NumWords);
+        Patched.insert(Patched.end(), ExtraExts.begin(), ExtraExts.end());
+        Patched.insert(Patched.end(), Words + CapInsertPos, Words + NumWords);
         Result.assign(reinterpret_cast<const char *>(Patched.data()),
                       Patched.size() * 4);
       }
@@ -4799,9 +4950,10 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       }
     }
   }
-  // Emit OpExecutionMode DepthReplacing / DepthGreater / DepthLess for PS
-  // shaders writing SV_Depth* (BuiltIn FragDepth).
-  if (!Opts.EmitSPIRVAsm && Lowerer.getDepthOutputMode() != 0 &&
+  // Emit OpExecutionMode DepthReplacing / DepthGreater / DepthLess /
+  // StencilRefReplacingEXT for PS shaders writing SV_Depth* / SV_StencilRef.
+  if (!Opts.EmitSPIRVAsm &&
+      (Lowerer.getDepthOutputMode() != 0 || Lowerer.usedStencilExport()) &&
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
@@ -4822,7 +4974,7 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       }
       if (EntryId != 0) {
         std::vector<uint32_t> Patched;
-        Patched.reserve(NumWords + 6);
+        Patched.reserve(NumWords + 9);
         for (size_t I = 0; I < 5; ++I)
           Patched.push_back(Words[I]);
         bool Inserted = false;
@@ -4835,18 +4987,26 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             Patched.push_back(Words[I + K]);
           if (!Inserted && Op == OpExecutionMode && WC >= 2 &&
               Words[I + 1] == EntryId) {
-            // OpExecutionMode %entry DepthReplacing (12)
-            Patched.push_back((3u << 16) | OpExecutionMode);
-            Patched.push_back(EntryId);
-            Patched.push_back(12u);
-            if (Lowerer.getDepthOutputMode() == 2u) {
+            if (Lowerer.getDepthOutputMode() != 0) {
+              // OpExecutionMode %entry DepthReplacing (12)
               Patched.push_back((3u << 16) | OpExecutionMode);
               Patched.push_back(EntryId);
-              Patched.push_back(14u); // DepthGreater
-            } else if (Lowerer.getDepthOutputMode() == 3u) {
+              Patched.push_back(12u);
+              if (Lowerer.getDepthOutputMode() == 2u) {
+                Patched.push_back((3u << 16) | OpExecutionMode);
+                Patched.push_back(EntryId);
+                Patched.push_back(14u); // DepthGreater
+              } else if (Lowerer.getDepthOutputMode() == 3u) {
+                Patched.push_back((3u << 16) | OpExecutionMode);
+                Patched.push_back(EntryId);
+                Patched.push_back(15u); // DepthLess
+              }
+            }
+            if (Lowerer.usedStencilExport()) {
+              // OpExecutionMode %entry StencilRefReplacingEXT (5027)
               Patched.push_back((3u << 16) | OpExecutionMode);
               Patched.push_back(EntryId);
-              Patched.push_back(15u); // DepthLess
+              Patched.push_back(5027u);
             }
             Inserted = true;
           }

@@ -301,17 +301,18 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       vkDestroyCommandPool(VK.Device, CmdPool, nullptr);
   };
 
-  using BufKey = std::tuple<CPUBuffer *, uint32_t, bool, bool>;
+  using BufKey = std::tuple<CPUBuffer *, uint32_t, bool, bool, bool>;
   std::map<BufKey, size_t> BufMap;
   using CounterKey = std::pair<CPUBuffer *, uint32_t>;
   std::map<CounterKey, size_t> CounterBufMap;
-  using ImgKey = std::pair<CPUBuffer *, uint32_t>;
+  using ImgKey = std::tuple<CPUBuffer *, uint32_t, bool>;
   std::map<ImgKey, size_t> ImgMap;
   std::map<YAMLSampler *, VkSampler> SamplerMap;
 
   auto getOrCreateBuffer = [&](CPUBuffer *CPU, uint32_t Slice, bool IsUniform,
-                               bool IsTyped, bool IsUAV) -> Expected<VkBufAlloc *> {
-    BufKey Key{CPU, Slice, IsUniform, IsTyped};
+                               bool IsTyped, bool IsUAV,
+                               bool RequiresAtomicUInt = false) -> Expected<VkBufAlloc *> {
+    BufKey Key{CPU, Slice, IsUniform, IsTyped, RequiresAtomicUInt};
     auto It = BufMap.find(Key);
     if (It != BufMap.end()) {
       AllBufs[It->second].IsUAV |= IsUAV;
@@ -373,6 +374,10 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       BVCI.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
       BVCI.buffer = A.Buffer;
       BVCI.format = vkFormatForBuffer(*CPU);
+      if (RequiresAtomicUInt &&
+          (BVCI.format == VK_FORMAT_R32_SFLOAT ||
+           BVCI.format == VK_FORMAT_R32_SINT))
+        BVCI.format = VK_FORMAT_R32_UINT;
       BVCI.offset = 0;
       BVCI.range = A.SizeBytes;
       if (VkResult R = vkCreateBufferView(VK.Device, &BVCI, nullptr, &A.View))
@@ -444,8 +449,9 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
   };
 
   auto getOrCreateImage = [&](CPUBuffer *CPU, uint32_t Slice, ResourceKind Kind,
-                              bool IsUAV) -> Expected<VkImgAlloc *> {
-    ImgKey Key{CPU, Slice};
+                              bool IsUAV,
+                              bool RequiresAtomicUInt = false) -> Expected<VkImgAlloc *> {
+    ImgKey Key{CPU, Slice, RequiresAtomicUInt};
     auto It = ImgMap.find(Key);
     if (It != ImgMap.end()) {
       AllImgs[It->second].IsUAV |= IsUAV;
@@ -519,6 +525,9 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       return std::move(MipErr);
 
     VkFormat Fmt = vkFormatForBuffer(*CPU);
+    if (RequiresAtomicUInt &&
+        (Fmt == VK_FORMAT_R32_SFLOAT || Fmt == VK_FORMAT_R32_SINT))
+      Fmt = VK_FORMAT_R32_UINT;
     bool IsDepth = (Fmt == VK_FORMAT_D32_SFLOAT);
     VkImageAspectFlags Aspect =
         IsDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -777,23 +786,19 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
         auto Class = classifyResource(Res.Kind);
         if (!Class || !Res.DXBinding)
           continue;
-        const auto *Match =
-            findReg(*Class, Res.DXBinding->Space, Res.DXBinding->Register);
-        if (!Match)
-          continue;
-        uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
-        uint32_t VkBind = Match->SPIRVBinding;
-
         if (Res.Kind == ResourceKind::Sampler) {
-          if (!Res.SamplerPtr)
+          const auto *Match =
+              findReg(*Class, Res.DXBinding->Space, Res.DXBinding->Register);
+          if (!Match || !Res.SamplerPtr)
             continue;
+          uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
           auto SampOrErr = getOrCreateSampler(Res.SamplerPtr);
           if (!SampOrErr) {
             vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
             cleanup();
             return SampOrErr.takeError();
           }
-          BoundList.push_back({Match->SPIRVSet, VkBind, SlotOffset,
+          BoundList.push_back({Match->SPIRVSet, Match->SPIRVBinding, SlotOffset,
                                VK_DESCRIPTOR_TYPE_SAMPLER, VK_NULL_HANDLE, 0,
                                VK_NULL_HANDLE, *SampOrErr});
           continue;
@@ -809,14 +814,23 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
         if (isTextureKind(Res.Kind)) {
           bool IsUAV = isUAVKind(Res.Kind);
           for (uint32_t Slice = 0; Slice < ArrayCount; ++Slice) {
-            auto ImgOrErr = getOrCreateImage(Res.BufferPtr, Slice, Res.Kind, IsUAV);
+            uint32_t SliceReg = Res.DXBinding->Register + Slice;
+            const auto *SliceMatch =
+                findReg(*Class, Res.DXBinding->Space, SliceReg);
+            if (!SliceMatch)
+              continue;
+            uint32_t ElemIdx = SliceReg - SliceMatch->LowerBound;
+            auto ImgOrErr = getOrCreateImage(Res.BufferPtr, Slice, Res.Kind,
+                                             IsUAV,
+                                             SliceMatch->RequiresTextureAtomics);
             if (!ImgOrErr) {
               vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
               cleanup();
               return ImgOrErr.takeError();
             }
             VkImgAlloc *IA = *ImgOrErr;
-            BoundList.push_back({Match->SPIRVSet, VkBind, SlotOffset + Slice,
+            BoundList.push_back({SliceMatch->SPIRVSet, SliceMatch->SPIRVBinding,
+                                 ElemIdx,
                                  IsUAV ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
                                        : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                                  VK_NULL_HANDLE, 0, VK_NULL_HANDLE,
@@ -834,18 +848,25 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
                                : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER)
                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         for (uint32_t Slice = 0; Slice < ArrayCount; ++Slice) {
-          auto BufOrErr =
-              getOrCreateBuffer(Res.BufferPtr, Slice, IsUniform, IsTyped, IsUAV);
+          uint32_t SliceReg = Res.DXBinding->Register + Slice;
+          const auto *SliceMatch =
+              findReg(*Class, Res.DXBinding->Space, SliceReg);
+          if (!SliceMatch)
+            continue;
+          uint32_t ElemIdx = SliceReg - SliceMatch->LowerBound;
+          auto BufOrErr = getOrCreateBuffer(Res.BufferPtr, Slice, IsUniform,
+                                            IsTyped, IsUAV,
+                                            SliceMatch->RequiresTextureAtomics);
           if (!BufOrErr) {
             vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
             cleanup();
             return BufOrErr.takeError();
           }
           VkBufAlloc *BA = *BufOrErr;
-          BoundList.push_back({Match->SPIRVSet, VkBind, SlotOffset + Slice, DT,
-                               BA->Buffer, BA->SizeBytes, BA->View,
+          BoundList.push_back({SliceMatch->SPIRVSet, SliceMatch->SPIRVBinding,
+                               ElemIdx, DT, BA->Buffer, BA->SizeBytes, BA->View,
                                VK_NULL_HANDLE});
-          if (Match->HasCounter) {
+          if (SliceMatch->HasCounter) {
             auto CntOrErr = getOrCreateCounterBuffer(Res.BufferPtr, Slice);
             if (!CntOrErr) {
               vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
@@ -853,8 +874,8 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
               return CntOrErr.takeError();
             }
             VkBufAlloc *CA = *CntOrErr;
-            BoundList.push_back({Match->SPIRVSet, Match->CounterSPIRVBinding,
-                                 SlotOffset + Slice,
+            BoundList.push_back({SliceMatch->SPIRVSet,
+                                 SliceMatch->CounterSPIRVBinding, ElemIdx,
                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, CA->Buffer,
                                  CA->SizeBytes, VK_NULL_HANDLE, VK_NULL_HANDLE});
           }
@@ -1514,9 +1535,9 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   uint32_t Stride = B.VertexBufferPtr ? static_cast<uint32_t>(B.VertexBufferPtr->Stride) : 0;
   if (!Stride)
     Stride = static_cast<uint32_t>(B.getVertexStride());
-  uint32_t VertexCount = 3;
+  uint32_t VertexCount = P.DispatchParameters.VertexCount.value_or(3u);
   if (B.VertexBufferPtr) {
-    if (Stride > 0)
+    if (Stride > 0 && !P.DispatchParameters.VertexCount)
       VertexCount = static_cast<uint32_t>(B.VertexBufferPtr->Size / Stride);
     if (Error E = allocHostBuf(B.VertexBufferPtr->Size,
                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -2305,15 +2326,35 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
   // Flip Vulkan viewport Y to match DirectX top-left clip-space convention.
-  VkViewport VP{0.0f, static_cast<float>(Height), static_cast<float>(Width),
-                -static_cast<float>(Height), 0.0f, 1.0f};
-  VkRect2D Scissor{{0, 0}, {Width, Height}};
+  std::vector<VkViewport> VPs;
+  for (const auto &VP : B.getViewports()) {
+    VPs.push_back({static_cast<float>(VP.X),
+                   static_cast<float>(VP.Y + VP.Height),
+                   static_cast<float>(VP.Width),
+                   -static_cast<float>(VP.Height),
+                   static_cast<float>(VP.MinDepth),
+                   static_cast<float>(VP.MaxDepth)});
+  }
+  if (VPs.empty()) {
+    VPs.push_back({0.0f, static_cast<float>(Height), static_cast<float>(Width),
+                   -static_cast<float>(Height), 0.0f, 1.0f});
+  }
+  std::vector<VkRect2D> Scissors;
+  for (const auto &Sc : B.getScissors()) {
+    Scissors.push_back(
+        {{static_cast<int32_t>(Sc.X), static_cast<int32_t>(Sc.Y)},
+         {static_cast<uint32_t>(Sc.Width), static_cast<uint32_t>(Sc.Height)}});
+  }
+  while (Scissors.size() < VPs.size()) {
+    Scissors.push_back(Scissors.empty() ? VkRect2D{{0, 0}, {Width, Height}}
+                                        : Scissors.back());
+  }
   VkPipelineViewportStateCreateInfo VPSCI{};
   VPSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-  VPSCI.viewportCount = 1;
-  VPSCI.pViewports = &VP;
-  VPSCI.scissorCount = 1;
-  VPSCI.pScissors = &Scissor;
+  VPSCI.viewportCount = static_cast<uint32_t>(VPs.size());
+  VPSCI.pViewports = VPs.data();
+  VPSCI.scissorCount = static_cast<uint32_t>(Scissors.size());
+  VPSCI.pScissors = Scissors.data();
 
   VkPipelineRasterizationStateCreateInfo RSCI{};
   RSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -2807,6 +2848,7 @@ createVulkanDevices(const DeviceConfig &Config) {
     EnabledDevExts.push_back("VK_KHR_fragment_shader_barycentric");
 
   VkPhysicalDeviceFeatures EnabledFeats{};
+  EnabledFeats.robustBufferAccess = SupportedFeats2.features.robustBufferAccess;
   EnabledFeats.shaderInt64 = SupportedFeats2.features.shaderInt64;
   EnabledFeats.shaderFloat64 = SupportedFeats2.features.shaderFloat64;
   EnabledFeats.shaderInt16 = SupportedFeats2.features.shaderInt16;
