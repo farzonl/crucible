@@ -6787,8 +6787,94 @@ static void scalarizeEmulatedF64Vectors(mlir::func::FuncOp Entry) {
   }
 }
 
+static void scalarizeVectorSubgroupOps(mlir::func::FuncOp Entry) {
+  auto isStaticVec = [](mlir::Type T) -> mlir::VectorType {
+    auto VT = mlir::dyn_cast<mlir::VectorType>(T);
+    if (VT && !VT.isScalable() && VT.getRank() == 1)
+      return VT;
+    return {};
+  };
+
+  SmallVector<mlir::Operation *, 16> Work;
+  Entry.walk([&](mlir::Operation *Op) {
+    if (auto Red = mlir::dyn_cast<mlir::gpu::SubgroupReduceOp>(Op)) {
+      if (isStaticVec(Red.getType()))
+        Work.push_back(Op);
+    } else if (auto BC = mlir::dyn_cast<mlir::gpu::SubgroupBroadcastOp>(Op)) {
+      if (isStaticVec(BC.getType()))
+        Work.push_back(Op);
+    } else if (auto Shuf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {
+      if (isStaticVec(Shuf.getShuffleResult().getType()))
+        Work.push_back(Op);
+    }
+  });
+
+  mlir::Type I32Ty = mlir::IntegerType::get(Entry.getContext(), 32);
+  for (mlir::Operation *Op : Work) {
+    mlir::OpBuilder B(Op);
+    mlir::Location Loc = Op->getLoc();
+    if (auto Red = mlir::dyn_cast<mlir::gpu::SubgroupReduceOp>(Op)) {
+      auto VecTy = mlir::cast<mlir::VectorType>(Red.getType());
+      mlir::Value Acc = mlir::LLVM::PoisonOp::create(B, Loc, VecTy);
+      auto ScanAttr = Red->getAttr("crucible.scan_kind");
+      for (int64_t I = 0; I < VecTy.getNumElements(); ++I) {
+        auto Idx = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                  static_cast<int32_t>(I));
+        auto Elem = mlir::LLVM::ExtractElementOp::create(B, Loc, Red.getValue(),
+                                                         Idx);
+        auto SRed = mlir::gpu::SubgroupReduceOp::create(
+            B, Loc, Elem, Red.getOp(), Red.getUniform());
+        if (ScanAttr)
+          SRed->setAttr("crucible.scan_kind", ScanAttr);
+        Acc = mlir::LLVM::InsertElementOp::create(B, Loc, Acc, SRed.getResult(),
+                                                  Idx);
+      }
+      Red.replaceAllUsesWith(Acc);
+      Red.erase();
+    } else if (auto BC = mlir::dyn_cast<mlir::gpu::SubgroupBroadcastOp>(Op)) {
+      auto VecTy = mlir::cast<mlir::VectorType>(BC.getType());
+      mlir::Value Acc = mlir::LLVM::PoisonOp::create(B, Loc, VecTy);
+      for (int64_t I = 0; I < VecTy.getNumElements(); ++I) {
+        auto Idx = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                  static_cast<int32_t>(I));
+        auto Elem =
+            mlir::LLVM::ExtractElementOp::create(B, Loc, BC.getSrc(), Idx);
+        mlir::Value IdxVal =
+            BC->getNumOperands() > 1 ? BC->getOperand(1) : mlir::Value();
+        auto SBC = mlir::gpu::SubgroupBroadcastOp::create(
+            B, Loc, Elem, IdxVal, BC.getBroadcastType());
+        Acc = mlir::LLVM::InsertElementOp::create(B, Loc, Acc, SBC.getResult(),
+                                                  Idx);
+      }
+      BC.replaceAllUsesWith(Acc);
+      BC.erase();
+    } else if (auto Shuf = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {
+      auto VecTy =
+          mlir::cast<mlir::VectorType>(Shuf.getShuffleResult().getType());
+      mlir::Value Acc = mlir::LLVM::PoisonOp::create(B, Loc, VecTy);
+      mlir::Value LastValid;
+      for (int64_t I = 0; I < VecTy.getNumElements(); ++I) {
+        auto Idx = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                  static_cast<int32_t>(I));
+        auto Elem =
+            mlir::LLVM::ExtractElementOp::create(B, Loc, Shuf.getValue(), Idx);
+        auto SShuf = mlir::gpu::ShuffleOp::create(
+            B, Loc, Elem, Shuf.getOffset(), Shuf.getWidth(), Shuf.getMode());
+        Acc = mlir::LLVM::InsertElementOp::create(
+            B, Loc, Acc, SShuf.getShuffleResult(), Idx);
+        LastValid = SShuf.getValid();
+      }
+      Shuf.getShuffleResult().replaceAllUsesWith(Acc);
+      if (LastValid)
+        Shuf.getValid().replaceAllUsesWith(LastValid);
+      Shuf.erase();
+    }
+  }
+}
+
 Expected<std::string> emitMSL(mlir::func::FuncOp Entry, Reflection &R,
                               const Options &Opts) {
+  scalarizeVectorSubgroupOps(Entry);
   if (Opts.EmulateF64)
     scalarizeEmulatedF64Vectors(Entry);
   return Emitter(Entry, R, Opts).run();
