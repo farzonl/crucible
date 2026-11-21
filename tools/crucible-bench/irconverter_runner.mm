@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "bench_types.h"
+#include "metal_helpers.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -26,22 +27,6 @@
 namespace crucible_bench {
 
 namespace {
-
-inline double measureCmdMs(id<MTLCommandBuffer> cmdBuf,
-                           std::chrono::steady_clock::time_point s0,
-                           std::chrono::steady_clock::time_point s1) {
-  double gpuMs = (cmdBuf.GPUEndTime - cmdBuf.GPUStartTime) * 1000.0;
-  if (gpuMs > 0.0)
-    return gpuMs;
-  return std::chrono::duration<double, std::milli>(s1 - s0).count();
-}
-
-template <typename Fn>
-inline void runWarmup(uint32_t minIters, Fn &&fn) {
-  double elapsedMs = 0.0;
-  for (uint32_t i = 0; i < minIters || (elapsedMs < 8.0 && i < 64); ++i)
-    elapsedMs += fn();
-}
 
 #if defined(CRUCIBLE_HAS_METAL_IRCONVERTER)
 struct CompiledIRStage {
@@ -158,18 +143,6 @@ bool compileDxilToMetalStage(id<MTLDevice> device,
   return out.fn != nil;
 }
 #endif
-
-static bool deviceSupportsMeshShaders(id<MTLDevice> device) {
-  if (![device respondsToSelector:@selector
-               (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)])
-    return false;
-  if (@available(macOS 13.0, *)) {
-    if (![device supportsFamily:MTLGPUFamilyApple7] &&
-        ![device supportsFamily:MTLGPUFamilyMetal3])
-      return false;
-  }
-  return true;
-}
 
 } // namespace
 
@@ -979,8 +952,7 @@ MetalBenchResult runIRConverterGraphicsBench(
         }
       } else {
 #if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
-        if (![enc respondsToSelector:@selector(setObjectBuffer:offset:atIndex:)] ||
-            ![enc respondsToSelector:@selector(setMeshBuffer:offset:atIndex:)]) {
+        if (!encoderSupportsMeshShaders(enc)) {
           [enc endEncoding];
           return -1.0;
         }
@@ -1180,9 +1152,7 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
 
       id<MTLRenderCommandEncoder> enc =
           [cmdBuf renderCommandEncoderWithDescriptor:rpd];
-      if (![enc respondsToSelector:@selector(setMeshBuffer:offset:atIndex:)] ||
-          ![enc respondsToSelector:@selector
-                (drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:)]) {
+      if (!encoderSupportsMeshShaders(enc)) {
         [enc endEncoding];
         return -1.0;
       }
