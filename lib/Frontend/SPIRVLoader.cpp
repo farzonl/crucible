@@ -577,6 +577,36 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
     }
 
     auto DS = GV.getDescriptorSet();
+    // PushConstant block (no DescriptorSet/Binding decorations).
+    if (SC == mlir::spirv::StorageClass::PushConstant) {
+      auto StructTy =
+          mlir::dyn_cast<mlir::spirv::StructType>(PtrTy.getPointeeType());
+      if (!StructTy || StructTy.getNumElements() == 0)
+        continue;
+      uint32_t RawBytes = spirvTypeBytes(StructTy);
+      uint32_t PaddedBytes = ((RawBytes + 15u) / 16u) * 16u;
+      if (PaddedBytes == 0)
+        PaddedBytes = 16;
+
+      ResourceBinding RB;
+      RB.Class = ResourceClass::CBV;
+      RB.Kind = ResourceKind::CBuffer;
+      RB.RecordID = NextCBVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = 0xFFFFFFFEu; // Sentinel space for Vulkan PushConstants.
+      RB.LowerBound = 0;
+      RB.RangeSize = 1;
+      RB.ElementStride = PaddedBytes;
+
+      BoundCBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.StructTy = StructTy;
+      CBufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+
     auto Binding = GV.getBinding();
     if (!DS || !Binding)
       continue;
@@ -1140,68 +1170,147 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       const BoundCBufferInfo &Info = CBIt->second;
       mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
 
+      std::function<Error(mlir::spirv::AccessChainOp,
+                          SmallVector<mlir::Value, 8>)>
+          lowerCBufferChain = [&](mlir::spirv::AccessChainOp Chain,
+                                  SmallVector<mlir::Value, 8> AllIndices) -> Error {
+        for (mlir::Value Idx : Chain.getIndices())
+          AllIndices.push_back(Idx);
+        if (AllIndices.empty())
+          return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
+
+        SmallVector<mlir::Operation *, 8> MemUsers(Chain->getUsers().begin(),
+                                                   Chain->getUsers().end());
+        for (mlir::Operation *MU : MemUsers) {
+          if (auto SubChain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(MU)) {
+            if (auto Err = lowerCBufferChain(SubChain, AllIndices))
+              return Err;
+            continue;
+          }
+          auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU);
+          if (!Load)
+            return makeError("unsupported non-load user of cbuffer '{0}'", Sym);
+
+          // Compute static byte offset through nested structs/arrays/matrices/vectors.
+          mlir::Type CurTy = Info.StructTy;
+          uint32_t ByteOffset = 0;
+          uint32_t CurMatrixStride = 16u;
+          bool CurMatrixRowMajor = false;
+          uint32_t NextVecElemStride = 0;
+          for (mlir::Value IdxV : AllIndices) {
+            auto ConstIdx = getConstSpirvInt(IdxV);
+            if (!ConstIdx)
+              return makeError("dynamic indexing into cbuffer '{0}' not yet supported",
+                               Sym);
+            uint32_t I = static_cast<uint32_t>(*ConstIdx);
+            if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
+              ByteOffset += ST.getMemberOffset(I);
+              CurMatrixStride = 16u;
+              CurMatrixRowMajor = false;
+              NextVecElemStride = 0;
+              SmallVector<mlir::spirv::StructType::MemberDecorationInfo> MDecs;
+              ST.getMemberDecorations(I, MDecs);
+              for (const auto &D : MDecs) {
+                if (D.decoration == mlir::spirv::Decoration::MatrixStride) {
+                  if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(D.decorationValue))
+                    CurMatrixStride = static_cast<uint32_t>(IA.getInt());
+                } else if (D.decoration == mlir::spirv::Decoration::RowMajor) {
+                  CurMatrixRowMajor = true;
+                }
+              }
+              CurTy = ST.getElementType(I);
+            } else if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(CurTy)) {
+              uint32_t Stride = Arr.getArrayStride();
+              if (Stride == 0)
+                Stride = spirvTypeBytes(Arr.getElementType());
+              ByteOffset += I * Stride;
+              CurTy = Arr.getElementType();
+            } else if (auto Mat = mlir::dyn_cast<mlir::spirv::MatrixType>(CurTy)) {
+              auto ColVec = mlir::cast<mlir::VectorType>(Mat.getColumnType());
+              uint32_t ElemBytes = scalarTypeBytes(ColVec.getElementType());
+              if (CurMatrixRowMajor) {
+                ByteOffset += I * ElemBytes;
+                NextVecElemStride = CurMatrixStride;
+              } else {
+                ByteOffset += I * CurMatrixStride;
+                NextVecElemStride = ElemBytes;
+              }
+              CurTy = ColVec;
+            } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(CurTy)) {
+              uint32_t Step = NextVecElemStride
+                                  ? NextVecElemStride
+                                  : scalarTypeBytes(Vec.getElementType());
+              ByteOffset += I * Step;
+              NextVecElemStride = 0;
+              CurTy = Vec.getElementType();
+            } else {
+              return makeError("unsupported cbuffer index step on '{0}'", Sym);
+            }
+          }
+
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+          mlir::Type OrigTy = Load.getType();
+          auto loadScalarAt = [&](mlir::Type ScalarTy,
+                                  uint32_t OffBytes) -> mlir::Value {
+            mlir::Type LoadScalarTy = ScalarTy;
+            if (ScalarTy.isInteger(1))
+              LoadScalarTy = I32Ty;
+            uint32_t ElemBytes = scalarTypeBytes(LoadScalarTy);
+            uint32_t Row = OffBytes / 16u;
+            uint32_t Comp = (OffBytes % 16u) / ElemBytes;
+            int64_t Lanes = 16 / ElemBytes;
+            auto RetVecTy = mlir::VectorType::get({Lanes}, LoadScalarTy);
+            auto RowC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(Row));
+            auto CBLoad =
+                ir::CBufferLoadOp::create(B, Loc, RetVecTy, Handle, RowC);
+            auto CompC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(Comp));
+            mlir::Value V = mlir::LLVM::ExtractElementOp::create(
+                B, Loc, CBLoad.getResult(), CompC);
+            if (ScalarTy.isInteger(1)) {
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              V = mlir::LLVM::ICmpOp::create(B, Loc, mlir::LLVM::ICmpPredicate::ne,
+                                             V, ZeroC);
+            }
+            return V;
+          };
+
+          mlir::Value ResultVal;
+          if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy)) {
+            mlir::Type ScalarTy = makeSignless(VecTy.getElementType(), B);
+            mlir::Type SignlessVecTy = makeSignless(VecTy, B);
+            uint32_t ElemBytes =
+                ScalarTy.isInteger(1) ? 4u : scalarTypeBytes(ScalarTy);
+            uint32_t LaneStride = NextVecElemStride ? NextVecElemStride : ElemBytes;
+            mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+            for (int64_t C = 0; C < VecTy.getNumElements(); ++C) {
+              mlir::Value Lane = loadScalarAt(
+                  ScalarTy, ByteOffset + static_cast<uint32_t>(C) * LaneStride);
+              auto IdxC = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(C));
+              Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, Lane, IdxC);
+            }
+            ResultVal = Vec;
+          } else {
+            mlir::Type ScalarTy = makeSignless(OrigTy, B);
+            ResultVal = loadScalarAt(ScalarTy, ByteOffset);
+          }
+          Load.replaceAllUsesWith(castFromSignless(B, Loc, ResultVal, OrigTy));
+          Load.erase();
+        }
+        Chain.erase();
+        return Error::success();
+      };
       SmallVector<mlir::Operation *, 8> ChainUsers(AO->getUsers().begin(),
                                                    AO->getUsers().end());
       for (mlir::Operation *CU : ChainUsers) {
         auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(CU);
-        if (!Chain || Chain.getIndices().empty())
+        if (!Chain)
           return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
-
-        // Compute static byte offset through nested structs/arrays.
-        mlir::Type CurTy = Info.StructTy;
-        uint32_t ByteOffset = 0;
-        for (mlir::Value IdxV : Chain.getIndices()) {
-          auto ConstIdx = getConstSpirvInt(IdxV);
-          if (!ConstIdx)
-            return makeError("dynamic indexing into cbuffer '{0}' not yet supported",
-                             Sym);
-          uint32_t I = static_cast<uint32_t>(*ConstIdx);
-          if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
-            ByteOffset += ST.getMemberOffset(I);
-            CurTy = ST.getElementType(I);
-          } else if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(CurTy)) {
-            uint32_t Stride = Arr.getArrayStride();
-            if (Stride == 0)
-              Stride = spirvTypeBytes(Arr.getElementType());
-            ByteOffset += I * Stride;
-            CurTy = Arr.getElementType();
-          } else if (auto Mat = mlir::dyn_cast<mlir::spirv::MatrixType>(CurTy)) {
-            ByteOffset += I * 16u;
-            CurTy = Mat.getColumnType();
-          } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(CurTy)) {
-            ByteOffset += I * scalarTypeBytes(Vec.getElementType());
-            CurTy = Vec.getElementType();
-          } else {
-            return makeError("unsupported cbuffer index step on '{0}'", Sym);
-          }
-        }
-
-        uint32_t Row = ByteOffset / 16u;
-
-        SmallVector<mlir::Operation *, 4> MemUsers(Chain->getUsers().begin(),
-                                                   Chain->getUsers().end());
-        for (mlir::Operation *MU : MemUsers) {
-          auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU);
-          if (!Load)
-            return makeError("unsupported non-load user of cbuffer '{0}'", Sym);
-          mlir::OpBuilder B(Load);
-          mlir::Location Loc = Load.getLoc();
-          mlir::Type ValTy = makeSignless(Load.getType(), B);
-          uint32_t ElemBytes = scalarTypeBytes(ValTy);
-          uint32_t Comp = (ByteOffset % 16u) / ElemBytes;
-          int64_t Lanes = 16 / ElemBytes;
-          auto RetVecTy = mlir::VectorType::get({Lanes}, ValTy);
-          auto RowC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(Row));
-          auto CBLoad = ir::CBufferLoadOp::create(B, Loc, RetVecTy, Handle, RowC);
-          auto CompC = mlir::LLVM::ConstantOp::create(
-              B, Loc, I32Ty, static_cast<int32_t>(Comp));
-          auto Val = mlir::LLVM::ExtractElementOp::create(
-              B, Loc, CBLoad.getResult(), CompC);
-          Load.replaceAllUsesWith(Val.getResult());
-          Load.erase();
-        }
-        Chain.erase();
+        if (auto Err = lowerCBufferChain(Chain, {}))
+          return Err;
       }
       AO.erase();
       continue;

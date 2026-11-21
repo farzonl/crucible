@@ -2147,6 +2147,28 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
         }
       }
     }
+    // Bind Vulkan PushConstants (sentinel CBV space 0xFFFFFFFEu) if referenced.
+    if (UseVulkanBinding && !P.PushConstants.empty()) {
+      for (const crucible::ResourceBinding &RB : R.Resources) {
+        if (RB.Class == crucible::ResourceClass::CBV &&
+            RB.Space == 0xFFFFFFFEu) {
+          llvm::SmallVector<uint8_t, 64> PCBytes;
+          for (const auto &Block : P.PushConstants) {
+            if (Block.Stage == Stages::Compute || P.PushConstants.size() == 1) {
+              Block.getContent(PCBytes);
+              break;
+            }
+          }
+          size_t AllocSize =
+              std::max<size_t>({PCBytes.size(), RB.ElementStride, 16u});
+          if (PCBytes.size() < AllocSize)
+            PCBytes.resize(AllocSize, 0);
+          MTL::Buffer *PCBuf = Device->newBuffer(
+              PCBytes.data(), AllocSize, MTL::ResourceStorageModeShared);
+          BufferBinds.push_back({RB.MetalIndex, PCBuf});
+        }
+      }
+    }
     if (R.BufferSizesMetalIndex != UINT32_MAX) {
       MTL::Buffer *DimsBuf = Device->newBuffer(
           BufferDims.data(),
