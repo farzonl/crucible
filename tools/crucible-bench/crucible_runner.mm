@@ -118,6 +118,18 @@ bool isTextureResource(crucible::ResourceKind k) {
   }
 }
 
+static bool deviceSupportsMeshShaders(id<MTLDevice> device) {
+  if (![device respondsToSelector:@selector
+               (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)])
+    return false;
+  if (@available(macOS 13.0, *)) {
+    if (![device supportsFamily:MTLGPUFamilyApple7] &&
+        ![device supportsFamily:MTLGPUFamilyMetal3])
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 MetalBenchResult runCrucibleComputeBench(const std::string &benchId,
@@ -709,9 +721,8 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
     }
     res.backend =
         std::string("Metal (crucible): ") + [[device name] UTF8String];
-    if (![device respondsToSelector:@selector
-                 (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)]) {
-      res.status = "UNSUPPORTED (no Metal Mesh Shader)";
+    if (!deviceSupportsMeshShaders(device)) {
+      res.status = "SKIPPED (no Metal Mesh Shader support on this GPU)";
       return res;
     }
 
@@ -800,6 +811,12 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
 
       id<MTLRenderCommandEncoder> enc =
           [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+      if (![enc respondsToSelector:@selector(setMeshBuffer:offset:atIndex:)] ||
+          ![enc respondsToSelector:@selector
+                (drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:)]) {
+        [enc endEncoding];
+        return -1.0;
+      }
       [enc setRenderPipelineState:pso];
       [enc setViewport:(MTLViewport){0.0, 0.0, static_cast<double>(rw),
                                      static_cast<double>(rh), 0.0, 1.0}];
@@ -820,6 +837,11 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
     };
 
     res.firstDispatchMs = drawOnce(128);
+    if (res.firstDispatchMs < 0.0) {
+      res.firstDispatchMs = 0.0;
+      res.status = "SKIPPED (no Metal Mesh Shader encoder on this GPU)";
+      return res;
+    }
     runWarmup(warmup, [&]() { return drawOnce(128); });
     std::vector<double> samples;
     samples.reserve(iters);

@@ -159,6 +159,18 @@ bool compileDxilToMetalStage(id<MTLDevice> device,
 }
 #endif
 
+static bool deviceSupportsMeshShaders(id<MTLDevice> device) {
+  if (![device respondsToSelector:@selector
+               (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)])
+    return false;
+  if (@available(macOS 13.0, *)) {
+    if (![device supportsFamily:MTLGPUFamilyApple7] &&
+        ![device supportsFamily:MTLGPUFamilyMetal3])
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 MetalBenchResult runIRConverterComputeBench(const std::string &benchId,
@@ -479,6 +491,10 @@ MetalBenchResult runIRConverterGraphicsBench(
     const bool hasTess = (!hsDxil.empty() && !dsDxil.empty());
     const bool hasGS = !gsDxil.empty();
     const bool useEmulation = hasTess || hasGS;
+    if (useEmulation && !deviceSupportsMeshShaders(device)) {
+      res.status = "SKIPPED (no Metal Mesh Shader support on this GPU)";
+      return res;
+    }
 #if !defined(IR_VERSION_MAJOR) || (IR_VERSION_MAJOR < 3)
     if (useEmulation) {
       res.status = "SKIPPED (Metal IRConverter < 3.0)";
@@ -963,6 +979,11 @@ MetalBenchResult runIRConverterGraphicsBench(
         }
       } else {
 #if defined(IR_VERSION_MAJOR) && IR_VERSION_MAJOR >= 3
+        if (![enc respondsToSelector:@selector(setObjectBuffer:offset:atIndex:)] ||
+            ![enc respondsToSelector:@selector(setMeshBuffer:offset:atIndex:)]) {
+          [enc endEncoding];
+          return -1.0;
+        }
         [enc useResource:cbBuf
                    usage:MTLResourceUsageRead
                   stages:MTLRenderStageObject | MTLRenderStageMesh |
@@ -1000,6 +1021,11 @@ MetalBenchResult runIRConverterGraphicsBench(
     getGfxParams(1, rw, rh, vc);
 
     res.firstDispatchMs = drawOnce(1, rw, rh, vc);
+    if (res.firstDispatchMs < 0.0) {
+      res.firstDispatchMs = 0.0;
+      res.status = "SKIPPED (no Metal Mesh Shader encoder on this GPU)";
+      return res;
+    }
     runWarmup(warmup, [&]() { return drawOnce(1, rw, rh, vc); });
 
     std::vector<double> samples;
@@ -1056,9 +1082,8 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
     }
     res.backend =
         std::string("Metal (IRConverter): ") + [[device name] UTF8String];
-    if (![device respondsToSelector:@selector
-                 (newRenderPipelineStateWithMeshDescriptor:options:reflection:error:)]) {
-      res.status = "UNSUPPORTED (no Metal Mesh Shader)";
+    if (!deviceSupportsMeshShaders(device)) {
+      res.status = "SKIPPED (no Metal Mesh Shader support on this GPU)";
       return res;
     }
     id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -1155,6 +1180,12 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
 
       id<MTLRenderCommandEncoder> enc =
           [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+      if (![enc respondsToSelector:@selector(setMeshBuffer:offset:atIndex:)] ||
+          ![enc respondsToSelector:@selector
+                (drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:)]) {
+        [enc endEncoding];
+        return -1.0;
+      }
       [enc setRenderPipelineState:pso];
       MTLViewport vp{0.0, 0.0, static_cast<double>(rw),
                      static_cast<double>(rh), 0.0, 1.0};
@@ -1175,6 +1206,11 @@ MetalBenchResult runIRConverterMeshBench(const std::string &benchId,
     };
 
     res.firstDispatchMs = drawOnce(128);
+    if (res.firstDispatchMs < 0.0) {
+      res.firstDispatchMs = 0.0;
+      res.status = "SKIPPED (no Metal Mesh Shader encoder on this GPU)";
+      return res;
+    }
     runWarmup(warmup, [&]() { return drawOnce(128); });
     std::vector<double> samples;
     samples.reserve(iters);
