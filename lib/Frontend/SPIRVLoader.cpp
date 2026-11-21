@@ -674,6 +674,36 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
       continue;
     }
 
+    // Single-element StorageBuffer struct (e.g., UAV counter.var.* with
+    // type.ACSBuffer.counter = struct<(si32 [0])>).
+    if (SC == mlir::spirv::StorageClass::StorageBuffer &&
+        StructTy.getNumElements() == 1) {
+      mlir::Type ElemTy = StructTy.getElementType(0);
+      uint32_t Stride = spirvTypeBytes(ElemTy);
+      if (Stride == 0)
+        Stride = 4;
+
+      ResourceBinding RB;
+      RB.Class = ResourceClass::UAV;
+      RB.Kind = ResourceKind::StructuredBuffer;
+      RB.ElementType = toComponentType(ElemTy);
+      RB.RecordID = NextUAVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = *DS;
+      RB.LowerBound = *Binding;
+      RB.RangeSize = 1;
+      RB.ElementStride = Stride;
+
+      BoundBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.ElemType = ElemTy;
+      Info.ElemStride = Stride;
+      BufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
+
     // Uniform Block struct without RuntimeArray -> Constant Buffer (CBV).
     if (SC == mlir::spirv::StorageClass::Uniform) {
       uint32_t RawBytes = spirvTypeBytes(StructTy);
@@ -870,10 +900,15 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                                  SmallVector<mlir::Value, 8> AllIndices) -> Error {
         for (mlir::Value Idx : Chain.getIndices())
           AllIndices.push_back(Idx);
-        if (AllIndices.size() < 2)
+        if (AllIndices.empty())
           return makeError("unsupported access pattern on buffer '{0}'", Sym);
 
-        mlir::Value ElemIdx = AllIndices[1];
+        mlir::Value ElemIdx = AllIndices.size() >= 2 ? AllIndices[1] : mlir::Value();
+        auto getElemIdx = [&](mlir::OpBuilder &B, mlir::Location Loc) -> mlir::Value {
+          if (ElemIdx)
+            return castToSignless(B, Loc, ElemIdx);
+          return mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+        };
         // Compute sub-element byte offset (constant or dynamic) for struct/
         // array/vector fields.
         auto computeByteOff = [&](mlir::OpBuilder &B,
@@ -957,7 +992,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
             uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
             auto RetVecTy = mlir::VectorType::get({4}, ScalarTy);
-            mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
+            mlir::Value IdxVal = getElemIdx(B, Loc);
             auto LoadOp = ir::BufferLoadOp::create(
                 B, Loc, RetVecTy, mlir::Type(), Handle,
                 ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
@@ -999,7 +1034,7 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
             uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
 
-            mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
+            mlir::Value IdxVal = getElemIdx(B, Loc);
             auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ScalarTy);
             SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
             if (!VecTy) {
@@ -1022,9 +1057,14 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           } else {
             // Structured buffer atomics -> crucible.buffer_atomic.
             std::optional<ir::AtomicOp> ABinOp;
+            bool NegateVal = false;
             mlir::Value AVal;
             if (auto A = mlir::dyn_cast<mlir::spirv::AtomicIAddOp>(MU)) {
               ABinOp = ir::AtomicOp::Add;
+              AVal = A.getValue();
+            } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicISubOp>(MU)) {
+              ABinOp = ir::AtomicOp::Add;
+              NegateVal = true;
               AVal = A.getValue();
             } else if (auto A = mlir::dyn_cast<mlir::spirv::AtomicAndOp>(MU)) {
               ABinOp = ir::AtomicOp::And;
@@ -1060,8 +1100,13 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             mlir::Location Loc = MU->getLoc();
             mlir::Type OrigTy = AVal.getType();
             mlir::Value SignlessVal = castToSignless(B, Loc, AVal);
-            mlir::Value IdxVal = castToSignless(B, Loc, ElemIdx);
+            mlir::Value IdxVal = getElemIdx(B, Loc);
             mlir::Type ValTy = SignlessVal.getType();
+            if (NegateVal) {
+              auto ZeroVal = mlir::LLVM::ConstantOp::create(B, Loc, ValTy, 0);
+              SignlessVal =
+                  mlir::LLVM::SubOp::create(B, Loc, ZeroVal, SignlessVal);
+            }
             auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
             auto UndefI32 = mlir::LLVM::UndefOp::create(B, Loc, I32Ty);
             SmallVector<mlir::Value, 3> Coords = {IdxVal, ZeroC, UndefI32};

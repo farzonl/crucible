@@ -1990,7 +1990,25 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
           } else {
             BufferBinds.push_back(
                 {BaseSlot + I, GetGPUBuffer(Res.BufferPtr, I)});
-            if (Match->HasCounter)
+            if (UseVulkanBinding && Res.HasCounter) {
+              if (!Res.VKBinding || !Res.VKBinding->CounterBinding)
+                return createStringError(
+                    inconvertibleErrorCode(),
+                    "No CounterBinding provided for resource '%s' with a counter",
+                    Res.Name.c_str());
+              uint32_t CBind = *Res.VKBinding->CounterBinding;
+              for (const crucible::ResourceBinding &CRB : R.Resources) {
+                if (CRB.Class == crucible::ResourceClass::UAV &&
+                    CRB.Space == 0 && CRB.LowerBound == CBind) {
+                  BufferBinds.push_back(
+                      {CRB.MetalIndex + I, GetGPUCounter(Res.BufferPtr, I)});
+                  if (R.BufferSizesMetalIndex != UINT32_MAX &&
+                      CRB.MetalIndex + I < BufferDims.size())
+                    BufferDims[CRB.MetalIndex + I] = 1;
+                  break;
+                }
+              }
+            } else if (Match->HasCounter)
               BufferBinds.push_back(
                   {Match->CounterMetalIndex + RegOffset + I,
                    GetGPUCounter(Res.BufferPtr, I)});
