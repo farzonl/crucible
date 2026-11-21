@@ -5,7 +5,7 @@
 # RUN: FileCheck %s --input-file=%t.metal
 
 # CHECK: kernel void main0(
-# CHECK: device float* [[BUF:[A-Za-z0-9_]+]] {{\[\[}}buffer(0){{\]\]}},
+# CHECK: device float* __restrict [[BUF:[A-Za-z0-9_]+]] {{\[\[}}buffer(0){{\]\]}},
 # CHECK: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
 # CHECK-DAG: sqrt(fabs(
 # CHECK-DAG: max(

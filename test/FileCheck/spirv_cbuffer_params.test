@@ -6,7 +6,7 @@
 # RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
 
 # CHECK: kernel void main0(
-# CHECK-NEXT: device float* Data {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: device float* __restrict Data {{\[\[}}buffer(0){{\]\]}},
 # CHECK-NEXT: constant float4* Params {{\[\[}}buffer(1){{\]\]}},
 # CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
 # CHECK: if (dtid.x < as_type<uint>(Params[0u].z)) {

@@ -5,7 +5,7 @@
 # RUN: FileCheck %s --input-file=%t.metal
 
 # CHECK: kernel void main0(
-# CHECK-NEXT: device float* Data {{\[\[}}buffer(0){{\]\]}},
+# CHECK-NEXT: device float* __restrict Data {{\[\[}}buffer(0){{\]\]}},
 # CHECK-NEXT: uint3 dtid {{\[\[}}thread_position_in_grid{{\]\]}}) {
 # CHECK: if ({{.*}} < 2.0f) {
 # CHECK: * 3.0f
