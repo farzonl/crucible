@@ -61,7 +61,8 @@ std::optional<crucible::ResourceClass> classify(ResourceKind Kind) {
 std::optional<uint32_t>
 resourceBindingOffset(const Resource &Res,
                       const crucible::ResourceBinding &RB,
-                      bool UseVulkanBinding) {
+                      bool UseVulkanBinding,
+                      uint32_t SetIndex = 0) {
   auto OffsetInRange = [&](uint32_t Register) -> std::optional<uint32_t> {
     if (Register < RB.LowerBound)
       return std::nullopt;
@@ -72,8 +73,8 @@ resourceBindingOffset(const Resource &Res,
   };
   if (UseVulkanBinding) {
     if (Res.VKBinding)
-      return RB.Space == 0 ? OffsetInRange(Res.VKBinding->Binding)
-                           : std::nullopt;
+      return RB.Space == SetIndex ? OffsetInRange(Res.VKBinding->Binding)
+                                  : std::nullopt;
     if (Res.DXBinding && RB.Space == Res.DXBinding->Space)
       return OffsetInRange(Res.DXBinding->Register);
     return std::nullopt;
@@ -1569,13 +1570,15 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
     return Samp;
   };
   auto FindBinding = [UseVulkanBinding](const Resource &Res,
-                                        const crucible::Reflection &R)
+                                        const crucible::Reflection &R,
+                                        uint32_t SetIndex = 0)
       -> const crucible::ResourceBinding * {
     auto Class = classify(Res.Kind);
     if (!Class)
       return nullptr;
     for (const crucible::ResourceBinding &RB : R.Resources)
-      if (RB.Class == *Class && resourceBindingOffset(Res, RB, UseVulkanBinding))
+      if (RB.Class == *Class &&
+          resourceBindingOffset(Res, RB, UseVulkanBinding, SetIndex))
         return &RB;
     return nullptr;
   };
@@ -1946,7 +1949,8 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
     std::vector<uint32_t> BufferDims;
     if (R.BufferSizesMetalIndex != UINT32_MAX)
       BufferDims.resize(R.BufferSizesMetalIndex + 1, 0);
-    for (DescriptorSet &Set : P.Sets) {
+    for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx) {
+      DescriptorSet &Set = P.Sets[SetIdx];
       for (Resource &Res : Set.Resources) {
         if (Res.HeapIndex)
           continue;
@@ -1956,10 +1960,11 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
               inconvertibleErrorCode(),
               "resource '%s': kind is not supported yet (accel)",
               Res.Name.c_str());
-        const auto *Match = FindBinding(Res, R);
+        const auto *Match = FindBinding(Res, R, SetIdx);
         if (!Match)
           continue; // not referenced by this shader
-        auto RegOffsetOrErr = resourceBindingOffset(Res, *Match, UseVulkanBinding);
+        auto RegOffsetOrErr =
+            resourceBindingOffset(Res, *Match, UseVulkanBinding, SetIdx);
         if (!RegOffsetOrErr)
           continue;
         uint32_t RegOffset = *RegOffsetOrErr;
