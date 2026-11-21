@@ -24,7 +24,8 @@ Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
   if (isSPIRVBinary(Input) || isMLIRText(Input)) {
     mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
     auto Loaded = isSPIRVBinary(Input)
-                      ? loadSPIRV(Input, MCtx, Opts.EntryPoint)
+                      ? loadSPIRV(Input, MCtx, Opts.EntryPoint,
+                                  Opts.SpecConstants)
                       : loadMLIR(Input, MCtx, Opts.EntryPoint);
     if (!Loaded)
       return Loaded.takeError();

@@ -16,7 +16,9 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 
+#include <cstdint>
 #include <memory>
+#include <unordered_map>
 
 namespace crucible {
 
@@ -49,9 +51,10 @@ bool isSPIRVBinary(llvm::MemoryBufferRef Buf);
 
 /// Deserialize a SPIR-V binary into MLIR, extract reflection metadata, and
 /// lower shader-ABI ops into Crucible's layered MLIR representation.
-llvm::Expected<LoadedMLIRShader> loadSPIRV(llvm::MemoryBufferRef Buf,
-                                           mlir::MLIRContext &Ctx,
-                                           llvm::StringRef EntryOverride = {});
+llvm::Expected<LoadedMLIRShader>
+loadSPIRV(llvm::MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
+          llvm::StringRef EntryOverride = {},
+          const std::unordered_map<uint32_t, uint64_t> &SpecConstants = {});
 
 /// Returns true when Buf contains standalone MLIR text (Layer 0 + Layer 1).
 bool isMLIRText(llvm::MemoryBufferRef Buf);

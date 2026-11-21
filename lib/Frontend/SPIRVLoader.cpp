@@ -356,9 +356,10 @@ mlir::Value emitGPUIdComponent(mlir::OpBuilder &B, mlir::Location Loc,
 
 } // namespace
 
-Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
-                                     mlir::MLIRContext &Ctx,
-                                     StringRef EntryOverride) {
+Expected<LoadedMLIRShader>
+loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
+          StringRef EntryOverride,
+          const std::unordered_map<uint32_t, uint64_t> &SpecConstants) {
   if (!isSPIRVBinary(Buf))
     return makeError("input buffer is not a valid SPIR-V binary");
   if (Buf.getBufferSize() % 4 != 0)
@@ -804,6 +805,61 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
   auto EntryFn = SpvModule.lookupSymbol<mlir::spirv::FuncOp>(Reflect.EntryName);
   if (!EntryFn)
     return makeError("SPIR-V entry function '{0}' not found", Reflect.EntryName);
+
+  // 2b. Fold spirv.SpecConstant + spirv.mlir.referenceof -> spirv.Constant.
+  struct SpecConstInfo {
+    uint32_t SpecId = 0;
+    mlir::Attribute DefaultVal;
+  };
+  llvm::StringMap<SpecConstInfo> SpecConstMap;
+  SmallVector<mlir::spirv::SpecConstantOp, 8> SpecConstsToErase;
+  for (mlir::spirv::SpecConstantOp SC :
+       SpvModule.getOps<mlir::spirv::SpecConstantOp>()) {
+    uint32_t Id = 0;
+    if (auto SpecIdAttr = SC->getAttrOfType<mlir::IntegerAttr>("spec_id"))
+      Id = static_cast<uint32_t>(SpecIdAttr.getInt());
+    SpecConstMap[SC.getSymName()] = {Id, SC.getDefaultValue()};
+    SpecConstsToErase.push_back(SC);
+  }
+  if (!SpecConstMap.empty()) {
+    SmallVector<mlir::spirv::ReferenceOfOp, 8> RefOps;
+    EntryFn.walk([&](mlir::spirv::ReferenceOfOp R) { RefOps.push_back(R); });
+    for (mlir::spirv::ReferenceOfOp Ref : RefOps) {
+      auto It = SpecConstMap.find(Ref.getSpecConst());
+      if (It == SpecConstMap.end())
+        continue;
+      mlir::OpBuilder B(Ref);
+      mlir::Type Ty = Ref.getType();
+      mlir::Attribute ValAttr = It->second.DefaultVal;
+      auto OverIt = SpecConstants.find(It->second.SpecId);
+      if (OverIt != SpecConstants.end()) {
+        uint64_t Bits = OverIt->second;
+        if (Ty.isInteger(1)) {
+          ValAttr = B.getBoolAttr(Bits != 0);
+        } else if (auto IT = mlir::dyn_cast<mlir::IntegerType>(Ty)) {
+          ValAttr = mlir::IntegerAttr::get(IT, llvm::APInt(IT.getWidth(), Bits));
+        } else if (Ty.isF16()) {
+          ValAttr = mlir::FloatAttr::get(
+              Ty, llvm::APFloat(llvm::APFloat::IEEEhalf(),
+                                llvm::APInt(16, Bits & 0xFFFFu)));
+        } else if (Ty.isF32()) {
+          ValAttr = mlir::FloatAttr::get(
+              Ty, llvm::APFloat(llvm::APFloat::IEEEsingle(),
+                                llvm::APInt(32, Bits & 0xFFFFFFFFu)));
+        } else if (Ty.isF64()) {
+          ValAttr = mlir::FloatAttr::get(
+              Ty, llvm::APFloat(llvm::APFloat::IEEEdouble(),
+                                llvm::APInt(64, Bits)));
+        }
+      }
+      auto Cst =
+          mlir::spirv::ConstantOp::create(B, Ref.getLoc(), Ty, ValAttr);
+      Ref.replaceAllUsesWith(Cst.getResult());
+      Ref.erase();
+    }
+    for (auto SC : SpecConstsToErase)
+      SC.erase();
+  }
 
   // 3. Rewrite built-in & bound-buffer accesses inside the entry function.
   mlir::OpBuilder EntryBuilder =
