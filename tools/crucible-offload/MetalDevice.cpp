@@ -73,8 +73,9 @@ resourceBindingOffset(const Resource &Res,
   };
   if (UseVulkanBinding) {
     if (Res.VKBinding)
-      return RB.Space == SetIndex ? OffsetInRange(Res.VKBinding->Binding)
-                                  : std::nullopt;
+      return (RB.Space == SetIndex && Res.VKBinding->Binding == RB.LowerBound)
+                 ? std::optional<uint32_t>(0u)
+                 : std::nullopt;
     if (Res.DXBinding && RB.Space == Res.DXBinding->Space)
       return OffsetInRange(Res.DXBinding->Register);
     return std::nullopt;
@@ -1952,10 +1953,20 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
     Opts.FlushDenormsF32 = true;
     Opts.BoundsCheckBuffers = true;
     Opts.EmulateF64 = true;
-    for (const DescriptorSet &Set : P.Sets) {
+    for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx) {
+      const DescriptorSet &Set = P.Sets[SetIdx];
       for (const Resource &Res : Set.Resources) {
         auto Class = classify(Res.Kind);
-        if (Class && Res.DXBinding && Res.getArraySize() > 1)
+        if (!Class || Res.getArraySize() <= 1)
+          continue;
+        if (UseVulkanBinding && Res.VKBinding) {
+          Opts.ArraySizeOverrides.push_back(
+              {*Class, SetIdx, Res.VKBinding->Binding, Res.getArraySize()});
+          if (Res.HasCounter && Res.VKBinding->CounterBinding)
+            Opts.ArraySizeOverrides.push_back(
+                {crucible::ResourceClass::UAV, SetIdx,
+                 *Res.VKBinding->CounterBinding, Res.getArraySize()});
+        } else if (Res.DXBinding)
           Opts.ArraySizeOverrides.push_back(
               {*Class, Res.DXBinding->Space, Res.DXBinding->Register,
                Res.getArraySize()});
@@ -2109,8 +2120,28 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
               "resource '%s': kind is not supported yet (accel)",
               Res.Name.c_str());
         const auto *Match = FindBinding(Res, R, SetIdx);
-        if (!Match)
+        if (!Match) {
+          // A shader may access only a Vulkan UAV's separate counter binding
+          // (counter.var.*) while optimizing out the main buffer binding.
+          if (UseVulkanBinding && Res.HasCounter && Res.BufferPtr &&
+              Res.VKBinding && Res.VKBinding->CounterBinding) {
+            uint32_t CBind = *Res.VKBinding->CounterBinding;
+            for (const crucible::ResourceBinding &CRB : R.Resources) {
+              if (CRB.Class == crucible::ResourceClass::UAV &&
+                  CRB.Space == SetIdx && CRB.LowerBound == CBind) {
+                for (uint32_t I = 0; I < Res.getArraySize(); ++I) {
+                  BufferBinds.push_back(
+                      {CRB.MetalIndex + I, GetGPUCounter(Res.BufferPtr, I)});
+                  if (R.BufferSizesMetalIndex != UINT32_MAX &&
+                      CRB.MetalIndex + I < BufferDims.size())
+                    BufferDims[CRB.MetalIndex + I] = 1;
+                }
+                break;
+              }
+            }
+          }
           continue; // not referenced by this shader
+        }
         auto RegOffsetOrErr =
             resourceBindingOffset(Res, *Match, UseVulkanBinding, SetIdx);
         if (!RegOffsetOrErr)
