@@ -59,6 +59,8 @@ struct BoundBufferInfo {
   mlir::Type ElemType;
   uint32_t ElemStride = 4;
   bool IsArray = false;
+  uint32_t MatrixStride = 16;
+  bool MatrixRowMajor = false;
 };
 
 struct BoundCBufferInfo {
@@ -735,11 +737,19 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         Stride = 4;
 
       bool IsReadOnly = false;
+      uint32_t MatStride = 16;
+      bool MatRowMajor = false;
       SmallVector<mlir::spirv::StructType::MemberDecorationInfo> MemDecs;
       StructTy.getMemberDecorations(0, MemDecs);
       for (const auto &D : MemDecs) {
         if (D.decoration == mlir::spirv::Decoration::NonWritable)
           IsReadOnly = true;
+        else if (D.decoration == mlir::spirv::Decoration::MatrixStride) {
+          if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(D.decorationValue))
+            MatStride = static_cast<uint32_t>(IA.getInt());
+        } else if (D.decoration == mlir::spirv::Decoration::RowMajor) {
+          MatRowMajor = true;
+        }
       }
 
       ResourceBinding RB;
@@ -758,6 +768,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Info.ElemType = ElemTy;
       Info.ElemStride = Stride;
       Info.IsArray = IsResourceArray;
+      Info.MatrixStride = MatStride;
+      Info.MatrixRowMajor = MatRowMajor;
       BufferGlobals[GV.getSymName()] = Info;
       Reflect.Resources.push_back(std::move(RB));
       GlobalsToErase.push_back(GV);
@@ -1090,12 +1102,29 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           return mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
         };
         // Compute sub-element byte offset (constant or dynamic) for struct/
-        // array/vector fields.
+        // array/matrix/vector fields.
+        uint32_t CurMatrixStride = Info.MatrixStride;
+        bool CurMatrixRowMajor = Info.MatrixRowMajor;
+        uint32_t NextVecElemStride = 0;
         auto computeByteOff = [&](mlir::OpBuilder &B,
                                   mlir::Location Loc) -> Expected<mlir::Value> {
           uint32_t ConstOff = 0;
           mlir::Value DynOff;
           mlir::Type CurTy = Info.ElemType;
+          CurMatrixStride = Info.MatrixStride;
+          CurMatrixRowMajor = Info.MatrixRowMajor;
+          NextVecElemStride = 0;
+          auto addDynTerm = [&](mlir::Value IdxV, uint32_t S) {
+            mlir::Value Idx32 = castToSignless(B, Loc, IdxV);
+            auto StrideC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(S));
+            mlir::Value Term =
+                mlir::LLVM::MulOp::create(B, Loc, Idx32, StrideC);
+            DynOff = DynOff
+                         ? mlir::Value(
+                               mlir::LLVM::AddOp::create(B, Loc, DynOff, Term))
+                         : Term;
+          };
           for (size_t K = BaseIdx + 2; K < AllIndices.size(); ++K) {
             mlir::Value IdxV = AllIndices[K];
             auto CIdx = getConstSpirvInt(IdxV);
@@ -1104,41 +1133,50 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                 return makeError("dynamic struct index on buffer '{0}'", Sym);
               uint32_t I = static_cast<uint32_t>(*CIdx);
               ConstOff += ST.getMemberOffset(I);
+              CurMatrixStride = 16u;
+              CurMatrixRowMajor = false;
+              NextVecElemStride = 0;
+              SmallVector<mlir::spirv::StructType::MemberDecorationInfo> MDecs;
+              ST.getMemberDecorations(I, MDecs);
+              for (const auto &D : MDecs) {
+                if (D.decoration == mlir::spirv::Decoration::MatrixStride) {
+                  if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(D.decorationValue))
+                    CurMatrixStride = static_cast<uint32_t>(IA.getInt());
+                } else if (D.decoration == mlir::spirv::Decoration::RowMajor) {
+                  CurMatrixRowMajor = true;
+                }
+              }
               CurTy = ST.getElementType(I);
             } else if (auto Arr =
                            mlir::dyn_cast<mlir::spirv::ArrayType>(CurTy)) {
               uint32_t S = Arr.getArrayStride();
               if (S == 0)
                 S = spirvTypeBytes(Arr.getElementType());
-              if (CIdx) {
+              if (CIdx)
                 ConstOff += static_cast<uint32_t>(*CIdx) * S;
-              } else {
-                mlir::Value Idx32 = castToSignless(B, Loc, IdxV);
-                auto StrideC = mlir::LLVM::ConstantOp::create(
-                    B, Loc, I32Ty, static_cast<int32_t>(S));
-                mlir::Value Term =
-                    mlir::LLVM::MulOp::create(B, Loc, Idx32, StrideC);
-                DynOff = DynOff
-                             ? mlir::Value(
-                                   mlir::LLVM::AddOp::create(B, Loc, DynOff, Term))
-                             : Term;
-              }
+              else
+                addDynTerm(IdxV, S);
               CurTy = Arr.getElementType();
+            } else if (auto Mat =
+                           mlir::dyn_cast<mlir::spirv::MatrixType>(CurTy)) {
+              auto ColVec = mlir::cast<mlir::VectorType>(Mat.getColumnType());
+              uint32_t ElemBytes = scalarTypeBytes(ColVec.getElementType());
+              uint32_t Step = CurMatrixRowMajor ? ElemBytes : CurMatrixStride;
+              NextVecElemStride = CurMatrixRowMajor ? CurMatrixStride : ElemBytes;
+              if (CIdx)
+                ConstOff += static_cast<uint32_t>(*CIdx) * Step;
+              else
+                addDynTerm(IdxV, Step);
+              CurTy = ColVec;
             } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(CurTy)) {
-              uint32_t S = scalarTypeBytes(Vec.getElementType());
-              if (CIdx) {
+              uint32_t S = NextVecElemStride
+                               ? NextVecElemStride
+                               : scalarTypeBytes(Vec.getElementType());
+              if (CIdx)
                 ConstOff += static_cast<uint32_t>(*CIdx) * S;
-              } else {
-                mlir::Value Idx32 = castToSignless(B, Loc, IdxV);
-                auto StrideC = mlir::LLVM::ConstantOp::create(
-                    B, Loc, I32Ty, static_cast<int32_t>(S));
-                mlir::Value Term =
-                    mlir::LLVM::MulOp::create(B, Loc, Idx32, StrideC);
-                DynOff = DynOff
-                             ? mlir::Value(
-                                   mlir::LLVM::AddOp::create(B, Loc, DynOff, Term))
-                             : Term;
-              }
+              else
+                addDynTerm(IdxV, S);
+              NextVecElemStride = 0;
               CurTy = Vec.getElementType();
             }
           }
@@ -1167,36 +1205,97 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
               return OffValOrErr.takeError();
             mlir::Value OffC = *OffValOrErr;
             mlir::Type OrigTy = Load.getType();
+            mlir::Value IdxVal = getElemIdx(B, Loc);
+            auto addByteOff = [&](uint32_t Delta) -> mlir::Value {
+              if (Delta == 0)
+                return OffC;
+              auto DeltaC = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(Delta));
+              return mlir::LLVM::AddOp::create(B, Loc, OffC, DeltaC);
+            };
+            if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(OrigTy)) {
+              auto ColVec = mlir::cast<mlir::VectorType>(MatTy.getColumnType());
+              mlir::Type ScalarTy = makeSignless(ColVec.getElementType(), B);
+              mlir::Type SignlessColTy = makeSignless(ColVec, B);
+              uint32_t ElemBytes = scalarTypeBytes(ScalarTy);
+              uint32_t ColStep = CurMatrixRowMajor ? ElemBytes : CurMatrixStride;
+              uint32_t RowStep = CurMatrixRowMajor ? CurMatrixStride : ElemBytes;
+              auto RetVecTy = mlir::VectorType::get({4}, ScalarTy);
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              SmallVector<mlir::Value, 4> Cols;
+              for (uint32_t Col = 0; Col < MatTy.getNumColumns(); ++Col) {
+                mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessColTy);
+                for (int64_t Row = 0; Row < ColVec.getNumElements(); ++Row) {
+                  mlir::Value ElemOff = addByteOff(
+                      Col * ColStep + static_cast<uint32_t>(Row) * RowStep);
+                  auto LOp = ir::BufferLoadOp::create(
+                      B, Loc, RetVecTy, mlir::Type(), Handle,
+                      ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                      ElemOff, B.getI32IntegerAttr(1),
+                      B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                  auto Lane = mlir::LLVM::ExtractElementOp::create(
+                      B, Loc, LOp.getResult(), ZeroC);
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(Row));
+                  Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, Lane,
+                                                            IdxC);
+                }
+                Cols.push_back(castFromSignless(B, Loc, Vec, ColVec));
+              }
+              auto MatCC = mlir::spirv::CompositeConstructOp::create(
+                  B, Loc, OrigTy, Cols);
+              Load.replaceAllUsesWith(MatCC.getResult());
+              Load.erase();
+              continue;
+            }
             auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy);
             mlir::Type ScalarTy = makeSignless(
                 VecTy ? VecTy.getElementType() : OrigTy, B);
+            uint32_t ElemBytes = scalarTypeBytes(ScalarTy);
             unsigned NumComps =
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
-            uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
             auto RetVecTy = mlir::VectorType::get({4}, ScalarTy);
-            mlir::Value IdxVal = getElemIdx(B, Loc);
-            auto LoadOp = ir::BufferLoadOp::create(
-                B, Loc, RetVecTy, mlir::Type(), Handle,
-                ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
-                OffC, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
-                B.getI32IntegerAttr(
-                    static_cast<int32_t>(scalarTypeBytes(ScalarTy))));
             mlir::Value ResultVal;
-            if (!VecTy) {
+            if (VecTy && NextVecElemStride > ElemBytes) {
               auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
-              ResultVal = mlir::LLVM::ExtractElementOp::create(
-                  B, Loc, LoadOp.getResult(), ZeroC);
-            } else {
               mlir::Type SignlessVecTy = makeSignless(VecTy, B);
               mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
               for (unsigned C = 0; C < NumComps && C < 4; ++C) {
+                auto LOp = ir::BufferLoadOp::create(
+                    B, Loc, RetVecTy, mlir::Type(), Handle,
+                    ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                    addByteOff(C * NextVecElemStride), B.getI32IntegerAttr(1),
+                    B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                auto VC = mlir::LLVM::ExtractElementOp::create(
+                    B, Loc, LOp.getResult(), ZeroC);
                 auto IdxC = mlir::LLVM::ConstantOp::create(
                     B, Loc, I32Ty, static_cast<int32_t>(C));
-                auto VC = mlir::LLVM::ExtractElementOp::create(
-                    B, Loc, LoadOp.getResult(), IdxC);
                 Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
               }
               ResultVal = Vec;
+            } else {
+              uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
+              auto LoadOp = ir::BufferLoadOp::create(
+                  B, Loc, RetVecTy, mlir::Type(), Handle,
+                  ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                  OffC, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
+                  B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+              if (!VecTy) {
+                auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+                ResultVal = mlir::LLVM::ExtractElementOp::create(
+                    B, Loc, LoadOp.getResult(), ZeroC);
+              } else {
+                mlir::Type SignlessVecTy = makeSignless(VecTy, B);
+                mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+                for (unsigned C = 0; C < NumComps && C < 4; ++C) {
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(C));
+                  auto VC = mlir::LLVM::ExtractElementOp::create(
+                      B, Loc, LoadOp.getResult(), IdxC);
+                  Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
+                }
+                ResultVal = Vec;
+              }
             }
             ResultVal = castFromSignless(B, Loc, ResultVal, OrigTy);
             Load.replaceAllUsesWith(ResultVal);
@@ -1210,16 +1309,72 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             if (!OffValOrErr)
               return OffValOrErr.takeError();
             mlir::Value OffC = *OffValOrErr;
+            mlir::Value IdxVal = getElemIdx(B, Loc);
+            auto addByteOff = [&](uint32_t Delta) -> mlir::Value {
+              if (Delta == 0)
+                return OffC;
+              auto DeltaC = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(Delta));
+              return mlir::LLVM::AddOp::create(B, Loc, OffC, DeltaC);
+            };
+            if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(
+                    Store.getValue().getType())) {
+              auto ColVec = mlir::cast<mlir::VectorType>(MatTy.getColumnType());
+              mlir::Type ScalarTy = makeSignless(ColVec.getElementType(), B);
+              uint32_t ElemBytes = scalarTypeBytes(ScalarTy);
+              uint32_t ColStep = CurMatrixRowMajor ? ElemBytes : CurMatrixStride;
+              uint32_t RowStep = CurMatrixRowMajor ? CurMatrixStride : ElemBytes;
+              auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ScalarTy);
+              for (uint32_t Col = 0; Col < MatTy.getNumColumns(); ++Col) {
+                mlir::Value ColV = mlir::spirv::CompositeExtractOp::create(
+                    B, Loc, ColVec, Store.getValue(),
+                    B.getI32ArrayAttr({static_cast<int32_t>(Col)}));
+                ColV = castToSignless(B, Loc, ColV);
+                for (int64_t Row = 0; Row < ColVec.getNumElements(); ++Row) {
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(Row));
+                  mlir::Value Lane =
+                      mlir::LLVM::ExtractElementOp::create(B, Loc, ColV, IdxC);
+                  SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
+                  Vals[0] = Lane;
+                  ir::BufferStoreOp::create(
+                      B, Loc, Handle,
+                      ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                      addByteOff(Col * ColStep +
+                                 static_cast<uint32_t>(Row) * RowStep),
+                      Vals, B.getI32IntegerAttr(1),
+                      B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                }
+              }
+              Store.erase();
+              continue;
+            }
             mlir::Value StoreVal = castToSignless(B, Loc, Store.getValue());
             auto VecTy = mlir::dyn_cast<mlir::VectorType>(StoreVal.getType());
             mlir::Type ScalarTy =
                 VecTy ? VecTy.getElementType() : StoreVal.getType();
+            uint32_t ElemBytes = scalarTypeBytes(ScalarTy);
             unsigned NumComps =
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
-            uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
-
-            mlir::Value IdxVal = getElemIdx(B, Loc);
             auto Undef = mlir::LLVM::UndefOp::create(B, Loc, ScalarTy);
+            if (VecTy && NextVecElemStride > ElemBytes) {
+              for (unsigned C = 0; C < NumComps && C < 4; ++C) {
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(C));
+                SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
+                Vals[0] = mlir::LLVM::ExtractElementOp::create(B, Loc, StoreVal,
+                                                               IdxC);
+                ir::BufferStoreOp::create(
+                    B, Loc, Handle,
+                    ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
+                    addByteOff(C * NextVecElemStride), Vals,
+                    B.getI32IntegerAttr(1),
+                    B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+              }
+              Store.erase();
+              continue;
+            }
+            uint8_t Mask = static_cast<uint8_t>((1u << std::min(NumComps, 4u)) - 1u);
             SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
             if (!VecTy) {
               Vals[0] = StoreVal;
@@ -1235,8 +1390,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                 B, Loc, Handle,
                 ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                 OffC, Vals, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
-                B.getI32IntegerAttr(
-                    static_cast<int32_t>(scalarTypeBytes(ScalarTy))));
+                B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
             Store.erase();
           } else {
             // Structured buffer atomics -> crucible.buffer_atomic.
@@ -1478,7 +1632,33 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           };
 
           mlir::Value ResultVal;
-          if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy)) {
+          if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(OrigTy)) {
+            auto ColVec = mlir::cast<mlir::VectorType>(MatTy.getColumnType());
+            mlir::Type ScalarTy = makeSignless(ColVec.getElementType(), B);
+            mlir::Type SignlessColTy = makeSignless(ColVec, B);
+            uint32_t ElemBytes = scalarTypeBytes(ScalarTy);
+            uint32_t ColStep = CurMatrixRowMajor ? ElemBytes : CurMatrixStride;
+            uint32_t RowStep = CurMatrixRowMajor ? CurMatrixStride : ElemBytes;
+            SmallVector<mlir::Value, 4> Cols;
+            for (uint32_t Col = 0; Col < MatTy.getNumColumns(); ++Col) {
+              mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessColTy);
+              for (int64_t Row = 0; Row < ColVec.getNumElements(); ++Row) {
+                mlir::Value Lane = loadScalarAt(
+                    ScalarTy, ByteOffset + Col * ColStep +
+                                  static_cast<uint32_t>(Row) * RowStep);
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(Row));
+                Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, Lane, IdxC);
+              }
+              Cols.push_back(castFromSignless(B, Loc, Vec, ColVec));
+            }
+            ResultVal = mlir::spirv::CompositeConstructOp::create(
+                            B, Loc, OrigTy, Cols)
+                            .getResult();
+            Load.replaceAllUsesWith(ResultVal);
+            Load.erase();
+            continue;
+          } else if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy)) {
             mlir::Type ScalarTy = makeSignless(VecTy.getElementType(), B);
             mlir::Type SignlessVecTy = makeSignless(VecTy, B);
             uint32_t ElemBytes =
@@ -2685,6 +2865,46 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     SW.erase();
   }
 
+  // Work around upstream MLIR SPIRVToLLVM BranchConditionalConversionPattern
+  // passing unconverted block arguments to LLVM::CondBrOp: route any
+  // conditional branch edge with block arguments through a spirv.Branch
+  // trampoline (BranchConversionPattern properly uses adaptor.getOperands()).
+  {
+    SmallVector<mlir::spirv::BranchConditionalOp, 8> CondBrs;
+    EntryFn.walk([&](mlir::spirv::BranchConditionalOp BC) {
+      if (!BC.getTrueBlockArguments().empty() ||
+          !BC.getFalseBlockArguments().empty())
+        CondBrs.push_back(BC);
+    });
+    for (auto BC : CondBrs) {
+      mlir::Location Loc = BC.getLoc();
+      mlir::Region *Reg = BC->getBlock()->getParent();
+      mlir::Block *TrueBB = BC.getTrueBlock();
+      mlir::Block *FalseBB = BC.getFalseBlock();
+      if (!BC.getTrueBlockArguments().empty()) {
+        auto *Tramp = new mlir::Block();
+        Reg->push_back(Tramp);
+        mlir::OpBuilder TB = mlir::OpBuilder::atBlockEnd(Tramp);
+        mlir::spirv::BranchOp::create(TB, Loc, TrueBB,
+                                      BC.getTrueBlockArguments());
+        TrueBB = Tramp;
+      }
+      if (!BC.getFalseBlockArguments().empty()) {
+        auto *Tramp = new mlir::Block();
+        Reg->push_back(Tramp);
+        mlir::OpBuilder FB = mlir::OpBuilder::atBlockEnd(Tramp);
+        mlir::spirv::BranchOp::create(FB, Loc, FalseBB,
+                                      BC.getFalseBlockArguments());
+        FalseBB = Tramp;
+      }
+      mlir::OpBuilder B(BC);
+      mlir::spirv::BranchConditionalOp::create(
+          B, Loc, BC.getCondition(), TrueBB, mlir::ValueRange{}, FalseBB,
+          mlir::ValueRange{});
+      BC.erase();
+    }
+  }
+
   // 3g4. Lower spirv.GL.* and spirv.*Dot ops -> math.* / llvm.*.
   SmallVector<mlir::Operation *, 16> GLMathOps;
   EntryFn.walk([&](mlir::Operation *Op) {
@@ -3165,6 +3385,25 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             CC.erase();
           continue;
         }
+        if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(PointeeTy)) {
+          mlir::OpBuilder SB(Store);
+          mlir::Type ColTy = MatTy.getColumnType();
+          for (uint32_t I = 0; I < MatTy.getNumColumns(); ++I) {
+            SmallVector<mlir::LLVM::GEPArg, 2> Idx{int32_t(0),
+                                                   static_cast<int32_t>(I)};
+            auto ElemPtr = mlir::LLVM::GEPOp::create(
+                SB, Store.getLoc(), Ptr0Ty, LLVMArrTy, Alloca, Idx);
+            auto ColVal = mlir::spirv::CompositeExtractOp::create(
+                SB, Store.getLoc(), ColTy, Store.getValue(),
+                SB.getI32ArrayAttr({static_cast<int32_t>(I)}));
+            mlir::Value SignlessCol =
+                castToSignless(SB, Store.getLoc(), ColVal.getResult());
+            mlir::LLVM::StoreOp::create(SB, Store.getLoc(), SignlessCol,
+                                        ElemPtr);
+          }
+          Store.erase();
+          continue;
+        }
       } else if (auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
         mlir::OpBuilder CB(Chain);
         SmallVector<mlir::LLVM::GEPArg, 4> GEPArgs;
@@ -3199,6 +3438,26 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         Chain.erase();
       } else if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(U)) {
         mlir::OpBuilder LB(Load);
+        if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(PointeeTy)) {
+          mlir::Type ColTy = MatTy.getColumnType();
+          mlir::Type SignlessColTy = makeSignless(ColTy, LB);
+          SmallVector<mlir::Value, 4> Cols;
+          for (uint32_t I = 0; I < MatTy.getNumColumns(); ++I) {
+            SmallVector<mlir::LLVM::GEPArg, 2> Idx{int32_t(0),
+                                                   static_cast<int32_t>(I)};
+            auto ElemPtr = mlir::LLVM::GEPOp::create(
+                LB, Load.getLoc(), Ptr0Ty, LLVMArrTy, Alloca, Idx);
+            auto LLVMLoad = mlir::LLVM::LoadOp::create(
+                LB, Load.getLoc(), SignlessColTy, ElemPtr);
+            Cols.push_back(castFromSignless(LB, Load.getLoc(),
+                                            LLVMLoad.getResult(), ColTy));
+          }
+          auto MatCC = mlir::spirv::CompositeConstructOp::create(
+              LB, Load.getLoc(), Load.getType(), Cols);
+          Load.replaceAllUsesWith(MatCC.getResult());
+          Load.erase();
+          continue;
+        }
         auto LLVMLoad =
             mlir::LLVM::LoadOp::create(LB, Load.getLoc(), LLVMArrTy, Alloca);
         mlir::Value Repl = LLVMLoad.getResult();
@@ -3213,6 +3472,267 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     }
     if (V->use_empty())
       V.erase();
+  }
+
+  // 3i. Lower matrix SSA ops (Constant, Transpose, MatrixTimes*, Composite*)
+  // to pure vector ops so no !spirv.matrix values survive to ConvertSPIRVToLLVM.
+  {
+    // Expand constant matrices into CompositeConstruct of column constants.
+    SmallVector<mlir::spirv::ConstantOp, 8> MatConsts;
+    EntryFn.walk([&](mlir::spirv::ConstantOp C) {
+      if (mlir::isa<mlir::spirv::MatrixType>(C.getType()))
+        MatConsts.push_back(C);
+    });
+    for (auto C : MatConsts) {
+      auto MatTy = mlir::cast<mlir::spirv::MatrixType>(C.getType());
+      auto ColTy = mlir::cast<mlir::VectorType>(MatTy.getColumnType());
+      auto AA = mlir::dyn_cast<mlir::ArrayAttr>(C.getValue());
+      if (!AA || AA.size() != MatTy.getNumColumns())
+        continue;
+      mlir::OpBuilder B(C);
+      SmallVector<mlir::Value, 4> Cols;
+      for (uint32_t I = 0; I < MatTy.getNumColumns(); ++I) {
+        auto ColC = mlir::spirv::ConstantOp::create(B, C.getLoc(), ColTy, AA[I]);
+        Cols.push_back(ColC.getResult());
+      }
+      auto CC = mlir::spirv::CompositeConstructOp::create(
+          B, C.getLoc(), MatTy, Cols);
+      C.replaceAllUsesWith(CC.getResult());
+      C.erase();
+    }
+
+    auto buildVec = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                        mlir::VectorType VecTy,
+                        ArrayRef<mlir::Value> Elems) -> mlir::Value {
+      mlir::Type SignlessVecTy = makeSignless(VecTy, B);
+      mlir::Value Acc = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+      for (size_t I = 0; I < Elems.size(); ++I) {
+        auto IdxC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty,
+                                                   static_cast<int32_t>(I));
+        mlir::Value EV = castToSignless(B, Loc, Elems[I]);
+        Acc = mlir::LLVM::InsertElementOp::create(B, Loc, Acc, EV, IdxC);
+      }
+      return castFromSignless(B, Loc, Acc, VecTy);
+    };
+    auto makeSplat = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                         mlir::Value Scalar, mlir::VectorType VecTy) -> mlir::Value {
+      SmallVector<mlir::Value, 4> Elems(VecTy.getNumElements(), Scalar);
+      return buildVec(B, Loc, VecTy, Elems);
+    };
+    auto emitMatVecMul = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                             mlir::spirv::CompositeConstructOp MatCC,
+                             mlir::Value Vec) -> mlir::Value {
+      auto Cols = MatCC.getConstituents();
+      auto ColTy = mlir::cast<mlir::VectorType>(Cols[0].getType());
+      mlir::Type ElemTy = ColTy.getElementType();
+      mlir::Value Acc;
+      for (unsigned C = 0; C < Cols.size(); ++C) {
+        auto VC = mlir::spirv::CompositeExtractOp::create(
+            B, Loc, ElemTy, Vec, B.getI32ArrayAttr({static_cast<int32_t>(C)}));
+        mlir::Value Splat = makeSplat(B, Loc, VC.getResult(), ColTy);
+        mlir::Value Prod = mlir::spirv::FMulOp::create(B, Loc, Cols[C], Splat);
+        Acc = Acc ? mlir::Value(mlir::spirv::FAddOp::create(B, Loc, Acc, Prod))
+                  : Prod;
+      }
+      return Acc;
+    };
+
+    bool Changed = true;
+    while (Changed) {
+      Changed = false;
+
+      // Transpose(CompositeConstruct) -> CompositeConstruct of transposed cols.
+      SmallVector<mlir::spirv::TransposeOp, 8> Transposes;
+      EntryFn.walk([&](mlir::spirv::TransposeOp T) { Transposes.push_back(T); });
+      for (auto T : Transposes) {
+        auto CC = T.getMatrix().getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!CC)
+          continue;
+        auto ResMatTy = mlir::cast<mlir::spirv::MatrixType>(T.getType());
+        auto ResColTy = mlir::cast<mlir::VectorType>(ResMatTy.getColumnType());
+        mlir::Type ElemTy = ResColTy.getElementType();
+        auto InCols = CC.getConstituents();
+        mlir::OpBuilder B(T);
+        SmallVector<mlir::Value, 4> OutCols;
+        for (uint32_t R = 0; R < ResMatTy.getNumColumns(); ++R) {
+          SmallVector<mlir::Value, 4> Lanes;
+          for (unsigned C = 0; C < InCols.size(); ++C) {
+            Lanes.push_back(mlir::spirv::CompositeExtractOp::create(
+                                B, T.getLoc(), ElemTy, InCols[C],
+                                B.getI32ArrayAttr({static_cast<int32_t>(R)}))
+                                .getResult());
+          }
+          OutCols.push_back(buildVec(B, T.getLoc(), ResColTy, Lanes));
+        }
+        auto OutCC = mlir::spirv::CompositeConstructOp::create(
+            B, T.getLoc(), ResMatTy, OutCols);
+        T.replaceAllUsesWith(OutCC.getResult());
+        T.erase();
+        Changed = true;
+      }
+
+      // MatrixTimesScalar(CompositeConstruct, s) -> CompositeConstruct.
+      SmallVector<mlir::spirv::MatrixTimesScalarOp, 8> MTSs;
+      EntryFn.walk([&](mlir::spirv::MatrixTimesScalarOp M) { MTSs.push_back(M); });
+      for (auto M : MTSs) {
+        auto CC = M.getMatrix().getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!CC)
+          continue;
+        mlir::OpBuilder B(M);
+        auto MatTy = mlir::cast<mlir::spirv::MatrixType>(M.getType());
+        auto ColTy = mlir::cast<mlir::VectorType>(MatTy.getColumnType());
+        mlir::Value Splat = makeSplat(B, M.getLoc(), M.getScalar(), ColTy);
+        SmallVector<mlir::Value, 4> OutCols;
+        for (mlir::Value Col : CC.getConstituents())
+          OutCols.push_back(mlir::spirv::FMulOp::create(B, M.getLoc(), Col, Splat));
+        auto OutCC = mlir::spirv::CompositeConstructOp::create(
+            B, M.getLoc(), MatTy, OutCols);
+        M.replaceAllUsesWith(OutCC.getResult());
+        M.erase();
+        Changed = true;
+      }
+
+      // MatrixTimesVector(CompositeConstruct, v) -> vector.
+      SmallVector<mlir::spirv::MatrixTimesVectorOp, 8> MTVs;
+      EntryFn.walk([&](mlir::spirv::MatrixTimesVectorOp M) { MTVs.push_back(M); });
+      for (auto M : MTVs) {
+        auto CC = M.getMatrix().getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!CC)
+          continue;
+        mlir::OpBuilder B(M);
+        mlir::Value Res = emitMatVecMul(B, M.getLoc(), CC, M.getVector());
+        M.replaceAllUsesWith(Res);
+        M.erase();
+        Changed = true;
+      }
+
+      // VectorTimesMatrix(v, CompositeConstruct) -> vector.
+      SmallVector<mlir::spirv::VectorTimesMatrixOp, 8> VTMs;
+      EntryFn.walk([&](mlir::spirv::VectorTimesMatrixOp M) { VTMs.push_back(M); });
+      for (auto M : VTMs) {
+        auto CC = M.getMatrix().getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!CC)
+          continue;
+        mlir::OpBuilder B(M);
+        auto ResVecTy = mlir::cast<mlir::VectorType>(M.getType());
+        mlir::Type ElemTy = ResVecTy.getElementType();
+        mlir::Value V = M.getVector();
+        auto VTy = mlir::cast<mlir::VectorType>(V.getType());
+        SmallVector<mlir::Value, 4> Lanes;
+        for (mlir::Value Col : CC.getConstituents()) {
+          mlir::Value Prod = mlir::spirv::FMulOp::create(B, M.getLoc(), V, Col);
+          mlir::Value Sum;
+          for (int64_t R = 0; R < VTy.getNumElements(); ++R) {
+            auto Lane = mlir::spirv::CompositeExtractOp::create(
+                B, M.getLoc(), ElemTy, Prod,
+                B.getI32ArrayAttr({static_cast<int32_t>(R)}));
+            Sum = Sum ? mlir::Value(mlir::spirv::FAddOp::create(
+                            B, M.getLoc(), Sum, Lane.getResult()))
+                      : Lane.getResult();
+          }
+          Lanes.push_back(Sum);
+        }
+        mlir::Value Res = buildVec(B, M.getLoc(), ResVecTy, Lanes);
+        M.replaceAllUsesWith(Res);
+        M.erase();
+        Changed = true;
+      }
+
+      // MatrixTimesMatrix(CompositeConstruct, CompositeConstruct) -> CompositeConstruct.
+      SmallVector<mlir::spirv::MatrixTimesMatrixOp, 8> MTMs;
+      EntryFn.walk([&](mlir::spirv::MatrixTimesMatrixOp M) { MTMs.push_back(M); });
+      for (auto M : MTMs) {
+        auto LeftCC =
+            M->getOperand(0).getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        auto RightCC =
+            M->getOperand(1).getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!LeftCC || !RightCC)
+          continue;
+        mlir::OpBuilder B(M);
+        SmallVector<mlir::Value, 4> OutCols;
+        for (mlir::Value RCol : RightCC.getConstituents())
+          OutCols.push_back(emitMatVecMul(B, M.getLoc(), LeftCC, RCol));
+        auto OutCC = mlir::spirv::CompositeConstructOp::create(
+            B, M.getLoc(), M.getType(), OutCols);
+        M.replaceAllUsesWith(OutCC.getResult());
+        M.erase();
+        Changed = true;
+      }
+
+      // CompositeInsert into CompositeConstruct (matrix/array) -> new CompositeConstruct.
+      SmallVector<mlir::spirv::CompositeInsertOp, 16> Inserts;
+      EntryFn.walk(
+          [&](mlir::spirv::CompositeInsertOp I) { Inserts.push_back(I); });
+      for (auto Ins : Inserts) {
+        auto CC =
+            Ins.getComposite().getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!CC || mlir::isa<mlir::VectorType>(CC.getType()) ||
+            Ins.getIndices().empty())
+          continue;
+        int64_t Idx = mlir::cast<mlir::IntegerAttr>(Ins.getIndices()[0]).getInt();
+        if (Idx < 0 || static_cast<size_t>(Idx) >= CC.getConstituents().size())
+          continue;
+        mlir::OpBuilder B(Ins);
+        SmallVector<mlir::Value, 4> NewElems(CC.getConstituents().begin(),
+                                             CC.getConstituents().end());
+        if (Ins.getIndices().size() == 1) {
+          NewElems[Idx] = Ins.getObject();
+        } else {
+          SmallVector<mlir::Attribute, 4> Rest(Ins.getIndices().begin() + 1,
+                                               Ins.getIndices().end());
+          NewElems[Idx] = mlir::spirv::CompositeInsertOp::create(
+                              B, Ins.getLoc(), NewElems[Idx].getType(),
+                              Ins.getObject(), NewElems[Idx],
+                              B.getArrayAttr(Rest))
+                              .getResult();
+        }
+        auto NewCC = mlir::spirv::CompositeConstructOp::create(
+            B, Ins.getLoc(), CC.getType(), NewElems);
+        Ins.replaceAllUsesWith(NewCC.getResult());
+        Ins.erase();
+        Changed = true;
+      }
+
+      // CompositeExtract from CompositeConstruct (matrix/array).
+      SmallVector<mlir::spirv::CompositeExtractOp, 16> Extracts;
+      EntryFn.walk(
+          [&](mlir::spirv::CompositeExtractOp E) { Extracts.push_back(E); });
+      for (auto E : Extracts) {
+        auto CC =
+            E.getComposite().getDefiningOp<mlir::spirv::CompositeConstructOp>();
+        if (!CC || mlir::isa<mlir::VectorType>(CC.getType()) ||
+            E.getIndices().empty())
+          continue;
+        int64_t Idx = mlir::cast<mlir::IntegerAttr>(E.getIndices()[0]).getInt();
+        if (Idx < 0 || static_cast<size_t>(Idx) >= CC.getConstituents().size())
+          continue;
+        mlir::Value Elem = CC.getConstituents()[Idx];
+        if (E.getIndices().size() == 1) {
+          E.replaceAllUsesWith(Elem);
+          E.erase();
+          Changed = true;
+        } else {
+          mlir::OpBuilder B(E);
+          SmallVector<mlir::Attribute, 4> Rest(E.getIndices().begin() + 1,
+                                               E.getIndices().end());
+          auto NewE = mlir::spirv::CompositeExtractOp::create(
+              B, E.getLoc(), E.getType(), Elem, B.getArrayAttr(Rest));
+          E.replaceAllUsesWith(NewE.getResult());
+          E.erase();
+          Changed = true;
+        }
+      }
+
+      SmallVector<mlir::spirv::CompositeConstructOp, 16> DeadCCs;
+      EntryFn.walk([&](mlir::spirv::CompositeConstructOp CC) {
+        if (CC->use_empty())
+          DeadCCs.push_back(CC);
+      });
+      for (auto CC : DeadCCs) {
+        CC.erase();
+        Changed = true;
+      }
+    }
   }
 
   // Erase rewritten shader-ABI globals and entry/execution-mode ops before
