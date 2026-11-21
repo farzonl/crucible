@@ -2776,6 +2776,8 @@ createVulkanDevices(const DeviceConfig &Config) {
   EnabledFeats.vertexPipelineStoresAndAtomics =
       SupportedFeats2.features.vertexPipelineStoresAndAtomics;
   EnabledFeats.imageCubeArray = SupportedFeats2.features.imageCubeArray;
+  EnabledFeats.shaderClipDistance = SupportedFeats2.features.shaderClipDistance;
+  EnabledFeats.shaderCullDistance = SupportedFeats2.features.shaderCullDistance;
   EnabledFeats.shaderResourceMinLod =
       SupportedFeats2.features.shaderResourceMinLod;
   EnabledFeats.multiViewport = SupportedFeats2.features.multiViewport;
