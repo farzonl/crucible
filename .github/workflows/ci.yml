@@ -46,19 +46,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ca-certificates curl ninja-build cmake libvulkan-dev python3-pip
-          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 23
-          sudo apt-get install -y --no-install-recommends \
-            llvm-23-dev llvm-23-tools libmlir-23-dev mlir-23-tools
           pip3 install --break-system-packages lit
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
 
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR=/usr/lib/llvm-23/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-23/lib/cmake/mlir \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
 
@@ -113,14 +111,18 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install llvm ninja
+          brew install ninja
           pip3 install --break-system-packages lit
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
 
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
 

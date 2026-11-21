@@ -1,0 +1,70 @@
+name: Setup third_party LLVM/MLIR
+description: Restore or build and cache third_party/llvm-project (MLIR + SPIR-V target)
+
+inputs:
+  github-token:
+    description: GitHub token for cache-timeout check
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute third_party LLVM revision
+      id: submodule-rev
+      shell: bash
+      run: |
+        LLVM_REV=$(git ls-tree HEAD third_party/llvm-project | awk '{print $3}')
+        echo "llvm=${LLVM_REV}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore third_party LLVM/MLIR binaries cache
+      id: cache-llvm
+      uses: actions/cache/restore@v4
+      with:
+        path: .toolchains/llvm
+        key: crucible-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}
+        restore-keys: |
+          crucible-llvm-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Fail if LLVM cache restore timed out
+      if: steps.cache-llvm.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        KEY="crucible-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}"
+        COUNT=$(gh api "repos/${{ github.repository }}/actions/caches?key=${KEY}" --jq '.total_count' 2>/dev/null || echo 0)
+        if [ "${COUNT:-0}" -gt 0 ]; then
+          echo "Error: LLVM cache (${KEY}) exists but restore failed or timed out; aborting instead of rebuilding."
+          exit 1
+        fi
+
+    - name: Build and install third_party LLVM/MLIR (SPIR-V)
+      if: steps.cache-llvm.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        git submodule update --init --depth 1 third_party/llvm-project
+        cmake -S third_party/llvm-project/llvm -B build-llvm -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/.toolchains/llvm" \
+          -DLLVM_ENABLE_PROJECTS="mlir" \
+          -DLLVM_TARGETS_TO_BUILD="SPIRV" \
+          -DLLVM_BUILD_UTILS=ON \
+          -DLLVM_INSTALL_UTILS=ON \
+          -DLLVM_ENABLE_ASSERTIONS=OFF \
+          -DLLVM_INCLUDE_TESTS=OFF \
+          -DLLVM_INCLUDE_EXAMPLES=OFF \
+          -DLLVM_INCLUDE_BENCHMARKS=OFF \
+          -DMLIR_INCLUDE_TESTS=OFF \
+          -DMLIR_INCLUDE_INTEGRATION_TESTS=OFF
+        cmake --build build-llvm --parallel
+        cmake --install build-llvm
+        rm -rf build-llvm
+
+    - name: Save third_party LLVM/MLIR binaries cache
+      if: always() && steps.cache-llvm.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: actions/cache/save@v4
+      with:
+        path: .toolchains/llvm
+        key: crucible-llvm-${{ runner.os }}-${{ runner.arch }}-${{ steps.submodule-rev.outputs.llvm }}

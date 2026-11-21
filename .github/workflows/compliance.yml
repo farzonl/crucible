@@ -69,14 +69,18 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install llvm ninja libpng
+          brew install ninja libpng
           pip3 install --break-system-packages lit psutil pyyaml
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
 
       - name: Configure and build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --parallel
@@ -144,14 +148,18 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          brew install llvm ninja libpng
+          brew install ninja libpng
           pip3 install --break-system-packages lit psutil pyyaml
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
 
       - name: Configure and build
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --parallel
@@ -190,22 +198,16 @@ jobs:
           repository: llvm/offload-golden-images
           path: third_party/offload-golden-images
 
-      - name: Install Vulkan (Lavapipe), LLVM/MLIR, and build tools
+      - name: Install Vulkan (Lavapipe) and build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             ca-certificates curl ninja-build cmake libpng-dev libvulkan-dev \
             mesa-vulkan-drivers vulkan-tools python3-pip
-          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 24
-          sudo apt-get install -y --no-install-recommends \
-            llvm-24-dev llvm-24-tools libmlir-24-dev mlir-24-tools
-          # Work around apt.llvm.org LLVM 24 MLIRTargets.cmake referencing unshipped binaries (e.g. cir-lsp-server).
-          for bin in $(grep -hoE 'bin/[A-Za-z0-9_.-]+' /usr/lib/llvm-24/lib/cmake/mlir/MLIRTargets*.cmake | sort -u); do
-            [ -e "/usr/lib/llvm-24/$bin" ] || sudo touch "/usr/lib/llvm-24/$bin"
-          done
           pip3 install --break-system-packages lit psutil pyyaml
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
 
       - name: Restore Linux DXC SDK cache
         id: cache-linux-sdk
@@ -236,8 +238,8 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_DIR=/usr/lib/llvm-24/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-24/lib/cmake/mlir \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --parallel
