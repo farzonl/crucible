@@ -32,12 +32,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1-msc
+          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1-msc4.0b3
 
       - name: Install DXC and metal-shaderconverter
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
-          mkdir -p .sdk/bin .sdk/lib
+          mkdir -p .sdk/bin .sdk/include .sdk/lib
           VULKAN_VER="1.4.363.1"
           curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_VER}/mac/vulkansdk-macos-${VULKAN_VER}.zip" -o /tmp/vulkansdk.zip
           unzip -q /tmp/vulkansdk.zip -d /tmp/vulkansdk-installer
@@ -48,21 +48,23 @@ jobs:
           cp -a /tmp/vulkansdk/macOS/lib/libdxcompiler* .sdk/lib/
           rm -rf /tmp/vulkansdk /tmp/vulkansdk-installer /tmp/vulkansdk.zip
 
-          git clone --depth 1 https://github.com/MethanePowered/MetalShaderConverterBinary.git /tmp/msc
-          unzip -q /tmp/msc/binaries/MacOS.zip -d /tmp/msc-bins
-          mkdir -p .sdk/include
-          cp -a /tmp/msc-bins/bin/metal-shaderconverter .sdk/bin/
-          cp -a /tmp/msc-bins/lib/libmetalirconverter.dylib .sdk/lib/ 2>/dev/null || true
-          cp -a /tmp/msc-bins/include/* .sdk/include/ 2>/dev/null || true
+          # Metal Shader Converter 4.0 beta 3 (.pkg)
+          curl -fsSL "https://drive.usercontent.google.com/download?id=1JJ9KhEtHPKfBN6yuXVL8QikTxsqTDA0B&export=download&confirm=t" \
+            -o /tmp/msc.pkg
+          pkgutil --expand-full /tmp/msc.pkg /tmp/msc-expanded
+          MSC_USR="/tmp/msc-expanded/MetalShaderConverter.pkg/Payload/usr/local"
+          cp -a "${MSC_USR}/bin/"* .sdk/bin/
+          cp -a "${MSC_USR}/lib/"* .sdk/lib/
+          cp -a "${MSC_USR}/include/"* .sdk/include/
           chmod +x .sdk/bin/metal-shaderconverter
-          rm -rf /tmp/msc /tmp/msc-bins
+          rm -rf /tmp/msc.pkg /tmp/msc-expanded
 
       - name: Save SDK cache
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1-msc
+          key: crucible-bench-sdk-${{ runner.os }}-${{ runner.arch }}-vk1.4.363.1-msc4.0b3
 
       - name: Install build dependencies
         run: brew install llvm ninja
@@ -72,6 +74,7 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="$(brew --prefix llvm)/lib/cmake/llvm" \
+            -DMETAL_IRCONVERTER_DIR="${{ github.workspace }}/.sdk" \
             -DCRUCIBLE_ENABLE_TESTS=OFF
           cmake --build build --target cruciblec crucible-run crucible-bench --parallel
 
