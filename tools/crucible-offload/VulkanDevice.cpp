@@ -1277,14 +1277,16 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   if (!P.isTraditionalRaster() || P.Shaders.size() < 2)
     return Fail("raster execution requires one vertex and one pixel shader");
 
-  const Shader *VS = nullptr, *PS = nullptr;
+  const Shader *VS = nullptr, *GS = nullptr, *PS = nullptr;
   for (const Shader &S : P.Shaders) {
     if (S.Stage == Stages::Vertex)
       VS = &S;
+    else if (S.Stage == Stages::Geometry)
+      GS = &S;
     else if (S.Stage == Stages::Pixel)
       PS = &S;
     else
-      return Fail("Vulkan raster currently supports VS + PS pipelines only");
+      return Fail("Vulkan raster currently supports VS + [GS] + PS pipelines only");
   }
   if (!VS || !PS)
     return Fail("raster execution requires one vertex and one pixel shader");
@@ -1312,6 +1314,18 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   if (!VSCompiled)
     return VSCompiled.takeError();
 
+  std::optional<crucible::SPIRVCompileResult> GSCompiled;
+  if (GS) {
+    crucible::Options GSOpts;
+    GSOpts.Target = crucible::TargetBackend::SPIRV;
+    GSOpts.EntryPoint = GS->Entry;
+    auto GSRes =
+        crucible::compileDXILToSPIRV(GS->Shader->getMemBufferRef(), GSOpts);
+    if (!GSRes)
+      return GSRes.takeError();
+    GSCompiled = std::move(*GSRes);
+  }
+
   crucible::Options PSOpts;
   PSOpts.Target = crucible::TargetBackend::SPIRV;
   PSOpts.EntryPoint = PS->Entry;
@@ -1320,7 +1334,8 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   if (!PSCompiled)
     return PSCompiled.takeError();
 
-  VkShaderModule VSMod = VK_NULL_HANDLE, PSMod = VK_NULL_HANDLE;
+  VkShaderModule VSMod = VK_NULL_HANDLE, GSMod = VK_NULL_HANDLE,
+                 PSMod = VK_NULL_HANDLE;
   auto createMod = [&](const std::string &Bytes,
                        VkShaderModule &Out) -> Error {
     VkShaderModuleCreateInfo CI{};
@@ -1333,7 +1348,14 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   };
   if (Error E = createMod(VSCompiled->Output, VSMod))
     return E;
+  if (GSCompiled) {
+    if (Error E = createMod(GSCompiled->Output, GSMod)) {
+      vkDestroyShaderModule(VK.Device, VSMod, nullptr);
+      return std::move(E);
+    }
+  }
   if (Error E = createMod(PSCompiled->Output, PSMod)) {
+    if (GSMod) vkDestroyShaderModule(VK.Device, GSMod, nullptr);
     vkDestroyShaderModule(VK.Device, VSMod, nullptr);
     return E;
   }
@@ -1418,6 +1440,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     if (ColorImg) vkDestroyImage(VK.Device, ColorImg, nullptr);
     if (ColorMem) vkFreeMemory(VK.Device, ColorMem, nullptr);
     if (PSMod) vkDestroyShaderModule(VK.Device, PSMod, nullptr);
+    if (GSMod) vkDestroyShaderModule(VK.Device, GSMod, nullptr);
     if (VSMod) vkDestroyShaderModule(VK.Device, VSMod, nullptr);
   };
 
@@ -1803,21 +1826,21 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
       auto Class = classifyResource(Res.Kind);
       if (!Class || !Res.DXBinding)
         continue;
-      SmallVector<const crucible::ResourceBinding *, 2> Matches;
-      if (const auto *M = findStageReg(VSCompiled->Reflect, *Class,
-                                       Res.DXBinding->Space,
-                                       Res.DXBinding->Register))
-        Matches.push_back(M);
-      if (const auto *M = findStageReg(PSCompiled->Reflect, *Class,
-                                       Res.DXBinding->Space,
-                                       Res.DXBinding->Register)) {
-        bool Dup = false;
-        for (const auto *E : Matches)
-          if (E->SPIRVSet == M->SPIRVSet && E->SPIRVBinding == M->SPIRVBinding)
-            Dup = true;
-        if (!Dup)
+      SmallVector<const crucible::ResourceBinding *, 3> Matches;
+      auto addStageMatch = [&](const crucible::Reflection &Ref) {
+        if (const auto *M = findStageReg(Ref, *Class, Res.DXBinding->Space,
+                                         Res.DXBinding->Register)) {
+          for (const auto *E : Matches)
+            if (E->SPIRVSet == M->SPIRVSet &&
+                E->SPIRVBinding == M->SPIRVBinding)
+              return;
           Matches.push_back(M);
-      }
+        }
+      };
+      addStageMatch(VSCompiled->Reflect);
+      if (GSCompiled)
+        addStageMatch(GSCompiled->Reflect);
+      addStageMatch(PSCompiled->Reflect);
       if (Matches.empty())
         continue;
 
@@ -2193,8 +2216,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
       LB.binding = BindIdx;
       LB.descriptorType = Info.Type;
       LB.descriptorCount = Info.Count;
-      LB.stageFlags =
-          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+      LB.stageFlags = VK_SHADER_STAGE_ALL_GRAPHICS;
       LayoutBinds.push_back(LB);
       PoolCounts[Info.Type] += Info.Count;
     }
@@ -2281,17 +2303,37 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
     return vkErr(R, "vkCreatePipelineLayout");
   }
 
-  VkPipelineShaderStageCreateInfo StagesCI[2]{};
-  StagesCI[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  StagesCI[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-  StagesCI[0].module = VSMod;
-  StagesCI[0].pName =
-      VSCompiled->Reflect.EntryName.empty() ? "main" : VSCompiled->Reflect.EntryName.c_str();
-  StagesCI[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-  StagesCI[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-  StagesCI[1].module = PSMod;
-  StagesCI[1].pName =
-      PSCompiled->Reflect.EntryName.empty() ? "main" : PSCompiled->Reflect.EntryName.c_str();
+  std::vector<VkPipelineShaderStageCreateInfo> StagesCI;
+  {
+    VkPipelineShaderStageCreateInfo VSCI{};
+    VSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    VSCI.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    VSCI.module = VSMod;
+    VSCI.pName = VSCompiled->Reflect.EntryName.empty()
+                     ? "main"
+                     : VSCompiled->Reflect.EntryName.c_str();
+    StagesCI.push_back(VSCI);
+  }
+  if (GSCompiled && GSMod) {
+    VkPipelineShaderStageCreateInfo GSCI{};
+    GSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    GSCI.stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+    GSCI.module = GSMod;
+    GSCI.pName = GSCompiled->Reflect.EntryName.empty()
+                     ? "main"
+                     : GSCompiled->Reflect.EntryName.c_str();
+    StagesCI.push_back(GSCI);
+  }
+  {
+    VkPipelineShaderStageCreateInfo PSCI{};
+    PSCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    PSCI.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    PSCI.module = PSMod;
+    PSCI.pName = PSCompiled->Reflect.EntryName.empty()
+                     ? "main"
+                     : PSCompiled->Reflect.EntryName.c_str();
+    StagesCI.push_back(PSCI);
+  }
 
   VkPipelineVertexInputStateCreateInfo VISCI{};
   VISCI.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -2303,6 +2345,15 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
   VkPipelineInputAssemblyStateCreateInfo IASCI{};
   IASCI.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
   IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  if (GSCompiled && GSCompiled->Reflect.Geometry) {
+    switch (GSCompiled->Reflect.Geometry->InputPrimitive) {
+    case 1: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
+    case 2: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+    case 6: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY; break;
+    case 7: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY; break;
+    default: IASCI.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+    }
+  }
 
   // Flip Vulkan viewport Y to match DirectX top-left clip-space convention.
   VkViewport VP{0.0f, static_cast<float>(Height), static_cast<float>(Width),
@@ -2357,8 +2408,8 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
 
   VkGraphicsPipelineCreateInfo GPCI{};
   GPCI.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-  GPCI.stageCount = 2;
-  GPCI.pStages = StagesCI;
+  GPCI.stageCount = static_cast<uint32_t>(StagesCI.size());
+  GPCI.pStages = StagesCI.data();
   GPCI.pVertexInputState = &VISCI;
   GPCI.pInputAssemblyState = &IASCI;
   GPCI.pViewportState = &VPSCI;
@@ -2807,6 +2858,7 @@ createVulkanDevices(const DeviceConfig &Config) {
     EnabledDevExts.push_back("VK_KHR_fragment_shader_barycentric");
 
   VkPhysicalDeviceFeatures EnabledFeats{};
+  EnabledFeats.geometryShader = SupportedFeats2.features.geometryShader;
   EnabledFeats.shaderInt64 = SupportedFeats2.features.shaderInt64;
   EnabledFeats.shaderFloat64 = SupportedFeats2.features.shaderFloat64;
   EnabledFeats.shaderInt16 = SupportedFeats2.features.shaderInt16;
