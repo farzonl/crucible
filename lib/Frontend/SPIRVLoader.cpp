@@ -58,11 +58,13 @@ struct BoundBufferInfo {
   size_t ReflectIndex = 0;
   mlir::Type ElemType;
   uint32_t ElemStride = 4;
+  bool IsArray = false;
 };
 
 struct BoundCBufferInfo {
   size_t ReflectIndex = 0;
   mlir::spirv::StructType StructTy;
+  bool IsArray = false;
 };
 
 struct WorkgroupGlobalInfo {
@@ -76,6 +78,7 @@ struct BoundImageInfo {
   ResourceKind Kind = ResourceKind::Invalid;
   mlir::Type ElemType;
   bool IsUAV = false;
+  bool IsArray = false;
 };
 
 struct StageIOInfo {
@@ -615,10 +618,23 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     if (!DS || !Binding)
       continue;
 
+    mlir::Type Pointee = PtrTy.getPointeeType();
+    uint32_t RangeSize = 1;
+    bool IsResourceArray = false;
+    if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(Pointee)) {
+      RangeSize = Arr.getNumElements();
+      Pointee = Arr.getElementType();
+      IsResourceArray = true;
+    } else if (auto RTArr =
+                   mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(Pointee)) {
+      RangeSize = 0xFFFFFFFFu;
+      Pointee = RTArr.getElementType();
+      IsResourceArray = true;
+    }
+
     // UniformConstant images (typed buffers & textures) and samplers.
     if (SC == mlir::spirv::StorageClass::UniformConstant) {
-      if (auto ImgTy =
-              mlir::dyn_cast<mlir::spirv::ImageType>(PtrTy.getPointeeType())) {
+      if (auto ImgTy = mlir::dyn_cast<mlir::spirv::ImageType>(Pointee)) {
         ResourceKind Kind = mapImageKind(ImgTy);
         if (Kind == ResourceKind::Invalid)
           continue;
@@ -632,7 +648,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         RB.Name = GV.getSymName().str();
         RB.Space = *DS;
         RB.LowerBound = *Binding;
-        RB.RangeSize = 1;
+        RB.RangeSize = RangeSize;
         if (Kind == ResourceKind::TypedBuffer)
           RB.TypedComponents = imageFormatComponents(ImgTy.getImageFormat());
 
@@ -641,13 +657,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         Info.Kind = Kind;
         Info.ElemType = ImgTy.getElementType();
         Info.IsUAV = IsUAV;
+        Info.IsArray = IsResourceArray;
         ImageGlobals[GV.getSymName()] = Info;
         Reflect.Resources.push_back(std::move(RB));
         GlobalsToErase.push_back(GV);
         continue;
       }
-      if (auto SITy = mlir::dyn_cast<mlir::spirv::SampledImageType>(
-              PtrTy.getPointeeType())) {
+      if (auto SITy = mlir::dyn_cast<mlir::spirv::SampledImageType>(Pointee)) {
         auto ImgTy = mlir::dyn_cast<mlir::spirv::ImageType>(SITy.getImageType());
         if (!ImgTy)
           continue;
@@ -662,7 +678,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         TexRB.Name = GV.getSymName().str();
         TexRB.Space = *DS;
         TexRB.LowerBound = *Binding;
-        TexRB.RangeSize = 1;
+        TexRB.RangeSize = RangeSize;
 
         ResourceBinding SampRB;
         SampRB.Class = ResourceClass::Sampler;
@@ -671,7 +687,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         SampRB.Name = GV.getSymName().str() + "_sampler";
         SampRB.Space = *DS;
         SampRB.LowerBound = *Binding;
-        SampRB.RangeSize = 1;
+        SampRB.RangeSize = RangeSize;
 
         BoundImageInfo Info;
         Info.ReflectIndex = Reflect.Resources.size();
@@ -681,11 +697,12 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         Info.Kind = Kind;
         Info.ElemType = ImgTy.getElementType();
         Info.IsUAV = false;
+        Info.IsArray = IsResourceArray;
         ImageGlobals[GV.getSymName()] = Info;
         GlobalsToErase.push_back(GV);
         continue;
       }
-      if (mlir::isa<mlir::spirv::SamplerType>(PtrTy.getPointeeType())) {
+      if (mlir::isa<mlir::spirv::SamplerType>(Pointee)) {
         ResourceBinding RB;
         RB.Class = ResourceClass::Sampler;
         RB.Kind = ResourceKind::Sampler;
@@ -693,7 +710,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         RB.Name = GV.getSymName().str();
         RB.Space = *DS;
         RB.LowerBound = *Binding;
-        RB.RangeSize = 1;
+        RB.RangeSize = RangeSize;
         SamplerGlobals[GV.getSymName()] = Reflect.Resources.size();
         Reflect.Resources.push_back(std::move(RB));
         GlobalsToErase.push_back(GV);
@@ -706,8 +723,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         SC != mlir::spirv::StorageClass::StorageBuffer)
       continue;
 
-    auto StructTy =
-        mlir::dyn_cast<mlir::spirv::StructType>(PtrTy.getPointeeType());
+    auto StructTy = mlir::dyn_cast<mlir::spirv::StructType>(Pointee);
     if (!StructTy || StructTy.getNumElements() == 0)
       continue;
 
@@ -734,13 +750,14 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       RB.Name = GV.getSymName().str();
       RB.Space = *DS;
       RB.LowerBound = *Binding;
-      RB.RangeSize = 1;
+      RB.RangeSize = RangeSize;
       RB.ElementStride = Stride;
 
       BoundBufferInfo Info;
       Info.ReflectIndex = Reflect.Resources.size();
       Info.ElemType = ElemTy;
       Info.ElemStride = Stride;
+      Info.IsArray = IsResourceArray;
       BufferGlobals[GV.getSymName()] = Info;
       Reflect.Resources.push_back(std::move(RB));
       GlobalsToErase.push_back(GV);
@@ -764,13 +781,14 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       RB.Name = GV.getSymName().str();
       RB.Space = *DS;
       RB.LowerBound = *Binding;
-      RB.RangeSize = 1;
+      RB.RangeSize = RangeSize;
       RB.ElementStride = Stride;
 
       BoundBufferInfo Info;
       Info.ReflectIndex = Reflect.Resources.size();
       Info.ElemType = ElemTy;
       Info.ElemStride = Stride;
+      Info.IsArray = IsResourceArray;
       BufferGlobals[GV.getSymName()] = Info;
       Reflect.Resources.push_back(std::move(RB));
       GlobalsToErase.push_back(GV);
@@ -791,12 +809,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       RB.Name = GV.getSymName().str();
       RB.Space = *DS;
       RB.LowerBound = *Binding;
-      RB.RangeSize = 1;
+      RB.RangeSize = RangeSize;
       RB.ElementStride = PaddedBytes;
 
       BoundCBufferInfo Info;
       Info.ReflectIndex = Reflect.Resources.size();
       Info.StructTy = StructTy;
+      Info.IsArray = IsResourceArray;
       CBufferGlobals[GV.getSymName()] = Info;
       Reflect.Resources.push_back(std::move(RB));
       GlobalsToErase.push_back(GV);
@@ -893,6 +912,36 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         EntryBuilder.getBoolAttr(false), IdxC);
     HandleCache[ReflectIndex] = H.getResult();
     return H.getResult();
+  };
+  auto getHandleForIndexAt = [&](size_t ReflectIndex, mlir::OpBuilder &B,
+                                 mlir::Location Loc,
+                                 mlir::Value ArrIdx) -> mlir::Value {
+    if (!ArrIdx)
+      return getHandleForIndex(ReflectIndex);
+    const ResourceBinding &RB = Reflect.Resources[ReflectIndex];
+    auto ResTy = ir::ResourceType::get(&Ctx);
+    mlir::Value IdxVal;
+    if (auto C = getConstSpirvInt(ArrIdx)) {
+      IdxVal = mlir::LLVM::ConstantOp::create(
+          B, Loc, I32Ty, static_cast<int32_t>(RB.LowerBound + *C));
+    } else {
+      mlir::Value Arr32 = castToSignless(B, Loc, ArrIdx);
+      if (RB.LowerBound != 0) {
+        auto BaseC = mlir::LLVM::ConstantOp::create(
+            B, Loc, I32Ty, static_cast<int32_t>(RB.LowerBound));
+        IdxVal = mlir::LLVM::AddOp::create(B, Loc, BaseC, Arr32);
+      } else {
+        IdxVal = Arr32;
+      }
+    }
+    return ir::BindResourceOp::create(
+               B, Loc, ResTy,
+               ir::ResourceClassAttr::get(
+                   &Ctx, static_cast<ir::ResourceClass>(RB.Class)),
+               B.getI32IntegerAttr(static_cast<int32_t>(RB.RecordID)),
+               /*space=*/nullptr, /*binding=*/nullptr, B.getBoolAttr(false),
+               IdxVal)
+        .getResult();
   };
 
   SmallVector<mlir::spirv::AddressOfOp, 8> AddrOps;
@@ -1020,7 +1069,6 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     auto BufIt = BufferGlobals.find(Sym);
     if (BufIt != BufferGlobals.end()) {
       const BoundBufferInfo &Info = BufIt->second;
-      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
 
       std::function<Error(mlir::spirv::AccessChainOp,
                           SmallVector<mlir::Value, 8>)>
@@ -1028,10 +1076,14 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                  SmallVector<mlir::Value, 8> AllIndices) -> Error {
         for (mlir::Value Idx : Chain.getIndices())
           AllIndices.push_back(Idx);
-        if (AllIndices.empty())
+        size_t BaseIdx = Info.IsArray ? 1 : 0;
+        if (AllIndices.size() <= BaseIdx)
           return makeError("unsupported access pattern on buffer '{0}'", Sym);
 
-        mlir::Value ElemIdx = AllIndices.size() >= 2 ? AllIndices[1] : mlir::Value();
+        mlir::Value ArrIdx = Info.IsArray ? AllIndices[0] : mlir::Value();
+        mlir::Value ElemIdx = AllIndices.size() >= BaseIdx + 2
+                                  ? AllIndices[BaseIdx + 1]
+                                  : mlir::Value();
         auto getElemIdx = [&](mlir::OpBuilder &B, mlir::Location Loc) -> mlir::Value {
           if (ElemIdx)
             return castToSignless(B, Loc, ElemIdx);
@@ -1044,7 +1096,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           uint32_t ConstOff = 0;
           mlir::Value DynOff;
           mlir::Type CurTy = Info.ElemType;
-          for (size_t K = 2; K < AllIndices.size(); ++K) {
+          for (size_t K = BaseIdx + 2; K < AllIndices.size(); ++K) {
             mlir::Value IdxV = AllIndices[K];
             auto CIdx = getConstSpirvInt(IdxV);
             if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
@@ -1108,6 +1160,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           } else if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU)) {
             mlir::OpBuilder B(Load);
             mlir::Location Loc = Load.getLoc();
+            mlir::Value Handle =
+                getHandleForIndexAt(Info.ReflectIndex, B, Loc, ArrIdx);
             auto OffValOrErr = computeByteOff(B, Loc);
             if (!OffValOrErr)
               return OffValOrErr.takeError();
@@ -1150,6 +1204,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(MU)) {
             mlir::OpBuilder B(Store);
             mlir::Location Loc = Store.getLoc();
+            mlir::Value Handle =
+                getHandleForIndexAt(Info.ReflectIndex, B, Loc, ArrIdx);
             auto OffValOrErr = computeByteOff(B, Loc);
             if (!OffValOrErr)
               return OffValOrErr.takeError();
@@ -1226,6 +1282,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
 
             mlir::OpBuilder B(MU);
             mlir::Location Loc = MU->getLoc();
+            mlir::Value Handle =
+                getHandleForIndexAt(Info.ReflectIndex, B, Loc, ArrIdx);
             mlir::Type OrigTy = AVal.getType();
             mlir::Value SignlessVal = castToSignless(B, Loc, AVal);
             mlir::Value IdxVal = getElemIdx(B, Loc);
@@ -1266,7 +1324,6 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     auto CBIt = CBufferGlobals.find(Sym);
     if (CBIt != CBufferGlobals.end()) {
       const BoundCBufferInfo &Info = CBIt->second;
-      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
 
       std::function<Error(mlir::spirv::AccessChainOp,
                           SmallVector<mlir::Value, 8>)>
@@ -1274,9 +1331,11 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                   SmallVector<mlir::Value, 8> AllIndices) -> Error {
         for (mlir::Value Idx : Chain.getIndices())
           AllIndices.push_back(Idx);
-        if (AllIndices.empty())
+        size_t StartIdx = Info.IsArray ? 1 : 0;
+        if (AllIndices.size() <= StartIdx)
           return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
 
+        mlir::Value ArrIdx = Info.IsArray ? AllIndices[0] : mlir::Value();
         SmallVector<mlir::Operation *, 8> MemUsers(Chain->getUsers().begin(),
                                                    Chain->getUsers().end());
         for (mlir::Operation *MU : MemUsers) {
@@ -1291,6 +1350,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
 
           mlir::OpBuilder B(Load);
           mlir::Location Loc = Load.getLoc();
+          mlir::Value Handle =
+              getHandleForIndexAt(Info.ReflectIndex, B, Loc, ArrIdx);
 
           // Compute static + dynamic byte offset through nested structs/arrays/matrices/vectors.
           mlir::Type CurTy = Info.StructTy;
@@ -1310,7 +1371,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                   B, Loc, DynOffset, Term))
                             : Term;
           };
-          for (mlir::Value IdxV : AllIndices) {
+          for (size_t IdxI = StartIdx; IdxI < AllIndices.size(); ++IdxI) {
+            mlir::Value IdxV = AllIndices[IdxI];
             auto ConstIdx = getConstSpirvInt(IdxV);
             if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
               if (!ConstIdx)
@@ -1665,13 +1727,33 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     auto ImgIt = ImageGlobals.find(Sym);
     if (ImgIt != ImageGlobals.end()) {
       const BoundImageInfo &Info = ImgIt->second;
-      mlir::Value Handle = getHandleForIndex(Info.ReflectIndex);
-      SmallVector<mlir::Operation *, 8> Loads(AO->getUsers().begin(),
+      SmallVector<std::pair<mlir::spirv::LoadOp, mlir::Value>, 8> LoadEntries;
+      SmallVector<mlir::spirv::AccessChainOp, 8> ChainsToErase;
+      SmallVector<mlir::Operation *, 8> Users(AO->getUsers().begin(),
                                               AO->getUsers().end());
-      for (mlir::Operation *LU : Loads) {
-        auto ImgLoad = mlir::dyn_cast<mlir::spirv::LoadOp>(LU);
-        if (!ImgLoad)
+      for (mlir::Operation *LU : Users) {
+        if (auto ImgLoad = mlir::dyn_cast<mlir::spirv::LoadOp>(LU)) {
+          LoadEntries.push_back({ImgLoad, mlir::Value()});
+        } else if (Info.IsArray) {
+          auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(LU);
+          if (!Chain || Chain.getIndices().size() != 1)
+            return makeError("unsupported user of image global '{0}'", Sym);
+          mlir::Value ArrIdx = Chain.getIndices()[0];
+          for (mlir::Operation *CU : Chain->getUsers()) {
+            auto ImgLoad = mlir::dyn_cast<mlir::spirv::LoadOp>(CU);
+            if (!ImgLoad)
+              return makeError("unsupported user of image global '{0}'", Sym);
+            LoadEntries.push_back({ImgLoad, ArrIdx});
+          }
+          ChainsToErase.push_back(Chain);
+        } else {
           return makeError("unsupported user of image global '{0}'", Sym);
+        }
+      }
+      for (auto &[ImgLoad, ArrIdx] : LoadEntries) {
+        mlir::OpBuilder LoadB(ImgLoad);
+        mlir::Value Handle = getHandleForIndexAt(Info.ReflectIndex, LoadB,
+                                                 ImgLoad.getLoc(), ArrIdx);
         SmallVector<mlir::Operation *, 8> ImgUsers;
         SmallVector<mlir::spirv::ImageOp, 4> ImageOpsToErase;
         for (mlir::Operation *U : ImgLoad->getUsers()) {
@@ -2011,14 +2093,28 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             // Lower SampledImage + ImageSample{Implicit,Explicit}Lod / Gather.
             auto SampLoad =
                 SI.getSampler().getDefiningOp<mlir::spirv::LoadOp>();
-            auto SampAO =
-                SampLoad
-                    ? SampLoad.getPtr().getDefiningOp<mlir::spirv::AddressOfOp>()
-                    : nullptr;
+            mlir::spirv::AddressOfOp SampAO;
+            mlir::spirv::AccessChainOp SampChain;
+            mlir::Value SampArrIdx;
+            if (SampLoad) {
+              SampAO =
+                  SampLoad.getPtr().getDefiningOp<mlir::spirv::AddressOfOp>();
+              if (!SampAO) {
+                SampChain =
+                    SampLoad.getPtr().getDefiningOp<mlir::spirv::AccessChainOp>();
+                if (SampChain && SampChain.getIndices().size() == 1) {
+                  SampAO = SampChain.getBasePtr()
+                               .getDefiningOp<mlir::spirv::AddressOfOp>();
+                  SampArrIdx = SampChain.getIndices()[0];
+                }
+              }
+            }
             if (!SampAO || !SamplerGlobals.contains(SampAO.getVariable()))
               return makeError("unresolved sampler in spirv.SampledImage");
-            mlir::Value SampHandle =
-                getHandleForIndex(SamplerGlobals[SampAO.getVariable()]);
+            mlir::OpBuilder SIB(SI);
+            mlir::Value SampHandle = getHandleForIndexAt(
+                SamplerGlobals[SampAO.getVariable()], SIB, SI.getLoc(),
+                SampArrIdx);
             SmallVector<mlir::Operation *, 4> SIUsers(SI->getUsers().begin(),
                                                       SI->getUsers().end());
             for (mlir::Operation *SU : SIUsers) {
@@ -2028,6 +2124,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             SI.erase();
             if (SampLoad && SampLoad->use_empty())
               SampLoad.erase();
+            if (SampChain && SampChain->use_empty())
+              SampChain.erase();
             if (SampAO && SampAO->use_empty()) {
               ErasedAddrOps.insert(SampAO);
               SampAO.erase();
@@ -2036,7 +2134,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                      mlir::isa<mlir::spirv::ImageSampleImplicitLodOp,
                                mlir::spirv::ImageSampleExplicitLodOp,
                                mlir::spirv::ImageDrefGatherOp>(IU)) {
-            mlir::Value SampHandle = getHandleForIndex(Info.SamplerReflectIndex);
+            mlir::Value SampHandle = getHandleForIndexAt(
+                Info.SamplerReflectIndex, LoadB, ImgLoad.getLoc(), ArrIdx);
             if (Error E = lowerSampledImageUser(IU, SampHandle))
               return std::move(E);
           } else if (auto QS = mlir::dyn_cast<mlir::spirv::ImageQuerySizeOp>(IU)) {
@@ -2079,6 +2178,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         }
         if (ImgLoad->use_empty())
           ImgLoad.erase();
+      }
+      for (auto Chain : ChainsToErase) {
+        if (Chain->use_empty())
+          Chain.erase();
       }
       if (AO->use_empty())
         AO.erase();
