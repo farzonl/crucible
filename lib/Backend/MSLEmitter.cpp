@@ -2974,6 +2974,17 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
                       PrecPrimary};
         }
       }
+      if (auto CB = mlir::dyn_cast<ir::CBufferLoadOp>(Prod)) {
+        auto RName = resourceExpr(CB.getHandle());
+        auto Row = exprFor(CB.getRegIndex(), PrecUnknown);
+        auto Idx = exprFor(EE.getPosition(), PrecUnknown);
+        auto Ty = mslType(EE.getType());
+        if (!RName || !Row || !Idx || !Ty)
+          return makeError("invalid dynamic cbuffer extractelement");
+        return Expr{"((constant " + *Ty + " *)(&(" + *RName + ")[" + Row->Text +
+                        "]))[" + Idx->Text + "]",
+                    PrecPrimary};
+      }
     }
     auto Vec = exprFor(EE.getVector(), PrecPrimary);
     auto Idx = exprFor(EE.getPosition(), PrecUnknown);

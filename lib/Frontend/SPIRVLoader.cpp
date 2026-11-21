@@ -1191,19 +1191,33 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           if (!Load)
             return makeError("unsupported non-load user of cbuffer '{0}'", Sym);
 
-          // Compute static byte offset through nested structs/arrays/matrices/vectors.
+          mlir::OpBuilder B(Load);
+          mlir::Location Loc = Load.getLoc();
+
+          // Compute static + dynamic byte offset through nested structs/arrays/matrices/vectors.
           mlir::Type CurTy = Info.StructTy;
           uint32_t ByteOffset = 0;
+          mlir::Value DynOffset;
           uint32_t CurMatrixStride = 16u;
           bool CurMatrixRowMajor = false;
           uint32_t NextVecElemStride = 0;
+          auto addDynTerm = [&](mlir::Value IdxV, uint32_t Stride) {
+            mlir::Value Idx32 = castToSignless(B, Loc, IdxV);
+            auto StrideC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32Ty, static_cast<int32_t>(Stride));
+            mlir::Value Term =
+                mlir::LLVM::MulOp::create(B, Loc, Idx32, StrideC);
+            DynOffset = DynOffset
+                            ? mlir::Value(mlir::LLVM::AddOp::create(
+                                  B, Loc, DynOffset, Term))
+                            : Term;
+          };
           for (mlir::Value IdxV : AllIndices) {
             auto ConstIdx = getConstSpirvInt(IdxV);
-            if (!ConstIdx)
-              return makeError("dynamic indexing into cbuffer '{0}' not yet supported",
-                               Sym);
-            uint32_t I = static_cast<uint32_t>(*ConstIdx);
             if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
+              if (!ConstIdx)
+                return makeError("dynamic struct index into cbuffer '{0}'", Sym);
+              uint32_t I = static_cast<uint32_t>(*ConstIdx);
               ByteOffset += ST.getMemberOffset(I);
               CurMatrixStride = 16u;
               CurMatrixRowMajor = false;
@@ -1223,24 +1237,29 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               uint32_t Stride = Arr.getArrayStride();
               if (Stride == 0)
                 Stride = spirvTypeBytes(Arr.getElementType());
-              ByteOffset += I * Stride;
+              if (ConstIdx)
+                ByteOffset += static_cast<uint32_t>(*ConstIdx) * Stride;
+              else
+                addDynTerm(IdxV, Stride);
               CurTy = Arr.getElementType();
             } else if (auto Mat = mlir::dyn_cast<mlir::spirv::MatrixType>(CurTy)) {
               auto ColVec = mlir::cast<mlir::VectorType>(Mat.getColumnType());
               uint32_t ElemBytes = scalarTypeBytes(ColVec.getElementType());
-              if (CurMatrixRowMajor) {
-                ByteOffset += I * ElemBytes;
-                NextVecElemStride = CurMatrixStride;
-              } else {
-                ByteOffset += I * CurMatrixStride;
-                NextVecElemStride = ElemBytes;
-              }
+              uint32_t Step = CurMatrixRowMajor ? ElemBytes : CurMatrixStride;
+              NextVecElemStride = CurMatrixRowMajor ? CurMatrixStride : ElemBytes;
+              if (ConstIdx)
+                ByteOffset += static_cast<uint32_t>(*ConstIdx) * Step;
+              else
+                addDynTerm(IdxV, Step);
               CurTy = ColVec;
             } else if (auto Vec = mlir::dyn_cast<mlir::VectorType>(CurTy)) {
               uint32_t Step = NextVecElemStride
                                   ? NextVecElemStride
                                   : scalarTypeBytes(Vec.getElementType());
-              ByteOffset += I * Step;
+              if (ConstIdx)
+                ByteOffset += static_cast<uint32_t>(*ConstIdx) * Step;
+              else
+                addDynTerm(IdxV, Step);
               NextVecElemStride = 0;
               CurTy = Vec.getElementType();
             } else {
@@ -1248,8 +1267,6 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             }
           }
 
-          mlir::OpBuilder B(Load);
-          mlir::Location Loc = Load.getLoc();
           mlir::Type OrigTy = Load.getType();
           auto loadScalarAt = [&](mlir::Type ScalarTy,
                                   uint32_t OffBytes) -> mlir::Value {
@@ -1257,18 +1274,41 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             if (ScalarTy.isInteger(1))
               LoadScalarTy = I32Ty;
             uint32_t ElemBytes = scalarTypeBytes(LoadScalarTy);
-            uint32_t Row = OffBytes / 16u;
-            uint32_t Comp = (OffBytes % 16u) / ElemBytes;
             int64_t Lanes = 16 / ElemBytes;
             auto RetVecTy = mlir::VectorType::get({Lanes}, LoadScalarTy);
-            auto RowC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(Row));
+            mlir::Value RowVal, CompVal;
+            if (!DynOffset) {
+              uint32_t Row = OffBytes / 16u;
+              uint32_t Comp = (OffBytes % 16u) / ElemBytes;
+              RowVal = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(Row));
+              CompVal = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(Comp));
+            } else {
+              mlir::Value TotalBytes = DynOffset;
+              if (OffBytes != 0) {
+                auto OffC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(OffBytes));
+                TotalBytes = mlir::LLVM::AddOp::create(B, Loc, DynOffset, OffC);
+              }
+              auto Shift4 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 4);
+              RowVal = mlir::LLVM::LShrOp::create(B, Loc, TotalBytes, Shift4);
+              auto Mask15 = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 15);
+              mlir::Value SubOff =
+                  mlir::LLVM::AndOp::create(B, Loc, TotalBytes, Mask15);
+              unsigned ElemShift = llvm::Log2_32(ElemBytes);
+              if (ElemShift > 0) {
+                auto ShiftE = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(ElemShift));
+                CompVal = mlir::LLVM::LShrOp::create(B, Loc, SubOff, ShiftE);
+              } else {
+                CompVal = SubOff;
+              }
+            }
             auto CBLoad =
-                ir::CBufferLoadOp::create(B, Loc, RetVecTy, Handle, RowC);
-            auto CompC = mlir::LLVM::ConstantOp::create(
-                B, Loc, I32Ty, static_cast<int32_t>(Comp));
+                ir::CBufferLoadOp::create(B, Loc, RetVecTy, Handle, RowVal);
             mlir::Value V = mlir::LLVM::ExtractElementOp::create(
-                B, Loc, CBLoad.getResult(), CompC);
+                B, Loc, CBLoad.getResult(), CompVal);
             if (ScalarTy.isInteger(1)) {
               auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
               V = mlir::LLVM::ICmpOp::create(B, Loc, mlir::LLVM::ICmpPredicate::ne,
