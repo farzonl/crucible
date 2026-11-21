@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace crucible {
@@ -92,6 +93,9 @@ struct Options {
   /// for lib_6_x raytracing pipelines.
   std::vector<std::string> MissShaders;
   std::vector<std::string> HitGroupClosestHits;
+
+  /// SPIR-V specialization constant overrides (ConstantID -> raw bit pattern).
+  std::unordered_map<uint32_t, uint64_t> SpecConstants;
 
   /// Compile a Vertex or Domain shader as a compute kernel that writes its
   /// packed 32-bit signature outputs to [[buffer(30)]] for downstream HS/GS.
