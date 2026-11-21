@@ -5,6 +5,10 @@
 import os
 import shlex
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+from crucible_lit_format import CrucibleOffloadShTest
 
 import lit.formats
 try:
@@ -57,40 +61,15 @@ if len(targets) != 1:
     )
 target = targets[0]
 host = report["Host"]
-# Known Apple Paravirtual GPU driver bugs on virtualized macOS runners
-# (e.g. GitHub Actions macOS VMs) that do not reproduce on bare-metal Apple Silicon:
-# - simd_min(half) / simd_max(half) fails MTLComputePipelineState compilation.
-# - Direct-bound array<texture*<..., access::read_write>, N> returns zeros for
-#   elements [1..N-1].
-_PARAVIRTUAL_METAL_XFAILS = frozenset({
-    "Feature/Textures/Array.SRVToUAV.array.test",
-    "Feature/Textures/SRVToUAV.array.test",
-    "WaveOps/WaveActiveMax.fp16.test",
-    "WaveOps/WaveActiveMin.fp16.test",
-})
-
-
-class _ParavirtualXFailShTest(lit.formats.ShTest):
-    def getTestsInDirectory(self, testSuite, path_in_suite, litConfig, localConfig):
-        for test in super().getTestsInDirectory(
-            testSuite, path_in_suite, litConfig, localConfig
-        ):
-            if "/".join(test.path_in_suite) in _PARAVIRTUAL_METAL_XFAILS:
-                if "*" not in test.xfails:
-                    test.xfails.append("*")
-            yield test
-
-    def __reduce__(self):
-        # Worker processes spawned via multiprocessing (macOS/Windows) cannot
-        # unpickle classes defined dynamically inside lit.cfg.py. Because
-        # test.xfails is already populated during discovery in the parent
-        # process, workers only need a standard picklable ShTest instance.
-        return (lit.formats.ShTest, (self.execute_external,))
-
-
-if "paravirtual" in str(target.get("Description", "")).lower():
+_is_paravirtual = "paravirtual" in str(target.get("Description", "")).lower()
+_use_spirv_frontend = bool(lit_config.params.get("spirv_frontend"))
+if _is_paravirtual:
     config.available_features.add("apple-paravirtual")
-    config.test_format = _ParavirtualXFailShTest()
+if _is_paravirtual or _use_spirv_frontend:
+    config.test_format = CrucibleOffloadShTest(
+        is_paravirtual=_is_paravirtual,
+        clear_spirv_xfails=_use_spirv_frontend,
+    )
 
 # Use the advertised API contract for test annotations, not the execution
 # backend.

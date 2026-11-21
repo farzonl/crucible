@@ -168,6 +168,18 @@ StringRef helperSource(StringRef Name) {
            "  return (as_type<uint>(x) & 0x7f800000u) == 0u\n"
            "             ? as_type<float>(as_type<uint>(x) & 0x80000000u)\n"
            "             : x;\n"
+           "}\n"
+           "static inline float2 crucible_ftz(float2 x) {\n"
+           "  return select(x, as_type<float2>(as_type<uint2>(x) & 0x80000000u),\n"
+           "                (as_type<uint2>(x) & 0x7f800000u) == 0u);\n"
+           "}\n"
+           "static inline float3 crucible_ftz(float3 x) {\n"
+           "  return select(x, as_type<float3>(as_type<uint3>(x) & 0x80000000u),\n"
+           "                (as_type<uint3>(x) & 0x7f800000u) == 0u);\n"
+           "}\n"
+           "static inline float4 crucible_ftz(float4 x) {\n"
+           "  return select(x, as_type<float4>(as_type<uint4>(x) & 0x80000000u),\n"
+           "                (as_type<uint4>(x) & 0x7f800000u) == 0u);\n"
            "}\n";
   if (Name == "crucible_ray_params")
     return "static inline intersection_params crucible_ray_params(uint flags) {\n"
@@ -3310,11 +3322,19 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     }
   }
 
+  auto isF32OrF32Vec = [](mlir::Type T) {
+    if (T.isF32())
+      return true;
+    if (auto VT = mlir::dyn_cast<mlir::VectorType>(T))
+      return VT.getElementType().isF32() && VT.getNumElements() >= 2 &&
+             VT.getNumElements() <= 4;
+    return false;
+  };
   auto emitUnaryCall = [&](StringRef Fn) -> Expected<Expr> {
     auto A = exprFor(Op->getOperand(0), PrecUnknown);
     if (!A)
       return A.takeError();
-    if (Opts.FlushDenormsF32 && Op->getResult(0).getType().isF32()) {
+    if (Opts.FlushDenormsF32 && isF32OrF32Vec(Op->getResult(0).getType())) {
       requireHelper("crucible_ftz");
       return Expr{("crucible_ftz(" + Fn + "(crucible_ftz(" + A->Text + ")))")
                       .str(),
