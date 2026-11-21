@@ -137,6 +137,7 @@ bool isTextureResource(ResourceKind Kind) {
   case ResourceKind::Texture1DArray:
   case ResourceKind::RWTexture1DArray:
   case ResourceKind::Texture2D:
+  case ResourceKind::SampledTexture2D:
   case ResourceKind::RWTexture2D:
   case ResourceKind::Texture2DArray:
   case ResourceKind::RWTexture2DArray:
@@ -168,6 +169,7 @@ MTL::TextureType metalTextureType(ResourceKind Kind) {
   case ResourceKind::Texture1D:
   case ResourceKind::RWTexture1D:
   case ResourceKind::Texture2D:
+  case ResourceKind::SampledTexture2D:
   case ResourceKind::RWTexture2D:
     return MTL::TextureType2D;
   case ResourceKind::Texture1DArray:
@@ -553,7 +555,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
         YAMLSampler *Samp = nullptr;
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
-            if (Res.Kind == ResourceKind::Sampler && !Res.IsReserved &&
+            if ((Res.Kind == ResourceKind::Sampler ||
+                 Res.Kind == ResourceKind::SampledTexture2D) &&
+                Res.SamplerPtr && !Res.IsReserved &&
                 resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
@@ -993,7 +997,9 @@ Error executeRaster(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
         YAMLSampler *Samp = nullptr;
         for (auto &Set : P.Sets)
           for (auto &Res : Set.Resources)
-            if (Res.Kind == ResourceKind::Sampler && !Res.IsReserved &&
+            if ((Res.Kind == ResourceKind::Sampler ||
+                 Res.Kind == ResourceKind::SampledTexture2D) &&
+                Res.SamplerPtr && !Res.IsReserved &&
                 resourceBindingOffset(Res, RB, UseVulkanBinding) == 0u &&
                 Res.getArraySize() == 1)
               Samp = Res.SamplerPtr;
@@ -1987,6 +1993,16 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
             if (!Tex)
               return Tex.takeError();
             TextureBinds.push_back({BaseSlot + I, *Tex});
+            if (Res.Kind == ResourceKind::SampledTexture2D && Res.SamplerPtr) {
+              for (const crucible::ResourceBinding &SRB : R.Resources) {
+                if (SRB.Class == crucible::ResourceClass::Sampler &&
+                    resourceBindingOffset(Res, SRB, UseVulkanBinding) == 0u) {
+                  SamplerBinds.push_back(
+                      {SRB.MetalIndex + I, GetGPUSampler(Res.SamplerPtr)});
+                  break;
+                }
+              }
+            }
           } else {
             BufferBinds.push_back(
                 {BaseSlot + I, GetGPUBuffer(Res.BufferPtr, I)});
