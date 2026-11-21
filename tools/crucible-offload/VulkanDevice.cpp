@@ -124,9 +124,33 @@ VkFormat vkFormatForBuffer(const CPUBuffer &Buf) {
   case DataFormat::Float64:
     if (Ch == 1) return VK_FORMAT_R32G32_UINT;
     return VK_FORMAT_R32G32B32A32_UINT;
+  case DataFormat::Depth32:
+    return VK_FORMAT_D32_SFLOAT;
   default:
     return VK_FORMAT_R32G32B32A32_SFLOAT;
   }
+}
+
+Error validateTextureMipLevels(const CPUBuffer &CPU, uint32_t W, uint32_t H,
+                               uint32_t D) {
+  if (CPU.OutputProps.MipLevels <= 0)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "Texture resource '%s' requires at least one mip level (got %d).",
+        CPU.Name.c_str(), CPU.OutputProps.MipLevels);
+  uint32_t MaxDim = std::max({W, H, D});
+  uint32_t MaxMips = 1;
+  while (MaxDim > 1) {
+    MaxDim >>= 1;
+    ++MaxMips;
+  }
+  uint32_t Mips = static_cast<uint32_t>(CPU.OutputProps.MipLevels);
+  if (Mips > MaxMips)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "Texture dimensions %ux%ux%u support at most %u mip levels, got %u.",
+        W, H, D, MaxMips, Mips);
+  return Error::success();
 }
 
 bool isTextureKind(ResourceKind K) {
@@ -491,7 +515,13 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       break;
     }
 
+    if (Error MipErr = validateTextureMipLevels(*CPU, W, H, D))
+      return std::move(MipErr);
+
     VkFormat Fmt = vkFormatForBuffer(*CPU);
+    bool IsDepth = (Fmt == VK_FORMAT_D32_SFLOAT);
+    VkImageAspectFlags Aspect =
+        IsDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
     uint32_t TexelBytes = std::max<uint32_t>(
         1u, static_cast<uint32_t>(CPU->getSingleElementSize()) *
                 std::max<uint32_t>(1u, CPU->Channels));
@@ -518,8 +548,9 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     ICI.arrayLayers = Layers;
     ICI.samples = VK_SAMPLE_COUNT_1_BIT;
     ICI.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ICI.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    ICI.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                (IsDepth ? 0u : VK_IMAGE_USAGE_STORAGE_BIT);
     ICI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ICI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (VkResult R = vkCreateImage(VK.Device, &ICI, nullptr, &A.Image))
@@ -553,7 +584,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     IVCI.image = A.Image;
     IVCI.viewType = ViewType;
     IVCI.format = Fmt;
-    IVCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+    IVCI.subresourceRange = {Aspect, 0, Mips, 0, Layers};
     if (VkResult R = vkCreateImageView(VK.Device, &IVCI, nullptr, &A.View)) {
       vkFreeMemory(VK.Device, A.Memory, nullptr);
       vkDestroyImage(VK.Device, A.Image, nullptr);
@@ -604,7 +635,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       B1.srcAccessMask = 0;
       B1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
       B1.image = A.Image;
-      B1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+      B1.subresourceRange = {Aspect, 0, Mips, 0, Layers};
       vkCmdPipelineBarrier(CB, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                            nullptr, 1, &B1);
@@ -620,7 +651,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
           if (Off + SubBytes <= StageBytes) {
             VkBufferImageCopy Reg{};
             Reg.bufferOffset = Off;
-            Reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, M, L, 1};
+            Reg.imageSubresource = {Aspect, M, L, 1};
             Reg.imageExtent = {MW, MH, MD};
             vkCmdCopyBufferToImage(CB, StageBuf, A.Image,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -635,9 +666,10 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       B2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
       B2.newLayout = VK_IMAGE_LAYOUT_GENERAL;
       B2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-      B2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      B2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                         (IsDepth ? 0u : VK_ACCESS_SHADER_WRITE_BIT);
       B2.image = A.Image;
-      B2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+      B2.subresourceRange = {Aspect, 0, Mips, 0, Layers};
       vkCmdPipelineBarrier(CB, VK_PIPELINE_STAGE_TRANSFER_BIT,
                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
                            0, nullptr, 1, &B2);
@@ -1889,7 +1921,14 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
           default:
             break;
           }
+          if (Error MipErr = validateTextureMipLevels(*CPU, TW, TH, TD)) {
+            cleanup();
+            return MipErr;
+          }
           VkFormat Fmt = vkFormatForBuffer(*CPU);
+          bool IsDepth = (Fmt == VK_FORMAT_D32_SFLOAT);
+          VkImageAspectFlags Aspect =
+              IsDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
           uint32_t TexelBytes = std::max<uint32_t>(
               1u, static_cast<uint32_t>(CPU->getSingleElementSize()) *
                       std::max<uint32_t>(1u, CPU->Channels));
@@ -1905,7 +1944,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
           TICI.samples = VK_SAMPLE_COUNT_1_BIT;
           TICI.tiling = VK_IMAGE_TILING_OPTIMAL;
           TICI.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                       (IsUAV ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+                       ((IsUAV && !IsDepth) ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
           TICI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
           TICI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
           if (VkResult R = vkCreateImage(VK.Device, &TICI, nullptr, &RI.Image)) {
@@ -1939,7 +1978,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
           TIVCI.image = RI.Image;
           TIVCI.viewType = ViewType;
           TIVCI.format = Fmt;
-          TIVCI.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+          TIVCI.subresourceRange = {Aspect, 0, Mips, 0, Layers};
           if (VkResult R = vkCreateImageView(VK.Device, &TIVCI, nullptr, &RI.View)) {
             vkFreeMemory(VK.Device, RI.Memory, nullptr);
             vkDestroyImage(VK.Device, RI.Image, nullptr);
@@ -1987,7 +2026,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
             B1.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             B1.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             B1.image = RI.Image;
-            B1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+            B1.subresourceRange = {Aspect, 0, Mips, 0, Layers};
             vkCmdPipelineBarrier(UCB, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
                                  0, nullptr, 1, &B1);
@@ -2002,7 +2041,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
                 if (Off + SubBytes <= StageBytes) {
                   VkBufferImageCopy Reg{};
                   Reg.bufferOffset = Off;
-                  Reg.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, M, L, 1};
+                  Reg.imageSubresource = {Aspect, M, L, 1};
                   Reg.imageExtent = {MW, MH, MD};
                   vkCmdCopyBufferToImage(UCB, StageBuf, RI.Image,
                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
@@ -2020,7 +2059,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
             B2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
                                (IsUAV ? VK_ACCESS_SHADER_WRITE_BIT : 0);
             B2.image = RI.Image;
-            B2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, Mips, 0, Layers};
+            B2.subresourceRange = {Aspect, 0, Mips, 0, Layers};
             vkCmdPipelineBarrier(UCB, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,

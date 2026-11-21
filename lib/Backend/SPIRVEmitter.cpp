@@ -203,10 +203,12 @@ public:
   uint32_t getDepthOutputMode() const { return DepthOutputMode; }
   bool usedClipDistance() const { return UsedClipDistance; }
   bool usedCullDistance() const { return UsedCullDistance; }
+  bool usedCubeArray() const { return UsedCubeArray; }
 
 private:
   bool UsedClipDistance = false;
   bool UsedCullDistance = false;
+  bool UsedCubeArray = false;
   Module &M;
   LLVMContext &Ctx;
   Function *Entry;
@@ -446,6 +448,15 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
       SampledTy = Type::getInt32Ty(Ctx);
     unsigned Dim = getSPIRVImageDim(RB.Kind);
     unsigned Arrayed = isArrayedResource(RB.Kind) ? 1u : 0u;
+    if (RB.Kind == ResourceKind::TextureCubeArray) {
+      // Upstream LLVM's SPIRVModuleAnalysis::initAvailableCapabilitiesForVulkan
+      // omits SampledCubeArray, causing checkSatisfiable() to abort on
+      // OpTypeImage Dim=Cube Arrayed=1. Emit Dim=3D Arrayed=1 (unique, no extra
+      // capability requirement) and patch Dim back to Cube + emit
+      // OpCapability SampledCubeArray (45) in the SPIR-V binary post-pass.
+      Dim = 2u; // Dim 3D sentinel
+      UsedCubeArray = true;
+    }
     unsigned MS = isMSResource(RB.Kind) ? 1u : 0u;
     unsigned Sampled = IsWritable ? 2u : 1u;
     return TargetExtType::get(Ctx, "spirv.Image", {SampledTy},
@@ -1495,7 +1506,9 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
     Value *Mip = CI->getArgOperand(2);
     if (isa<UndefValue>(Mip) || isa<PoisonValue>(Mip))
       Mip = B.getInt32(0);
-    unsigned DimCount = (Coords >= 3) ? 3u : Coords;
+    unsigned DimCount = (RH.RB->Kind == ResourceKind::TextureCube)
+                            ? 2u
+                            : ((Coords >= 3) ? 3u : Coords);
     Intrinsic::ID ID = Intrinsic::spv_resource_getdimensions_levels_xy;
     if (DimCount == 1)
       ID = Intrinsic::spv_resource_getdimensions_levels_x;
@@ -4446,6 +4459,52 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
         Patched.insert(Patched.end(), Words, Words + InsertPos);
         Patched.insert(Patched.end(), ExtraCaps.begin(), ExtraCaps.end());
         Patched.insert(Patched.end(), Words + InsertPos, Words + NumWords);
+        Result.assign(reinterpret_cast<const char *>(Patched.data()),
+                      Patched.size() * 4);
+      }
+    }
+  }
+
+  // Patch TextureCubeArray sentinel OpTypeImage (Dim=3D, Arrayed=1) back to
+  // Dim=Cube, Arrayed=1 and emit OpCapability SampledCubeArray (45).
+  if (!Opts.EmitSPIRVAsm && Lowerer.usedCubeArray() &&
+      Result.size() >= 20 && (Result.size() % 4) == 0) {
+    uint32_t *Words = reinterpret_cast<uint32_t *>(Result.data());
+    size_t NumWords = Result.size() / 4;
+    if (Words[0] == 0x07230203u) {
+      constexpr uint16_t OpCapability = 17;
+      constexpr uint16_t OpTypeImage = 25;
+      constexpr uint32_t CapSampledCubeArray = 45;
+      bool HasCap = false;
+      bool PatchedAny = false;
+      size_t CapInsertPos = 5;
+      bool InCaps = true;
+      for (size_t I = 5; I < NumWords;) {
+        uint32_t WC = Words[I] >> 16;
+        uint16_t Op = Words[I] & 0xFFFFu;
+        if (WC == 0 || I + WC > NumWords)
+          break;
+        if (InCaps && Op == OpCapability && WC == 2) {
+          if (Words[I + 1] == CapSampledCubeArray)
+            HasCap = true;
+          CapInsertPos = I + WC;
+        } else {
+          InCaps = false;
+        }
+        if (Op == OpTypeImage && WC >= 9 && Words[I + 3] == 2u /* 3D */ &&
+            Words[I + 5] == 1u /* Arrayed */) {
+          Words[I + 3] = 3u; // Dim::Cube
+          PatchedAny = true;
+        }
+        I += WC;
+      }
+      if (PatchedAny && !HasCap) {
+        std::vector<uint32_t> Patched;
+        Patched.reserve(NumWords + 2);
+        Patched.insert(Patched.end(), Words, Words + CapInsertPos);
+        Patched.push_back((2u << 16) | OpCapability);
+        Patched.push_back(CapSampledCubeArray);
+        Patched.insert(Patched.end(), Words + CapInsertPos, Words + NumWords);
         Result.assign(reinterpret_cast<const char *>(Patched.data()),
                       Patched.size() * 4);
       }
