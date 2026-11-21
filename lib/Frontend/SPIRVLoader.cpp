@@ -1636,9 +1636,71 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
 
     auto emitReduce = [&](mlir::Value RawVal,
                           mlir::gpu::AllReduceOperation ReduceOp,
-                          mlir::spirv::GroupOperation GroupOp) {
+                          mlir::spirv::GroupOperation GroupOp,
+                          mlir::Value ClusterSize = mlir::Value()) {
       mlir::Type OrigTy = RawVal.getType();
       mlir::Value Val = castToSignless(B, Loc, RawVal);
+      if (GroupOp == mlir::spirv::GroupOperation::PartitionedExclusiveScanNV &&
+          ClusterSize) {
+        std::optional<ir::WaveMultiPrefixOpKind> MPKind;
+        switch (ReduceOp) {
+        case mlir::gpu::AllReduceOperation::ADD:
+          MPKind = ir::WaveMultiPrefixOpKind::Sum;
+          break;
+        case mlir::gpu::AllReduceOperation::MUL:
+          MPKind = ir::WaveMultiPrefixOpKind::Product;
+          break;
+        case mlir::gpu::AllReduceOperation::AND:
+          MPKind = ir::WaveMultiPrefixOpKind::And;
+          break;
+        case mlir::gpu::AllReduceOperation::OR:
+          MPKind = ir::WaveMultiPrefixOpKind::Or;
+          break;
+        case mlir::gpu::AllReduceOperation::XOR:
+          MPKind = ir::WaveMultiPrefixOpKind::Xor;
+          break;
+        default:
+          break;
+        }
+        if (MPKind) {
+          mlir::Value MaskVec = castToSignless(B, Loc, ClusterSize);
+          SmallVector<mlir::Value, 4> Mask;
+          for (int32_t I = 0; I < 4; ++I) {
+            auto Idx = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, I);
+            Mask.push_back(
+                mlir::LLVM::ExtractElementOp::create(B, Loc, MaskVec, Idx));
+          }
+          mlir::Type OrigElemTy = OrigTy;
+          if (auto VT = mlir::dyn_cast<mlir::VectorType>(OrigTy))
+            OrigElemTy = VT.getElementType();
+          bool IsUnsigned = false;
+          if (auto IT = mlir::dyn_cast<mlir::IntegerType>(OrigElemTy))
+            IsUnsigned = IT.isUnsigned();
+          mlir::Value Res;
+          if (auto VT = mlir::dyn_cast<mlir::VectorType>(Val.getType())) {
+            mlir::Value Acc = mlir::LLVM::UndefOp::create(B, Loc, VT);
+            for (int64_t I = 0; I < VT.getNumElements(); ++I) {
+              auto Idx = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(I));
+              mlir::Value Lane =
+                  mlir::LLVM::ExtractElementOp::create(B, Loc, Val, Idx);
+              auto W = ir::WaveMultiPrefixOp::create(
+                  B, Loc, VT.getElementType(), Lane, Mask, *MPKind, IsUnsigned);
+              Acc = mlir::LLVM::InsertElementOp::create(B, Loc, Acc,
+                                                        W.getResult(), Idx);
+            }
+            Res = Acc;
+          } else {
+            auto W = ir::WaveMultiPrefixOp::create(B, Loc, Val.getType(), Val,
+                                                   Mask, *MPKind, IsUnsigned);
+            Res = W.getResult();
+          }
+          Op->getResult(0).replaceAllUsesWith(
+              castFromSignless(B, Loc, Res, OrigTy));
+          Op->erase();
+          return;
+        }
+      }
       auto Red = mlir::gpu::SubgroupReduceOp::create(B, Loc, Val, ReduceOp,
                                                      /*uniform=*/false);
       if (GroupOp == mlir::spirv::GroupOperation::ExclusiveScan)
@@ -1652,55 +1714,55 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
 
     if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformIAddOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::ADD,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformFAddOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::ADD,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformIMulOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MUL,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformFMulOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MUL,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformSMinOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINSI,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformUMinOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINUI,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformFMinOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MINNUMF,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformSMaxOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXSI,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformUMaxOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXUI,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformFMaxOp>(Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::MAXNUMF,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseAndOp>(
                    Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::AND,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseOrOp>(
                    Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::OR,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformBitwiseXorOp>(
                    Op)) {
       emitReduce(G.getValue(), mlir::gpu::AllReduceOperation::XOR,
-                 G.getGroupOperation());
+                 G.getGroupOperation(), G.getClusterSize());
     } else if (auto G = mlir::dyn_cast<
                    mlir::spirv::GroupNonUniformBroadcastFirstOp>(Op)) {
       mlir::Type OrigTy = G.getType();
@@ -1763,6 +1825,18 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
           B, Loc, Val, Delta, Width, mlir::gpu::ShuffleMode::DOWN);
       G.replaceAllUsesWith(
           castFromSignless(B, Loc, Shuf.getShuffleResult(), OrigTy));
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformAllOp>(Op)) {
+      auto W = ir::WaveVoteOp::create(
+          B, Loc, I1Ty, G.getPredicate(),
+          ir::WaveVoteKindAttr::get(B.getContext(), ir::WaveVoteKind::All));
+      G.replaceAllUsesWith(W.getResult());
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformAnyOp>(Op)) {
+      auto W = ir::WaveVoteOp::create(
+          B, Loc, I1Ty, G.getPredicate(),
+          ir::WaveVoteKindAttr::get(B.getContext(), ir::WaveVoteKind::Any));
+      G.replaceAllUsesWith(W.getResult());
       G.erase();
     } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformAllEqualOp>(
                    Op)) {

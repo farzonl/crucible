@@ -5760,6 +5760,15 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
         PointeeTy = G.getGlobalType();
     } else if (auto AL = Store.getAddr().getDefiningOp<mlir::LLVM::AllocaOp>()) {
       PointeeTy = AL.getElemType();
+      if (auto ValVec =
+              mlir::dyn_cast<mlir::VectorType>(Store.getValue().getType());
+          ValVec && mlir::isa<mlir::VectorType>(PointeeTy)) {
+        std::string BaseName = ValueNames.lookup(AL.getResult());
+        for (int64_t I = 0; I < ValVec.getNumElements(); ++I)
+          line(Ind, BaseName + "[" + std::to_string(I) + "] = (" + V->Text +
+                        ")[" + std::to_string(I) + "];");
+        return Error::success();
+      }
     }
     if (PointeeTy &&
         mlir::isa<mlir::LLVM::LLVMStructType, mlir::LLVM::LLVMArrayType>(
