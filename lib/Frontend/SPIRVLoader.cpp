@@ -1521,8 +1521,68 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
             mlir::Value SampHandle =
                 getHandleForIndex(SamplerGlobals[SampAO.getVariable()]);
 
+            auto unpackFloatVec = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                                      mlir::Value V,
+                                      SmallVectorImpl<mlir::Value> &Out) {
+              auto F32Ty = B.getF32Type();
+              if (auto CVec = mlir::dyn_cast<mlir::VectorType>(V.getType())) {
+                for (unsigned C = 0; C < CVec.getNumElements() && C < 4; ++C) {
+                  Out.push_back(mlir::spirv::CompositeExtractOp::create(
+                      B, Loc, F32Ty, V,
+                      B.getI32ArrayAttr({static_cast<int32_t>(C)})));
+                }
+              } else {
+                Out.push_back(V);
+              }
+            };
+            auto unpackIntVec = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                                    mlir::Value V,
+                                    SmallVectorImpl<mlir::Value> &Out) {
+              mlir::Value SV = castToSignless(B, Loc, V);
+              if (auto CVec = mlir::dyn_cast<mlir::VectorType>(SV.getType())) {
+                for (unsigned C = 0; C < CVec.getNumElements() && C < 3; ++C) {
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(C));
+                  Out.push_back(
+                      mlir::LLVM::ExtractElementOp::create(B, Loc, SV, IdxC));
+                }
+              } else {
+                Out.push_back(SV);
+              }
+            };
+            auto replaceVec4Result = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                                         mlir::Operation *TargetOp,
+                                         mlir::Value Vec4Res) {
+              mlir::Type ResTy = TargetOp->getResult(0).getType();
+              auto ResVec = mlir::dyn_cast<mlir::VectorType>(ResTy);
+              mlir::Value ResultVal;
+              if (!ResVec) {
+                auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+                ResultVal =
+                    mlir::LLVM::ExtractElementOp::create(B, Loc, Vec4Res, ZeroC);
+              } else {
+                mlir::Type SignlessVecTy = makeSignless(ResVec, B);
+                unsigned N = static_cast<unsigned>(ResVec.getNumElements());
+                mlir::Value Vec =
+                    mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+                for (unsigned C = 0; C < N && C < 4; ++C) {
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(C));
+                  auto VC =
+                      mlir::LLVM::ExtractElementOp::create(B, Loc, Vec4Res, IdxC);
+                  Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC,
+                                                            IdxC);
+                }
+                ResultVal = Vec;
+              }
+              TargetOp->getResult(0).replaceAllUsesWith(
+                  castFromSignless(B, Loc, ResultVal, ResTy));
+              TargetOp->erase();
+            };
+
             auto lowerSample = [&](mlir::Operation *SampleOp, mlir::Value Coord,
-                                   mlir::Value LodVal,
+                                   std::optional<mlir::spirv::ImageOperands> ImgOps,
+                                   mlir::ValueRange OpArgs,
                                    bool IsExplicit) -> Error {
               mlir::OpBuilder B(SampleOp);
               mlir::Location Loc = SampleOp->getLoc();
@@ -1531,49 +1591,58 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               mlir::Type ElemTy = makeSignless(
                   ResVec ? ResVec.getElementType() : ResTy, B);
               auto RetVecTy = mlir::VectorType::get({4}, ElemTy);
-              auto F32Ty = B.getF32Type();
 
               SmallVector<mlir::Value, 4> Coords;
-              if (auto CVec =
-                      mlir::dyn_cast<mlir::VectorType>(Coord.getType())) {
-                for (unsigned C = 0; C < CVec.getNumElements() && C < 4; ++C) {
-                  Coords.push_back(mlir::spirv::CompositeExtractOp::create(
-                      B, Loc, F32Ty, Coord,
-                      B.getI32ArrayAttr({static_cast<int32_t>(C)})));
+              unpackFloatVec(B, Loc, Coord, Coords);
+
+              ir::SampleMode Mode =
+                  IsExplicit ? ir::SampleMode::Level : ir::SampleMode::Implicit;
+              mlir::Value LodOrBias;
+              SmallVector<mlir::Value, 3> Ddx, Ddy, Offsets;
+              mlir::Value ClampVal;
+
+              uint32_t Mask = ImgOps ? static_cast<uint32_t>(*ImgOps) : 0u;
+              size_t ArgIdx = 0;
+              if (Mask & static_cast<uint32_t>(mlir::spirv::ImageOperands::Bias)) {
+                if (ArgIdx < OpArgs.size()) {
+                  Mode = ir::SampleMode::Bias;
+                  LodOrBias = OpArgs[ArgIdx++];
                 }
-              } else {
-                Coords.push_back(Coord);
+              }
+              if (Mask & static_cast<uint32_t>(mlir::spirv::ImageOperands::Lod)) {
+                if (ArgIdx < OpArgs.size()) {
+                  Mode = ir::SampleMode::Level;
+                  LodOrBias = OpArgs[ArgIdx++];
+                }
+              }
+              if (Mask & static_cast<uint32_t>(mlir::spirv::ImageOperands::Grad)) {
+                if (ArgIdx + 1 < OpArgs.size()) {
+                  Mode = ir::SampleMode::Grad;
+                  unpackFloatVec(B, Loc, OpArgs[ArgIdx++], Ddx);
+                  unpackFloatVec(B, Loc, OpArgs[ArgIdx++], Ddy);
+                }
+              }
+              if (Mask &
+                  static_cast<uint32_t>(mlir::spirv::ImageOperands::ConstOffset)) {
+                if (ArgIdx < OpArgs.size())
+                  unpackIntVec(B, Loc, OpArgs[ArgIdx++], Offsets);
+              }
+              if (Mask &
+                  static_cast<uint32_t>(mlir::spirv::ImageOperands::Offset)) {
+                if (ArgIdx < OpArgs.size())
+                  unpackIntVec(B, Loc, OpArgs[ArgIdx++], Offsets);
+              }
+              if (Mask &
+                  static_cast<uint32_t>(mlir::spirv::ImageOperands::MinLod)) {
+                if (ArgIdx < OpArgs.size())
+                  ClampVal = OpArgs[ArgIdx++];
               }
 
-              auto Mode = IsExplicit ? ir::SampleMode::Level
-                                     : ir::SampleMode::Implicit;
               auto SampOp = ir::TexSampleOp::create(
                   B, Loc, RetVecTy, mlir::Type(), Handle, SampHandle,
-                  ir::SampleModeAttr::get(&Ctx, Mode), Coords,
-                  /*offsets=*/mlir::ValueRange{},
-                  IsExplicit ? LodVal : mlir::Value(),
-                  /*ddx=*/mlir::ValueRange{}, /*ddy=*/mlir::ValueRange{},
-                  /*cmp_val=*/mlir::Value(), /*clamp=*/mlir::Value());
-
-              if (!ResVec) {
-                auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
-                auto V0 = mlir::LLVM::ExtractElementOp::create(
-                    B, Loc, SampOp.getResult(), ZeroC);
-                SampleOp->getResult(0).replaceAllUsesWith(V0.getResult());
-              } else {
-                unsigned N = static_cast<unsigned>(ResVec.getNumElements());
-                mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, ResTy);
-                for (unsigned C = 0; C < N; ++C) {
-                  auto IdxC = mlir::LLVM::ConstantOp::create(
-                      B, Loc, I32Ty, static_cast<int32_t>(C));
-                  auto VC = mlir::LLVM::ExtractElementOp::create(
-                      B, Loc, SampOp.getResult(), IdxC);
-                  Vec = mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC,
-                                                            IdxC);
-                }
-                SampleOp->getResult(0).replaceAllUsesWith(Vec);
-              }
-              SampleOp->erase();
+                  ir::SampleModeAttr::get(&Ctx, Mode), Coords, Offsets,
+                  LodOrBias, Ddx, Ddy, /*cmp_val=*/mlir::Value(), ClampVal);
+              replaceVec4Result(B, Loc, SampleOp, SampOp.getResult());
               return Error::success();
             };
 
@@ -1583,20 +1652,49 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               if (auto Imp =
                       mlir::dyn_cast<mlir::spirv::ImageSampleImplicitLodOp>(
                           SU)) {
-                if (Error E = lowerSample(Imp, Imp.getCoordinate(), nullptr,
+                if (Error E = lowerSample(Imp, Imp.getCoordinate(),
+                                          Imp.getImageOperands(),
+                                          Imp.getOperandArguments(),
                                           /*IsExplicit=*/false))
                   return std::move(E);
               } else if (auto Exp = mlir::dyn_cast<
                              mlir::spirv::ImageSampleExplicitLodOp>(SU)) {
-                mlir::Value LodVal = Exp.getOperandArguments().empty()
-                                         ? nullptr
-                                         : Exp.getOperandArguments()[0];
-                if (!LodVal)
-                  return makeError(
-                      "spirv.ImageSampleExplicitLod missing LOD operand");
-                if (Error E = lowerSample(Exp, Exp.getCoordinate(), LodVal,
+                if (Error E = lowerSample(Exp, Exp.getCoordinate(),
+                                          Exp.getImageOperands(),
+                                          Exp.getOperandArguments(),
                                           /*IsExplicit=*/true))
                   return std::move(E);
+              } else if (auto DG =
+                             mlir::dyn_cast<mlir::spirv::ImageDrefGatherOp>(
+                                 SU)) {
+                mlir::OpBuilder B(DG);
+                mlir::Location Loc = DG.getLoc();
+                mlir::Type ResTy = DG.getType();
+                auto ResVec = mlir::dyn_cast<mlir::VectorType>(ResTy);
+                mlir::Type ElemTy = makeSignless(
+                    ResVec ? ResVec.getElementType() : ResTy, B);
+                auto RetVecTy = mlir::VectorType::get({4}, ElemTy);
+                SmallVector<mlir::Value, 4> Coords;
+                unpackFloatVec(B, Loc, DG.getCoordinate(), Coords);
+                SmallVector<mlir::Value, 3> Offsets;
+                auto ImgOps = DG.getImageOperands();
+                uint32_t Mask = ImgOps ? static_cast<uint32_t>(*ImgOps) : 0u;
+                mlir::ValueRange OpArgs = DG.getOperandArguments();
+                size_t ArgIdx = 0;
+                if (Mask & static_cast<uint32_t>(
+                               mlir::spirv::ImageOperands::ConstOffset)) {
+                  if (ArgIdx < OpArgs.size())
+                    unpackIntVec(B, Loc, OpArgs[ArgIdx++], Offsets);
+                }
+                if (Mask & static_cast<uint32_t>(
+                               mlir::spirv::ImageOperands::Offset)) {
+                  if (ArgIdx < OpArgs.size())
+                    unpackIntVec(B, Loc, OpArgs[ArgIdx++], Offsets);
+                }
+                auto G = ir::TexGatherOp::create(
+                    B, Loc, RetVecTy, mlir::Type(), Handle, SampHandle, Coords,
+                    Offsets, DG.getDref(), B.getI32IntegerAttr(0));
+                replaceVec4Result(B, Loc, DG, G.getResult());
               } else {
                 return makeError("unsupported sampled-image op '{0}'",
                                  SU->getName().getStringRef());
@@ -1609,6 +1707,35 @@ Expected<LoadedMLIRShader> loadSPIRV(MemoryBufferRef Buf,
               ErasedAddrOps.insert(SampAO);
               SampAO.erase();
             }
+          } else if (auto QS = mlir::dyn_cast<mlir::spirv::ImageQuerySizeOp>(IU)) {
+            mlir::OpBuilder B(QS);
+            mlir::Location Loc = QS.getLoc();
+            auto RetVecTy = mlir::VectorType::get({4}, I32Ty);
+            auto D = ir::TexGetDimensionsOp::create(B, Loc, RetVecTy, Handle,
+                                                    /*mip=*/mlir::Value());
+            mlir::Type OrigTy = QS.getType();
+            auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy);
+            mlir::Value ResultVal;
+            if (!VecTy) {
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              ResultVal = mlir::LLVM::ExtractElementOp::create(
+                  B, Loc, D.getResult(), ZeroC);
+            } else {
+              mlir::Type SignlessVecTy = makeSignless(VecTy, B);
+              mlir::Value Vec =
+                  mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
+              for (int64_t C = 0; C < VecTy.getNumElements() && C < 4; ++C) {
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(C));
+                auto VC = mlir::LLVM::ExtractElementOp::create(
+                    B, Loc, D.getResult(), IdxC);
+                Vec =
+                    mlir::LLVM::InsertElementOp::create(B, Loc, Vec, VC, IdxC);
+              }
+              ResultVal = Vec;
+            }
+            QS.replaceAllUsesWith(castFromSignless(B, Loc, ResultVal, OrigTy));
+            QS.erase();
           } else {
             return makeError("unsupported image op '{0}' on '{1}'",
                              IU->getName().getStringRef(), Sym);
