@@ -100,6 +100,8 @@ struct ResourceBinding {
   uint32_t SPIRVBinding = 0;
   /// Assigned Vulkan binding for UAV atomic counter (when HasCounter).
   uint32_t CounterSPIRVBinding = 0;
+  /// Optional StorageBuffer descriptor containing logical and mapped byte sizes.
+  uint32_t BufferInfoSPIRVBinding = UINT32_MAX;
 };
 
 struct StageParameter {

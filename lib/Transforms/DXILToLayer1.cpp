@@ -584,7 +584,16 @@ void lowerDXILToLayer1(mlir::ModuleOp Mod) {
       ir::BufferKind Kind =
           Op == DXILOp::BufferLoad ? ir::BufferKind::Typed : ir::BufferKind::Raw;
       mlir::IntegerAttr MaskAttr, AlignAttr;
-      if (Op == DXILOp::RawBufferLoad) {
+      if (Op == DXILOp::BufferLoad) {
+        uint32_t Mask = 0;
+        for (mlir::Operation *U : Call.getResult().getUsers()) {
+          auto EV = mlir::cast<mlir::LLVM::ExtractValueOp>(U);
+          int64_t Idx = EV.getPosition()[0];
+          if (Idx < 4)
+            Mask |= 1u << Idx;
+        }
+        MaskAttr = B.getI32IntegerAttr(Mask ? Mask : 1u);
+      } else {
         if (auto M = getConstInt(Args[4]))
           MaskAttr = B.getI32IntegerAttr(static_cast<int32_t>(*M));
         if (auto A = getConstInt(Args[5]))

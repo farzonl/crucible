@@ -68,6 +68,7 @@ enum class SpvOp : uint32_t {
   HeapResource,
   // Buffers & CBuffers
   BufferLoad,
+  BufferStatus,
   BufferStore,
   CBufferLoad,
   BufferUpdateCounter,
@@ -244,6 +245,7 @@ private:
   DenseMap<const Value *, ResolvedHandle> HandleMap;
   DenseSet<const ResourceBinding *> AtomicImageBindings;
   DenseMap<Type *, Function *> ArrayLengthHelpers;
+  DenseMap<const ResourceBinding *, const ResourceBinding *> BufferInfoBindings;
   DenseMap<unsigned, Function *> CmpXchgHelpers;
   DenseMap<std::tuple<uint32_t, uint32_t, uint32_t, Type *>, Function *>
       ImgAtomicHelpers;
@@ -307,6 +309,8 @@ private:
                                  Value *WordIdx);
   Value *computeBufferByteOffset(IRBuilder<> &B, const ResourceBinding &RB,
                                  Value *Index, Value *ElemOffset);
+  Expected<Value *> loadBufferInfo(IRBuilder<> &B, const ResolvedHandle &RH,
+                                   unsigned Field);
   Value *loadTypedValueFromStorageBuffer(IRBuilder<> &B,
                                          const ResolvedHandle &RH,
                                          Value *ByteOffset, Type *ElemTy);
@@ -317,6 +321,7 @@ private:
   Error lowerBindResource(CallInst *CI);
   Error lowerHeapResource(CallInst *CI);
   Error lowerBufferLoad(CallInst *CI);
+  Error lowerBufferStatus(CallInst *CI);
   Error lowerBufferStore(CallInst *CI);
   Error lowerCBufferLoad(CallInst *CI);
   Error lowerBufferUpdateCounter(CallInst *CI);
@@ -550,6 +555,60 @@ Value *SPIRVLowerer::computeBufferByteOffset(IRBuilder<> &B,
       return B.CreateAdd(Base, ElemOffset);
   }
   return Base;
+}
+
+Expected<Value *> SPIRVLowerer::loadBufferInfo(IRBuilder<> &B,
+                                               const ResolvedHandle &RH,
+                                               unsigned Field) {
+  const ResourceBinding *InfoRB = BufferInfoBindings.lookup(RH.RB);
+  if (!InfoRB) {
+    ResourceBinding *Original = nullptr;
+    uint64_t NextBinding = 0;
+    for (ResourceBinding &RB : Reflect.Resources) {
+      if (&RB == RH.RB)
+        Original = &RB;
+      if (RB.SPIRVSet != RH.RB->SPIRVSet)
+        continue;
+      uint32_t Count = RB.RangeSize == UINT32_MAX ? 1u : RB.RangeSize;
+      NextBinding = std::max(NextBinding, uint64_t(RB.SPIRVBinding) + Count);
+      if (RB.HasCounter)
+        NextBinding =
+            std::max(NextBinding, uint64_t(RB.CounterSPIRVBinding) + Count);
+      if (RB.BufferInfoSPIRVBinding != UINT32_MAX)
+        NextBinding =
+            std::max(NextBinding, uint64_t(RB.BufferInfoSPIRVBinding) + Count);
+    }
+    if (!Original)
+      return makeError("SPIR-V backend: buffer size metadata for dynamic heaps "
+                       "is not supported");
+    if (NextBinding >= UINT32_MAX)
+      return makeError("SPIR-V backend: no binding available for buffer size "
+                       "metadata");
+    Original->BufferInfoSPIRVBinding = static_cast<uint32_t>(NextBinding);
+    auto Info = std::make_unique<ResourceBinding>();
+    Info->Class = ResourceClass::SRV;
+    Info->Kind = ResourceKind::RawBuffer;
+    Info->Name = "__crucible_buffer_info_" +
+                 std::to_string(Original->SPIRVSet) + "_" +
+                 std::to_string(Original->BufferInfoSPIRVBinding);
+    Info->SPIRVSet = Original->SPIRVSet;
+    Info->SPIRVBinding = Original->BufferInfoSPIRVBinding;
+    Info->RangeSize = Original->RangeSize;
+    InfoRB = Info.get();
+    SyntheticBindings.push_back(std::move(Info));
+    BufferInfoBindings[RH.RB] = InfoRB;
+  }
+  Type *InfoTy = getSPIRVResourceType(*InfoRB);
+  Function *HandleFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_resource_handlefrombinding, {InfoTy});
+  uint32_t Count = InfoRB->RangeSize == UINT32_MAX ? 0u : InfoRB->RangeSize;
+  Value *Handle = B.CreateCall(
+      HandleFn, {B.getInt32(InfoRB->SPIRVSet), B.getInt32(InfoRB->SPIRVBinding),
+                 B.getInt32(Count), RH.ArrIdx ? RH.ArrIdx : B.getInt32(0),
+                 getOrCreateResourceName(*InfoRB)});
+  ResolvedHandle InfoRH{InfoRB, Handle, InfoTy};
+  Value *Ptr = getStorageBufferWordPtr(B, InfoRH, B.getInt32(Field));
+  return B.CreateAlignedLoad(B.getInt32Ty(), Ptr, Align(4));
 }
 
 Value *SPIRVLowerer::loadTypedValueFromStorageBuffer(IRBuilder<> &B,
@@ -908,6 +967,55 @@ Error SPIRVLowerer::lowerBufferLoad(CallInst *CI) {
     Res = B.CreateInsertElement(Res, Loaded, B.getInt32(C));
   }
   CI->replaceAllUsesWith(Res);
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerBufferStatus(CallInst *CI) {
+  auto RHOrErr = resolveHandle(CI->getArgOperand(1));
+  if (!RHOrErr)
+    return RHOrErr.takeError();
+  const ResolvedHandle &RH = *RHOrErr;
+  if (RH.RB->Kind != ResourceKind::RawBuffer &&
+      RH.RB->Kind != ResourceKind::StructuredBuffer &&
+      RH.RB->Kind != ResourceKind::TypedBuffer)
+    return makeError("SPIR-V backend: residency status requires a buffer");
+  IRBuilder<> B(CI);
+  auto MappedBytes = loadBufferInfo(B, RH, 1);
+  if (!MappedBytes)
+    return MappedBytes.takeError();
+  uint32_t Mask = cast<ConstantInt>(CI->getArgOperand(4))->getZExtValue();
+  uint32_t ElemBytes = cast<ConstantInt>(CI->getArgOperand(5))->getZExtValue();
+  unsigned Components = 0;
+  for (unsigned C = 0; C < 4; ++C)
+    if (Mask & (1u << C))
+      Components = C + 1;
+  uint32_t LoadBytes = Components * ElemBytes;
+  if (RH.RB->Kind == ResourceKind::StructuredBuffer && RH.RB->ElementStride)
+    LoadBytes = std::min(LoadBytes, RH.RB->ElementStride);
+  uint32_t Stride = RH.RB->ElementStride ? RH.RB->ElementStride : 4u;
+  if (RH.RB->Kind == ResourceKind::TypedBuffer) {
+    Stride = std::max(1u, RH.RB->TypedComponents) *
+             (getComponentLLVMType(RH.RB->ElementType)->getPrimitiveSizeInBits() /
+              8u);
+    LoadBytes = Stride;
+  }
+  Value *Offset = computeBufferByteOffset(B, *RH.RB, CI->getArgOperand(2),
+                                          CI->getArgOperand(3));
+  if (RH.RB->Kind == ResourceKind::TypedBuffer)
+    Offset = B.CreateMul(CI->getArgOperand(2), B.getInt32(Stride));
+  Value *HasSpace = B.CreateICmpUGE(*MappedBytes, B.getInt32(LoadBytes));
+  Value *InRange =
+      B.CreateICmpULE(Offset, B.CreateSub(*MappedBytes, B.getInt32(LoadBytes)));
+  if (RH.RB->Kind != ResourceKind::RawBuffer) {
+    Value *Index = CI->getArgOperand(2);
+    Value *IndexInRange =
+        B.CreateICmpULE(Index, B.CreateUDiv(*MappedBytes, B.getInt32(Stride)));
+    Value *Base = B.CreateMul(Index, B.getInt32(Stride));
+    InRange = B.CreateAnd(
+        InRange, B.CreateAnd(IndexInRange, B.CreateICmpUGE(Offset, Base)));
+  }
+  CI->replaceAllUsesWith(
+      B.CreateZExt(B.CreateAnd(HasSpace, InRange), B.getInt32Ty()));
   return Error::success();
 }
 
@@ -1483,6 +1591,24 @@ Error SPIRVLowerer::lowerGetDimensions(CallInst *CI) {
   Value *Res = PoisonValue::get(RetVecTy);
   if (RH.RB->Kind == ResourceKind::RawBuffer ||
       RH.RB->Kind == ResourceKind::StructuredBuffer) {
+    if (RH.RB->Kind == ResourceKind::RawBuffer ||
+        RH.RB->ElementStride % 4u != 0u) {
+      auto ByteSize = loadBufferInfo(B, RH, 0);
+      if (!ByteSize)
+        return ByteSize.takeError();
+      uint32_t Stride = RH.RB->ElementStride ? RH.RB->ElementStride : 4u;
+      Value *Count = RH.RB->Kind == ResourceKind::RawBuffer
+                         ? *ByteSize
+                         : B.CreateUDiv(*ByteSize, B.getInt32(Stride));
+      Res = B.CreateInsertElement(Res, Count, B.getInt32(0));
+      Res = B.CreateInsertElement(
+          Res, B.getInt32(RH.RB->Kind == ResourceKind::RawBuffer ? 0u : Stride),
+          B.getInt32(1));
+      Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(2));
+      Res = B.CreateInsertElement(Res, B.getInt32(0), B.getInt32(3));
+      CI->replaceAllUsesWith(Res);
+      return Error::success();
+    }
     // StorageBuffer is modeled as target("spirv.VulkanBuffer", [0 x i32], 12, ...).
     // LLVM's SPIR-V backend does not have an OpArrayLength intrinsic yet, so
     // emit a sentinel helper call rewritten to OpArrayLength in the SPIR-V
@@ -2444,6 +2570,8 @@ Error SPIRVLowerer::lowerBridgeCall(CallInst *CI) {
     return lowerHeapResource(CI);
   case SpvOp::BufferLoad:
     return lowerBufferLoad(CI);
+  case SpvOp::BufferStatus:
+    return lowerBufferStatus(CI);
   case SpvOp::BufferStore:
     return lowerBufferStore(CI);
   case SpvOp::CBufferLoad:
@@ -4345,8 +4473,15 @@ lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
           B, Loc, SpvOp::BufferLoad, COp.getResult().getType(),
           {COp.getHandle(), COp.getIndex(), ElemOff, i32C(B, Loc, Mask)});
       COp.getResult().replaceAllUsesWith(Rep);
-      if (COp.getStatus())
-        COp.getStatus().replaceAllUsesWith(i32C(B, Loc, 1));
+      if (COp.getStatus()) {
+        auto VecTy = mlir::cast<mlir::VectorType>(COp.getResult().getType());
+        uint32_t ElemBytes = VecTy.getElementTypeBitWidth() / 8u;
+        mlir::Value Status = makeBridgeCall(
+            B, Loc, SpvOp::BufferStatus, I32Ty,
+            {COp.getHandle(), COp.getIndex(), ElemOff, i32C(B, Loc, Mask),
+             i32C(B, Loc, ElemBytes)});
+        COp.getStatus().replaceAllUsesWith(Status);
+      }
       COp.erase();
       continue;
     }

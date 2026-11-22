@@ -1,0 +1,63 @@
+---
+Shaders:
+  - Stage: Compute
+    Entry: residency
+Buffers:
+  - Name: Prefix
+    Format: Int32
+    Stride: 16
+    FillSize: 131072
+    FillValue: 9001
+  - Name: Empty
+    Format: Int32
+    Stride: 16
+    FillSize: 131072
+    FillValue: 9002
+  - Name: Result
+    Format: Int32
+    Stride: 4
+    FillSize: 72
+  - Name: RawPrefix
+    Format: Int32
+    Stride: 4
+    FillSize: 131072
+    FillValue: 9001
+  - Name: Expected
+    Format: Int32
+    Data: [9001, 1, 9001, 1, 0, 0, 0, 0, 9001, 1, 0, 0, 0, 131072, 9001, 1, 0, 0]
+  - Name: TypedPrefix
+    Format: UInt32
+    Stride: 4
+    FillSize: 131072
+    FillValue: 9001
+DescriptorSets:
+  - Resources:
+      - Name: Prefix
+        Kind: StructuredBuffer
+        DirectXBinding: {Register: 10, Space: 0}
+        IsReserved: True
+        TilesMapped: 1
+      - Name: Empty
+        Kind: StructuredBuffer
+        DirectXBinding: {Register: 11, Space: 0}
+        IsReserved: True
+        TilesMapped: 0
+      - Name: Result
+        Kind: RWStructuredBuffer
+        DirectXBinding: {Register: 12, Space: 0}
+      - Name: RawPrefix
+        Kind: ByteAddressBuffer
+        DirectXBinding: {Register: 13, Space: 0}
+        IsReserved: True
+        TilesMapped: 1
+      - Name: TypedPrefix
+        Kind: Buffer
+        DirectXBinding: {Register: 14, Space: 0}
+        IsReserved: True
+        TilesMapped: 1
+Results:
+  - Result: Mapped prefix and empty resources
+    Rule: BufferExact
+    Actual: Result
+    Expected: Expected
+...

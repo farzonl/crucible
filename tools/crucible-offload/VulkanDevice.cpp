@@ -40,6 +40,34 @@ Error vkErr(VkResult R, const char *What) {
                            static_cast<int>(R));
 }
 
+size_t mappedBufferBytes(const offloadtest::Resource &Res) {
+  size_t Size = Res.BufferPtr->Size;
+  if (Res.IsReserved)
+    Size = std::min<uint64_t>(
+        Size, uint64_t(Res.TilesMapped.value_or(0)) * 65536u);
+  return Size;
+}
+
+Expected<std::unique_ptr<CPUBuffer>>
+makeBufferInfo(CPUBuffer *CPU, size_t MappedBytes) {
+  if (CPU->Size > UINT32_MAX)
+    return createStringError(inconvertibleErrorCode(),
+                             "Buffer '%s' exceeds 32-bit size metadata",
+                             CPU->Name.c_str());
+  auto Info = std::make_unique<CPUBuffer>();
+  Info->Name = CPU->Name + ".buffer_info";
+  Info->Format = DataFormat::UInt32;
+  Info->Channels = 1;
+  Info->Stride = 4;
+  Info->ArraySize = 1;
+  Info->Size = 8;
+  uint32_t Sizes[] = {static_cast<uint32_t>(CPU->Size),
+                      static_cast<uint32_t>(std::min(CPU->Size, MappedBytes))};
+  Info->Data.push_back(std::make_unique<char[]>(sizeof(Sizes)));
+  memcpy(Info->Data[0].get(), Sizes, sizeof(Sizes));
+  return Info;
+}
+
 VkFilter vkFilter(FilterMode F) {
   return F == FilterMode::Nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
 }
@@ -283,6 +311,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
   std::vector<VkBufAlloc> AllBufs;
   std::vector<VkImgAlloc> AllImgs;
   std::vector<VkSampler> AllSamplers;
+  std::vector<std::unique_ptr<CPUBuffer>> BufferInfos;
 
   auto cleanup = [&]() {
     for (VkSampler S : AllSamplers)
@@ -301,7 +330,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       vkDestroyCommandPool(VK.Device, CmdPool, nullptr);
   };
 
-  using BufKey = std::tuple<CPUBuffer *, uint32_t, bool, bool, bool>;
+  using BufKey = std::tuple<CPUBuffer *, uint32_t, bool, bool, bool, size_t>;
   std::map<BufKey, size_t> BufMap;
   using CounterKey = std::pair<CPUBuffer *, uint32_t>;
   std::map<CounterKey, size_t> CounterBufMap;
@@ -311,8 +340,10 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
 
   auto getOrCreateBuffer = [&](CPUBuffer *CPU, uint32_t Slice, bool IsUniform,
                                bool IsTyped, bool IsUAV,
-                               bool RequiresAtomicUInt = false) -> Expected<VkBufAlloc *> {
-    BufKey Key{CPU, Slice, IsUniform, IsTyped, RequiresAtomicUInt};
+                               bool RequiresAtomicUInt = false,
+                               size_t MappedBytes = SIZE_MAX) -> Expected<VkBufAlloc *> {
+    MappedBytes = std::min(CPU->Size, MappedBytes);
+    BufKey Key{CPU, Slice, IsUniform, IsTyped, RequiresAtomicUInt, MappedBytes};
     auto It = BufMap.find(Key);
     if (It != BufMap.end()) {
       AllBufs[It->second].IsUAV |= IsUAV;
@@ -328,6 +359,8 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
     A.SizeBytes = std::max<VkDeviceSize>(CPU->Size, 16);
     if (IsUniform && (A.SizeBytes % 16) != 0)
       A.SizeBytes = ((A.SizeBytes + 15) / 16) * 16;
+    else if (!IsTyped)
+      A.SizeBytes = ((A.SizeBytes + 3) / 4) * 4;
 
     VkBufferCreateInfo BCI{};
     BCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -366,7 +399,7 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       return vkErr(R, "vkMapMemory");
     memset(Mapped, 0, A.SizeBytes);
     if (Slice < CPU->Data.size() && CPU->Data[Slice])
-      memcpy(Mapped, CPU->Data[Slice].get(), CPU->Size);
+      memcpy(Mapped, CPU->Data[Slice].get(), std::min(CPU->Size, MappedBytes));
     vkUnmapMemory(VK.Device, A.Memory);
 
     if (IsTyped) {
@@ -770,6 +803,25 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
       VkImageView ImageView = VK_NULL_HANDLE;
     };
     std::vector<BoundResource> BoundList;
+    auto bindBufferInfo = [&](CPUBuffer *CPU,
+                              const crucible::ResourceBinding &RB,
+                              uint32_t ElemIdx, size_t MappedBytes) -> Error {
+      if (RB.BufferInfoSPIRVBinding == UINT32_MAX)
+        return Error::success();
+      auto Info = makeBufferInfo(CPU, MappedBytes);
+      if (!Info)
+        return Info.takeError();
+      BufferInfos.push_back(std::move(*Info));
+      auto InfoBuf = getOrCreateBuffer(BufferInfos.back().get(), 0, false,
+                                       false, false);
+      if (!InfoBuf)
+        return InfoBuf.takeError();
+      BoundList.push_back(
+          {RB.SPIRVSet, RB.BufferInfoSPIRVBinding, ElemIdx,
+           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, (*InfoBuf)->Buffer,
+           (*InfoBuf)->SizeBytes});
+      return Error::success();
+    };
 
     auto findReg = [&](crucible::ResourceClass Class, uint32_t Space,
                        uint32_t Reg) -> const crucible::ResourceBinding * {
@@ -856,7 +908,8 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
           uint32_t ElemIdx = SliceReg - SliceMatch->LowerBound;
           auto BufOrErr = getOrCreateBuffer(Res.BufferPtr, Slice, IsUniform,
                                             IsTyped, IsUAV,
-                                            SliceMatch->RequiresTextureAtomics);
+                                            SliceMatch->RequiresTextureAtomics,
+                                            mappedBufferBytes(Res));
           if (!BufOrErr) {
             vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
             cleanup();
@@ -866,6 +919,12 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
           BoundList.push_back({SliceMatch->SPIRVSet, SliceMatch->SPIRVBinding,
                                ElemIdx, DT, BA->Buffer, BA->SizeBytes, BA->View,
                                VK_NULL_HANDLE});
+          if (Error E = bindBufferInfo(Res.BufferPtr, *SliceMatch, ElemIdx,
+                                       mappedBufferBytes(Res))) {
+            vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
+            cleanup();
+            return E;
+          }
           if (SliceMatch->HasCounter) {
             auto CntOrErr = getOrCreateCounterBuffer(Res.BufferPtr, Slice);
             if (!CntOrErr) {
@@ -964,6 +1023,14 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
                                  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                        (*BufOrErr)->Buffer, (*BufOrErr)->SizeBytes,
                        VK_NULL_HANDLE, VK_NULL_HANDLE});
+                  if (Error E = bindBufferInfo(
+                          RR.BufferPtr, *Match,
+                          Info->ShaderRegister - Match->LowerBound,
+                          RR.BufferPtr->Size)) {
+                    vkDestroyShaderModule(VK.Device, ShaderMod, nullptr);
+                    cleanup();
+                    return E;
+                  }
                 }
               }
             }
@@ -999,6 +1066,11 @@ Error executeVulkanCompute(Pipeline &P, VkContext &VK) {
             It->second.Count = std::max(It->second.Count, RB.RangeSize);
           if (RB.HasCounter) {
             if (auto It = BindingMap.find(RB.CounterSPIRVBinding);
+                It != BindingMap.end())
+              It->second.Count = std::max(It->second.Count, RB.RangeSize);
+          }
+          if (RB.BufferInfoSPIRVBinding != UINT32_MAX) {
+            if (auto It = BindingMap.find(RB.BufferInfoSPIRVBinding);
                 It != BindingMap.end())
               It->second.Count = std::max(It->second.Count, RB.RangeSize);
           }
@@ -1903,9 +1975,19 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
       if (!Class || !Res.DXBinding)
         continue;
       SmallVector<const crucible::ResourceBinding *, 5> Matches;
+      SmallVector<const crucible::ResourceBinding *, 5> InfoMatches;
       auto addStageMatch = [&](const crucible::Reflection &Ref) {
         if (const auto *M = findStageReg(Ref, *Class, Res.DXBinding->Space,
                                          Res.DXBinding->Register)) {
+          if (M->BufferInfoSPIRVBinding != UINT32_MAX) {
+            bool AlreadyAdded = false;
+            for (const auto *E : InfoMatches)
+              AlreadyAdded |= E->SPIRVSet == M->SPIRVSet &&
+                              E->BufferInfoSPIRVBinding ==
+                                  M->BufferInfoSPIRVBinding;
+            if (!AlreadyAdded)
+              InfoMatches.push_back(M);
+          }
           for (const auto *E : Matches)
             if (E->SPIRVSet == M->SPIRVSet &&
                 E->SPIRVBinding == M->SPIRVBinding)
@@ -2204,6 +2286,8 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
         RB.SizeBytes = std::max<VkDeviceSize>(CPU->Size, 16);
         if (IsUniform && (RB.SizeBytes % 16) != 0)
           RB.SizeBytes = ((RB.SizeBytes + 15) / 16) * 16;
+        else if (!IsTyped)
+          RB.SizeBytes = ((RB.SizeBytes + 3) / 4) * 4;
         VkBufferCreateInfo BCI{};
         BCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         BCI.size = RB.SizeBytes;
@@ -2245,7 +2329,7 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
         vkMapMemory(VK.Device, RB.Memory, 0, RB.SizeBytes, 0, &BMapped);
         memset(BMapped, 0, RB.SizeBytes);
         if (Slice < CPU->Data.size() && CPU->Data[Slice])
-          memcpy(BMapped, CPU->Data[Slice].get(), CPU->Size);
+          memcpy(BMapped, CPU->Data[Slice].get(), mappedBufferBytes(Res));
         vkUnmapMemory(VK.Device, RB.Memory);
         if (IsTyped) {
           VkBufferViewCreateInfo BVCI{};
@@ -2267,6 +2351,28 @@ Error executeVulkanRaster(Pipeline &P, VkContext &VK) {
           BoundList.push_back({Match->SPIRVSet, Match->SPIRVBinding,
                                SlotOffset + Slice, DT, RB.Buffer, RB.SizeBytes,
                                RB.View, VK_NULL_HANDLE, VK_NULL_HANDLE});
+        }
+        for (const auto *Match : InfoMatches) {
+          auto Info = makeBufferInfo(CPU, mappedBufferBytes(Res));
+          if (!Info) {
+            cleanup();
+            return Info.takeError();
+          }
+          RasterBuf InfoBuf;
+          InfoBuf.SizeBytes = (*Info)->Size;
+          RasterBufs.push_back(InfoBuf);
+          auto &Alloc = RasterBufs.back();
+          if (Error E = allocHostBuf(
+                  Alloc.SizeBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                  (*Info)->Data[0].get(), Alloc.Buffer, Alloc.Memory)) {
+            cleanup();
+            return E;
+          }
+          uint32_t SlotOffset = Res.DXBinding->Register - Match->LowerBound;
+          BoundList.push_back(
+              {Match->SPIRVSet, Match->BufferInfoSPIRVBinding, SlotOffset + Slice,
+               VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, Alloc.Buffer,
+               Alloc.SizeBytes});
         }
       }
     }
