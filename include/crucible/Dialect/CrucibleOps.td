@@ -318,12 +318,15 @@ def Crucible_BarrierOp : Crucible_Op<"barrier"> {
   );
 }
 
-def Crucible_WaveIsFirstLaneOp : Crucible_Op<"wave_is_first_lane", [Pure]> {
+// Wave results depend on the active lanes, not just their explicit operands.
+// Keep conservative effects so optimizers cannot move or merge them across
+// divergent control flow.
+def Crucible_WaveIsFirstLaneOp : Crucible_Op<"wave_is_first_lane"> {
   let summary = "True for the lowest active lane in the subgroup";
   let results = (outs I1:$result);
 }
 
-def Crucible_WaveVoteOp : Crucible_Op<"wave_vote", [Pure]> {
+def Crucible_WaveVoteOp : Crucible_Op<"wave_vote"> {
   let summary = "Subgroup vote (any, all, or all_equal)";
   let arguments = (ins
     AnyType:$value,
@@ -332,13 +335,13 @@ def Crucible_WaveVoteOp : Crucible_Op<"wave_vote", [Pure]> {
   let results = (outs I1:$result);
 }
 
-def Crucible_WaveBallotOp : Crucible_Op<"wave_ballot", [Pure]> {
+def Crucible_WaveBallotOp : Crucible_Op<"wave_ballot"> {
   let summary = "Subgroup ballot returning a 4xi32 bitmask";
   let arguments = (ins I1:$cond);
   let results = (outs AnyType:$result);
 }
 
-def Crucible_WaveBitCountOp : Crucible_Op<"wave_bit_count", [Pure]> {
+def Crucible_WaveBitCountOp : Crucible_Op<"wave_bit_count"> {
   let summary = "Subgroup active/prefix/multi-prefix bit count";
   let arguments = (ins
     I1:$cond,
@@ -348,7 +351,7 @@ def Crucible_WaveBitCountOp : Crucible_Op<"wave_bit_count", [Pure]> {
   let results = (outs I32:$result);
 }
 
-def Crucible_WaveMultiPrefixOp : Crucible_Op<"wave_multi_prefix", [Pure]> {
+def Crucible_WaveMultiPrefixOp : Crucible_Op<"wave_multi_prefix"> {
   let summary = "Subgroup multi-prefix reduction with partition mask";
   let arguments = (ins
     AnyType:$value,
