@@ -1582,8 +1582,10 @@
       const sel = document.getElementById("global-scope");
       if (!sel) return;
       const seenShaders = new Map([["bench_raymarch", { name: "Raymarcher (ALU+CF)", cat: "Compute" }]]);
+      const seenCategories = new Set(["Compute"]);
       for (const h of benchHistory) {
         for (const r of getEntrySuites(h)) {
+          seenCategories.add(r.category || "Compute");
           const id = r.benchId || "bench_raymarch";
           if (!seenShaders.has(id)) {
             seenShaders.set(id, { name: formatBenchName(r), cat: r.category || "Compute" });
@@ -1598,9 +1600,10 @@
         { val: "regime:all:minMs", label: "Best GPU sample (geomean ms)" },
         { val: "regime:all:compileMs", label: "Shader compile time (geomean ms)" },
       ];
-      const stageOpts = [
-        { val: "cat:Compute:medianMs", label: "Category Avg: Compute (ms)" },
-      ];
+      const stageOpts = [...seenCategories].map(category => ({
+        val: `cat:${category}:medianMs`,
+        label: `Category Avg: ${category} (ms)`
+      }));
       const shaderOpts = [...seenShaders.entries()].map(([id, info]) => ({
         val: `shader:${id}:medianMs`,
         label: `Test: ${info.name} (${info.cat})`

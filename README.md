@@ -99,6 +99,7 @@ xychart-beta
 
 > [!TIP]
 > Track per-commit GPU timings on the [**Live Benchmark Dashboard**](https://farzonl.github.io/crucible/bench.html) and multi-backend [llvm/offload-test-suite](https://github.com/llvm/offload-test-suite) pass rates on the [**Live Compliance Dashboard**](https://farzonl.github.io/crucible/).
+> Click a category or regime winner with recorded timings to select its scope; category scopes are populated from the benchmark history.
 
 ### Multi-Runtime `offload-test-suite` Integration
 
