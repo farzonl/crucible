@@ -49,6 +49,7 @@
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/SROA.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #include <algorithm>
 #include <mutex>
@@ -93,6 +94,9 @@ enum class SpvOp : uint32_t {
   StoreOutput,
   EmitStream,
   CutStream,
+  LoadControlPoint,
+  LoadPatchConstant,
+  StorePatchConstant,
   Discard,
   Deriv,
   // Wave & Quad
@@ -161,6 +165,10 @@ Expected<std::string> stageTripleSuffix(ShaderStage Stage, bool StageAsCompute) 
     return "vertex";
   case ShaderStage::Geometry:
     return "geometry";
+  case ShaderStage::Hull:
+    return "hull";
+  case ShaderStage::Domain:
+    return "domain";
   case ShaderStage::Pixel:
     return "pixel";
   case ShaderStage::RayGeneration:
@@ -248,6 +256,7 @@ private:
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
   DenseMap<uint32_t, StageVar> OutputVars;
+  DenseMap<uint32_t, StageVar> PatchConstVars;
   DenseMap<uint32_t, StageVar> ExtraBuiltInInputs;
   GlobalVariable *getOrCreateBuiltInInput(uint32_t BuiltInId, Type *Ty,
                                           StringRef Name) {
@@ -325,8 +334,12 @@ private:
   Error lowerPixelOp(CallInst *CI, SpvOp Op);
   Error lowerLoadInput(CallInst *CI);
   Error lowerStoreOutput(CallInst *CI);
+  Error lowerLoadControlPoint(CallInst *CI);
+  Error lowerLoadPatchConstant(CallInst *CI);
+  Error lowerStorePatchConstant(CallInst *CI);
   Error lowerRaytracingOp(CallInst *CI, SpvOp Op);
 
+  void mergeHullPatchConstantFunc();
   void prepareStageInterface();
   void emitStageDecorations();
   void rewriteFloatAtomicGlobals();
@@ -2557,6 +2570,12 @@ Error SPIRVLowerer::lowerBridgeCall(CallInst *CI) {
     B.CreateCall(EndPrimitiveHelper);
     return Error::success();
   }
+  case SpvOp::LoadControlPoint:
+    return lowerLoadControlPoint(CI);
+  case SpvOp::LoadPatchConstant:
+    return lowerLoadPatchConstant(CI);
+  case SpvOp::StorePatchConstant:
+    return lowerStorePatchConstant(CI);
 
   case SpvOp::RayQueryAlloc:
   case SpvOp::RayQueryTraceInline:
@@ -2575,34 +2594,116 @@ Error SPIRVLowerer::lowerBridgeCall(CallInst *CI) {
   }
 }
 
+void SPIRVLowerer::mergeHullPatchConstantFunc() {
+  if (Reflect.Stage != ShaderStage::Hull || !Reflect.Hull)
+    return;
+  Function *PCF = nullptr;
+  if (!Reflect.Hull->PatchConstantFuncName.empty())
+    PCF = M.getFunction(Reflect.Hull->PatchConstantFuncName);
+  if (!PCF) {
+    for (Function &F : M) {
+      if (!F.isDeclaration() && &F != Entry &&
+          !F.getName().starts_with("__crucible_")) {
+        PCF = &F;
+        break;
+      }
+    }
+  }
+  if (!PCF || PCF->isDeclaration())
+    return;
+
+  SmallVector<ReturnInst *, 4> Rets;
+  for (BasicBlock &BB : *Entry) {
+    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+      Rets.push_back(RI);
+  }
+  if (Rets.empty())
+    return;
+
+  BasicBlock *BarBB = BasicBlock::Create(Ctx, "hs.barrier", Entry);
+  BasicBlock *PcfBB = BasicBlock::Create(Ctx, "hs.patch_const", Entry);
+  BasicBlock *ExitBB = BasicBlock::Create(Ctx, "hs.exit", Entry);
+
+  for (ReturnInst *RI : Rets) {
+    IRBuilder<>(RI).CreateBr(BarBB);
+    RI->eraseFromParent();
+  }
+
+  IRBuilder<> BB(BarBB);
+  Function *BarFn = Intrinsic::getOrInsertDeclaration(
+      &M, Intrinsic::spv_group_memory_barrier_with_group_sync);
+  BB.CreateCall(BarFn);
+  GlobalVariable *InvGV = getOrCreateBuiltInInput(8u /* InvocationId */,
+                                                  BB.getInt32Ty(),
+                                                  "in_SV_OutputControlPointID");
+  Value *InvId = BB.CreateLoad(BB.getInt32Ty(), InvGV);
+  Value *IsZero = BB.CreateICmpEQ(InvId, BB.getInt32(0));
+  BB.CreateCondBr(IsZero, PcfBB, ExitBB);
+
+  IRBuilder<> PB(PcfBB);
+  CallInst *CallPCF = PB.CreateCall(PCF);
+  PB.CreateBr(ExitBB);
+
+  IRBuilder<>(ExitBB).CreateRetVoid();
+
+  InlineFunctionInfo IFI;
+  InlineFunction(*CallPCF, IFI);
+  if (PCF->use_empty())
+    PCF->eraseFromParent();
+}
+
 void SPIRVLowerer::prepareStageInterface() {
   if (Reflect.Stage != ShaderStage::Vertex &&
       Reflect.Stage != ShaderStage::Geometry &&
+      Reflect.Stage != ShaderStage::Hull &&
+      Reflect.Stage != ShaderStage::Domain &&
       Reflect.Stage != ShaderStage::Pixel)
     return;
 
-  uint32_t GSInputVerts = 0;
+  uint32_t InputVerts = 0;
+  uint32_t OutputVerts = 0;
   if (Reflect.Stage == ShaderStage::Geometry) {
     uint32_t InPrim = Reflect.Geometry ? Reflect.Geometry->InputPrimitive : 3u;
     switch (InPrim) {
-    case 1: GSInputVerts = 1; break; // Point
-    case 2: GSInputVerts = 2; break; // Line
-    case 6: GSInputVerts = 4; break; // LineAdj
-    case 7: GSInputVerts = 6; break; // TriangleAdj
-    default: GSInputVerts = 3; break; // Triangle
+    case 1:
+      InputVerts = 1;
+      break; // Point
+    case 2:
+      InputVerts = 2;
+      break; // Line
+    case 6:
+      InputVerts = 4;
+      break; // LineAdj
+    case 7:
+      InputVerts = 6;
+      break; // TriangleAdj
+    default:
+      InputVerts = 3;
+      break; // Triangle
     }
+  } else if (Reflect.Stage == ShaderStage::Hull && Reflect.Hull) {
+    InputVerts = std::max(1u, Reflect.Hull->InputControlPointCount);
+    OutputVerts = std::max(1u, Reflect.Hull->OutputControlPointCount);
+  } else if (Reflect.Stage == ShaderStage::Domain && Reflect.Domain) {
+    InputVerts = std::max(1u, Reflect.Domain->ControlPointCount);
   }
 
+  uint32_t LastInputNextLoc = 0;
+  uint32_t LastOutputNextLoc = 0;
   auto buildStageVars = [&](const std::vector<StageParameter> &Params,
                             unsigned AddrSpace, bool IsOutput,
-                            DenseMap<uint32_t, StageVar> &Table) {
-    uint32_t NextLoc = 0;
+                            DenseMap<uint32_t, StageVar> &Table,
+                            uint32_t PerVertCount, bool IsPatchConst,
+                            uint32_t StartLoc) -> uint32_t {
+    uint32_t NextLoc = StartLoc;
     for (const StageParameter &P : Params) {
       StageVar SV;
       SV.Param = &P;
 
       std::optional<uint32_t> BuiltIn;
       bool IsBoolBI = false;
+      bool IsTessOuter = false;
+      bool IsTessInner = false;
       switch (P.Kind) {
       case 1: // VertexID
         BuiltIn = 42; // VertexIndex
@@ -2662,6 +2763,14 @@ void SPIRVLowerer::prepareStageInterface() {
         if (IsOutput)
           UsedStencilExport = true;
         break;
+      case 25: // TessFactor
+        BuiltIn = 11; // TessLevelOuter
+        IsTessOuter = true;
+        break;
+      case 26: // InsideTessFactor
+        BuiltIn = 12; // TessLevelInner
+        IsTessInner = true;
+        break;
       default:
         break;
       }
@@ -2678,7 +2787,11 @@ void SPIRVLowerer::prepareStageInterface() {
       unsigned Cols = std::max(1u, P.Columns);
       unsigned Rows = std::max(1u, P.Rows);
       Type *VarTy = nullptr;
-      if (SV.IsFlatFloatArray) {
+      if (IsTessOuter) {
+        VarTy = ArrayType::get(Type::getFloatTy(Ctx), 4);
+      } else if (IsTessInner) {
+        VarTy = ArrayType::get(Type::getFloatTy(Ctx), 2);
+      } else if (SV.IsFlatFloatArray) {
         VarTy = ArrayType::get(ScalarTy, Rows * Cols);
       } else {
         Type *RowTy =
@@ -2686,17 +2799,17 @@ void SPIRVLowerer::prepareStageInterface() {
         VarTy = (Rows == 1) ? RowTy : ArrayType::get(RowTy, Rows);
       }
       bool IsPerVertex =
-          (!IsOutput && Reflect.Stage == ShaderStage::Geometry &&
-           GSInputVerts > 0 && P.Kind != 10 /* PrimitiveID */ &&
-           P.Kind != 11 /* GSInstanceID */);
+          !IsPatchConst && PerVertCount > 0 && P.Kind != 10 /* PrimitiveID */ &&
+          P.Kind != 11 /* GSInstanceID */;
       if (IsPerVertex) {
-        VarTy = ArrayType::get(VarTy, GSInputVerts);
+        VarTy = ArrayType::get(VarTy, PerVertCount);
         SV.IsPerVertexArray = true;
       }
       SV.VarTy = VarTy;
 
       std::string Name =
-          (IsOutput ? "out_" : "in_") +
+          (IsPatchConst ? (IsOutput ? "out_patch_" : "in_patch_")
+                        : (IsOutput ? "out_" : "in_")) +
           (P.Semantic.empty() ? ("sig_" + std::to_string(P.ID)) : P.Semantic) +
           "_" + std::to_string(P.SemanticIndex);
       auto *GV = new GlobalVariable(
@@ -2716,6 +2829,8 @@ void SPIRVLowerer::prepareStageInterface() {
         SV.Decorations.push_back({30u /* Location */, NextLoc});
         NextLoc += Rows;
       }
+      if (IsPatchConst)
+        SV.Decorations.push_back({15u /* Patch */});
 
       if (Reflect.Stage == ShaderStage::Pixel && !IsOutput && !BuiltIn) {
         bool IsInt = ScalarTy->isIntegerTy();
@@ -2738,14 +2853,25 @@ void SPIRVLowerer::prepareStageInterface() {
 
       Table[P.ID] = std::move(SV);
     }
+    return NextLoc;
   };
 
-  buildStageVars(Reflect.Inputs, 7 /* Input */, false, InputVars);
-  buildStageVars(Reflect.Outputs, 8 /* Output */, true, OutputVars);
+  LastInputNextLoc = buildStageVars(Reflect.Inputs, 7 /* Input */, false,
+                                    InputVars, InputVerts, false, 0);
+  LastOutputNextLoc = buildStageVars(Reflect.Outputs, 8 /* Output */, true,
+                                     OutputVars, OutputVerts, false, 0);
+  if (Reflect.Stage == ShaderStage::Hull && Reflect.Hull) {
+    buildStageVars(Reflect.Hull->PatchConstants, 8 /* Output */, true,
+                   PatchConstVars, 0, true, LastOutputNextLoc);
+  } else if (Reflect.Stage == ShaderStage::Domain && Reflect.Domain) {
+    buildStageVars(Reflect.Domain->PatchConstants, 7 /* Input */, false,
+                   PatchConstVars, 0, true, LastInputNextLoc);
+  }
 }
 
 void SPIRVLowerer::emitStageDecorations() {
-  if (InputVars.empty() && OutputVars.empty() && ExtraBuiltInInputs.empty())
+  if (InputVars.empty() && OutputVars.empty() && PatchConstVars.empty() &&
+      ExtraBuiltInInputs.empty())
     return;
 
   IRBuilder<> B(&*Entry->getEntryBlock().getFirstInsertionPt());
@@ -2771,6 +2897,7 @@ void SPIRVLowerer::emitStageDecorations() {
   };
   emitForTable(InputVars);
   emitForTable(OutputVars);
+  emitForTable(PatchConstVars);
   emitForTable(ExtraBuiltInInputs);
 }
 
@@ -2846,8 +2973,14 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   IRBuilder<> B(CI);
   Value *Ptr = SV.GV;
   Type *ElemTy = SV.VarTy;
-  SmallVector<Value *, 3> Indices;
+  SmallVector<Value *, 4> Indices;
   Indices.push_back(B.getInt32(0));
+  if (SV.IsPerVertexArray) {
+    GlobalVariable *InvGV = getOrCreateBuiltInInput(
+        8u /* InvocationId */, B.getInt32Ty(), "in_SV_OutputControlPointID");
+    Indices.push_back(B.CreateLoad(B.getInt32Ty(), InvGV));
+    ElemTy = cast<ArrayType>(ElemTy)->getElementType();
+  }
   if (SV.IsFlatFloatArray) {
     unsigned Cols = std::max(1u, SV.Param->Columns);
     unsigned Rows = std::max(1u, SV.Param->Rows);
@@ -2869,6 +3002,114 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
       Indices.push_back(CI->getArgOperand(3));
       ElemTy = VT->getElementType();
     }
+  }
+  if (Indices.size() > 1)
+    Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, Indices);
+
+  Value *Val = CI->getArgOperand(4);
+  if (Val->getType() != ElemTy) {
+    if (Val->getType()->isIntegerTy() && ElemTy->isIntegerTy())
+      Val = B.CreateZExtOrTrunc(Val, ElemTy);
+    else
+      Val = B.CreateBitCast(Val, ElemTy);
+  }
+  B.CreateStore(Val, Ptr);
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerLoadControlPoint(CallInst *CI) {
+  auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!IdC)
+    return makeError("SPIR-V backend: non-constant inputSigId in loadControlPoint");
+  auto It = OutputVars.find(static_cast<uint32_t>(IdC->getZExtValue()));
+  if (It == OutputVars.end())
+    return makeError("SPIR-V backend: unknown control point ID {0}",
+                     IdC->getZExtValue());
+  StageVar &SV = It->second;
+  SV.Referenced = true;
+
+  IRBuilder<> B(CI);
+  Value *Ptr = SV.GV;
+  Type *RowTy = SV.VarTy;
+  if (SV.IsPerVertexArray) {
+    Value *CpIdx = CI->getArgOperand(4);
+    auto *OuterAT = cast<ArrayType>(RowTy);
+    Ptr = B.CreateInBoundsGEP(OuterAT, Ptr, {B.getInt32(0), CpIdx});
+    RowTy = OuterAT->getElementType();
+  }
+  if (auto *AT = dyn_cast<ArrayType>(RowTy)) {
+    Ptr = B.CreateInBoundsGEP(RowTy, Ptr, {B.getInt32(0), CI->getArgOperand(2)});
+    RowTy = AT->getElementType();
+  }
+  Value *Loaded = B.CreateLoad(RowTy, Ptr);
+  Value *Val = Loaded;
+  if (isa<FixedVectorType>(RowTy))
+    Val = B.CreateExtractElement(Loaded, CI->getArgOperand(3));
+  if (Val->getType() != CI->getType()) {
+    if (Val->getType()->isIntegerTy() && CI->getType()->isIntegerTy())
+      Val = B.CreateZExtOrTrunc(Val, CI->getType());
+    else
+      Val = B.CreateBitCast(Val, CI->getType());
+  }
+  CI->replaceAllUsesWith(Val);
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerLoadPatchConstant(CallInst *CI) {
+  auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!IdC)
+    return makeError("SPIR-V backend: non-constant id in loadPatchConstant");
+  auto It = PatchConstVars.find(static_cast<uint32_t>(IdC->getZExtValue()));
+  if (It == PatchConstVars.end())
+    return makeError("SPIR-V backend: unknown patch constant ID {0}",
+                     IdC->getZExtValue());
+  StageVar &SV = It->second;
+  SV.Referenced = true;
+
+  IRBuilder<> B(CI);
+  Value *Ptr = SV.GV;
+  Type *RowTy = SV.VarTy;
+  if (auto *AT = dyn_cast<ArrayType>(RowTy)) {
+    Ptr = B.CreateInBoundsGEP(RowTy, Ptr, {B.getInt32(0), CI->getArgOperand(2)});
+    RowTy = AT->getElementType();
+  }
+  Value *Loaded = B.CreateLoad(RowTy, Ptr);
+  Value *Val = Loaded;
+  if (isa<FixedVectorType>(RowTy))
+    Val = B.CreateExtractElement(Loaded, CI->getArgOperand(3));
+  if (Val->getType() != CI->getType()) {
+    if (Val->getType()->isIntegerTy() && CI->getType()->isIntegerTy())
+      Val = B.CreateZExtOrTrunc(Val, CI->getType());
+    else
+      Val = B.CreateBitCast(Val, CI->getType());
+  }
+  CI->replaceAllUsesWith(Val);
+  return Error::success();
+}
+
+Error SPIRVLowerer::lowerStorePatchConstant(CallInst *CI) {
+  auto *IdC = dyn_cast<ConstantInt>(CI->getArgOperand(1));
+  if (!IdC)
+    return makeError("SPIR-V backend: non-constant id in storePatchConstant");
+  auto It = PatchConstVars.find(static_cast<uint32_t>(IdC->getZExtValue()));
+  if (It == PatchConstVars.end())
+    return makeError("SPIR-V backend: unknown patch constant ID {0}",
+                     IdC->getZExtValue());
+  StageVar &SV = It->second;
+  SV.Referenced = true;
+
+  IRBuilder<> B(CI);
+  Value *Ptr = SV.GV;
+  Type *ElemTy = SV.VarTy;
+  SmallVector<Value *, 3> Indices;
+  Indices.push_back(B.getInt32(0));
+  if (auto *AT = dyn_cast<ArrayType>(ElemTy)) {
+    Indices.push_back(CI->getArgOperand(2));
+    ElemTy = AT->getElementType();
+  }
+  if (auto *VT = dyn_cast<FixedVectorType>(ElemTy)) {
+    Indices.push_back(CI->getArgOperand(3));
+    ElemTy = VT->getElementType();
   }
   if (Indices.size() > 1)
     Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, Indices);
@@ -3065,6 +3306,24 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
       if (V->getType() != CI->getType())
         V = B.CreateZExtOrTrunc(V, CI->getType());
       CI->replaceAllUsesWith(V);
+      return Error::success();
+    }
+    case ir::SysValKind::OutputControlPointId: {
+      GlobalVariable *GV = getOrCreateBuiltInInput(
+          8u /* InvocationId */, B.getInt32Ty(), "in_SV_OutputControlPointID");
+      Value *V = B.CreateLoad(B.getInt32Ty(), GV);
+      if (V->getType() != CI->getType())
+        V = B.CreateZExtOrTrunc(V, CI->getType());
+      CI->replaceAllUsesWith(V);
+      return Error::success();
+    }
+    case ir::SysValKind::DomainLocation: {
+      Type *Vec3F = FixedVectorType::get(B.getFloatTy(), 3);
+      GlobalVariable *GV = getOrCreateBuiltInInput(13u /* TessCoord */, Vec3F,
+                                                   "in_SV_DomainLocation");
+      Value *Coord = B.CreateLoad(Vec3F, GV);
+      Value *Comp = B.CreateExtractElement(Coord, CI->getArgOperand(2));
+      CI->replaceAllUsesWith(Comp);
       return Error::success();
     }
     case ir::SysValKind::PrimitiveIndex:
@@ -3399,7 +3658,9 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
                          std::to_string(Reflect.NumThreads[1]) + "," +
                          std::to_string(Reflect.NumThreads[2]);
         F.addFnAttr("hlsl.numthreads", NT);
-      } else if (Reflect.Stage == ShaderStage::Geometry) {
+      } else if (Reflect.Stage == ShaderStage::Geometry ||
+                 Reflect.Stage == ShaderStage::Hull ||
+                 Reflect.Stage == ShaderStage::Domain) {
         NamedMDNode *EMNode = M.getOrInsertNamedMetadata("spirv.ExecutionMode");
         auto *I32Ty = Type::getInt32Ty(Ctx);
         auto addEM = [&](uint32_t Mode,
@@ -3412,27 +3673,67 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
                 ConstantAsMetadata::get(ConstantInt::get(I32Ty, *Arg)));
           EMNode->addOperand(MDNode::get(Ctx, Ops));
         };
-        uint32_t InPrim =
-            Reflect.Geometry ? Reflect.Geometry->InputPrimitive : 3u;
-        uint32_t OutTopo =
-            Reflect.Geometry ? Reflect.Geometry->OutputTopology : 5u;
-        uint32_t MaxVerts =
-            Reflect.Geometry ? Reflect.Geometry->MaxVertexCount : 3u;
-        uint32_t InstCount =
-            Reflect.Geometry ? std::max(1u, Reflect.Geometry->InstanceCount)
-                             : 1u;
-        uint32_t InMode = 22u; // Triangles
-        if (InPrim == 1u) InMode = 19u;      // InputPoints
-        else if (InPrim == 2u) InMode = 20u; // InputLines
-        else if (InPrim == 6u) InMode = 21u; // InputLinesAdjacency
-        else if (InPrim == 7u) InMode = 23u; // InputTrianglesAdjacency
-        uint32_t OutMode = 29u; // OutputTriangleStrip
-        if (OutTopo == 1u) OutMode = 27u;      // OutputPoints
-        else if (OutTopo == 3u) OutMode = 28u; // OutputLineStrip
-        addEM(InMode);
-        addEM(0u /* Invocations */, InstCount);
-        addEM(OutMode);
-        addEM(26u /* OutputVertices */, MaxVerts);
+        if (Reflect.Stage == ShaderStage::Geometry) {
+          uint32_t InPrim =
+              Reflect.Geometry ? Reflect.Geometry->InputPrimitive : 3u;
+          uint32_t OutTopo =
+              Reflect.Geometry ? Reflect.Geometry->OutputTopology : 5u;
+          uint32_t MaxVerts =
+              Reflect.Geometry ? Reflect.Geometry->MaxVertexCount : 3u;
+          uint32_t InstCount =
+              Reflect.Geometry ? std::max(1u, Reflect.Geometry->InstanceCount)
+                               : 1u;
+          uint32_t InMode = 22u; // Triangles
+          if (InPrim == 1u)
+            InMode = 19u; // InputPoints
+          else if (InPrim == 2u)
+            InMode = 20u; // InputLines
+          else if (InPrim == 6u)
+            InMode = 21u; // InputLinesAdjacency
+          else if (InPrim == 7u)
+            InMode = 23u; // InputTrianglesAdjacency
+          uint32_t OutMode = 29u; // OutputTriangleStrip
+          if (OutTopo == 1u)
+            OutMode = 27u; // OutputPoints
+          else if (OutTopo == 3u)
+            OutMode = 28u; // OutputLineStrip
+          addEM(InMode);
+          addEM(0u /* Invocations */, InstCount);
+          addEM(OutMode);
+          addEM(26u /* OutputVertices */, MaxVerts);
+        } else if (Reflect.Stage == ShaderStage::Hull) {
+          uint32_t OutCPs =
+              Reflect.Hull ? std::max(1u, Reflect.Hull->OutputControlPointCount)
+                           : 3u;
+          addEM(26u /* OutputVertices */, OutCPs);
+        } else {
+          TessellationDomain Dom = Reflect.Domain
+                                       ? Reflect.Domain->Domain
+                                       : TessellationDomain::Triangle;
+          uint32_t DomMode = 22u; // Triangles
+          if (Dom == TessellationDomain::Quad) DomMode = 24u; // Quads
+          else if (Dom == TessellationDomain::Isoline) DomMode = 25u; // Isolines
+          addEM(DomMode);
+
+          uint32_t SpacingMode = 1u; // SpacingEqual
+          if (Opts.TessPartitioning ==
+              static_cast<uint8_t>(TessellationPartitioning::FractionalEven))
+            SpacingMode = 2u;
+          else if (Opts.TessPartitioning ==
+                   static_cast<uint8_t>(
+                       TessellationPartitioning::FractionalOdd))
+            SpacingMode = 3u;
+          addEM(SpacingMode);
+
+          uint32_t OrderMode = 4u; // VertexOrderCw
+          if (Opts.TessOutputPrimitive ==
+              static_cast<uint8_t>(TessellationOutputPrimitive::TriangleCCW))
+            OrderMode = 5u; // VertexOrderCcw
+          addEM(OrderMode);
+          if (Opts.TessOutputPrimitive ==
+              static_cast<uint8_t>(TessellationOutputPrimitive::Point))
+            addEM(10u /* PointMode */);
+        }
       }
     } else if (!F.isDeclaration()) {
       F.setLinkage(GlobalValue::InternalLinkage);
@@ -3553,6 +3854,7 @@ Error SPIRVLowerer::run() {
     return StageOrErr.takeError();
 
   prepareStageInterface();
+  mergeHullPatchConstantFunc();
   rewriteFloatAtomicGlobals();
 
   SmallVector<CallInst *, 64> BridgeCalls;
@@ -4227,6 +4529,31 @@ lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
     if (auto COp = mlir::dyn_cast<ir::CutStreamOp>(Op)) {
       makeBridgeCall(B, Loc, SpvOp::CutStream, mlir::Type(),
                      {i8C(B, Loc, COp.getStreamId())});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::LoadControlPointOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::LoadControlPoint, COp.getResult().getType(),
+          {i32C(B, Loc, COp.getInputId()), COp.getRow(),
+           i8C(B, Loc, COp.getCol()), COp.getCpId()});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::LoadPatchConstantOp>(Op)) {
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, SpvOp::LoadPatchConstant, COp.getResult().getType(),
+          {i32C(B, Loc, COp.getInputId()), COp.getRow(),
+           i8C(B, Loc, COp.getCol())});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::StorePatchConstantOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::StorePatchConstant, mlir::Type(),
+                     {i32C(B, Loc, COp.getOutputId()), COp.getRow(),
+                      i8C(B, Loc, COp.getCol()), COp.getValue()});
       COp.erase();
       continue;
     }
@@ -5181,7 +5508,76 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       }
     }
   }
-
+  // Patch OpControlBarrier in Hull (TessellationControl) shaders to use
+  // Memory=Invocation (4) and Semantics=None (0) per
+  // VUID-StandaloneSpirv-ExecutionModel-07320 (GLSL450 forbids Workgroup
+  // memory scope in TessellationControl).
+  if (!Opts.EmitSPIRVAsm && Reflect.Stage == ShaderStage::Hull &&
+      Result.size() >= 20 && (Result.size() % 4) == 0) {
+    const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
+    size_t NumWords = Result.size() / 4;
+    if (Words[0] == 0x07230203u) {
+      constexpr uint16_t OpTypeInt = 21;
+      constexpr uint16_t OpConstant = 43;
+      constexpr uint16_t OpControlBarrier = 224;
+      bool HasBarrier = false;
+      uint32_t UintTyId = 0;
+      for (size_t I = 5; I < NumWords;) {
+        uint32_t WC = Words[I] >> 16;
+        uint16_t Op = Words[I] & 0xFFFFu;
+        if (WC == 0 || I + WC > NumWords)
+          break;
+        if (Op == OpTypeInt && WC == 4 && Words[I + 2] == 32u &&
+            Words[I + 3] == 0u && UintTyId == 0)
+          UintTyId = Words[I + 1];
+        else if (Op == OpControlBarrier && WC == 4)
+          HasBarrier = true;
+        I += WC;
+      }
+      if (HasBarrier && UintTyId != 0) {
+        uint32_t Bound = Words[3];
+        uint32_t InvocScopeId = Bound++;
+        uint32_t ZeroSemId = Bound++;
+        bool EmittedBarrierConsts = false;
+        std::vector<uint32_t> Patched;
+        Patched.reserve(NumWords + 8);
+        for (size_t I = 0; I < 5; ++I)
+          Patched.push_back(Words[I]);
+        Patched[3] = Bound;
+        for (size_t I = 5; I < NumWords;) {
+          uint32_t WC = Words[I] >> 16;
+          uint16_t Op = Words[I] & 0xFFFFu;
+          if (WC == 0 || I + WC > NumWords)
+            break;
+          if (Op == OpControlBarrier && WC == 4) {
+            Patched.push_back(Words[I]);
+            Patched.push_back(Words[I + 1]); // Execution = Workgroup
+            Patched.push_back(InvocScopeId); // Memory = Invocation (4)
+            Patched.push_back(ZeroSemId);    // Semantics = None (0)
+            I += WC;
+            continue;
+          }
+          for (uint32_t K = 0; K < WC; ++K)
+            Patched.push_back(Words[I + K]);
+          if (!EmittedBarrierConsts && Op == OpTypeInt && WC == 4 &&
+              Words[I + 1] == UintTyId) {
+            Patched.push_back((4u << 16) | OpConstant);
+            Patched.push_back(UintTyId);
+            Patched.push_back(InvocScopeId);
+            Patched.push_back(4u); // Scope::Invocation
+            Patched.push_back((4u << 16) | OpConstant);
+            Patched.push_back(UintTyId);
+            Patched.push_back(ZeroSemId);
+            Patched.push_back(0u); // MemorySemantics::None
+            EmittedBarrierConsts = true;
+          }
+          I += WC;
+        }
+        Result.assign(reinterpret_cast<const char *>(Patched.data()),
+                      Patched.size() * 4);
+      }
+    }
+  }
   return Result;
 }
 
