@@ -128,6 +128,21 @@ ninja -C build check-crucible-offload-vk-molten      # Vulkan/SPIR-V on MoltenVK
 
 Useful CMake flags: `-DLLVM_DIR=...`, `-DDXC_EXECUTABLE=...`, `-DLLVM_EXTERNAL_LIT=...`, `-DCRUCIBLE_OFFLOAD_SUITE_DIR=...`.
 
+### Vulkan buffer layout and residency
+
+Raw and structured GPU buffers are padded to complete 32-bit words, including
+the final word of native 16-bit buffers. CPU readback retains the logical size.
+Shaders querying raw-buffer sizes, sub-word structured-buffer dimensions, or
+buffer residency may require an auxiliary StorageBuffer descriptor, identified
+by `bufferInfoSpirvBinding` in each reflected binding. Each descriptor-array
+element supplies two `uint32_t` values: logical byte size and mapped byte size.
+For ordinary buffers, both values are the logical byte size.
+
+The Vulkan offload provider supplies this metadata automatically. Reserved-buffer
+loads use the same mapped-prefix model as the Metal provider: `TilesMapped`
+64-KiB tiles are resident, and the remaining bytes read as zero. This is buffer
+load emulation, not general Vulkan sparse-resource support.
+
 ---
 
 ## Usage & Tools

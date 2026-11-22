@@ -1,0 +1,62 @@
+---
+Shaders:
+  - Stage: Compute
+    Entry: nativeTail
+Buffers:
+  - Name: In16
+    Format: UInt16
+    Stride: 2
+    Data: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  - Name: Out16
+    Format: UInt16
+    Stride: 2
+    FillSize: 18
+  - Name: Expected16
+    Format: UInt16
+    Data: [17, 34, 51, 68, 85, 102, 119, 136, 153]
+  - Name: InHalf
+    Format: Hex16
+    Stride: 2
+    Data: [0x3c00, 0x4000, 0x4200, 0x4400, 0x4500, 0x4600, 0x4700, 0x4800, 0x4880]
+  - Name: OutHalf
+    Format: Hex16
+    Stride: 2
+    FillSize: 18
+  - Name: Dimensions
+    Format: UInt32
+    Stride: 4
+    FillSize: 40
+  - Name: ExpectedDimensions
+    Format: UInt32
+    Data: [9, 2, 9, 2, 9, 2, 9, 2, 1, 0]
+DescriptorSets:
+  - Resources:
+      - Name: In16
+        Kind: StructuredBuffer
+        DirectXBinding: {Register: 0, Space: 0}
+      - Name: Out16
+        Kind: RWStructuredBuffer
+        DirectXBinding: {Register: 1, Space: 0}
+      - Name: Dimensions
+        Kind: RWStructuredBuffer
+        DirectXBinding: {Register: 2, Space: 0}
+      - Name: InHalf
+        Kind: StructuredBuffer
+        DirectXBinding: {Register: 3, Space: 0}
+      - Name: OutHalf
+        Kind: RWStructuredBuffer
+        DirectXBinding: {Register: 4, Space: 0}
+Results:
+  - Result: Integer tail
+    Rule: BufferExact
+    Actual: Out16
+    Expected: Expected16
+  - Result: Half tail
+    Rule: BufferExact
+    Actual: OutHalf
+    Expected: InHalf
+  - Result: Logical dimensions
+    Rule: BufferExact
+    Actual: Dimensions
+    Expected: ExpectedDimensions
+...

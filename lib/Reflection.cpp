@@ -58,7 +58,7 @@ static const char *className(ResourceClass C) {
 std::string Reflection::toJSON() const {
   json::Array Bindings;
   for (const ResourceBinding &RB : Resources) {
-    Bindings.push_back(json::Object{
+    json::Object Binding{
         {"class", className(RB.Class)},
         {"kind", static_cast<int64_t>(RB.Kind)},
         {"name", RB.Name},
@@ -70,7 +70,11 @@ std::string Reflection::toJSON() const {
         {"spirvSet", static_cast<int64_t>(RB.SPIRVSet)},
         {"spirvBinding", static_cast<int64_t>(RB.SPIRVBinding)},
         {"requiresTextureAtomics", RB.RequiresTextureAtomics},
-    });
+    };
+    if (RB.BufferInfoSPIRVBinding != UINT32_MAX)
+      Binding["bufferInfoSpirvBinding"] =
+          static_cast<int64_t>(RB.BufferInfoSPIRVBinding);
+    Bindings.push_back(std::move(Binding));
   }
 
   json::Object Root{
