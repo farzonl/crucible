@@ -91,6 +91,8 @@ enum class SpvOp : uint32_t {
   // Stage I/O & Pixel
   LoadInput,
   StoreOutput,
+  EmitStream,
+  CutStream,
   Discard,
   Deriv,
   // Wave & Quad
@@ -157,6 +159,8 @@ Expected<std::string> stageTripleSuffix(ShaderStage Stage, bool StageAsCompute) 
     return "compute";
   case ShaderStage::Vertex:
     return "vertex";
+  case ShaderStage::Geometry:
+    return "geometry";
   case ShaderStage::Pixel:
     return "pixel";
   case ShaderStage::RayGeneration:
@@ -187,6 +191,7 @@ struct StageVar {
   SmallVector<SmallVector<uint32_t, 2>, 3> Decorations;
   bool IsBoolBuiltIn = false;
   bool IsFlatFloatArray = false;
+  bool IsPerVertexArray = false;
   bool Referenced = false;
 };
 
@@ -201,6 +206,9 @@ public:
   bool usedCmpXchg() const { return !CmpXchgHelpers.empty(); }
   bool usedImageAtomics() const {
     return !ImgAtomicHelpers.empty() || !ImgCmpXchgHelpers.empty();
+  }
+  bool usedGeometryStreamOps() const {
+    return EmitVertexHelper != nullptr || EndPrimitiveHelper != nullptr;
   }
   uint32_t getDepthOutputMode() const { return DepthOutputMode; }
   bool usedClipDistance() const { return UsedClipDistance; }
@@ -233,11 +241,30 @@ private:
       ImgAtomicHelpers;
   DenseMap<std::tuple<uint32_t, uint32_t, Type *>, Function *>
       ImgCmpXchgHelpers;
+  Function *EmitVertexHelper = nullptr;
+  Function *EndPrimitiveHelper = nullptr;
   uint32_t DepthOutputMode = 0; // 1=Replacing, 2=Greater, 3=Less
   std::vector<std::unique_ptr<ResourceBinding>> SyntheticBindings;
   DenseMap<const ResourceBinding *, GlobalVariable *> NameGlobals;
   DenseMap<uint32_t, StageVar> InputVars;
   DenseMap<uint32_t, StageVar> OutputVars;
+  DenseMap<uint32_t, StageVar> ExtraBuiltInInputs;
+  GlobalVariable *getOrCreateBuiltInInput(uint32_t BuiltInId, Type *Ty,
+                                          StringRef Name) {
+    auto It = ExtraBuiltInInputs.find(BuiltInId);
+    if (It != ExtraBuiltInInputs.end())
+      return It->second.GV;
+    StageVar SV;
+    SV.VarTy = Ty;
+    SV.GV = new GlobalVariable(
+        M, Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
+        PoisonValue::get(Ty), Name, /*InsertBefore=*/nullptr,
+        GlobalValue::NotThreadLocal, 7 /* Input */);
+    SV.Decorations.push_back({11u /* BuiltIn */, BuiltInId});
+    SV.Referenced = true;
+    ExtraBuiltInInputs[BuiltInId] = std::move(SV);
+    return ExtraBuiltInInputs[BuiltInId].GV;
+  }
   struct RayQueryState {
     AllocaInst *Flags = nullptr;
     AllocaInst *Origin[3] = {nullptr, nullptr, nullptr};
@@ -2502,6 +2529,34 @@ Error SPIRVLowerer::lowerBridgeCall(CallInst *CI) {
     return lowerLoadInput(CI);
   case SpvOp::StoreOutput:
     return lowerStoreOutput(CI);
+  case SpvOp::EmitStream: {
+    IRBuilder<> B(CI);
+    if (!EmitVertexHelper) {
+      FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {}, false);
+      EmitVertexHelper = Function::Create(FT, GlobalValue::InternalLinkage,
+                                          "__crucible_spv_emit_vertex", M);
+      EmitVertexHelper->addFnAttr(Attribute::NoInline);
+      EmitVertexHelper->addFnAttr(Attribute::OptimizeNone);
+      BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", EmitVertexHelper);
+      IRBuilder<>(HBB).CreateRetVoid();
+    }
+    B.CreateCall(EmitVertexHelper);
+    return Error::success();
+  }
+  case SpvOp::CutStream: {
+    IRBuilder<> B(CI);
+    if (!EndPrimitiveHelper) {
+      FunctionType *FT = FunctionType::get(Type::getVoidTy(Ctx), {}, false);
+      EndPrimitiveHelper = Function::Create(FT, GlobalValue::InternalLinkage,
+                                            "__crucible_spv_end_primitive", M);
+      EndPrimitiveHelper->addFnAttr(Attribute::NoInline);
+      EndPrimitiveHelper->addFnAttr(Attribute::OptimizeNone);
+      BasicBlock *HBB = BasicBlock::Create(Ctx, "entry", EndPrimitiveHelper);
+      IRBuilder<>(HBB).CreateRetVoid();
+    }
+    B.CreateCall(EndPrimitiveHelper);
+    return Error::success();
+  }
 
   case SpvOp::RayQueryAlloc:
   case SpvOp::RayQueryTraceInline:
@@ -2522,8 +2577,21 @@ Error SPIRVLowerer::lowerBridgeCall(CallInst *CI) {
 
 void SPIRVLowerer::prepareStageInterface() {
   if (Reflect.Stage != ShaderStage::Vertex &&
+      Reflect.Stage != ShaderStage::Geometry &&
       Reflect.Stage != ShaderStage::Pixel)
     return;
+
+  uint32_t GSInputVerts = 0;
+  if (Reflect.Stage == ShaderStage::Geometry) {
+    uint32_t InPrim = Reflect.Geometry ? Reflect.Geometry->InputPrimitive : 3u;
+    switch (InPrim) {
+    case 1: GSInputVerts = 1; break; // Point
+    case 2: GSInputVerts = 2; break; // Line
+    case 6: GSInputVerts = 4; break; // LineAdj
+    case 7: GSInputVerts = 6; break; // TriangleAdj
+    default: GSInputVerts = 3; break; // Triangle
+    }
+  }
 
   auto buildStageVars = [&](const std::vector<StageParameter> &Params,
                             unsigned AddrSpace, bool IsOutput,
@@ -2617,6 +2685,14 @@ void SPIRVLowerer::prepareStageInterface() {
             (Cols == 1) ? ScalarTy : FixedVectorType::get(ScalarTy, Cols);
         VarTy = (Rows == 1) ? RowTy : ArrayType::get(RowTy, Rows);
       }
+      bool IsPerVertex =
+          (!IsOutput && Reflect.Stage == ShaderStage::Geometry &&
+           GSInputVerts > 0 && P.Kind != 10 /* PrimitiveID */ &&
+           P.Kind != 11 /* GSInstanceID */);
+      if (IsPerVertex) {
+        VarTy = ArrayType::get(VarTy, GSInputVerts);
+        SV.IsPerVertexArray = true;
+      }
       SV.VarTy = VarTy;
 
       std::string Name =
@@ -2669,7 +2745,7 @@ void SPIRVLowerer::prepareStageInterface() {
 }
 
 void SPIRVLowerer::emitStageDecorations() {
-  if (InputVars.empty() && OutputVars.empty())
+  if (InputVars.empty() && OutputVars.empty() && ExtraBuiltInInputs.empty())
     return;
 
   IRBuilder<> B(&*Entry->getEntryBlock().getFirstInsertionPt());
@@ -2695,6 +2771,7 @@ void SPIRVLowerer::emitStageDecorations() {
   };
   emitForTable(InputVars);
   emitForTable(OutputVars);
+  emitForTable(ExtraBuiltInInputs);
 }
 
 Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
@@ -2712,6 +2789,13 @@ Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
   IRBuilder<> B(CI);
   Value *Ptr = SV.GV;
   Type *RowTy = SV.VarTy;
+  if (SV.IsPerVertexArray) {
+    Value *VertIdx =
+        (CI->arg_size() > 4) ? CI->getArgOperand(4) : B.getInt32(0);
+    auto *OuterAT = cast<ArrayType>(RowTy);
+    Ptr = B.CreateInBoundsGEP(OuterAT, Ptr, {B.getInt32(0), VertIdx});
+    RowTy = OuterAT->getElementType();
+  }
   if (SV.IsFlatFloatArray) {
     unsigned Cols = std::max(1u, SV.Param->Columns);
     unsigned Rows = std::max(1u, SV.Param->Rows);
@@ -2722,11 +2806,11 @@ Error SPIRVLowerer::lowerLoadInput(CallInst *CI) {
     Value *FlatIdx =
         (Rows == 1) ? ColIdx
                     : B.CreateAdd(B.CreateMul(RowIdx, B.getInt32(Cols)), ColIdx);
-    Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, {B.getInt32(0), FlatIdx});
-    RowTy = cast<ArrayType>(SV.VarTy)->getElementType();
-  } else if (auto *AT = dyn_cast<ArrayType>(SV.VarTy)) {
+    Ptr = B.CreateInBoundsGEP(RowTy, Ptr, {B.getInt32(0), FlatIdx});
+    RowTy = cast<ArrayType>(RowTy)->getElementType();
+  } else if (auto *AT = dyn_cast<ArrayType>(RowTy)) {
     Value *RowIdx = CI->getArgOperand(2);
-    Ptr = B.CreateInBoundsGEP(SV.VarTy, Ptr, {B.getInt32(0), RowIdx});
+    Ptr = B.CreateInBoundsGEP(RowTy, Ptr, {B.getInt32(0), RowIdx});
     RowTy = AT->getElementType();
   }
   Value *Loaded = B.CreateLoad(RowTy, Ptr);
@@ -2973,6 +3057,16 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
     case ir::SysValKind::RayTCurrent:
       CI->replaceAllUsesWith(ConstantFP::get(CI->getType(), 0.0));
       return Error::success();
+    case ir::SysValKind::PrimitiveId: {
+      GlobalVariable *GV = getOrCreateBuiltInInput(7u /* PrimitiveId */,
+                                                   B.getInt32Ty(),
+                                                   "in_SV_PrimitiveID");
+      Value *V = B.CreateLoad(B.getInt32Ty(), GV);
+      if (V->getType() != CI->getType())
+        V = B.CreateZExtOrTrunc(V, CI->getType());
+      CI->replaceAllUsesWith(V);
+      return Error::success();
+    }
     case ir::SysValKind::PrimitiveIndex:
       CI->replaceAllUsesWith(B.getInt32(0));
       return Error::success();
@@ -3305,6 +3399,40 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
                          std::to_string(Reflect.NumThreads[1]) + "," +
                          std::to_string(Reflect.NumThreads[2]);
         F.addFnAttr("hlsl.numthreads", NT);
+      } else if (Reflect.Stage == ShaderStage::Geometry) {
+        NamedMDNode *EMNode = M.getOrInsertNamedMetadata("spirv.ExecutionMode");
+        auto *I32Ty = Type::getInt32Ty(Ctx);
+        auto addEM = [&](uint32_t Mode,
+                         std::optional<uint32_t> Arg = std::nullopt) {
+          SmallVector<Metadata *, 3> Ops;
+          Ops.push_back(ValueAsMetadata::get(&F));
+          Ops.push_back(ConstantAsMetadata::get(ConstantInt::get(I32Ty, Mode)));
+          if (Arg)
+            Ops.push_back(
+                ConstantAsMetadata::get(ConstantInt::get(I32Ty, *Arg)));
+          EMNode->addOperand(MDNode::get(Ctx, Ops));
+        };
+        uint32_t InPrim =
+            Reflect.Geometry ? Reflect.Geometry->InputPrimitive : 3u;
+        uint32_t OutTopo =
+            Reflect.Geometry ? Reflect.Geometry->OutputTopology : 5u;
+        uint32_t MaxVerts =
+            Reflect.Geometry ? Reflect.Geometry->MaxVertexCount : 3u;
+        uint32_t InstCount =
+            Reflect.Geometry ? std::max(1u, Reflect.Geometry->InstanceCount)
+                             : 1u;
+        uint32_t InMode = 22u; // Triangles
+        if (InPrim == 1u) InMode = 19u;      // InputPoints
+        else if (InPrim == 2u) InMode = 20u; // InputLines
+        else if (InPrim == 6u) InMode = 21u; // InputLinesAdjacency
+        else if (InPrim == 7u) InMode = 23u; // InputTrianglesAdjacency
+        uint32_t OutMode = 29u; // OutputTriangleStrip
+        if (OutTopo == 1u) OutMode = 27u;      // OutputPoints
+        else if (OutTopo == 3u) OutMode = 28u; // OutputLineStrip
+        addEM(InMode);
+        addEM(0u /* Invocations */, InstCount);
+        addEM(OutMode);
+        addEM(26u /* OutputVertices */, MaxVerts);
       }
     } else if (!F.isDeclaration()) {
       F.setLinkage(GlobalValue::InternalLinkage);
@@ -4073,10 +4201,12 @@ lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       continue;
     }
     if (auto COp = mlir::dyn_cast<ir::LoadInputOp>(Op)) {
+      mlir::Value VertId =
+          COp.getVertexId() ? COp.getVertexId() : i32C(B, Loc, 0);
       mlir::Value Rep = makeBridgeCall(
           B, Loc, SpvOp::LoadInput, COp.getResult().getType(),
           {i32C(B, Loc, COp.getInputId()), COp.getRow(),
-           i8C(B, Loc, COp.getCol())});
+           i8C(B, Loc, COp.getCol()), VertId});
       COp.getResult().replaceAllUsesWith(Rep);
       COp.erase();
       continue;
@@ -4085,6 +4215,18 @@ lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       makeBridgeCall(B, Loc, SpvOp::StoreOutput, mlir::Type(),
                      {i32C(B, Loc, COp.getOutputId()), COp.getRow(),
                       i8C(B, Loc, COp.getCol()), COp.getValue()});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::EmitStreamOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::EmitStream, mlir::Type(),
+                     {i8C(B, Loc, COp.getStreamId())});
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::CutStreamOp>(Op)) {
+      makeBridgeCall(B, Loc, SpvOp::CutStream, mlir::Type(),
+                     {i8C(B, Loc, COp.getStreamId())});
       COp.erase();
       continue;
     }
@@ -4668,7 +4810,7 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
   // (98) + OpAtomic* and strip the stub functions.
   if (!Opts.EmitSPIRVAsm &&
       (Lowerer.usedArrayLength() || Lowerer.usedCmpXchg() ||
-       Lowerer.usedImageAtomics()) &&
+       Lowerer.usedImageAtomics() || Lowerer.usedGeometryStreamOps()) &&
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
@@ -4689,6 +4831,8 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       constexpr uint16_t OpCopyObject = 83;
       constexpr uint16_t OpImageTexelPointer = 60;
       constexpr uint16_t OpBitcast = 124;
+      constexpr uint16_t OpEmitVertex = 218;
+      constexpr uint16_t OpEndPrimitive = 219;
       constexpr uint16_t OpAtomicCompareExchange = 230;
       constexpr uint16_t OpLabel = 248;
 
@@ -4699,6 +4843,8 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       };
       DenseSet<uint32_t> ArrayLenHelperIds;
       DenseSet<uint32_t> CmpXchgHelperIds;
+      DenseSet<uint32_t> EmitVertexHelperIds;
+      DenseSet<uint32_t> EndPrimitiveHelperIds;
       DenseMap<uint32_t, ImgHelperInfo> ImgAtomicHelpersMap;
       DenseMap<uint32_t, ImgHelperInfo> ImgCmpXchgHelpersMap;
       DenseSet<uint32_t> HelperIds;
@@ -4736,6 +4882,12 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
                   static_cast<uint16_t>(SpvOpNum), SetNum, BindNum};
               HelperIds.insert(Words[I + 1]);
             }
+          } else if (Name == "__crucible_spv_emit_vertex") {
+            EmitVertexHelperIds.insert(Words[I + 1]);
+            HelperIds.insert(Words[I + 1]);
+          } else if (Name == "__crucible_spv_end_primitive") {
+            EndPrimitiveHelperIds.insert(Words[I + 1]);
+            HelperIds.insert(Words[I + 1]);
           } else if (Name.starts_with("__crucible_spv_img_cmpxchg.")) {
             SmallVector<StringRef, 5> Parts;
             Name.drop_front(strlen("__crucible_spv_img_cmpxchg."))
@@ -4931,6 +5083,18 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             I += WC;
             continue;
           }
+          if (Op == OpFunctionCall && WC == 4 &&
+              EmitVertexHelperIds.contains(Words[I + 3])) {
+            Patched.push_back((1u << 16) | OpEmitVertex);
+            I += WC;
+            continue;
+          }
+          if (Op == OpFunctionCall && WC == 4 &&
+              EndPrimitiveHelperIds.contains(Words[I + 3])) {
+            Patched.push_back((1u << 16) | OpEndPrimitive);
+            I += WC;
+            continue;
+          }
           for (uint32_t K = 0; K < WC; ++K)
             Patched.push_back(Words[I + K]);
           if (NeedPtrImageUint && !EmittedPtrImageUint && Op == OpTypeInt &&
@@ -5017,6 +5181,7 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       }
     }
   }
+
   return Result;
 }
 
