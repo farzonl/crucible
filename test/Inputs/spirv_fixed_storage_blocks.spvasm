@@ -19,17 +19,20 @@ OpDecorate %output Binding 1
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
 %u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
 %u16 = OpTypeInt 16 0
+%v2u16 = OpTypeVector %u16 2
 %v3u32 = OpTypeVector %u32 3
 %zero = OpConstant %u32 0
 %two = OpConstant %u32 2
-%in_array = OpTypeArray %u16 %two
+%in_array = OpTypeArray %v2u16 %two
 %out_array = OpTypeArray %u32 %two
 %in_block = OpTypeStruct %in_array
 %out_block = OpTypeStruct %out_array
 %pin = OpTypePointer Uniform %in_block
 %pout = OpTypePointer Uniform %out_block
 %pu16 = OpTypePointer Uniform %u16
+%pv2u16 = OpTypePointer Uniform %v2u16
 %pu32 = OpTypePointer Uniform %u32
 %pgid = OpTypePointer Input %v3u32
 %input = OpVariable %pin Uniform
@@ -39,8 +42,10 @@ OpDecorate %output Binding 1
 %entry = OpLabel
 %id = OpLoad %v3u32 %gid
 %x = OpCompositeExtract %u32 %id 0
-%src = OpInBoundsAccessChain %pu16 %input %zero %x
-%value = OpLoad %u16 %src
+%src = OpInBoundsAccessChain %pv2u16 %input %zero %x
+%vector = OpLoad %v2u16 %src
+%signed_x = OpBitcast %i32 %x
+%value = OpVectorExtractDynamic %u16 %vector %signed_x
 %wide = OpUConvert %u32 %value
 %dst = OpInBoundsAccessChain %pu32 %output %zero %x
 OpStore %dst %wide

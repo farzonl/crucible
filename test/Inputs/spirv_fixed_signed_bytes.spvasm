@@ -1,0 +1,50 @@
+OpCapability Shader
+OpCapability Int8
+OpCapability StorageBuffer8BitAccess
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %output %gid
+OpExecutionMode %main LocalSize 2 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %in_array ArrayStride 8
+OpDecorate %out_array ArrayStride 2
+OpMemberDecorate %in_block 0 Offset 0
+OpMemberDecorate %out_block 0 Offset 0
+OpDecorate %in_block Block
+OpDecorate %out_block Block
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%i8 = OpTypeInt 8 1
+%v2i32 = OpTypeVector %i32 2
+%v2i8 = OpTypeVector %i8 2
+%v3u32 = OpTypeVector %u32 3
+%zero = OpConstant %u32 0
+%two = OpConstant %u32 2
+%in_array = OpTypeArray %v2i32 %two
+%out_array = OpTypeArray %v2i8 %two
+%in_block = OpTypeStruct %in_array
+%out_block = OpTypeStruct %out_array
+%pin = OpTypePointer StorageBuffer %in_block
+%pout = OpTypePointer StorageBuffer %out_block
+%pv2i32 = OpTypePointer StorageBuffer %v2i32
+%pv2i8 = OpTypePointer StorageBuffer %v2i8
+%pgid = OpTypePointer Input %v3u32
+%input = OpVariable %pin StorageBuffer
+%output = OpVariable %pout StorageBuffer
+%gid = OpVariable %pgid Input
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3u32 %gid
+%x = OpCompositeExtract %u32 %id 0
+%src = OpAccessChain %pv2i32 %input %zero %x
+%wide = OpLoad %v2i32 %src
+%narrow = OpSConvert %v2i8 %wide
+%dst = OpAccessChain %pv2i8 %output %zero %x
+OpStore %dst %narrow
+OpReturn
+OpFunctionEnd

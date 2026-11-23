@@ -2,5 +2,5 @@
 # RUN: %spirv-as --target-env vulkan1.0 %S/../Inputs/spirv_fixed_storage_blocks.spvasm -o %t.spv
 # RUN: %spirv-val --target-env vulkan1.0 %t.spv
 # RUN: %cruciblec %t.spv -o %t.metal --metallib %t.metallib
-# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 2,1,1 --groups 1,1,1 --buffer 0:u32:6:99,99,99,99,99,99 --buffer 1:u32:8:3,0,0,0,7,0,0,0 | FileCheck %s
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 2,1,1 --groups 1,1,1 --buffer 0:u32:6:99,99,99,99,99,99 --buffer 1:u32:8:0x000a0003,0,0,0,0x0007000b,0,0,0 | FileCheck %s
 # CHECK: buffer0: 99 99 3 99 7 99

@@ -161,6 +161,9 @@ Legacy single-member `Uniform` blocks marked `BufferBlock` remain storage
 buffers, including fixed-size arrays; `Uniform` blocks marked `Block` remain cbuffers.
 Storage array accesses retain declared strides and member offsets.
 `OpInBoundsAccessChain` uses the same address calculation as `OpAccessChain`.
+Dynamic vector extraction preserves the selected lane, including narrow UBO
+vectors. Fixed storage arrays use their element stride, not the whole array size,
+including signed narrowing stores into adjacent byte lanes.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

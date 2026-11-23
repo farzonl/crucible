@@ -907,6 +907,21 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     Chain.erase();
   }
 
+  SmallVector<mlir::spirv::VectorExtractDynamicOp, 8> DynamicExtracts;
+  EntryFn.walk([&](mlir::spirv::VectorExtractDynamicOp Extract) {
+    DynamicExtracts.push_back(Extract);
+  });
+  for (auto Extract : DynamicExtracts) {
+    mlir::OpBuilder B(Extract);
+    auto Loc = Extract.getLoc();
+    auto Value = mlir::LLVM::ExtractElementOp::create(
+        B, Loc, castToSignless(B, Loc, Extract.getVector()),
+        castToSignless(B, Loc, Extract.getIndex()));
+    Extract.replaceAllUsesWith(
+        castFromSignless(B, Loc, Value, Extract.getType()));
+    Extract.erase();
+  }
+
   SmallVector<mlir::spirv::CopyMemoryOp, 8> Copies;
   EntryFn.walk([&](mlir::spirv::CopyMemoryOp Copy) { Copies.push_back(Copy); });
   for (auto Copy : Copies) {
