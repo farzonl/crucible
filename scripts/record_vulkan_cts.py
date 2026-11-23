@@ -22,6 +22,12 @@ STATUSES = (
 FAILURES = {"Fail", "InternalError", "ResourceError", "Crash", "Timeout",
             "CompilerError", "MetadataError"}
 TRACE_EVENTS = {"attempt", "compiled", "failed", "adapter_failed", "metadata_failed"}
+RUNTIME_CONFIGURATION = {
+    # CTS 1.3.9's version DAG does not know Vulkan 1.4; negotiating it returns 0.
+    "MVK_CONFIG_API_VERSION_TO_ADVERTISE": str((1 << 22) | (3 << 12)),
+    "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS": "0",
+    "MVK_CONFIG_LOG_LEVEL": "1",
+}
 
 
 def read_cases(path: Path, active: frozenset[Path] = frozenset()) -> list[str]:
@@ -199,8 +205,8 @@ def record(qpa: Path, caselist: Path, metadata: dict, data_dir: Path,
     if reference_qpa is not None:
         if reference_metadata is None or reference_metadata.get("measurementMode") != "reference":
             raise ValueError("Native reference metadata is required")
-        for key in ("sha", "ctsRevision", "runtimeVersion"):
-            if reference_metadata[key] != metadata[key]:
+        for key in ("sha", "ctsRevision", "runtimeVersion", "device", "runtimeConfiguration"):
+            if reference_metadata.get(key) != metadata.get(key):
                 raise ValueError(f"Reference does not match compiler run: {key}")
         if reference_metadata["caselistSha256"] != caselist_hash:
             raise ValueError("Reference caselist does not match compiler run")
@@ -274,6 +280,7 @@ def run_cases(args: argparse.Namespace) -> dict:
     environment = dict(os.environ)
     environment.pop("CRUCIBLE_CTS_COMPILER", None)
     environment.pop("CRUCIBLE_CTS_TRACE", None)
+    environment.update(RUNTIME_CONFIGURATION)
     evidence = {}
     metadata = {
         "sha": args.sha, "runUrl": args.run_url,
@@ -288,6 +295,7 @@ def run_cases(args: argparse.Namespace) -> dict:
             Path(__file__).with_name("prepare_cts_moltenvk.py").read_bytes()).hexdigest(),
         "compiler": str(args.compiler.resolve()) if args.compiler else None,
         "shaderTimeoutSeconds": 30,
+        "runtimeConfiguration": RUNTIME_CONFIGURATION,
         "exitCode": 0, "timedOut": False,
     }
     if args.compiler:
@@ -327,6 +335,16 @@ def run_cases(args: argparse.Namespace) -> dict:
             if not case_qpa.exists():
                 raise RuntimeError(f"CTS produced no QPA for {name}; exit {exit_code}")
             parsed = parse_qpa(case_qpa, [name])
+            device = {}
+            for line in case_qpa.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("#sessionInfo"):
+                    parts = shlex.split(line)
+                    if len(parts) >= 3 and parts[1] in ("vendorID", "deviceID", "deviceName"):
+                        device[parts[1]] = " ".join(parts[2:])
+            if device:
+                if metadata.get("device", device) != device:
+                    raise ValueError("CTS physical device changed within this measurement")
+                metadata["device"] = device
             with args.qpa.open("a", encoding="utf-8") as combined:
                 # Terminate an interrupted record before appending the next session.
                 text = case_qpa.read_text(encoding="utf-8", errors="replace")

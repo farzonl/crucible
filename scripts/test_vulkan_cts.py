@@ -13,6 +13,7 @@ from unittest.mock import patch
 from cts_data import preserve_cts_data
 from record_vulkan_cts import (
     build_tree, compiler_results, parse_qpa, record, run_cases, select_cases, summarize,
+    RUNTIME_CONFIGURATION,
 )
 from prepare_cts_moltenvk import prepare
 import record_bench_history
@@ -203,6 +204,9 @@ class CTSResultsTests(unittest.TestCase):
             self.assertEqual(reference["measurementMode"], "reference")
             self.assertNotIn("CRUCIBLE_CTS_COMPILER", environments[-1])
             self.assertNotIn("CRUCIBLE_CTS_TRACE", environments[-1])
+            for environment in environments:
+                for key, value in RUNTIME_CONFIGURATION.items():
+                    self.assertEqual(environment[key], value)
 
     def test_driver_patching_fails_if_pinned_integration_changes(self) -> None:
         module = self.root / "MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm"

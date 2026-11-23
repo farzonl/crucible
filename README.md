@@ -151,7 +151,10 @@ Adapter rejection is visible, rather than being hidden by native fallback.
 MoltenVK 1.4.2 is pinned at `db66022459ffb663aa2b50f6b018bc2e124f5edf`;
 its external dependencies and CTS dependencies are pinned by their sources.
 Loader and Xcode versions, the compiler path, adapter hash and exact invocation
-are recorded per run. Every case runs in a fresh process, with a separate
+are recorded per run, along with the actual Vulkan physical device and runtime
+configuration. The driver advertises Vulkan **1.3** because this CTS revision's
+version graph cannot negotiate 1.4. Metal argument buffers are disabled in both
+tracks to match the adapter's direct-binding ABI. Every case runs in a fresh process, with a separate
 compiler attribution trace and raw QPA. Shader compilation is limited to 30
 seconds; reaching the track budget terminates the entire process group.
 
@@ -211,7 +214,7 @@ Crucible invocation cannot publish a compiler score. Interrupted records become
 `InternalError`, missing selected cases become `NotRun`, and empty/malformed QPA
 cannot publish a success score. Unselected CTS cases are never counted.
 History charts do not connect different caselist hashes, CTS revisions, adapter
-hashes, or runtime versions. Both existing Pages publishers preserve the CTS JSON dataset.
+hashes, devices, runtime configurations, or runtime versions. Both existing Pages publishers preserve the CTS JSON dataset.
 Build/history caches and raw QPA/caselist/metadata artifacts support reruns.
 The pinned CTS source receives a syntax-only compatibility patch removing four
 redundant C++ `template` qualifiers rejected by newer Xcode Clang; test behavior

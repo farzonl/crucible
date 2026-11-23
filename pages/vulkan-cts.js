@@ -93,6 +93,7 @@ async function initializeCTS() {
       safeLink(`Commit ${latest.shortSha}`, `https://github.com/farzonl/crucible/commit/${latest.sha}`),
       document.createTextNode(" | "), safeLink("Workflow run", latest.runUrl),
       textElement("div", `${latest.timestamp} | ${latest.platform} | ${latest.runtimeVersion}`),
+      textElement("div", `Device: ${latest.device?.deviceName || "not recorded"} | Runtime configuration: ${JSON.stringify(latest.runtimeConfiguration || {})}`),
       textElement("div", `Baseline: ${latest.baseline}`),
       safeLink(`CTS ${latest.ctsRevision}`, `https://github.com/KhronosGroup/VK-GL-CTS/commit/${latest.ctsRevision}`),
       textElement("div", `Caselist SHA-256: ${latest.caselistSha256}`),
@@ -249,6 +250,8 @@ async function initializeCTS() {
     function renderHistory() {
       const sameBaseline = history.filter(entry => entry.measurementMode === "crucible" &&
         entry.caselistSha256 === primary.caselistSha256 && entry.adapterVersion === primary.adapterVersion &&
+        JSON.stringify(entry.device) === JSON.stringify(primary.device) &&
+        JSON.stringify(entry.runtimeConfiguration) === JSON.stringify(primary.runtimeConfiguration) &&
         entry.ctsRevision === primary.ctsRevision && entry.runtimeVersion === primary.runtimeVersion);
       const svg = byId("trend"), ns = "http://www.w3.org/2000/svg";
       function svgElement(tag, attributes, text = "") {
