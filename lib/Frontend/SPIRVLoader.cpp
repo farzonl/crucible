@@ -20,7 +20,9 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Endian.h"
 
+#include "mlir/Conversion/SPIRVToLLVM/SPIRVToLLVM.h"
 #include "mlir/Conversion/SPIRVToLLVM/SPIRVToLLVMPass.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/DLTI/DLTI.h"
@@ -3883,6 +3885,38 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         Changed = true;
       }
     }
+  }
+
+  // Upstream handles struct insert/extract and memory operations, but not
+  // construction. Use its type converter so local struct layouts agree.
+  mlir::LLVMTypeConverter AggregateTypes(&Ctx);
+  mlir::populateSPIRVToLLVMTypeConversion(AggregateTypes);
+  SmallVector<mlir::spirv::CompositeConstructOp, 8> StructConstructs;
+  EntryFn.walk([&](mlir::spirv::CompositeConstructOp CC) {
+    if (mlir::isa<mlir::spirv::StructType>(CC.getType()))
+      StructConstructs.push_back(CC);
+  });
+  for (auto CC : StructConstructs) {
+    auto Ty = AggregateTypes.convertType(CC.getType());
+    if (!Ty)
+      return makeError("unsupported SPIR-V struct construction type");
+    mlir::OpBuilder B(CC);
+    auto Loc = CC.getLoc();
+    mlir::Value Value = mlir::LLVM::UndefOp::create(B, Loc, Ty);
+    for (auto [I, Elem] : llvm::enumerate(CC.getConstituents())) {
+      auto ElemTy = AggregateTypes.convertType(Elem.getType());
+      if (!ElemTy)
+        return makeError("unsupported SPIR-V struct member type");
+      if (ElemTy != Elem.getType())
+        Elem = mlir::UnrealizedConversionCastOp::create(B, Loc, ElemTy, Elem)
+                   .getResult(0);
+      Value = mlir::LLVM::InsertValueOp::create(
+          B, Loc, Value, Elem, ArrayRef<int64_t>{static_cast<int64_t>(I)});
+    }
+    auto Cast = mlir::UnrealizedConversionCastOp::create(
+        B, Loc, CC.getType(), Value);
+    CC.replaceAllUsesWith(Cast.getResult(0));
+    CC.erase();
   }
 
   // Erase rewritten shader-ABI globals and entry/execution-mode ops before

@@ -1,0 +1,77 @@
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %array ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%inner = OpTypeStruct %u32 %u32 %u32 %u32 %u32
+%outer = OpTypeStruct %inner %u32 %inner
+%pouter = OpTypePointer Function %outer
+%pinner = OpTypePointer Function %inner
+%plocal = OpTypePointer Function %u32
+%array = OpTypeRuntimeArray %u32
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pu32 = OpTypePointer StorageBuffer %u32
+%input = OpVariable %pblock StorageBuffer
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%three = OpConstant %u32 3
+%four = OpConstant %u32 4
+%five = OpConstant %u32 5
+%six = OpConstant %u32 6
+%seven = OpConstant %u32 7
+%eight = OpConstant %u32 8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local = OpVariable %pouter Function
+%inptr = OpAccessChain %pu32 %input %zero %zero
+%value = OpLoad %u32 %inptr
+%initial = OpCompositeConstruct %inner %one %two %three %four %five
+%nested = OpCompositeConstruct %outer %initial %six %initial
+%updated = OpCompositeInsert %outer %value %nested 2 3
+OpStore %local %updated
+%inner_ptr = OpInBoundsAccessChain %pinner %local %two
+%loaded = OpLoad %inner %inner_ptr
+%outer_loaded = OpLoad %outer %local
+%changed = OpCompositeInsert %outer %value %outer_loaded 0 1
+OpStore %local %changed
+%changed_field = OpCompositeExtract %u32 %changed 0 1
+%snapshot_field = OpCompositeExtract %u32 %outer_loaded 0 1
+%a = OpCompositeExtract %u32 %loaded 0
+%b = OpCompositeExtract %u32 %loaded 1
+%c = OpCompositeExtract %u32 %loaded 2
+%d = OpCompositeExtract %u32 %loaded 3
+%e = OpCompositeExtract %u32 %loaded 4
+%middle = OpCompositeExtract %u32 %updated 1
+%original = OpCompositeExtract %u32 %nested 2 3
+%out0 = OpAccessChain %pu32 %output %zero %zero
+%out1 = OpAccessChain %pu32 %output %zero %one
+%out2 = OpAccessChain %pu32 %output %zero %two
+%out3 = OpAccessChain %pu32 %output %zero %three
+%out4 = OpAccessChain %pu32 %output %zero %four
+%out5 = OpAccessChain %pu32 %output %zero %five
+%out6 = OpAccessChain %pu32 %output %zero %six
+%out7 = OpAccessChain %pu32 %output %zero %seven
+%out8 = OpAccessChain %pu32 %output %zero %eight
+OpStore %out0 %a
+OpStore %out1 %b
+OpStore %out2 %c
+OpStore %out3 %d
+OpStore %out4 %e
+OpStore %out5 %middle
+OpStore %out6 %original
+OpStore %out7 %changed_field
+OpStore %out8 %snapshot_field
+OpReturn
+OpFunctionEnd
