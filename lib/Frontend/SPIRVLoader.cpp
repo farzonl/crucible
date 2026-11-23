@@ -3556,6 +3556,16 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           Store.erase();
           continue;
         }
+        if (Store.getMemoryAccess() &&
+            *Store.getMemoryAccess() != mlir::spirv::MemoryAccess::None)
+          return makeError(
+              "memory operands on whole-array stores are unsupported");
+        mlir::OpBuilder SB(Store);
+        mlir::Value Value = mlir::UnrealizedConversionCastOp::create(
+                                SB, Store.getLoc(), LLVMArrTy, Store.getValue())
+                                .getResult(0);
+        mlir::LLVM::StoreOp::create(SB, Store.getLoc(), Value, Alloca);
+        Store.erase();
       } else if (auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
         mlir::OpBuilder CB(Chain);
         SmallVector<mlir::LLVM::GEPArg, 4> GEPArgs;
@@ -3887,26 +3897,27 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     }
   }
 
-  // Upstream handles struct insert/extract and memory operations, but not
-  // construction. Use its type converter so local struct layouts agree.
+  // Upstream handles aggregate insert/extract and memory operations, but not
+  // construction. Use its type converter so local aggregate layouts agree.
   mlir::LLVMTypeConverter AggregateTypes(&Ctx);
   mlir::populateSPIRVToLLVMTypeConversion(AggregateTypes);
-  SmallVector<mlir::spirv::CompositeConstructOp, 8> StructConstructs;
+  SmallVector<mlir::spirv::CompositeConstructOp, 8> AggregateConstructs;
   EntryFn.walk([&](mlir::spirv::CompositeConstructOp CC) {
-    if (mlir::isa<mlir::spirv::StructType>(CC.getType()))
-      StructConstructs.push_back(CC);
+    if (mlir::isa<mlir::spirv::StructType, mlir::spirv::ArrayType>(
+            CC.getType()))
+      AggregateConstructs.push_back(CC);
   });
-  for (auto CC : StructConstructs) {
+  for (auto CC : AggregateConstructs) {
     auto Ty = AggregateTypes.convertType(CC.getType());
     if (!Ty)
-      return makeError("unsupported SPIR-V struct construction type");
+      return makeError("unsupported SPIR-V aggregate construction type");
     mlir::OpBuilder B(CC);
     auto Loc = CC.getLoc();
     mlir::Value Value = mlir::LLVM::UndefOp::create(B, Loc, Ty);
     for (auto [I, Elem] : llvm::enumerate(CC.getConstituents())) {
       auto ElemTy = AggregateTypes.convertType(Elem.getType());
       if (!ElemTy)
-        return makeError("unsupported SPIR-V struct member type");
+        return makeError("unsupported SPIR-V aggregate element type");
       if (ElemTy != Elem.getType())
         Elem = mlir::UnrealizedConversionCastOp::create(B, Loc, ElemTy, Elem)
                    .getResult(0);
@@ -3917,6 +3928,36 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         B, Loc, CC.getType(), Value);
     CC.replaceAllUsesWith(Cast.getResult(0));
     CC.erase();
+  }
+
+  // LLVM extractvalue cannot index vector lanes; split those from aggregates.
+  SmallVector<mlir::spirv::CompositeExtractOp, 8> AggregateExtracts;
+  EntryFn.walk([&](mlir::spirv::CompositeExtractOp E) {
+    if (E.getIndices().size() > 1)
+      AggregateExtracts.push_back(E);
+  });
+  for (auto E : AggregateExtracts) {
+    mlir::Type Ty = E.getComposite().getType();
+    for (auto [I, Index] : llvm::enumerate(E.getIndices())) {
+      if (I && mlir::isa<mlir::VectorType>(Ty)) {
+        mlir::OpBuilder B(E);
+        auto Indices = E.getIndices().getValue();
+        auto Aggregate = mlir::spirv::CompositeExtractOp::create(
+            B, E.getLoc(), Ty, E.getComposite(),
+            B.getArrayAttr(Indices.take_front(I)));
+        auto Lane = mlir::spirv::CompositeExtractOp::create(
+            B, E.getLoc(), E.getType(), Aggregate,
+            B.getArrayAttr(Indices.drop_front(I)));
+        E.replaceAllUsesWith(Lane.getResult());
+        E.erase();
+        break;
+      }
+      auto CompositeTy = mlir::dyn_cast<mlir::spirv::CompositeType>(Ty);
+      if (!CompositeTy)
+        break;
+      Ty = CompositeTy.getElementType(
+          mlir::cast<mlir::IntegerAttr>(Index).getInt());
+    }
   }
 
   // Erase rewritten shader-ABI globals and entry/execution-mode ops before

@@ -1,0 +1,112 @@
+OpCapability Shader
+OpCapability Float16
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %uints ArrayStride 4
+OpDecorate %floats ArrayStride 4
+OpDecorate %array ArrayStride 4
+OpMemberDecorate %iblock 0 Offset 0
+OpMemberDecorate %oblock 0 Offset 0
+OpDecorate %iblock Block
+OpDecorate %oblock Block
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%half = OpTypeFloat 16
+%v2half = OpTypeVector %half 2
+%uints = OpTypeRuntimeArray %uint
+%floats = OpTypeRuntimeArray %float
+%iblock = OpTypeStruct %uints
+%oblock = OpTypeStruct %floats
+%piblock = OpTypePointer StorageBuffer %iblock
+%poblock = OpTypePointer StorageBuffer %oblock
+%puint = OpTypePointer StorageBuffer %uint
+%pfloat = OpTypePointer StorageBuffer %float
+%input = OpVariable %piblock StorageBuffer
+%output = OpVariable %poblock StorageBuffer
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%three = OpConstant %uint 3
+%four = OpConstant %uint 4
+%five = OpConstant %uint 5
+%six = OpConstant %uint 6
+%seven = OpConstant %uint 7
+%array = OpTypeArray %v2half %five
+%wrapper = OpTypeStruct %array %uint
+%pwrapper = OpTypePointer Function %wrapper
+%parray = OpTypePointer Function %array
+%pvector = OpTypePointer Function %v2half
+%h1 = OpConstant %half 1
+%h2 = OpConstant %half 2
+%h3 = OpConstant %half 3
+%h4 = OpConstant %half 4
+%h5 = OpConstant %half 5
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local = OpVariable %parray Function
+%aggregate = OpVariable %pwrapper Function
+%in0 = OpAccessChain %puint %input %zero %zero
+%in1 = OpAccessChain %puint %input %zero %one
+%index = OpLoad %uint %in0
+%number = OpLoad %uint %in1
+%value = OpConvertUToF %half %number
+%negative = OpFNegate %half %value
+%replacement = OpCompositeConstruct %v2half %value %negative
+%v1 = OpCompositeConstruct %v2half %h1 %h2
+%v2 = OpCompositeConstruct %v2half %h2 %h3
+%v3 = OpCompositeConstruct %v2half %h3 %h4
+%v4 = OpCompositeConstruct %v2half %h4 %h5
+%v5 = OpCompositeConstruct %v2half %h5 %h1
+%initial = OpCompositeConstruct %array %v1 %v2 %v3 %v4 %v5
+%wrapped = OpCompositeConstruct %wrapper %initial %number
+OpStore %aggregate %wrapped
+%wrapped_loaded = OpLoad %wrapper %aggregate
+%restored = OpCompositeExtract %array %wrapped_loaded 0
+OpStore %local %restored
+%snapshot = OpLoad %array %local
+%updated = OpCompositeInsert %array %replacement %snapshot 3
+OpStore %local %updated
+%dynamic_ptr = OpAccessChain %pvector %local %index
+%dynamic = OpLoad %v2half %dynamic_ptr
+%loaded = OpLoad %array %local
+%a = OpCompositeExtract %half %loaded 0 0
+%b = OpCompositeExtract %half %loaded 2 1
+%c = OpCompositeExtract %half %loaded 3 0
+%d = OpCompositeExtract %half %loaded 3 1
+%e = OpCompositeExtract %half %loaded 4 0
+%f = OpCompositeExtract %half %snapshot 3 0
+%g = OpCompositeExtract %half %dynamic 0
+%h = OpCompositeExtract %half %dynamic 1
+%fa = OpFConvert %float %a
+%fb = OpFConvert %float %b
+%fc = OpFConvert %float %c
+%fd = OpFConvert %float %d
+%fe = OpFConvert %float %e
+%ff = OpFConvert %float %f
+%fg = OpFConvert %float %g
+%fh = OpFConvert %float %h
+%out0 = OpAccessChain %pfloat %output %zero %zero
+%out1 = OpAccessChain %pfloat %output %zero %one
+%out2 = OpAccessChain %pfloat %output %zero %two
+%out3 = OpAccessChain %pfloat %output %zero %three
+%out4 = OpAccessChain %pfloat %output %zero %four
+%out5 = OpAccessChain %pfloat %output %zero %five
+%out6 = OpAccessChain %pfloat %output %zero %six
+%out7 = OpAccessChain %pfloat %output %zero %seven
+OpStore %out0 %fa
+OpStore %out1 %fb
+OpStore %out2 %fc
+OpStore %out3 %fd
+OpStore %out4 %fe
+OpStore %out5 %ff
+OpStore %out6 %fg
+OpStore %out7 %fh
+OpReturn
+OpFunctionEnd
