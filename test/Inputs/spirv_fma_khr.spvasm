@@ -1,0 +1,76 @@
+OpCapability Shader
+OpCapability FMAKHR
+OpCapability RoundingModeRTE
+OpExtension "SPV_KHR_fma"
+OpExtension "SPV_KHR_float_controls"
+%existing_glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input0 %input1 %input2 %output
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionMode %main RoundingModeRTE 32
+OpDecorate %array ArrayStride 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %input0 DescriptorSet 0
+OpDecorate %input0 Binding 0
+OpDecorate %input1 DescriptorSet 0
+OpDecorate %input1 Binding 1
+OpDecorate %input2 DescriptorSet 0
+OpDecorate %input2 Binding 2
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 3
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%v3float = OpTypeVector %float 3
+%uint = OpTypeInt 32 0
+%array = OpTypeRuntimeArray %float
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pfloat = OpTypePointer StorageBuffer %float
+%input0 = OpVariable %pblock StorageBuffer
+%input1 = OpVariable %pblock StorageBuffer
+%input2 = OpVariable %pblock StorageBuffer
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%three = OpConstant %uint 3
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%p00 = OpAccessChain %pfloat %input0 %zero %zero
+%p01 = OpAccessChain %pfloat %input0 %zero %one
+%p02 = OpAccessChain %pfloat %input0 %zero %two
+%p10 = OpAccessChain %pfloat %input1 %zero %zero
+%p11 = OpAccessChain %pfloat %input1 %zero %one
+%p12 = OpAccessChain %pfloat %input1 %zero %two
+%p20 = OpAccessChain %pfloat %input2 %zero %zero
+%p21 = OpAccessChain %pfloat %input2 %zero %one
+%p22 = OpAccessChain %pfloat %input2 %zero %two
+%a0 = OpLoad %float %p00
+%a1 = OpLoad %float %p01
+%a2 = OpLoad %float %p02
+%b0 = OpLoad %float %p10
+%b1 = OpLoad %float %p11
+%b2 = OpLoad %float %p12
+%c0 = OpLoad %float %p20
+%c1 = OpLoad %float %p21
+%c2 = OpLoad %float %p22
+%a = OpCompositeConstruct %v3float %a0 %a1 %a2
+%b = OpCompositeConstruct %v3float %b0 %b1 %b2
+%c = OpCompositeConstruct %v3float %c0 %c1 %c2
+%result = OpFmaKHR %v3float %a %b %c
+%scalar = OpFmaKHR %float %a1 %b1 %c1
+%r0 = OpCompositeExtract %float %result 0
+%r1 = OpCompositeExtract %float %result 1
+%r2 = OpCompositeExtract %float %result 2
+%out0 = OpAccessChain %pfloat %output %zero %zero
+%out1 = OpAccessChain %pfloat %output %zero %one
+%out2 = OpAccessChain %pfloat %output %zero %two
+%out3 = OpAccessChain %pfloat %output %zero %three
+OpStore %out0 %r0
+OpStore %out1 %r1
+OpStore %out2 %r2
+OpStore %out3 %scalar
+OpReturn
+OpFunctionEnd
