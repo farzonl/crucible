@@ -1,0 +1,128 @@
+OpCapability Shader
+OpCapability Int8
+OpCapability Int16
+OpCapability DotProductKHR
+OpCapability DotProductInputAllKHR
+OpCapability DotProductInput4x8BitPackedKHR
+OpExtension "SPV_KHR_integer_dot_product"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %words ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%u16 = OpTypeInt 16 0
+%i16 = OpTypeInt 16 1
+%u8 = OpTypeInt 8 0
+%i8 = OpTypeInt 8 1
+%v4u8 = OpTypeVector %u8 4
+%v3u8 = OpTypeVector %u8 3
+%v4i8 = OpTypeVector %i8 4
+%v3i8 = OpTypeVector %i8 3
+%words = OpTypeRuntimeArray %u32
+%block = OpTypeStruct %words
+%pblock = OpTypePointer StorageBuffer %block
+%pu32 = OpTypePointer StorageBuffer %u32
+%input = OpVariable %pblock StorageBuffer
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%three = OpConstant %u32 3
+%four = OpConstant %u32 4
+%five = OpConstant %u32 5
+%six = OpConstant %u32 6
+%seven = OpConstant %u32 7
+%eight = OpConstant %u32 8
+%nine = OpConstant %u32 9
+%ten = OpConstant %u32 10
+%eleven = OpConstant %u32 11
+%max32 = OpConstant %i32 2147483647
+%min32 = OpConstant %i32 -2147483648
+%umax32 = OpConstant %u32 4294967295
+%acc8pos = OpConstant %i8 125
+%acc8neg = OpConstant %i8 -125
+%acc8unsigned = OpConstant %u8 250
+%acc16pos = OpConstant %i16 32766
+%acc16neg = OpConstant %i16 -32766
+%acc16unsigned = OpConstant %u16 65534
+%acc32small = OpConstant %i32 17
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%a_ptr = OpAccessChain %pu32 %input %zero %zero
+%b_ptr = OpAccessChain %pu32 %input %zero %one
+%neg_ptr = OpAccessChain %pu32 %input %zero %two
+%a = OpLoad %u32 %a_ptr
+%b = OpLoad %u32 %b_ptr
+%neg = OpLoad %u32 %neg_ptr
+%av4 = OpBitcast %v4i8 %a
+%bv4 = OpBitcast %v4i8 %b
+%nv4 = OpBitcast %v4i8 %neg
+%bu4 = OpBitcast %v4u8 %b
+%au4 = OpBitcast %v4u8 %a
+%av3 = OpVectorShuffle %v3i8 %av4 %av4 0 1 2
+%bv3 = OpVectorShuffle %v3i8 %bv4 %bv4 0 1 2
+%nv3 = OpVectorShuffle %v3i8 %nv4 %nv4 0 1 2
+%au3 = OpVectorShuffle %v3u8 %au4 %au4 0 1 2
+%bu3 = OpVectorShuffle %v3u8 %bu4 %bu4 0 1 2
+%s32pos = OpSDotAccSatKHR %i32 %a %b %max32 PackedVectorFormat4x8BitKHR
+%s32neg = OpSDotAccSatKHR %i32 %neg %b %min32 PackedVectorFormat4x8BitKHR
+%u32sat = OpUDotAccSatKHR %u32 %a %b %umax32 PackedVectorFormat4x8BitKHR
+%su32 = OpSUDotAccSatKHR %i32 %neg %b %acc32small PackedVectorFormat4x8BitKHR
+%s8pos = OpSDotAccSatKHR %i8 %av3 %bv3 %acc8pos
+%s8neg = OpSDotAccSatKHR %i8 %nv3 %bv3 %acc8neg
+%su16pos = OpSUDotAccSatKHR %i16 %av4 %bu4 %acc16pos
+%su16neg = OpSUDotAccSatKHR %i16 %nv4 %bu4 %acc16neg
+%u16sat = OpUDotAccSatKHR %u16 %au4 %bu4 %acc16unsigned
+%u8sat = OpUDotAccSatKHR %u8 %au3 %bu3 %acc8unsigned
+%s32normal = OpSDotAccSatKHR %i32 %av4 %bv4 %acc32small
+%sunormal = OpSUDotAccSatKHR %i32 %nv4 %bu4 %acc32small
+%s32pos_bits = OpBitcast %u32 %s32pos
+%s32neg_bits = OpBitcast %u32 %s32neg
+%su32_bits = OpBitcast %u32 %su32
+%s8pos_bits = OpBitcast %u8 %s8pos
+%s8neg_bits = OpBitcast %u8 %s8neg
+%s8pos_word = OpUConvert %u32 %s8pos_bits
+%s8neg_word = OpUConvert %u32 %s8neg_bits
+%su16pos_bits = OpBitcast %u16 %su16pos
+%su16neg_bits = OpBitcast %u16 %su16neg
+%su16pos_word = OpUConvert %u32 %su16pos_bits
+%su16neg_word = OpUConvert %u32 %su16neg_bits
+%u16word = OpUConvert %u32 %u16sat
+%u8word = OpUConvert %u32 %u8sat
+%s32normal_bits = OpBitcast %u32 %s32normal
+%sunormal_bits = OpBitcast %u32 %sunormal
+%out0 = OpAccessChain %pu32 %output %zero %zero
+%out1 = OpAccessChain %pu32 %output %zero %one
+%out2 = OpAccessChain %pu32 %output %zero %two
+%out3 = OpAccessChain %pu32 %output %zero %three
+%out4 = OpAccessChain %pu32 %output %zero %four
+%out5 = OpAccessChain %pu32 %output %zero %five
+%out6 = OpAccessChain %pu32 %output %zero %six
+%out7 = OpAccessChain %pu32 %output %zero %seven
+%out8 = OpAccessChain %pu32 %output %zero %eight
+%out9 = OpAccessChain %pu32 %output %zero %nine
+%out10 = OpAccessChain %pu32 %output %zero %ten
+%out11 = OpAccessChain %pu32 %output %zero %eleven
+OpStore %out0 %s32pos_bits
+OpStore %out1 %s32neg_bits
+OpStore %out2 %u32sat
+OpStore %out3 %su32_bits
+OpStore %out4 %s8pos_word
+OpStore %out5 %s8neg_word
+OpStore %out6 %su16pos_word
+OpStore %out7 %su16neg_word
+OpStore %out8 %u16word
+OpStore %out9 %u8word
+OpStore %out10 %s32normal_bits
+OpStore %out11 %sunormal_bits
+OpReturn
+OpFunctionEnd

@@ -37,6 +37,9 @@ if getattr(config, "spirv_val", "") and os.path.exists(config.spirv_val):
     if getattr(config, "spirv_dis", "") and os.path.exists(config.spirv_dis):
         config.substitutions.append(("%spirv-dis", config.spirv_dis))
         config.available_features.add("spirv-tools")
+    if getattr(config, "spirv_as", "") and os.path.exists(config.spirv_as):
+        config.substitutions.append(("%spirv-as", config.spirv_as))
+        config.available_features.add("spirv-assembler")
 
 # Feature flags:
 #   metal-tools -- Apple's `xcrun metal` toolchain is available, so emitted

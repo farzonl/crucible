@@ -2492,6 +2492,21 @@ static std::optional<BinOpInfo> binOpInfo(mlir::Operation *Op) {
 Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   using namespace mlir::LLVM;
 
+  if (mlir::isa<SAddSat, UAddSat>(Op)) {
+    auto L = exprFor(Op->getOperand(0), PrecUnknown);
+    if (!L)
+      return L.takeError();
+    auto R2 = exprFor(Op->getOperand(1), PrecUnknown);
+    if (!R2)
+      return R2.takeError();
+    mlir::Type T = Op->getResult(0).getType();
+    if (mlir::isa<SAddSat>(Op))
+      return Expr{unsignedView(T, "addsat(" + signedView(T, L->Text) + ", " +
+                                     signedView(T, R2->Text) + ")"),
+                  PrecPrimary};
+    return Expr{"addsat(" + L->Text + ", " + R2->Text + ")", PrecPrimary};
+  }
+
   if (auto Info = binOpInfo(Op)) {
     mlir::Type T = Op->getResult(0).getType();
     int LPrec = Info->Prec == PrecShift ? PrecMul : Info->Prec;

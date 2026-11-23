@@ -44,8 +44,8 @@ jobs:
 
       - name: Install macOS Vulkan runtime and build tools
         run: |
-          brew install ninja vulkan-loader
-          python3 -m pip install --break-system-packages lxml
+          brew install ninja vulkan-loader spirv-tools
+          python3 -m pip install --break-system-packages lxml lit
 
       - name: Setup third_party LLVM/MLIR
         uses: ./.github/actions/setup-llvm
@@ -55,8 +55,11 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
-            -DCRUCIBLE_ENABLE_TESTS=OFF
-          cmake --build build --target cruciblec --parallel 3
+            -DLLVM_EXTERNAL_LIT="$(which lit)"
+          cmake --build build --target cruciblec crucible-run --parallel 3
+
+      - name: Verify reduced integer dot-accumulate compiler and GPU regressions
+        run: lit -v --filter='spirv_dot_acc_sat' build/test
 
       - name: Checkout pinned MoltenVK 1.4.2
         uses: actions/checkout@v4
