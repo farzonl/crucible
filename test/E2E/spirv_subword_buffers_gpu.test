@@ -1,0 +1,7 @@
+# REQUIRES: gpu, spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_subword_buffers.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 4,1,1 --groups 1,1,1 --buffer 0:u32:1:0x08060402 --buffer 1:u32:2:0xa5a5a5a5,0xa5a5a5a5 --buffer 2:u32:2:zero | FileCheck %s
+# CHECK: buffer1: 77922981 145032869
+# CHECK: buffer2: 262146 524294

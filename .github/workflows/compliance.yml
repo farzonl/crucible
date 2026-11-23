@@ -58,8 +58,8 @@ jobs:
             -DLLVM_EXTERNAL_LIT="$(which lit)"
           cmake --build build --target cruciblec crucible-run --parallel 3
 
-      - name: Verify reduced integer dot-accumulate compiler and GPU regressions
-        run: lit -v --filter='spirv_dot_acc_sat' build/test
+      - name: Verify reduced CTS compiler and GPU regressions
+        run: lit -v --filter='spirv_dot_acc_sat|spirv_subword_buffers' build/test
 
       - name: Checkout pinned MoltenVK 1.4.2
         uses: actions/checkout@v4
