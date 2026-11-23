@@ -4,6 +4,7 @@
 import os
 import platform
 import shutil
+import subprocess
 
 import lit.formats
 
@@ -40,6 +41,14 @@ if getattr(config, "spirv_val", "") and os.path.exists(config.spirv_val):
     if getattr(config, "spirv_as", "") and os.path.exists(config.spirv_as):
         config.substitutions.append(("%spirv-as", config.spirv_as))
         config.available_features.add("spirv-assembler")
+        if subprocess.run(
+            [config.spirv_as, "-o", os.devnull],
+            input="OpCapability FMAKHR\n",
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0:
+            config.available_features.add("spirv-fma-khr")
 
 # Feature flags:
 #   metal-tools -- Apple's `xcrun metal` toolchain is available, so emitted

@@ -61,6 +61,97 @@ bool isSPIRVBinary(MemoryBufferRef Buf) {
 
 namespace {
 
+static Error expandFmaKHR(SmallVectorImpl<uint32_t> &Words) {
+  if (Words.size() < 5)
+    return makeError("truncated SPIR-V header");
+  bool HasFma = false;
+  uint32_t GLSL = 0;
+  DenseSet<uint32_t> Float32Types;
+  auto IsString = [](ArrayRef<uint32_t> Words, StringRef Text) {
+    StringRef Bytes(reinterpret_cast<const char *>(Words.data()),
+                    Words.size() * sizeof(uint32_t));
+    return Bytes.size() > Text.size() && Bytes.starts_with(Text) &&
+           Bytes[Text.size()] == '\0';
+  };
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (!Count || Count > Words.size() - I)
+      return makeError("malformed SPIR-V instruction");
+    if (Op == spv::OpFmaKHR)
+      HasFma = true;
+    if (Op == spv::OpExtInstImport && Count >= 3 &&
+        IsString(ArrayRef(Words).slice(I + 2, Count - 2), "GLSL.std.450"))
+      GLSL = Words[I + 1];
+    if (Op == spv::OpTypeFloat && Count == 3 && Words[I + 2] == 32)
+      Float32Types.insert(Words[I + 1]);
+    if (Op == spv::OpTypeVector && Count == 4 &&
+        Float32Types.contains(Words[I + 2]) && Words[I + 3] >= 2 &&
+        Words[I + 3] <= 4)
+      Float32Types.insert(Words[I + 1]);
+    I += Count;
+  }
+  if (!HasFma)
+    return Error::success();
+
+  SmallVector<uint32_t> Normalized(Words.begin(), Words.begin() + 5);
+  bool AddImport = !GLSL;
+  if (AddImport) {
+    if (Words[3] == UINT32_MAX)
+      return makeError("SPIR-V ID bound is too large for FmaKHR normalization");
+    GLSL = Normalized[3]++;
+  }
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (Op == spv::OpCapability && Count == 2 &&
+        Words[I + 1] == spv::CapabilityFMAKHR) {
+      // The core operation is implemented as LLVM fma via GLSL Fma, not
+      // discarded as an unknown capability. LLVM/Metal retain fused rounding.
+      I += Count;
+      continue;
+    }
+    if (Op == spv::OpExtension && Count >= 2 &&
+        IsString(ArrayRef(Words).slice(I + 1, Count - 1), "SPV_KHR_fma")) {
+      I += Count;
+      continue;
+    }
+    if (Op == spv::OpExecutionMode && Count >= 3) {
+      uint32_t Mode = Words[I + 2];
+      if (Mode == spv::ExecutionModeRoundingModeRTZ ||
+          Mode == spv::ExecutionModeDenormPreserve ||
+          Mode == spv::ExecutionModeDenormFlushToZero ||
+          Mode == spv::ExecutionModeSignedZeroInfNanPreserve ||
+          (Mode == spv::ExecutionModeRoundingModeRTE &&
+           (Count != 4 || Words[I + 3] != 32)))
+        return makeError(
+            "unsupported floating-point execution mode for FmaKHR");
+    }
+    if (Op == spv::OpDecorate && Count == 4 &&
+        Words[I + 2] == spv::DecorationFPRoundingMode &&
+        Words[I + 3] != spv::FPRoundingModeRTE)
+      return makeError(
+          "unsupported floating-point rounding decoration for FmaKHR");
+    if (Op == spv::OpMemoryModel && AddImport) {
+      Normalized.append({(6u << 16) | spv::OpExtInstImport, GLSL, 0x4c534c47,
+                         0x6474732e, 0x3035342e, 0});
+      AddImport = false;
+    }
+    if (Op == spv::OpFmaKHR) {
+      if (Count != 6 || !Float32Types.contains(Words[I + 1]))
+        return makeError("FmaKHR supports only scalar/vector float32");
+      Normalized.append({(8u << 16) | spv::OpExtInst, Words[I + 1],
+                         Words[I + 2], GLSL, GLSLstd450Fma, Words[I + 3],
+                         Words[I + 4], Words[I + 5]});
+    } else {
+      Normalized.append(Words.begin() + I, Words.begin() + I + Count);
+    }
+    I += Count;
+  }
+  if (AddImport)
+    return makeError("missing SPIR-V memory model for FmaKHR normalization");
+  Words.assign(Normalized.begin(), Normalized.end());
+  return Error::success();
+}
+
 // Normalize the GLSL aggregate operation missing from MLIR's deserializer.
 static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
   if (Words.size() < 5)
@@ -625,6 +716,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   const char *Raw = Buf.getBufferStart();
   for (size_t I = 0; I < NumWords; ++I)
     Words[I] = support::endian::read32le(Raw + I * 4);
+  if (Error E = expandFmaKHR(Words))
+    return std::move(E);
   if (Error E = expandModfStruct(Words))
     return std::move(E);
 
