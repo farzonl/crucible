@@ -1044,6 +1044,8 @@ private:
 
   // --- types & constants ---
   Expected<std::string> ensureStruct(mlir::LLVM::LLVMStructType ST);
+  Expected<std::string> aggregateMemberPath(mlir::Type Ty,
+                                             ArrayRef<int64_t> Indices);
   Expected<std::string> mslType(mlir::Type T);
   Expected<Expr> constant(mlir::Operation *Def);
 
@@ -1573,6 +1575,27 @@ Expected<std::string> Emitter::ensureStruct(mlir::LLVM::LLVMStructType ST) {
   Decl += "};\n";
   StructDecls += Decl;
   return SName;
+}
+
+Expected<std::string> Emitter::aggregateMemberPath(
+    mlir::Type Ty, ArrayRef<int64_t> Indices) {
+  std::string Path;
+  for (int64_t I : Indices) {
+    if (auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(Ty)) {
+      if (I < 0 || static_cast<size_t>(I) >= ST.getBody().size())
+        return makeError("invalid struct aggregate member index");
+      Path += ".f" + std::to_string(I);
+      Ty = ST.getBody()[I];
+    } else if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(Ty)) {
+      if (I < 0 || static_cast<uint64_t>(I) >= Arr.getNumElements())
+        return makeError("invalid array aggregate member index");
+      Path += "[" + std::to_string(I) + "]";
+      Ty = Arr.getElementType();
+    } else {
+      return makeError("unsupported aggregate member type");
+    }
+  }
+  return Path;
 }
 
 Expected<std::string> Emitter::mslType(mlir::Type T) {
@@ -2370,7 +2393,8 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
 
   // Side-effecting or aggregate-producing ops are materialized as statements.
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
-                mlir::LLVM::AtomicCmpXchgOp, mlir::LLVM::AllocaOp>(Op))
+                mlir::LLVM::AtomicCmpXchgOp, mlir::LLVM::AllocaOp,
+                mlir::LLVM::InsertValueOp>(Op))
     return false;
   if (auto Ld = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
       Ld && mlir::isa<mlir::LLVM::LLVMArrayType>(Ld.getType()))
@@ -4289,6 +4313,16 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     return Expr{It->second + " == " + Cmp->Text, PrecEq};
   }
 
+  if (mlir::isa<mlir::LLVM::LLVMStructType>(EV.getContainer().getType())) {
+    auto Value = exprFor(EV.getContainer(), PrecPrimary);
+    auto Path = aggregateMemberPath(EV.getContainer().getType(), Pos);
+    if (!Value)
+      return Value.takeError();
+    if (!Path)
+      return Path.takeError();
+    return Expr{Value->Text + *Path, PrecPrimary};
+  }
+
   if (auto Ld = mlir::dyn_cast_or_null<mlir::LLVM::LoadOp>(Producer)) {
     auto LV = lvalueFor(Ld.getAddr(), /*DecayArray=*/false);
     if (!LV)
@@ -5871,9 +5905,35 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return Error::success();
   }
 
-  // The ResBind aggregate feeding createHandleFromBinding.
-  if (mlir::isa<mlir::LLVM::InsertValueOp>(Op))
+  if (auto IV = mlir::dyn_cast<mlir::LLVM::InsertValueOp>(Op)) {
+    // Binding aggregates are consumed by resource reflection, not Metal code.
+    auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(IV.getType());
+    if (ST && ST.isIdentified() && ST.getName() == "dx.types.ResBind")
+      return Error::success();
+    if (!ST)
+      return makeError("non-struct insertvalue is unsupported in Metal emission");
+    auto Ty = mslType(ST);
+    if (!Ty)
+      return Ty.takeError();
+    auto Path = aggregateMemberPath(ST, IV.getPosition());
+    if (!Path)
+      return Path.takeError();
+    std::string Init = "{}";
+    if (!isUndefLike(IV.getContainer())) {
+      auto Base = exprFor(IV.getContainer(), PrecUnknown);
+      if (!Base)
+        return Base.takeError();
+      Init = Base->Text;
+    }
+    auto Value = exprFor(IV.getValue(), PrecUnknown);
+    if (!Value)
+      return Value.takeError();
+    std::string Name = freshName();
+    line(Ind, *Ty + " " + Name + " = " + Init + ";");
+    line(Ind, Name + *Path + " = " + Value->Text + ";");
+    ValueNames[IV.getResult()] = Name;
     return Error::success();
+  }
 
   // Metal locals do not need LLVM's stack lifetime hints.
   if (mlir::isa<mlir::LLVM::LifetimeStartOp, mlir::LLVM::LifetimeEndOp>(Op))

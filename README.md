@@ -164,6 +164,9 @@ Storage array accesses retain declared strides and member offsets.
 Dynamic vector extraction preserves the selected lane, including narrow UBO
 vectors. Fixed storage arrays use their element stride, not the whole array size,
 including signed narrowing stores into adjacent byte lanes.
+Function-local struct construction uses the upstream SPIR-V-to-LLVM type
+conversion. Metal struct insertion copies the original value before updating
+the selected member; nested extraction follows typed struct/array member paths.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and
