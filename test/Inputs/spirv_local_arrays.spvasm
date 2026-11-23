@@ -5,7 +5,6 @@ OpEntryPoint GLCompute %main "main" %input %output
 OpExecutionMode %main LocalSize 1 1 1
 OpDecorate %uints ArrayStride 4
 OpDecorate %floats ArrayStride 4
-OpDecorate %array ArrayStride 4
 OpMemberDecorate %iblock 0 Offset 0
 OpMemberDecorate %oblock 0 Offset 0
 OpDecorate %iblock Block
