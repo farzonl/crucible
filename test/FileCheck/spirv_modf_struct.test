@@ -6,4 +6,4 @@
 # CHECK: kernel void main0(
 # CHECK-DAG: trunc(
 # CHECK-DAG: fmod(
-# CHECK-DAG: HUGE_VALF
+# CHECK-DAG: as_type<

@@ -68,6 +68,8 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
   DenseMap<uint32_t, SmallVector<uint32_t, 4>> Types;
   DenseMap<uint32_t, uint32_t> TypeKinds;
   DenseSet<uint32_t> GLSLImports;
+  DenseSet<uint32_t> Capabilities;
+  DenseMap<uint32_t, uint32_t> UnsignedTypes;
   uint32_t BoolTy = 0;
   bool HasModf = false;
   for (size_t I = 5; I < Words.size();) {
@@ -82,6 +84,10 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
     }
     if (Op == spv::OpTypeBool && Count == 2)
       BoolTy = Words[I + 1];
+    if (Op == spv::OpCapability && Count == 2)
+      Capabilities.insert(Words[I + 1]);
+    if (Op == spv::OpTypeInt && Count == 4 && Words[I + 3] == 0)
+      UnsignedTypes[Words[I + 2]] = Words[I + 1];
     if ((Op == spv::OpTypeFloat && Count == 3) ||
         (Op == spv::OpTypeVector && Count == 4) ||
         (Op == spv::OpTypeStruct && Count >= 2)) {
@@ -98,7 +104,7 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
   if (!HasModf)
     return Error::success();
 
-  SmallVector<uint32_t> Declarations, Body;
+  SmallVector<uint32_t> NewCapabilities, Declarations, Body;
   uint32_t NextID = Words[3];
   auto Emit = [](SmallVectorImpl<uint32_t> &Out, spv::Op Op,
                  ArrayRef<uint32_t> Args) {
@@ -106,7 +112,7 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
     Out.append(Args.begin(), Args.end());
   };
   struct Constants {
-    uint32_t Bool, Zero, NegativeZero, One;
+    uint32_t Bool, UInt, Zero, SignMask, AbsMask, Infinity, One;
   };
   DenseMap<uint32_t, Constants> Cached;
   DenseMap<uint32_t, uint32_t> BoolVectors;
@@ -119,7 +125,7 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
       I += Count;
       continue;
     }
-    if (Count != 6 || NextID > UINT32_MAX - 32)
+    if (Count != 6 || NextID > UINT32_MAX - 64)
       return makeError("malformed or oversized SPIR-V ModfStruct");
     auto Struct = Types.find(Words[I + 1]);
     if (Struct == Types.end() ||
@@ -163,43 +169,92 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
         }
         BoolVectors[Lanes] = Bool;
       }
-      auto Constant = [&](uint64_t Bits) {
+      uint32_t Width = Scalar->second[1];
+      uint32_t UIntScalar = UnsignedTypes.lookup(Width);
+      if (!UIntScalar) {
+        UIntScalar = NextID++;
+        Emit(Declarations, spv::OpTypeInt, {UIntScalar, Width, 0});
+        UnsignedTypes[Width] = UIntScalar;
+        auto Capability = Width == 16   ? spv::CapabilityInt16
+                          : Width == 64 ? spv::CapabilityInt64
+                                        : spv::CapabilityShader;
+        if (Capabilities.insert(Capability).second)
+          Emit(NewCapabilities, spv::OpCapability,
+               {static_cast<uint32_t>(Capability)});
+      }
+      uint32_t UInt = UIntScalar;
+      if (Lanes != 1) {
+        auto It = llvm::find_if(Types, [&](const auto &KV) {
+          return TypeKinds[KV.first] == spv::OpTypeVector &&
+                 KV.second[1] == UIntScalar && KV.second[2] == Lanes;
+        });
+        if (It != Types.end()) {
+          UInt = It->first;
+        } else {
+          UInt = NextID++;
+          Emit(Declarations, spv::OpTypeVector, {UInt, UIntScalar, Lanes});
+        }
+      }
+      auto Constant = [&](uint32_t ScalarType, uint32_t ValueType,
+                          uint64_t Bits) {
         uint32_t ID = NextID++;
-        SmallVector<uint32_t, 4> Args{ScalarTy, ID,
+        SmallVector<uint32_t, 4> Args{ScalarType, ID,
                                       static_cast<uint32_t>(Bits)};
-        if (Scalar->second[1] == 64)
+        if (Width == 64)
           Args.push_back(Bits >> 32);
         Emit(Declarations, spv::OpConstant, Args);
         if (Lanes == 1)
           return ID;
         uint32_t VectorID = NextID++;
-        SmallVector<uint32_t, 6> Elements{Ty, VectorID};
+        SmallVector<uint32_t, 6> Elements{ValueType, VectorID};
         Elements.append(Lanes, ID);
         Emit(Declarations, spv::OpConstantComposite, Elements);
         return VectorID;
       };
-      uint32_t Width = Scalar->second[1];
       uint64_t One = Width == 16   ? 0x3c00ull
                      : Width == 32 ? 0x3f800000ull
                                    : 0x3ff0000000000000ull;
-      Cached[Ty] = {Bool, Constant(0), Constant(uint64_t(1) << (Width - 1)),
-                    Constant(One)};
+      uint64_t SignMask = uint64_t(1) << (Width - 1);
+      uint64_t Infinity = Width == 16   ? 0x7c00ull
+                          : Width == 32 ? 0x7f800000ull
+                                        : 0x7ff0000000000000ull;
+      Cached[Ty] = {Bool,
+                    UInt,
+                    Constant(UIntScalar, UInt, 0),
+                    Constant(UIntScalar, UInt, SignMask),
+                    Constant(UIntScalar, UInt, SignMask - 1),
+                    Constant(UIntScalar, UInt, Infinity),
+                    Constant(ScalarTy, Ty, One)};
     }
     auto C = Cached[Ty];
     uint32_t X = Words[I + 5], Whole = NextID++, Fraction = NextID++,
-             Infinite = NextID++, Negative = NextID++, SignedZero = NextID++,
-             ResultFraction = NextID++;
+             Bits = NextID++, Sign = NextID++, Abs = NextID++,
+             Infinite = NextID++, FractionBits = NextID++,
+             FiniteFraction = NextID++;
     Emit(Body, spv::OpExtInst, {Ty, Whole, Words[I + 3], GLSLstd450Trunc, X});
-    // Remainder by one preserves the sign of zero, unlike x - trunc(x).
     Emit(Body, spv::OpFRem, {Ty, Fraction, X, C.One});
-    Emit(Body, spv::OpIsInf, {C.Bool, Infinite, X});
-    Emit(Body, spv::OpFOrdLessThan, {C.Bool, Negative, X, C.Zero});
+    Emit(Body, spv::OpBitcast, {C.UInt, Bits, X});
+    Emit(Body, spv::OpBitwiseAnd, {C.UInt, Sign, Bits, C.SignMask});
+    Emit(Body, spv::OpBitwiseAnd, {C.UInt, Abs, Bits, C.AbsMask});
+    Emit(Body, spv::OpIEqual, {C.Bool, Infinite, Abs, C.Infinity});
+    Emit(Body, spv::OpBitcast, {C.UInt, FractionBits, Fraction});
     Emit(Body, spv::OpSelect,
-         {Ty, SignedZero, Negative, C.NegativeZero, C.Zero});
-    Emit(Body, spv::OpSelect,
-         {Ty, ResultFraction, Infinite, SignedZero, Fraction});
+         {C.UInt, FiniteFraction, Infinite, C.Zero, FractionBits});
+    // Metal fmod can lose the sign of zero. Restore signs using input bits,
+    // including the whole-number result for negative zero and |x| < 1.
+    auto CopySign = [&](uint32_t ValueBits) {
+      uint32_t Magnitude = NextID++, Signed = NextID++, Result = NextID++;
+      Emit(Body, spv::OpBitwiseAnd, {C.UInt, Magnitude, ValueBits, C.AbsMask});
+      Emit(Body, spv::OpBitwiseOr, {C.UInt, Signed, Magnitude, Sign});
+      Emit(Body, spv::OpBitcast, {Ty, Result, Signed});
+      return Result;
+    };
+    uint32_t ResultFraction = CopySign(FiniteFraction);
+    uint32_t WholeBits = NextID++;
+    Emit(Body, spv::OpBitcast, {C.UInt, WholeBits, Whole});
+    uint32_t ResultWhole = CopySign(WholeBits);
     Emit(Body, spv::OpCompositeConstruct,
-         {Words[I + 1], Words[I + 2], ResultFraction, Whole});
+         {Words[I + 1], Words[I + 2], ResultFraction, ResultWhole});
     I += Count;
   }
   // Generated types/constants must precede all function definitions.
@@ -208,6 +263,7 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
     Function += Body[Function] >> 16;
   Words.resize(5);
   Words[3] = NextID;
+  Words.append(NewCapabilities.begin(), NewCapabilities.end());
   Words.append(Body.begin(), Body.begin() + Function);
   Words.append(Declarations.begin(), Declarations.end());
   Words.append(Body.begin() + Function, Body.end());
