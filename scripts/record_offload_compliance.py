@@ -2,9 +2,15 @@
 """Parse llvm-lit JSON results and update multi-track GitHub Pages compliance history."""
 
 import argparse
+import io
 import json
+import os
 import shutil
+import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +26,14 @@ def category_for_test(test_name: str) -> str:
     return parts[0]
 
 
+def normalize_test_name(name: str) -> str:
+    name = name.split("::", 1)[-1].strip().replace("\\", "/")
+    name = name.rsplit("/", 1)[-1]
+    if name.endswith(".test"):
+        name = name[:-5]
+    return name
+
+
 def parse_lit_json(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -30,6 +44,7 @@ def parse_lit_json(path: Path) -> dict:
         lambda: {"passed": 0, "failed": 0, "xfail": 0, "unsupported": 0}
     )
     failures = []
+    tests_out = []
 
     for t in tests:
         name = t.get("name", "")
@@ -39,21 +54,29 @@ def parse_lit_json(path: Path) -> dict:
         if code in ("PASS", "FLAKYPASS"):
             counts["PASS"] += 1
             categories[cat]["passed"] += 1
+            test_status = "pass"
         elif code in ("XFAIL",):
             counts["XFAIL"] += 1
             categories[cat]["xfail"] += 1
+            test_status = "xfail"
         elif code in ("UNSUPPORTED",):
             counts["UNSUPPORTED"] += 1
             categories[cat]["unsupported"] += 1
+            test_status = "unsupported"
         else:
             counts["FAIL"] += 1
             categories[cat]["failed"] += 1
+            test_status = "fail"
             failures.append({
                 "name": name.split("::", 1)[-1].strip(),
                 "category": cat,
                 "code": code,
                 "elapsed": round(float(t.get("elapsed", 0.0)), 3),
             })
+        tests_out.append({
+            "name": normalize_test_name(name),
+            "status": test_status,
+        })
 
     total = len(tests)
     executed = counts["PASS"] + counts["FAIL"] + counts["XFAIL"]
@@ -83,6 +106,7 @@ def parse_lit_json(path: Path) -> dict:
         "elapsed": round(float(data.get("elapsed", 0.0)), 2),
         "categories": cat_list,
         "failures": sorted(failures, key=lambda x: x["name"]),
+        "tests": sorted(tests_out, key=lambda x: x["name"]),
     }
 
 
@@ -150,6 +174,197 @@ def parse_track_spec(spec: str) -> tuple[str, str, Path]:
             f"invalid --track-lit '{spec}' (expected id=label=path)"
         )
     return parts[0].strip(), parts[1].strip(), Path(parts[2].strip())
+
+
+def github_api_json(url: str) -> dict | None:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Crucible-Compliance-CI",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        print(f"Warning: external GitHub data unavailable from {url}: {exc}")
+        return None
+
+
+def normalize_external_tests(data: dict) -> list:
+    tests = []
+    for test in data.get("tests", []):
+        name = normalize_test_name(str(test.get("name", "")))
+        code = str(test.get("code", "UNKNOWN"))
+        if code in ("PASS", "FLAKYPASS"):
+            status = "pass"
+        elif code == "XFAIL":
+            status = "xfail"
+        elif code == "UNSUPPORTED":
+            status = "unsupported"
+        else:
+            status = "fail"
+        if name:
+            tests.append({"name": name, "status": status})
+    return sorted(tests, key=lambda test: test["name"])
+
+
+def parse_xunit_tests(xml_text: str) -> list:
+    root = ET.fromstring(xml_text)
+    tests = []
+    for testcase in root.iter("testcase"):
+        name = normalize_test_name(testcase.get("name", ""))
+        if not name:
+            continue
+        if testcase.find("failure") is not None:
+            status = "fail"
+        elif testcase.find("skipped") is not None:
+            status = "unsupported"
+        else:
+            status = "pass"
+        tests.append({"name": name, "status": status})
+    return sorted(tests, key=lambda test: test["name"])
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def download_github_zip(url: str) -> bytes | None:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Crucible-Compliance-CI",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    try:
+        with opener.open(req, timeout=60) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            return None
+        location = exc.headers.get("Location")
+        if not location:
+            return None
+        dl_req = urllib.request.Request(
+            location,
+            headers={"User-Agent": "Crucible-Compliance-CI"},
+        )
+        try:
+            with urllib.request.urlopen(dl_req, timeout=60) as resp:
+                return resp.read()
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            return None
+    except (urllib.error.URLError, TimeoutError):
+        return None
+
+
+def fetch_external_comparisons() -> dict:
+    comparisons = {
+        "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "repository": "llvm/offload-test-suite",
+        "runs": [],
+    }
+
+    official_workflows = (
+        ("windows-intel-dxc-vk", "windows-intel-dxc-vk.yaml", "vulkan", "DXC"),
+        ("windows-amd-dxc-lavapipe", "windows-amd-dxc-lavapipe.yaml", "vulkan", "DXC"),
+        ("windows-intel-clang-vk", "windows-intel-clang-vk.yaml", "vulkan", "Clang"),
+        ("windows-amd-clang-lavapipe", "windows-amd-clang-lavapipe.yaml", "vulkan", "Clang"),
+        ("macos-dxc-mtl", "macos-dxc-mtl.yaml", "metal", "DXC"),
+        ("macos-clang-mtl", "macos-clang-mtl.yaml", "metal", "Clang"),
+        ("windows-intel-dxc-d3d12", "windows-intel-dxc-d3d12.yaml", "directx", "DXC"),
+        ("windows-nvidia-dxc-d3d12", "windows-nvidia-dxc-d3d12.yaml", "directx", "DXC"),
+        ("windows-amd-dxc-d3d12", "windows-amd-dxc-d3d12.yaml", "directx", "DXC"),
+        ("windows-intel-clang-d3d12", "windows-intel-clang-d3d12.yaml", "directx", "Clang"),
+        ("windows-nvidia-clang-d3d12", "windows-nvidia-clang-d3d12.yaml", "directx", "Clang"),
+        ("windows-amd-clang-d3d12", "windows-amd-clang-d3d12.yaml", "directx", "Clang"),
+    )
+    for key, workflow_file, platform, compiler in official_workflows:
+        workflow_runs_url = (
+            "https://api.github.com/repos/llvm/offload-test-suite/actions/"
+            f"workflows/{urllib.parse.quote(workflow_file)}/runs"
+            "?branch=main&status=completed&per_page=5"
+        )
+        run_data = github_api_json(workflow_runs_url)
+        workflow_runs = (
+            run_data.get("workflow_runs", []) if isinstance(run_data, dict) else []
+        )
+        run = next(
+            (
+                item for item in workflow_runs
+                if item.get("conclusion") not in ("cancelled", "skipped")
+            ),
+            None,
+        )
+        if not run:
+            continue
+        run_id = run.get("id")
+        tests = []
+        if run_id:
+            artifacts_url = (
+                f"https://api.github.com/repos/llvm/offload-test-suite/"
+                f"actions/runs/{run_id}/artifacts?per_page=100"
+            )
+            artifact_data = github_api_json(artifacts_url)
+            if artifact_data:
+                token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+                headers = {"User-Agent": "Crucible-Compliance-CI"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                for artifact in artifact_data.get("artifacts", []):
+                    name = artifact.get("name", "")
+                    if artifact.get("expired") or not name.startswith("test-results-"):
+                        continue
+                    dl_url = artifact.get("archive_download_url")
+                    if not dl_url:
+                        continue
+                    try:
+                        raw_zip = download_github_zip(dl_url)
+                        if not raw_zip:
+                            continue
+                        with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+                            for member in zf.namelist():
+                                if member.endswith("testresults.json"):
+                                    lit_data = json.loads(
+                                        zf.read(member).decode("utf-8")
+                                    )
+                                    candidate = normalize_external_tests(lit_data)
+                                elif member.endswith(".xml"):
+                                    candidate = parse_xunit_tests(
+                                        zf.read(member).decode("utf-8")
+                                    )
+                                else:
+                                    continue
+                                if len(candidate) > len(tests):
+                                    tests = candidate
+                    except (urllib.error.HTTPError, urllib.error.URLError,
+                            TimeoutError, zipfile.BadZipFile, json.JSONDecodeError,
+                            UnicodeDecodeError, ET.ParseError):
+                        continue
+
+        label = f"{compiler} · {key.replace('-', ' ').title()}"
+        comparisons["runs"].append({
+            "id": key,
+            "workflow": workflow_file,
+            "label": label,
+            "platform": platform,
+            "compiler": compiler,
+            "runId": run_id,
+            "runUrl": run.get("html_url", ""),
+            "updatedAt": run.get("updated_at", ""),
+            "results": {},
+            "tests": tests,
+        })
+    return comparisons
 
 
 def main() -> None:
@@ -250,11 +465,13 @@ def main() -> None:
                 "passRate": summary["passRate"],
                 "elapsed": summary["elapsed"],
                 "categories": summary["categories"],
+                "failures": summary["failures"],
+                "tests": summary["tests"],
             }
             history = [h for h in history if h.get("sha") != args.sha]
             history.append(entry)
             history.sort(key=lambda h: h.get("timestamp", ""))
-            entry = {**entry, "failures": summary["failures"]}
+            entry = {**entry, "failures": summary["failures"], "tests": summary["tests"]}
 
         if cache_file:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +553,10 @@ def main() -> None:
 
     with open(data_dir / "tracks.json", "w", encoding="utf-8") as f:
         json.dump(tracks_manifest, f, indent=2)
+
+    comparisons = fetch_external_comparisons()
+    with open(data_dir / "comparisons.json", "w", encoding="utf-8") as f:
+        json.dump(comparisons, f, indent=2)
 
     if args.pages_url:
         for fname in ("history.json", "latest.json", "badge.json"):

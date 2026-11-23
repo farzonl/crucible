@@ -441,6 +441,8 @@ jobs:
             offload-history-
 
       - name: Record multi-track compliance history and build GitHub Pages site
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           COMMIT_MSG=$(git log -1 --pretty=%s)
           COMMIT_AUTHOR=$(git log -1 --pretty=%an)
