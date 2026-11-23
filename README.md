@@ -148,6 +148,12 @@ to MoltenVK's actual Metal ABI. Graphics, descriptor arrays, textures/samplers,
 specialization constants and auxiliary-buffer ABIs are not yet integrated.
 Adapter rejection is visible, rather than being hidden by native fallback.
 
+SPIR-V integer dot products include packed and unpacked `SDotAccSat`,
+`SUDotAccSat`, and `UDotAccSat`, lowered to Metal saturating addition after
+the dot product. Only the final accumulation saturates; intermediate dot-product
+overflow remains undefined as specified by SPIR-V. Native CTS parity is tracked
+case-by-case in [#144](https://github.com/farzonl/crucible/issues/144).
+
 MoltenVK 1.4.2 is pinned at `db66022459ffb663aa2b50f6b018bc2e124f5edf`;
 its external dependencies and CTS dependencies are pinned by their sources.
 Loader and Xcode versions, the compiler path, adapter hash and exact invocation

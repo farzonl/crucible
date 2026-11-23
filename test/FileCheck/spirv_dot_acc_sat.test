@@ -1,0 +1,17 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_dot_acc_sat.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv --dump-mlir -o %t.metal 2>&1 | FileCheck %s --check-prefix=IR
+# RUN: FileCheck %s --check-prefix=MSL --input-file=%t.metal
+# IR: llvm.intr.sadd.sat
+# IR: llvm.intr.uadd.sat
+# IR: llvm.intr.sadd.sat
+# MSL: add_sat(as_type<int>(
+# MSL: add_sat(as_type<int>(
+# MSL: add_sat(
+# MSL: add_sat(as_type<int>(
+# MSL: add_sat(as_type<char>(
+# MSL: add_sat(as_type<char>(
+# MSL: add_sat(as_type<short>(
+# MSL: add_sat(as_type<short>(
+# MSL: add_sat(

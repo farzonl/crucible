@@ -2911,7 +2911,9 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     if (mlir::isa<mlir::spirv::GLAtan2Op, mlir::spirv::GLStepOp,
                   mlir::spirv::GLNormalizeOp, mlir::spirv::DotOp,
                   mlir::spirv::SDotOp, mlir::spirv::UDotOp,
-                  mlir::spirv::SUDotOp, mlir::spirv::GLFSignOp,
+                  mlir::spirv::SUDotOp, mlir::spirv::SDotAccSatOp,
+                  mlir::spirv::UDotAccSatOp, mlir::spirv::SUDotAccSatOp,
+                  mlir::spirv::GLFSignOp,
                   mlir::spirv::GLSSignOp, mlir::spirv::GLLengthOp,
                   mlir::spirv::GLDistanceOp, mlir::spirv::GLCrossOp,
                   mlir::spirv::GLReflectOp, mlir::spirv::GLSmoothStepOp,
@@ -3011,15 +3013,25 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Dot.replaceAllUsesWith(Sum);
       Dot.erase();
     } else if (mlir::isa<mlir::spirv::SDotOp, mlir::spirv::UDotOp,
-                         mlir::spirv::SUDotOp>(Op)) {
+                         mlir::spirv::SUDotOp, mlir::spirv::SDotAccSatOp,
+                         mlir::spirv::UDotAccSatOp,
+                         mlir::spirv::SUDotAccSatOp>(Op)) {
+      bool Saturating = Op->getNumOperands() == 3;
       bool Signed1 =
-          mlir::isa<mlir::spirv::SDotOp, mlir::spirv::SUDotOp>(Op);
-      bool Signed2 = mlir::isa<mlir::spirv::SDotOp>(Op);
+          mlir::isa<mlir::spirv::SDotOp, mlir::spirv::SUDotOp,
+                    mlir::spirv::SDotAccSatOp,
+                    mlir::spirv::SUDotAccSatOp>(Op);
+      bool Signed2 =
+          mlir::isa<mlir::spirv::SDotOp, mlir::spirv::SDotAccSatOp>(Op);
       mlir::Value V1 = castToSignless(B, Loc, Op->getOperand(0));
       mlir::Value V2 = castToSignless(B, Loc, Op->getOperand(1));
       mlir::Type OrigResTy = Op->getResult(0).getType();
       mlir::Type SignlessResTy =
           B.getIntegerType(OrigResTy.getIntOrFloatBitWidth());
+      mlir::Type DotTy = Saturating
+                            ? B.getIntegerType(std::max(
+                                  32u, OrigResTy.getIntOrFloatBitWidth()))
+                            : SignlessResTy;
       auto I8V4Ty = mlir::VectorType::get({4}, B.getI8Type());
       if (V1.getType().isInteger(32))
         V1 = mlir::LLVM::BitcastOp::create(B, Loc, I8V4Ty, V1);
@@ -3032,20 +3044,30 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                                    static_cast<int32_t>(C));
         mlir::Value E1 = mlir::LLVM::ExtractElementOp::create(B, Loc, V1, IdxC);
         mlir::Value E2 = mlir::LLVM::ExtractElementOp::create(B, Loc, V2, IdxC);
-        if (E1.getType() != SignlessResTy)
+        if (E1.getType() != DotTy)
           E1 = Signed1
                    ? mlir::Value(mlir::LLVM::SExtOp::create(B, Loc,
-                                                            SignlessResTy, E1))
+                                                            DotTy, E1))
                    : mlir::Value(mlir::LLVM::ZExtOp::create(B, Loc,
-                                                            SignlessResTy, E1));
-        if (E2.getType() != SignlessResTy)
+                                                            DotTy, E1));
+        if (E2.getType() != DotTy)
           E2 = Signed2
                    ? mlir::Value(mlir::LLVM::SExtOp::create(B, Loc,
-                                                            SignlessResTy, E2))
+                                                            DotTy, E2))
                    : mlir::Value(mlir::LLVM::ZExtOp::create(B, Loc,
-                                                            SignlessResTy, E2));
+                                                            DotTy, E2));
         mlir::Value P = mlir::LLVM::MulOp::create(B, Loc, E1, E2);
         Sum = Sum ? mlir::Value(mlir::LLVM::AddOp::create(B, Loc, Sum, P)) : P;
+      }
+      if (Saturating) {
+        // Only the final accumulation saturates. Intermediate dot overflow is
+        // undefined by SPIR-V; keep narrow arithmetic out of MSL promotions.
+        if (DotTy != SignlessResTy)
+          Sum = mlir::LLVM::TruncOp::create(B, Loc, SignlessResTy, Sum);
+        mlir::Value Acc = castToSignless(B, Loc, Op->getOperand(2));
+        Sum = Signed1
+                  ? mlir::Value(mlir::LLVM::SAddSat::create(B, Loc, Sum, Acc))
+                  : mlir::Value(mlir::LLVM::UAddSat::create(B, Loc, Sum, Acc));
       }
       Op->getResult(0).replaceAllUsesWith(
           castFromSignless(B, Loc, Sum, OrigResTy));

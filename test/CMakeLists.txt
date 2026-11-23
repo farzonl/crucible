@@ -21,6 +21,8 @@ find_program(SPIRV_VAL_EXECUTABLE spirv-val
   HINTS /opt/homebrew/bin /usr/local/bin)
 find_program(SPIRV_DIS_EXECUTABLE spirv-dis
   HINTS /opt/homebrew/bin /usr/local/bin)
+find_program(SPIRV_AS_EXECUTABLE spirv-as
+  HINTS /opt/homebrew/bin /usr/local/bin)
 
 # lit can come from pip (`pip install lit`), from an LLVM build tree, or be
 # pointed at explicitly with -DLLVM_EXTERNAL_LIT=/path/to/lit[.py].

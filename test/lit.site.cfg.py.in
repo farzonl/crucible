@@ -9,6 +9,7 @@ config.dxc = "@DXC_EXECUTABLE@"
 config.filecheck = "@FILECHECK_EXECUTABLE@"
 config.spirv_val = "@SPIRV_VAL_EXECUTABLE@"
 config.spirv_dis = "@SPIRV_DIS_EXECUTABLE@"
+config.spirv_as = "@SPIRV_AS_EXECUTABLE@"
 config.test_exec_root = "@CMAKE_CURRENT_BINARY_DIR@"
 
 lit_config.load_config(
