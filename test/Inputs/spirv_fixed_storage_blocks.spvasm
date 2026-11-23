@@ -1,0 +1,48 @@
+OpCapability Shader
+OpCapability Int16
+OpCapability UniformAndStorageBuffer16BitAccess
+OpExtension "SPV_KHR_16bit_storage"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid
+OpExecutionMode %main LocalSize 2 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %in_array ArrayStride 16
+OpDecorate %out_array ArrayStride 8
+OpMemberDecorate %in_block 0 Offset 0
+OpMemberDecorate %out_block 0 Offset 8
+OpDecorate %in_block Block
+OpDecorate %out_block BufferBlock
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u16 = OpTypeInt 16 0
+%v3u32 = OpTypeVector %u32 3
+%zero = OpConstant %u32 0
+%two = OpConstant %u32 2
+%in_array = OpTypeArray %u16 %two
+%out_array = OpTypeArray %u32 %two
+%in_block = OpTypeStruct %in_array
+%out_block = OpTypeStruct %out_array
+%pin = OpTypePointer Uniform %in_block
+%pout = OpTypePointer Uniform %out_block
+%pu16 = OpTypePointer Uniform %u16
+%pu32 = OpTypePointer Uniform %u32
+%pgid = OpTypePointer Input %v3u32
+%input = OpVariable %pin Uniform
+%output = OpVariable %pout Uniform
+%gid = OpVariable %pgid Input
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3u32 %gid
+%x = OpCompositeExtract %u32 %id 0
+%src = OpInBoundsAccessChain %pu16 %input %zero %x
+%value = OpLoad %u16 %src
+%wide = OpUConvert %u32 %value
+%dst = OpInBoundsAccessChain %pu32 %output %zero %x
+OpStore %dst %wide
+OpReturn
+OpFunctionEnd
