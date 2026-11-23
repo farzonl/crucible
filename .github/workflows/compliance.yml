@@ -111,11 +111,12 @@ jobs:
           path: |
             .cts/src/external
             .cts/build
-          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-v1
+          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/prepare_vulkan_cts.py') }}
 
       - name: Fetch pinned CTS dependencies and build deqp-vk
         if: steps.cts-build-cache.outputs.cache-hit != 'true'
         run: |
+          python3 scripts/prepare_vulkan_cts.py --source .cts/src
           python3 .cts/src/external/fetch_sources.py
           cmake -S .cts/src -B .cts/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGET=osx
@@ -128,7 +129,7 @@ jobs:
           path: |
             .cts/src/external
             .cts/build
-          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-v1
+          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/prepare_vulkan_cts.py') }}
 
       - name: Run matched Crucible compiler and native reference CTS samples
         run: |

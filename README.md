@@ -167,6 +167,7 @@ python3 scripts/prepare_cts_moltenvk.py --source .cts/mvk
 (cd .cts/mvk && ./fetchDependencies --macos && make macos)
 git clone https://github.com/KhronosGroup/VK-GL-CTS .cts/src
 git -C .cts/src checkout 65fff6ac4d782ad42a490b007376e84159a113e3
+python3 scripts/prepare_vulkan_cts.py --source .cts/src
 python3 .cts/src/external/fetch_sources.py
 cmake -S .cts/src -B .cts/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGET=osx
 cmake --build .cts/build --target deqp-vk --parallel 3
@@ -212,6 +213,9 @@ cannot publish a success score. Unselected CTS cases are never counted.
 History charts do not connect different caselist hashes, CTS revisions, adapter
 hashes, or runtime versions. Both existing Pages publishers preserve the CTS JSON dataset.
 Build/history caches and raw QPA/caselist/metadata artifacts support reruns.
+The pinned CTS source receives a syntax-only compatibility patch removing four
+redundant C++ `template` qualifiers rejected by newer Xcode Clang; test behavior
+and the selected caselist are unchanged.
 
 Validate the recorder with `python3 -m unittest discover -s scripts -p 'test_vulkan_cts.py'`.
 For branch validation without publishing Pages, dispatch Compliance with
