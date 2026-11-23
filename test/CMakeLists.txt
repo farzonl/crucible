@@ -37,10 +37,10 @@ if(TARGET crucible-run)
 else()
   set(CRUCIBLE_RUN_PATH "")
 endif()
-if(TARGET crucible-vk-run)
-  set(CRUCIBLE_VK_RUN_PATH $<TARGET_FILE:crucible-vk-run>)
+if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
+  set(CRUCIBLE_HAS_VULKAN 1)
 else()
-  set(CRUCIBLE_VK_RUN_PATH "")
+  set(CRUCIBLE_HAS_VULKAN 0)
 endif()
 
 set(LIT_SITE_CFG_IN_HEADER
@@ -66,9 +66,6 @@ if(LLVM_EXTERNAL_LIT)
     COMMENT "Running crucible lit tests")
   if(TARGET crucible-run)
     add_dependencies(check-crucible crucible-run)
-  endif()
-  if(TARGET crucible-vk-run)
-    add_dependencies(check-crucible crucible-vk-run)
   endif()
 
   # llvm/offload-test-suite compliance run (crucible-offload backend).
