@@ -1,0 +1,73 @@
+OpCapability Shader
+OpCapability Int8
+OpCapability Int16
+OpCapability StorageBuffer8BitAccess
+OpCapability StorageBuffer16BitAccess
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %bytes %halves %gid
+OpExecutionMode %main LocalSize 4 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %pairs ArrayStride 2
+OpDecorate %byte_array ArrayStride 1
+OpDecorate %half_array ArrayStride 2
+OpMemberDecorate %input_block 0 Offset 0
+OpMemberDecorate %byte_block 0 Offset 0
+OpMemberDecorate %half_block 0 Offset 0
+OpDecorate %input_block Block
+OpDecorate %byte_block Block
+OpDecorate %half_block Block
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %bytes DescriptorSet 0
+OpDecorate %bytes Binding 1
+OpDecorate %halves DescriptorSet 0
+OpDecorate %halves Binding 2
+%void = OpTypeVoid
+%bool = OpTypeBool
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u16 = OpTypeInt 16 0
+%u8 = OpTypeInt 8 0
+%v2u8 = OpTypeVector %u8 2
+%v3u32 = OpTypeVector %u32 3
+%pairs = OpTypeRuntimeArray %v2u8
+%byte_array = OpTypeRuntimeArray %u8
+%half_array = OpTypeRuntimeArray %u16
+%input_block = OpTypeStruct %pairs
+%byte_block = OpTypeStruct %byte_array
+%half_block = OpTypeStruct %half_array
+%pinput = OpTypePointer StorageBuffer %input_block
+%pbytes = OpTypePointer StorageBuffer %byte_block
+%phalves = OpTypePointer StorageBuffer %half_block
+%ppair = OpTypePointer StorageBuffer %v2u8
+%pbyte = OpTypePointer StorageBuffer %u8
+%phalf = OpTypePointer StorageBuffer %u16
+%pgid = OpTypePointer Input %v3u32
+%input = OpVariable %pinput StorageBuffer
+%bytes = OpVariable %pbytes StorageBuffer
+%halves = OpVariable %phalves StorageBuffer
+%gid = OpVariable %pgid Input
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3u32 %gid
+%x = OpCompositeExtract %u32 %id 0
+%pair_idx = OpShiftRightLogical %u32 %x %one
+%lane = OpBitwiseAnd %u32 %x %one
+%inptr = OpAccessChain %ppair %input %zero %pair_idx
+%pair = OpLoad %v2u8 %inptr
+%first = OpCompositeExtract %u8 %pair 0
+%second = OpCompositeExtract %u8 %pair 1
+%is_first = OpIEqual %bool %lane %zero
+%value = OpSelect %u8 %is_first %first %second
+%half_value = OpUConvert %u16 %value
+%byte_base = OpIMul %u32 %x %two
+%byte_idx = OpIAdd %u32 %byte_base %one
+%byte_ptr = OpAccessChain %pbyte %bytes %zero %byte_idx
+%half_ptr = OpAccessChain %phalf %halves %zero %x
+OpStore %byte_ptr %value
+OpStore %half_ptr %half_value
+OpReturn
+OpFunctionEnd

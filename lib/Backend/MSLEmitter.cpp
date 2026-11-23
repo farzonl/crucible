@@ -1069,6 +1069,8 @@ private:
   Expected<std::string> bufferBoundExpr(ResState &RS, mlir::Value Handle);
   /// Byte size of one scalar element of an MSL type name.
   static unsigned elemByteSize(StringRef MSLTy) {
+    if (MSLTy == "uchar")
+      return 1;
     if (MSLTy == "half" || MSLTy == "ushort")
       return 2;
     if (MSLTy == "ulong")
@@ -4010,7 +4012,7 @@ Expected<std::string> Emitter::bufferIndexExpr(ResState &RS, mlir::Value Coord0,
   std::string Index;
   uint64_t ConstOffset = 0; // in scalar elements
   const unsigned EB = elemByteSize(RS.ElemType);
-  const unsigned Shift = EB == 2 ? 1 : EB == 8 ? 3 : 2;
+  const unsigned Shift = EB == 1 ? 0 : EB == 2 ? 1 : EB == 8 ? 3 : 2;
 
   switch (RS.RB->Kind) {
   case ResourceKind::StructuredBuffer: {
@@ -4096,7 +4098,7 @@ Expected<std::string> Emitter::bufferBoundExpr(ResState &RS,
   if (!Dim)
     return Dim.takeError();
   const unsigned EB = elemByteSize(RS.ElemType);
-  const unsigned Shift = EB == 2 ? 1 : EB == 8 ? 3 : 2;
+  const unsigned Shift = EB == 1 ? 0 : EB == 2 ? 1 : EB == 8 ? 3 : 2;
   switch (RS.RB->Kind) {
   case ResourceKind::StructuredBuffer: {
     uint32_t K = RS.RB->ElementStride / EB;

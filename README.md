@@ -154,6 +154,9 @@ the dot product. Only the final accumulation saturates; intermediate dot-product
 overflow remains undefined as specified by SPIR-V. Native CTS parity is tracked
 case-by-case in [#144](https://github.com/farzonl/crucible/issues/144).
 
+Byte-sized Metal buffer elements retain their one-byte storage stride, including
+packed vectors and byte offsets; stores do not widen into adjacent elements.
+
 MoltenVK 1.4.2 is pinned at `db66022459ffb663aa2b50f6b018bc2e124f5edf`;
 its external dependencies and CTS dependencies are pinned by their sources.
 Loader and Xcode versions, the compiler path, adapter hash and exact invocation
