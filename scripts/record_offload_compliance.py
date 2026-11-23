@@ -9,6 +9,7 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -21,6 +22,14 @@ def category_for_test(test_name: str) -> str:
     if len(parts) >= 2 and parts[0] in ("Feature", "Basic", "Tools"):
         return f"{parts[0]}/{parts[1]}"
     return parts[0]
+
+
+def normalize_test_name(name: str) -> str:
+    name = name.split("::", 1)[-1].strip().replace("\\", "/")
+    name = name.rsplit("/", 1)[-1]
+    if name.endswith(".test"):
+        name = name[:-5]
+    return name
 
 
 def parse_lit_json(path: Path) -> dict:
@@ -63,7 +72,7 @@ def parse_lit_json(path: Path) -> dict:
                 "elapsed": round(float(t.get("elapsed", 0.0)), 3),
             })
         tests_out.append({
-            "name": name.split("::", 1)[-1].strip(),
+            "name": normalize_test_name(name),
             "status": test_status,
         })
 
@@ -186,7 +195,7 @@ def github_api_json(url: str) -> dict | None:
 def normalize_external_tests(data: dict) -> list:
     tests = []
     for test in data.get("tests", []):
-        name = str(test.get("name", "")).split("::", 1)[-1].strip()
+        name = normalize_test_name(str(test.get("name", "")))
         code = str(test.get("code", "UNKNOWN"))
         if code in ("PASS", "FLAKYPASS"):
             status = "pass"
@@ -201,38 +210,102 @@ def normalize_external_tests(data: dict) -> list:
     return sorted(tests, key=lambda test: test["name"])
 
 
+def parse_xunit_tests(xml_text: str) -> list:
+    root = ET.fromstring(xml_text)
+    tests = []
+    for testcase in root.iter("testcase"):
+        name = normalize_test_name(testcase.get("name", ""))
+        if not name:
+            continue
+        if testcase.find("failure") is not None:
+            status = "fail"
+        elif testcase.find("skipped") is not None:
+            status = "unsupported"
+        else:
+            status = "pass"
+        tests.append({"name": name, "status": status})
+    return sorted(tests, key=lambda test: test["name"])
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def download_github_zip(url: str) -> bytes | None:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Crucible-Compliance-CI",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    try:
+        with opener.open(req, timeout=60) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (301, 302, 303, 307, 308):
+            return None
+        location = exc.headers.get("Location")
+        if not location:
+            return None
+        dl_req = urllib.request.Request(
+            location,
+            headers={"User-Agent": "Crucible-Compliance-CI"},
+        )
+        try:
+            with urllib.request.urlopen(dl_req, timeout=60) as resp:
+                return resp.read()
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+            return None
+    except (urllib.error.URLError, TimeoutError):
+        return None
+
+
 def fetch_external_comparisons() -> dict:
-    summary_url = (
-        "https://raw.githubusercontent.com/farzonl/"
-        "offload-test-suite-badges/badges/summary.json"
-    )
-    summary = fetch_json(summary_url)
-    workflows = summary.get("workflows", {}) if isinstance(summary, dict) else {}
     comparisons = {
-        "generatedAt": summary.get("generatedAt", "") if isinstance(summary, dict) else "",
+        "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "repository": "llvm/offload-test-suite",
         "runs": [],
     }
 
-    preferred_keys = (
-        "windows-intel-dxc-vk",
-        "windows-amd-dxc-lavapipe",
-        "windows-intel-clang-vk",
-        "windows-amd-clang-lavapipe",
-        "macos-dxc-mtl",
-        "macos-clang-mtl",
-        "windows-intel-dxc-d3d12",
-        "windows-nvidia-dxc-d3d12",
-        "windows-amd-dxc-d3d12",
-        "windows-intel-clang-d3d12",
-        "windows-nvidia-clang-d3d12",
-        "windows-amd-clang-d3d12",
+    official_workflows = (
+        ("windows-intel-dxc-vk", "windows-intel-dxc-vk.yaml", "vulkan", "DXC"),
+        ("windows-amd-dxc-lavapipe", "windows-amd-dxc-lavapipe.yaml", "vulkan", "DXC"),
+        ("windows-intel-clang-vk", "windows-intel-clang-vk.yaml", "vulkan", "Clang"),
+        ("windows-amd-clang-lavapipe", "windows-amd-clang-lavapipe.yaml", "vulkan", "Clang"),
+        ("macos-dxc-mtl", "macos-dxc-mtl.yaml", "metal", "DXC"),
+        ("macos-clang-mtl", "macos-clang-mtl.yaml", "metal", "Clang"),
+        ("windows-intel-dxc-d3d12", "windows-intel-dxc-d3d12.yaml", "directx", "DXC"),
+        ("windows-nvidia-dxc-d3d12", "windows-nvidia-dxc-d3d12.yaml", "directx", "DXC"),
+        ("windows-amd-dxc-d3d12", "windows-amd-dxc-d3d12.yaml", "directx", "DXC"),
+        ("windows-intel-clang-d3d12", "windows-intel-clang-d3d12.yaml", "directx", "Clang"),
+        ("windows-nvidia-clang-d3d12", "windows-nvidia-clang-d3d12.yaml", "directx", "Clang"),
+        ("windows-amd-clang-d3d12", "windows-amd-clang-d3d12.yaml", "directx", "Clang"),
     )
-    for key in preferred_keys:
-        workflow = workflows.get(key)
-        if not isinstance(workflow, dict):
+    for key, workflow_file, platform, compiler in official_workflows:
+        workflow_runs_url = (
+            "https://api.github.com/repos/llvm/offload-test-suite/actions/"
+            f"workflows/{urllib.parse.quote(workflow_file)}/runs"
+            "?branch=main&status=completed&per_page=5"
+        )
+        run_data = github_api_json(workflow_runs_url)
+        workflow_runs = (
+            run_data.get("workflow_runs", []) if isinstance(run_data, dict) else []
+        )
+        run = next(
+            (
+                item for item in workflow_runs
+                if item.get("conclusion") not in ("cancelled", "skipped")
+            ),
+            None,
+        )
+        if not run:
             continue
-        run_id = workflow.get("runId")
+        run_id = run.get("id")
         tests = []
         if run_id:
             artifacts_url = (
@@ -253,44 +326,40 @@ def fetch_external_comparisons() -> dict:
                     if not dl_url:
                         continue
                     try:
-                        req = urllib.request.Request(dl_url, headers=headers)
-                        with urllib.request.urlopen(req, timeout=60) as resp:
-                            raw_zip = resp.read()
+                        raw_zip = download_github_zip(dl_url)
+                        if not raw_zip:
+                            continue
                         with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
                             for member in zf.namelist():
-                                if not member.endswith("testresults.json"):
+                                if member.endswith("testresults.json"):
+                                    lit_data = json.loads(
+                                        zf.read(member).decode("utf-8")
+                                    )
+                                    candidate = normalize_external_tests(lit_data)
+                                elif member.endswith(".xml"):
+                                    candidate = parse_xunit_tests(
+                                        zf.read(member).decode("utf-8")
+                                    )
+                                else:
                                     continue
-                                lit_data = json.loads(
-                                    zf.read(member).decode("utf-8")
-                                )
-                                candidate = normalize_external_tests(lit_data)
                                 if len(candidate) > len(tests):
                                     tests = candidate
                     except (urllib.error.HTTPError, urllib.error.URLError,
                             TimeoutError, zipfile.BadZipFile, json.JSONDecodeError,
-                            UnicodeDecodeError):
+                            UnicodeDecodeError, ET.ParseError):
                         continue
 
-        platform = "vulkan" if "-vk" in key or "-lavapipe" in key else (
-            "metal" if "-mtl" in key else "directx"
-        )
-        if "-dxc-" in key:
-            compiler = "DXC"
-        elif "-clang-" in key:
-            compiler = "Clang"
-        else:
-            compiler = workflow.get("label", "")
-        label = f"{workflow.get('label', compiler)} · {key.replace('-', ' ').title()}"
+        label = f"{compiler} · {key.replace('-', ' ').title()}"
         comparisons["runs"].append({
             "id": key,
-            "workflow": workflow.get("workflow", f"{key}.yaml"),
+            "workflow": workflow_file,
             "label": label,
             "platform": platform,
             "compiler": compiler,
             "runId": run_id,
-            "runUrl": workflow.get("runUrl", ""),
-            "updatedAt": workflow.get("updatedAt", ""),
-            "results": workflow.get("results", {}),
+            "runUrl": run.get("html_url", ""),
+            "updatedAt": run.get("updated_at", ""),
+            "results": {},
             "tests": tests,
         })
     return comparisons
