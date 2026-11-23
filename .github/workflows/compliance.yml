@@ -22,6 +22,80 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  vulkan-cts-macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      CTS_REVISION: 65fff6ac4d782ad42a490b007376e84159a113e3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned Vulkan CTS 1.3.9.0
+        uses: actions/checkout@v4
+        with:
+          repository: KhronosGroup/VK-GL-CTS
+          ref: 65fff6ac4d782ad42a490b007376e84159a113e3
+          path: .cts/src
+
+      - name: Install macOS Vulkan runtime and build tools
+        run: |
+          brew install ninja molten-vk vulkan-loader
+          python3 -m pip install --break-system-packages lxml
+
+      - name: Restore CTS build and pinned external dependencies
+        id: cts-build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cts/src/external
+            .cts/build
+          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-v1
+
+      - name: Fetch pinned CTS dependencies and build deqp-vk
+        if: steps.cts-build-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 .cts/src/external/fetch_sources.py
+          cmake -S .cts/src -B .cts/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGET=osx
+          cmake --build .cts/build --target deqp-vk --parallel 3
+
+      - name: Save CTS build cache
+        if: steps.cts-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cts/src/external
+            .cts/build
+          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-v1
+
+      - name: Run bounded SPIR-V assembly baseline on native MoltenVK
+        run: |
+          python3 scripts/record_vulkan_cts.py select \
+            --source .cts/src/external/vulkancts/mustpass/main/vk-default/spirv-assembly.txt \
+            --prefix dEQP-VK.spirv_assembly. --limit 256 \
+            --output cts-results/caselist.txt
+          export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          test -f "$VK_ICD_FILENAMES"
+          export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
+          python3 scripts/record_vulkan_cts.py run \
+            --binary .cts/build/external/vulkancts/modules/vulkan/deqp-vk \
+            --archive .cts/build/external/vulkancts/modules/vulkan \
+            --library "$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib" \
+            --caselist cts-results/caselist.txt --qpa cts-results/results.qpa \
+            --metadata cts-results/metadata.json --timeout 900 \
+            --sha "${{ github.sha }}" \
+            --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --cts-revision "$CTS_REVISION" \
+            --runtime-version "$(brew list --versions molten-vk vulkan-loader | tr '\n' ';')" \
+            --baseline "vulkan-cts-1.3.9.0 spirv-assembly mustpass, evenly spaced 256 cases, fraction 0/1"
+
+      - name: Upload CTS QPA, exact caselist, and run metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-cts-results
+          path: cts-results/
+          if-no-files-found: warn
+
   compliance-dxil-to-metal:
     runs-on: macos-latest
     steps:
@@ -262,8 +336,8 @@ jobs:
 
   publish:
     runs-on: ubuntu-latest
-    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv, compliance-spirv-to-metal]
-    if: always() && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success')
+    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv, compliance-spirv-to-metal, vulkan-cts-macos]
+    if: always() && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success' || needs.vulkan-cts-macos.result == 'success')
     outputs:
       artifact_name: ${{ steps.set-artifact-name.outputs.artifact_name }}
     steps:
@@ -310,6 +384,29 @@ jobs:
         with:
           path: .compliance-cache
           key: offload-history-v2-${{ github.sha }}
+
+      - name: Restore historical CTS data cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cts-history
+          key: vulkan-cts-history-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            vulkan-cts-history-v1-
+
+      - name: Record CTS results without replacing other dashboard data
+        if: needs.vulkan-cts-macos.result == 'success'
+        run: |
+          python3 scripts/record_vulkan_cts.py record \
+            --qpa artifacts/results.qpa --caselist artifacts/caselist.txt \
+            --metadata artifacts/metadata.json --data-dir _site/data \
+            --history-cache .cts-history/history.json
+
+      - name: Save historical CTS data cache
+        if: needs.vulkan-cts-macos.result == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .cts-history
+          key: vulkan-cts-history-v1-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

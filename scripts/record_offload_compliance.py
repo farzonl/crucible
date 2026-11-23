@@ -9,6 +9,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cts_data import preserve_cts_data
+
 
 def category_for_test(test_name: str) -> str:
     rel = test_name.split("::", 1)[-1].strip()
@@ -348,6 +350,7 @@ def main() -> None:
 
     # Preserve benchmark histories if already deployed on Pages
     if args.pages_url:
+        preserve_cts_data(args.pages_url, data_dir)
         for fname in ("bench-history.json", "bench-history-macos.json"):
             if (data_dir / fname).exists():
                 continue
