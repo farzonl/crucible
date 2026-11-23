@@ -83,6 +83,7 @@ struct BoundBufferInfo {
   bool IsArray = false;
   uint32_t MatrixStride = 16;
   bool MatrixRowMajor = false;
+  uint32_t BaseByteOffset = 0;
 };
 
 struct BoundCBufferInfo {
@@ -768,10 +769,24 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     if (!StructTy || StructTy.getNumElements() == 0)
       continue;
 
-    if (auto RTArr = mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(
+    bool IsStorageBlock =
+        SC == mlir::spirv::StorageClass::StorageBuffer ||
+        StructTy.hasDecoration(mlir::spirv::Decoration::BufferBlock);
+    mlir::Type ArrayElemTy;
+    uint32_t ArrayStride = 0;
+    if (auto Arr = mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(
             StructTy.getElementType(0))) {
-      mlir::Type ElemTy = RTArr.getElementType();
-      uint32_t Stride = RTArr.getArrayStride();
+      ArrayElemTy = Arr.getElementType();
+      ArrayStride = Arr.getArrayStride();
+    } else if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(
+                   StructTy.getElementType(0));
+               Arr && IsStorageBlock && StructTy.getNumElements() == 1) {
+      ArrayElemTy = Arr.getElementType();
+      ArrayStride = Arr.getArrayStride();
+    }
+    if (ArrayElemTy) {
+      mlir::Type ElemTy = ArrayElemTy;
+      uint32_t Stride = ArrayStride;
       if (Stride == 0)
         Stride = 4;
 
@@ -809,16 +824,16 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Info.IsArray = IsResourceArray;
       Info.MatrixStride = MatStride;
       Info.MatrixRowMajor = MatRowMajor;
+      Info.BaseByteOffset = StructTy.getMemberOffset(0);
       BufferGlobals[GV.getSymName()] = Info;
       Reflect.Resources.push_back(std::move(RB));
       GlobalsToErase.push_back(GV);
       continue;
     }
 
-    // Single-element StorageBuffer struct (e.g., UAV counter.var.* with
+    // Single-element storage block (e.g., UAV counter.var.* with
     // type.ACSBuffer.counter = struct<(si32 [0])>).
-    if (SC == mlir::spirv::StorageClass::StorageBuffer &&
-        StructTy.getNumElements() == 1) {
+    if (IsStorageBlock && StructTy.getNumElements() == 1) {
       mlir::Type ElemTy = StructTy.getElementType(0);
       uint32_t Stride = spirvTypeBytes(ElemTy);
       if (Stride == 0)
@@ -840,6 +855,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Info.ElemType = ElemTy;
       Info.ElemStride = Stride;
       Info.IsArray = IsResourceArray;
+      Info.BaseByteOffset = StructTy.getMemberOffset(0);
       BufferGlobals[GV.getSymName()] = Info;
       Reflect.Resources.push_back(std::move(RB));
       GlobalsToErase.push_back(GV);
@@ -877,6 +893,34 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   auto EntryFn = SpvModule.lookupSymbol<mlir::spirv::FuncOp>(Reflect.EntryName);
   if (!EntryFn)
     return makeError("SPIR-V entry function '{0}' not found", Reflect.EntryName);
+
+  SmallVector<mlir::spirv::InBoundsAccessChainOp, 8> InBoundsChains;
+  EntryFn.walk([&](mlir::spirv::InBoundsAccessChainOp Chain) {
+    InBoundsChains.push_back(Chain);
+  });
+  for (auto Chain : InBoundsChains) {
+    mlir::OpBuilder B(Chain);
+    auto Replacement = mlir::spirv::AccessChainOp::create(
+        B, Chain.getLoc(), Chain.getBasePtr(), Chain.getIndices());
+    Replacement->setAttrs(Chain->getAttrs());
+    Chain.replaceAllUsesWith(Replacement.getResult());
+    Chain.erase();
+  }
+
+  SmallVector<mlir::spirv::VectorExtractDynamicOp, 8> DynamicExtracts;
+  EntryFn.walk([&](mlir::spirv::VectorExtractDynamicOp Extract) {
+    DynamicExtracts.push_back(Extract);
+  });
+  for (auto Extract : DynamicExtracts) {
+    mlir::OpBuilder B(Extract);
+    auto Loc = Extract.getLoc();
+    auto Value = mlir::LLVM::ExtractElementOp::create(
+        B, Loc, castToSignless(B, Loc, Extract.getVector()),
+        castToSignless(B, Loc, Extract.getIndex()));
+    Extract.replaceAllUsesWith(
+        castFromSignless(B, Loc, Value, Extract.getType()));
+    Extract.erase();
+  }
 
   SmallVector<mlir::spirv::CopyMemoryOp, 8> Copies;
   EntryFn.walk([&](mlir::spirv::CopyMemoryOp Copy) { Copies.push_back(Copy); });
@@ -1169,7 +1213,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         uint32_t NextVecElemStride = 0;
         auto computeByteOff = [&](mlir::OpBuilder &B,
                                   mlir::Location Loc) -> Expected<mlir::Value> {
-          uint32_t ConstOff = 0;
+          uint32_t ConstOff = Info.BaseByteOffset;
           mlir::Value DynOff;
           mlir::Type CurTy = Info.ElemType;
           CurMatrixStride = Info.MatrixStride;

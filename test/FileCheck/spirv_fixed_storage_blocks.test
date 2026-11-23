@@ -1,0 +1,8 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.0 %S/../Inputs/spirv_fixed_storage_blocks.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.0 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# CHECK: device uint* __restrict [[OUT:spirv_var_[0-9]+]] {{.*}}buffer(0)
+# CHECK: constant {{.*}}buffer(1)
+# CHECK: [[OUT]][{{.*}} * 2u + 2u] =
