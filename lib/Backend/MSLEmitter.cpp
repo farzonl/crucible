@@ -2501,10 +2501,10 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
       return R2.takeError();
     mlir::Type T = Op->getResult(0).getType();
     if (mlir::isa<SAddSat>(Op))
-      return Expr{unsignedView(T, "add_sat(" + signedView(T, L->Text) + ", " +
+      return Expr{unsignedView(T, "addsat(" + signedView(T, L->Text) + ", " +
                                      signedView(T, R2->Text) + ")"),
                   PrecPrimary};
-    return Expr{"add_sat(" + L->Text + ", " + R2->Text + ")", PrecPrimary};
+    return Expr{"addsat(" + L->Text + ", " + R2->Text + ")", PrecPrimary};
   }
 
   if (auto Info = binOpInfo(Op)) {
