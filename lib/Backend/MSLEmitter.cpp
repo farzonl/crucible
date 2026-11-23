@@ -6431,7 +6431,12 @@ Expected<std::string> Emitter::run() {
       UsesGidx = true;
     }
   }
-  R.MSLEntryName = sanitizeIdentifier(R.EntryName, "kernel_main");
+  if (!Opts.MSLEntryPoint.empty() &&
+      sanitizeIdentifier(Opts.MSLEntryPoint, "kernel_main") != Opts.MSLEntryPoint)
+    return makeError("invalid Metal entry point name '{0}'", Opts.MSLEntryPoint);
+  R.MSLEntryName = Opts.MSLEntryPoint.empty()
+                       ? sanitizeIdentifier(R.EntryName, "kernel_main")
+                       : Opts.MSLEntryPoint;
 
   if (Error E = resolveHandles())
     return std::move(E);

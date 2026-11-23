@@ -3,6 +3,9 @@ build/
 .sdk/
 .toolchains/
 .compliance-cache/
+.cts/
+.cts-history/
+cts-results/
 *.dxil
 *.air
 *.metallib

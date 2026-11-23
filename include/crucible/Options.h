@@ -41,6 +41,12 @@ struct ArraySizeOverride {
   uint32_t Size = 1;
 };
 
+struct MetalBufferBinding {
+  uint32_t Space = 0;
+  uint32_t Register = 0;
+  uint32_t Index = 0;
+};
+
 /// DXC-style Vulkan register shift override (-fvk-b/t/u/s-shift).
 struct VulkanRegisterShift {
   ResourceClass Class = ResourceClass::CBV;
@@ -71,6 +77,11 @@ struct Options {
   /// Entry point to compile when the container exports multiple (libraries).
   /// Empty selects the sole entry point.
   std::string EntryPoint;
+
+  /// Explicit Metal ABI used by external Vulkan runtimes.
+  std::string MSLEntryPoint;
+  std::vector<MetalBufferBinding> MetalBufferBindings;
+  bool RequireMetalBufferBindings = false;
 
   /// Flush f32 denormals to signed zero around math builtins (D3D12 FTZ).
   bool FlushDenormsF32 = false;

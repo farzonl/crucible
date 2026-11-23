@@ -8,6 +8,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cts_data import preserve_cts_data
+
 
 def fetch_json_url(url: str):
     try:
@@ -145,6 +147,7 @@ def main() -> None:
     # Preserve other OS benchmark history and the complete multi-track compliance
     # report, regardless of which workflow deploys Pages next.
     if args.pages_url:
+        preserve_cts_data(args.pages_url, data_dir)
         base_url = args.pages_url.rstrip("/")
         for fname in ("bench-history.json", "bench-history-macos.json", "history.json"):
             if fname != args.history_filename and not (data_dir / fname).exists():

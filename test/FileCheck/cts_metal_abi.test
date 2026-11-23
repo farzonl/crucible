@@ -1,0 +1,20 @@
+# Explicit runtime ABI must affect both emitted MSL and its reflection.
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec %t.spv -o %t.metal --reflect %t.json --entry=main --msl-entry=cts_main --require-msl-buffer-bindings --msl-buffer-binding=0,0,7
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+# RUN: not %cruciblec %t.spv --require-msl-buffer-bindings 2>&1 | FileCheck %s --check-prefix=MISSING
+# RUN: not %cruciblec %t.spv --msl-buffer-binding=0,0,31 2>&1 | FileCheck %s --check-prefix=LIMIT
+# RUN: not %cruciblec %t.spv --msl-buffer-binding=0,0,1 --msl-buffer-binding=0,0,2 2>&1 | FileCheck %s --check-prefix=DUPLICATE
+# RUN: not %cruciblec %t.spv --msl-buffer-binding=bad 2>&1 | FileCheck %s --check-prefix=INVALID
+# RUN: not %cruciblec %t.spv --msl-entry=bad-name 2>&1 | FileCheck %s --check-prefix=NAME
+
+# CHECK: kernel void cts_main(
+# CHECK: {{\[\[}}buffer(7){{\]\]}}
+# REFLECT: "metalIndex": 7
+# REFLECT: "mslEntry": "cts_main"
+# MISSING: missing explicit Metal buffer ABI binding (0, 0)
+# LIMIT: exceeds the buffer slot limit
+# DUPLICATE: duplicate Metal buffer ABI binding (0, 0)
+# INVALID: invalid --msl-buffer-binding
+# NAME: invalid Metal entry point name 'bad-name'
