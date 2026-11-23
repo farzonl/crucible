@@ -97,6 +97,14 @@ if(UNIX AND NOT APPLE)
   list(APPEND CRUCIBLE_COMMON_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden)
 endif()
 
+set(CRUCIBLE_SPIRV_HEADERS_INCLUDE_DIR
+    "${CMAKE_SOURCE_DIR}/third_party/spirv-headers/include")
+if(NOT EXISTS "${CRUCIBLE_SPIRV_HEADERS_INCLUDE_DIR}/spirv/unified1/spirv.hpp")
+  message(FATAL_ERROR
+    "SPIRV-Headers not found at ${CRUCIBLE_SPIRV_HEADERS_INCLUDE_DIR}. "
+    "Run: git submodule update --init third_party/spirv-headers")
+endif()
+
 add_subdirectory(lib)
 add_subdirectory(tools/cruciblec)
 if(APPLE)
