@@ -59,8 +59,8 @@ flowchart LR
     end
 
     subgraph Runners["Execution & Compliance (tools/)"]
-        Metal["Metal Runtime\ncrucible-run / MetalDevice"]
-        Vulkan["Vulkan / MoltenVK / Lavapipe\ncrucible-vk-run / VulkanDevice"]
+        Metal["Metal Runtime\ncrucible-run --backend metal / MetalDevice"]
+        Vulkan["Vulkan / MoltenVK / Lavapipe\ncrucible-run --backend vulkan / VulkanDevice"]
     end
 
     DXIL --> Res
@@ -310,15 +310,14 @@ cruciblec shader.spv -o out.metal --reflect out.json
 cruciblec kernel.mlir -o out.metal --dump-mlir
 
 # Run GPU E2E dispatches directly
-crucible-run --lib out.metallib --entry main0 --threads 64,1,1 --groups 1,1,1 --buffer 0:f32:64:iota
-crucible-vk-run --spv out.spv --reflect out.json --groups 1,1,1 --buffer 0:f32:64:iota
+crucible-run --backend metal --lib out.metallib --entry main0 --threads 64,1,1 --groups 1,1,1 --buffer 0:f32:64:iota
+crucible-run --backend vulkan --spv out.spv --entry main --groups 1,1,1 --buffer 0:f32:64:iota
 ```
 
 | Tool | Purpose |
 | :--- | :--- |
 | `tools/cruciblec` | Multi-frontend, multi-backend compiler CLI (`--target=msl\|spirv`, `--reflect`, `--metallib`, `--vk-*-shift`, `--stage-as-compute`, `--dump-mlir`). |
-| `tools/crucible-run` | Native Metal compute runner and GPU-timestamp benchmark harness (`--bench-json`). |
-| `tools/crucible-vk-run` | Vulkan / MoltenVK / Lavapipe compute runner for SPIR-V GPU E2E verification. |
+| `tools/crucible-run` | Multi-backend compute runner (`--backend metal\|vulkan`) and Metal GPU-timestamp benchmark harness (`--bench-json`). |
 | `tools/crucible-offload` | Multi-runtime `llvm/offload-test-suite` device provider (`MetalDevice` + `VulkanDevice` via `CRUCIBLE_OFFLOAD_RUNTIME`). |
 
 ---

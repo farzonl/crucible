@@ -23,8 +23,7 @@ config.substitutions.append(("FileCheck", config.filecheck))
 if config.crucible_run:
     config.substitutions.append(("%crucible-run", config.crucible_run))
 
-if getattr(config, "crucible_vk_run", "") and os.path.exists(config.crucible_vk_run):
-    config.substitutions.append(("%crucible-vk-run", config.crucible_vk_run))
+if getattr(config, "crucible_has_vulkan", False) and config.crucible_run and os.path.exists(config.crucible_run):
     config.available_features.add("vulkan-gpu")
 
 if config.crucible_offload:

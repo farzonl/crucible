@@ -1,6 +1,37 @@
-add_executable(crucible-run main.mm)
-target_compile_options(crucible-run PRIVATE -fobjc-arc)
-target_link_libraries(crucible-run PRIVATE
-  "-framework Metal"
-  "-framework Foundation"
+set(CRUCIBLE_RUN_SOURCES
+  main.cpp
+  Common.cpp
 )
+
+if(APPLE)
+  list(APPEND CRUCIBLE_RUN_SOURCES MetalBackend.mm)
+  set_source_files_properties(MetalBackend.mm PROPERTIES
+    COMPILE_FLAGS "-fobjc-arc")
+endif()
+
+if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
+  list(APPEND CRUCIBLE_RUN_SOURCES VulkanBackend.cpp)
+endif()
+
+add_executable(crucible-run ${CRUCIBLE_RUN_SOURCES})
+
+if(APPLE)
+  target_compile_definitions(crucible-run PRIVATE CRUCIBLE_RUN_HAS_METAL=1)
+  target_link_libraries(crucible-run PRIVATE
+    "-framework Metal"
+    "-framework Foundation"
+  )
+endif()
+
+if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
+  target_compile_definitions(crucible-run PRIVATE CRUCIBLE_RUN_HAS_VULKAN=1)
+  target_include_directories(crucible-run PRIVATE ${CRUCIBLE_VULKAN_INCLUDE_DIR})
+  target_link_libraries(crucible-run PRIVATE ${CRUCIBLE_VULKAN_LIB})
+  if(APPLE)
+    # Ensure MoltenVK / vulkan-loader dylib rpath is embedded so crucible-run
+    # runs cleanly from the build tree without DYLD_LIBRARY_PATH.
+    get_filename_component(_vk_lib_dir "${CRUCIBLE_VULKAN_LIB}" DIRECTORY)
+    set_target_properties(crucible-run PROPERTIES
+      BUILD_RPATH "${_vk_lib_dir}")
+  endif()
+endif()

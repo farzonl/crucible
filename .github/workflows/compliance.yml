@@ -56,7 +56,7 @@ jobs:
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
-          cmake --build build --target cruciblec crucible-run crucible-vk-run --parallel 3
+          cmake --build build --target cruciblec crucible-run --parallel 3
 
       - name: Verify reduced CTS compiler and GPU regressions
         run: lit -v --filter='spirv_dot_acc_sat|spirv_subword_buffers|spirv_helper_calls|spirv_volatile_copy|spirv_fixed_storage_blocks|spirv_fixed_signed_bytes|spirv_local_structs|spirv_local_arrays|cts_image_abi' build/test
@@ -126,7 +126,7 @@ jobs:
           export VK_DRIVER_FILES="$GITHUB_WORKSPACE/.cts/mvk/Package/Release/MoltenVK/dylib/macOS/MoltenVK_icd.json"
           export MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0
           export MVK_CONFIG_LOG_LEVEL=1
-          build/tools/crucible-vk-run/crucible-vk-run \
+          build/tools/crucible-run/crucible-run --backend vulkan \
             --spv .cts/specialization.spv --buffer 0:u32:8:99 \
             --specialization default \
             --specialization 7:28000000,8:04000000,9:00000000 \

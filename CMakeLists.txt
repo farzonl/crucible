@@ -108,18 +108,21 @@ endif()
 add_subdirectory(lib)
 add_subdirectory(tools/cruciblec)
 if(APPLE)
-  add_subdirectory(tools/crucible-run)
   add_subdirectory(tools/crucible-bench)
 endif()
 
-# Optional Vulkan / MoltenVK E2E compute runner (crucible-vk-run).
+# Optional Vulkan / MoltenVK / Lavapipe support for crucible-run and
+# crucible-offload.
 find_path(CRUCIBLE_VULKAN_INCLUDE_DIR vulkan/vulkan.h
   HINTS /usr/local/include /opt/homebrew/include)
 find_library(CRUCIBLE_VULKAN_LIB NAMES vulkan vulkan-1 libMoltenVK.dylib
   HINTS /opt/homebrew/lib /usr/local/lib)
 if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   message(STATUS "Found Vulkan/MoltenVK: ${CRUCIBLE_VULKAN_LIB}")
-  add_subdirectory(tools/crucible-vk-run)
+endif()
+
+if(APPLE OR (CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB))
+  add_subdirectory(tools/crucible-run)
 endif()
 
 # llvm/offload-test-suite integration: builds the upstream CLI tools with

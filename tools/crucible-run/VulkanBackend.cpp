@@ -1,20 +1,11 @@
-//===- main.cpp - crucible-vk-run Vulkan/MoltenVK compute runner -*- C++ -*-===//
+//===- VulkanBackend.cpp - Vulkan compute backend for crucible-run -*- C++ -*-===//
 //
-// Part of Crucible, an open-source DXIL compiler.
+// Part of Crucible, an open-source DXIL/SPIR-V compiler.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Minimal Vulkan / MoltenVK compute dispatch harness for lit/FileCheck E2E
-// tests of the DXIL -> SPIR-V backend:
-//
-//   crucible-vk-run --spv k.spv --entry main --groups 1,1,1 \
-//                   --buffer 0:f32:64:iota [--cbuffer 1:f32:4:2,1,0,0]
-//
-// Buffers are declared as <binding>:<type>:<count>:<init> where <type> is one
-// of f32/u32/i32 and <init> is "iota", "zero", or comma-separated values.
-// After dispatch every storage buffer is printed as "buffer<binding>: v0 v1 ..."
-// so FileCheck can assert exact GPU results.
-//
 //===----------------------------------------------------------------------===//
+
+#include "Common.h"
 
 #include <vulkan/vulkan.h>
 
@@ -26,46 +17,17 @@
 #include <string>
 #include <vector>
 
+namespace crucible_run {
 namespace {
-
-struct BufferSpec {
-  uint32_t Binding = 0;
-  std::string Type; // f32, u32, i32
-  size_t Count = 0;
-  std::string Init;
-  bool IsUniform = false;
-};
 
 struct SpecializationSpec {
   std::vector<VkSpecializationMapEntry> Entries;
   std::vector<uint8_t> Data{0};
 };
 
-[[noreturn]] void fail(const std::string &Msg) {
-  fprintf(stderr, "crucible-vk-run: error: %s\n", Msg.c_str());
-  exit(1);
-}
-
 void checkVk(VkResult R, const char *What) {
   if (R != VK_SUCCESS)
     fail(std::string(What) + " failed (VkResult=" + std::to_string(R) + ")");
-}
-
-bool parseTriple(const char *S, uint32_t Out[3]) {
-  return sscanf(S, "%u,%u,%u", &Out[0], &Out[1], &Out[2]) == 3;
-}
-
-std::vector<std::string> split(const std::string &S, char Sep) {
-  std::vector<std::string> Parts;
-  size_t Start = 0;
-  while (true) {
-    size_t Pos = S.find(Sep, Start);
-    Parts.push_back(S.substr(Start, Pos - Start));
-    if (Pos == std::string::npos)
-      break;
-    Start = Pos + 1;
-  }
-  return Parts;
 }
 
 SpecializationSpec parseSpecialization(const std::string &Arg) {
@@ -93,64 +55,6 @@ SpecializationSpec parseSpecialization(const std::string &Arg) {
     Spec.Data.push_back(0);
   }
   return Spec;
-}
-
-BufferSpec parseBufferSpec(const std::string &Arg, bool IsUniform) {
-  auto Parts = split(Arg, ':');
-  if (Parts.size() != 4)
-    fail("bad buffer spec '" + Arg + "' (want binding:type:count:init)");
-  BufferSpec Spec;
-  Spec.Binding = static_cast<uint32_t>(strtoul(Parts[0].c_str(), nullptr, 10));
-  Spec.Type = Parts[1];
-  Spec.Count = strtoull(Parts[2].c_str(), nullptr, 10);
-  Spec.Init = Parts[3];
-  Spec.IsUniform = IsUniform;
-  if (Spec.Type != "f32" && Spec.Type != "u32" && Spec.Type != "i32")
-    fail("unsupported buffer type '" + Spec.Type + "'");
-  if (Spec.Count == 0)
-    fail("buffer count must be nonzero");
-  return Spec;
-}
-
-void fillBuffer(const BufferSpec &Spec, void *Data) {
-  std::vector<std::string> Values;
-  bool Iota = Spec.Init == "iota";
-  bool Zero = Spec.Init == "zero";
-  if (!Iota && !Zero)
-    Values = split(Spec.Init, ',');
-  for (size_t I = 0; I < Spec.Count; ++I) {
-    if (!Iota && !Zero && I < Values.size() &&
-        Values[I].rfind("0x", 0) == 0) {
-      uint32_t Bits =
-          static_cast<uint32_t>(strtoul(Values[I].c_str(), nullptr, 16));
-      memcpy(static_cast<uint32_t *>(Data) + I, &Bits, 4);
-      continue;
-    }
-    double V = 0;
-    if (Iota)
-      V = static_cast<double>(I);
-    else if (!Zero)
-      V = I < Values.size() ? strtod(Values[I].c_str(), nullptr) : 0;
-    if (Spec.Type == "f32")
-      static_cast<float *>(Data)[I] = static_cast<float>(V);
-    else if (Spec.Type == "u32")
-      static_cast<uint32_t *>(Data)[I] = static_cast<uint32_t>(V);
-    else
-      static_cast<int32_t *>(Data)[I] = static_cast<int32_t>(V);
-  }
-}
-
-void printBuffer(const BufferSpec &Spec, const void *Data) {
-  printf("buffer%u:", Spec.Binding);
-  for (size_t I = 0; I < Spec.Count; ++I) {
-    if (Spec.Type == "f32")
-      printf(" %g", static_cast<const float *>(Data)[I]);
-    else if (Spec.Type == "u32")
-      printf(" %u", static_cast<const uint32_t *>(Data)[I]);
-    else
-      printf(" %d", static_cast<const int32_t *>(Data)[I]);
-  }
-  printf("\n");
 }
 
 std::vector<uint32_t> readSPIRV(const std::string &Path) {
@@ -188,45 +92,21 @@ struct AllocatedBuffer {
 
 } // namespace
 
-int main(int argc, char **argv) {
-  std::string SpvPath;
-  std::string Entry = "main";
-  uint32_t Groups[3] = {1, 1, 1};
-  std::vector<BufferSpec> Specs;
+int runVulkan(const RunnerOptions &Opts) {
+  if (Opts.SpvPath.empty())
+    fail("--spv <file.spv> is required for vulkan backend");
+
+  std::string Entry = Opts.Entry.empty() ? "main" : Opts.Entry;
   std::vector<SpecializationSpec> Specializations;
+  Specializations.reserve(Opts.SpecializationArgs.size());
+  for (const std::string &Arg : Opts.SpecializationArgs)
+    Specializations.push_back(parseSpecialization(Arg));
 
-  for (int I = 1; I < argc; ++I) {
-    std::string Arg = argv[I];
-    auto needVal = [&]() -> std::string {
-      if (I + 1 >= argc)
-        fail("missing value for " + Arg);
-      return argv[++I];
-    };
-    if (Arg == "--spv")
-      SpvPath = needVal();
-    else if (Arg == "--entry")
-      Entry = needVal();
-    else if (Arg == "--groups") {
-      if (!parseTriple(needVal().c_str(), Groups))
-        fail("bad --groups triple (want gx,gy,gz)");
-    } else if (Arg == "--buffer")
-      Specs.push_back(parseBufferSpec(needVal(), /*IsUniform=*/false));
-    else if (Arg == "--cbuffer")
-      Specs.push_back(parseBufferSpec(needVal(), /*IsUniform=*/true));
-    else if (Arg == "--specialization")
-      Specializations.push_back(parseSpecialization(needVal()));
-    else
-      fail("unknown argument '" + Arg + "'");
-  }
-
-  if (SpvPath.empty())
-    fail("--spv <file.spv> is required");
-
-  std::vector<uint32_t> Code = readSPIRV(SpvPath);
+  std::vector<uint32_t> Code = readSPIRV(Opts.SpvPath);
 
   VkApplicationInfo AppInfo{};
   AppInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-  AppInfo.pApplicationName = "crucible-vk-run";
+  AppInfo.pApplicationName = "crucible-run";
   AppInfo.apiVersion = VK_API_VERSION_1_2;
 
   std::vector<const char *> InstanceExts;
@@ -303,7 +183,7 @@ int main(int argc, char **argv) {
   std::vector<VkDescriptorSetLayoutBinding> Bindings;
   uint32_t NumStorage = 0, NumUniform = 0;
 
-  for (const BufferSpec &Spec : Specs) {
+  for (const BufferSpec &Spec : Opts.Buffers) {
     AllocatedBuffer AB;
     AB.Spec = Spec;
     // Pad uniform buffers to 16-byte multiples (std140 vec4 rows).
@@ -341,7 +221,7 @@ int main(int argc, char **argv) {
     vkUnmapMemory(Device, AB.Memory);
 
     VkDescriptorSetLayoutBinding B{};
-    B.binding = Spec.Binding;
+    B.binding = Spec.Index;
     B.descriptorType = Spec.IsUniform ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
                                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     B.descriptorCount = 1;
@@ -440,7 +320,7 @@ int main(int argc, char **argv) {
     Writes[I] = {};
     Writes[I].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     Writes[I].dstSet = DSet;
-    Writes[I].dstBinding = Bufs[I].Spec.Binding;
+    Writes[I].dstBinding = Bufs[I].Spec.Index;
     Writes[I].descriptorCount = 1;
     Writes[I].descriptorType = Bufs[I].Spec.IsUniform
                                    ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
@@ -488,7 +368,7 @@ int main(int argc, char **argv) {
     vkCmdBindPipeline(CmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, Pipelines[I]);
     vkCmdBindDescriptorSets(CmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, PipeLayout,
                             0, 1, &DSet, 0, nullptr);
-    vkCmdDispatch(CmdBuf, Groups[0], Groups[1], Groups[2]);
+    vkCmdDispatch(CmdBuf, Opts.Groups[0], Opts.Groups[1], Opts.Groups[2]);
     checkVk(vkEndCommandBuffer(CmdBuf), "vkEndCommandBuffer");
 
     VkSubmitInfo SI{};
@@ -526,3 +406,5 @@ int main(int argc, char **argv) {
   vkDestroyInstance(Instance, nullptr);
   return 0;
 }
+
+} // namespace crucible_run
