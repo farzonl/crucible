@@ -1107,6 +1107,9 @@ private:
   Error emitTextureGather(ir::TexGatherOp Gather, unsigned Ind);
   Error emitAtomic(mlir::Operation *Op, unsigned Ind);
   Error emitTemp(mlir::Operation *Op, unsigned Ind);
+  Expected<std::string> localDeclaration(mlir::Type Ty, StringRef Name);
+  void emitAggregateCopy(mlir::Type Ty, const std::string &Dst,
+                         const std::string &Src, unsigned Ind);
 
   /// Guarantee V is referable by a stable name (or literal) and return it.
   Expected<std::string> ensureNamed(mlir::Value V, unsigned Ind,
@@ -1596,6 +1599,34 @@ Expected<std::string> Emitter::aggregateMemberPath(
     }
   }
   return Path;
+}
+
+Expected<std::string> Emitter::localDeclaration(mlir::Type Ty, StringRef Name) {
+  std::string Suffix;
+  while (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(Ty)) {
+    Suffix += "[" + std::to_string(Arr.getNumElements()) + "]";
+    Ty = Arr.getElementType();
+  }
+  auto Type = mslType(Ty);
+  if (!Type)
+    return Type.takeError();
+  return *Type + " " + Name.str() + Suffix;
+}
+
+void Emitter::emitAggregateCopy(mlir::Type Ty, const std::string &Dst,
+                                const std::string &Src, unsigned Ind) {
+  if (auto Arr = mlir::dyn_cast<mlir::LLVM::LLVMArrayType>(Ty)) {
+    auto Index = freshName();
+    line(Ind, "for (uint " + Index + " = 0u; " + Index + " < " +
+                  std::to_string(Arr.getNumElements()) + "u; ++" + Index +
+                  ") {");
+    auto Suffix = "[" + Index + "]";
+    emitAggregateCopy(Arr.getElementType(), Dst + Suffix, Src + Suffix,
+                      Ind + 1);
+    line(Ind, "}");
+  } else {
+    line(Ind, Dst + " = " + Src + ";");
+  }
 }
 
 Expected<std::string> Emitter::mslType(mlir::Type T) {
@@ -2398,7 +2429,7 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
     return false;
   if (auto Ld = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
       Ld && mlir::isa<mlir::LLVM::LLVMArrayType>(Ld.getType()))
-    return true;
+    return false;
 
   if (Op->getNumResults() != 1 || !Op->getResult(0).hasOneUse())
     return false;
@@ -4313,7 +4344,8 @@ Expected<Expr> Emitter::bufferElementExpr(mlir::LLVM::ExtractValueOp EV) {
     return Expr{It->second + " == " + Cmp->Text, PrecEq};
   }
 
-  if (mlir::isa<mlir::LLVM::LLVMStructType>(EV.getContainer().getType())) {
+  if (mlir::isa<mlir::LLVM::LLVMStructType, mlir::LLVM::LLVMArrayType>(
+          EV.getContainer().getType())) {
     auto Value = exprFor(EV.getContainer(), PrecPrimary);
     auto Path = aggregateMemberPath(EV.getContainer().getType(), Pos);
     if (!Value)
@@ -4373,6 +4405,22 @@ Error Emitter::emitTemp(mlir::Operation *Op, unsigned Ind) {
   if (Op->getNumResults() != 1)
     return makeError("cannot materialize multi-result op '{0}'",
                      Op->getName().getStringRef());
+  if (auto Load = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
+      Load && mlir::isa<mlir::LLVM::LLVMArrayType>(Load.getType())) {
+    if (Load.getVolatile_())
+      return makeError("volatile LLVM array loads are unsupported");
+    auto Source = lvalueFor(Load.getAddr(), /*DecayArray=*/false);
+    auto Name = freshName();
+    auto Decl = localDeclaration(Load.getType(), Name);
+    if (!Source)
+      return Source.takeError();
+    if (!Decl)
+      return Decl.takeError();
+    line(Ind, *Decl + ";");
+    emitAggregateCopy(Load.getType(), Name, Source->Text, Ind);
+    ValueNames[Load.getResult()] = Name;
+    return Error::success();
+  }
   auto Ty = mslType(Op->getResult(0).getType());
   if (!Ty)
     return Ty.takeError();
@@ -5910,27 +5958,27 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     auto ST = mlir::dyn_cast<mlir::LLVM::LLVMStructType>(IV.getType());
     if (ST && ST.isIdentified() && ST.getName() == "dx.types.ResBind")
       return Error::success();
-    if (!ST)
-      return makeError("non-struct insertvalue is unsupported in Metal emission");
-    auto Ty = mslType(ST);
-    if (!Ty)
-      return Ty.takeError();
-    auto Path = aggregateMemberPath(ST, IV.getPosition());
+    if (!ST && !mlir::isa<mlir::LLVM::LLVMArrayType>(IV.getType()))
+      return makeError(
+          "non-aggregate insertvalue is unsupported in Metal emission");
+    auto Path = aggregateMemberPath(IV.getType(), IV.getPosition());
     if (!Path)
       return Path.takeError();
-    std::string Init = "{}";
+    std::string Name = freshName();
+    auto Decl = localDeclaration(IV.getType(), Name);
+    if (!Decl)
+      return Decl.takeError();
+    line(Ind, *Decl + " = {};");
     if (!isUndefLike(IV.getContainer())) {
       auto Base = exprFor(IV.getContainer(), PrecUnknown);
       if (!Base)
         return Base.takeError();
-      Init = Base->Text;
+      emitAggregateCopy(IV.getType(), Name, Base->Text, Ind);
     }
     auto Value = exprFor(IV.getValue(), PrecUnknown);
     if (!Value)
       return Value.takeError();
-    std::string Name = freshName();
-    line(Ind, *Ty + " " + Name + " = " + Init + ";");
-    line(Ind, Name + *Path + " = " + Value->Text + ";");
+    emitAggregateCopy(IV.getValue().getType(), Name + *Path, Value->Text, Ind);
     ValueNames[IV.getResult()] = Name;
     return Error::success();
   }
@@ -5971,7 +6019,8 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
   }
 
   if (auto Store = mlir::dyn_cast<mlir::LLVM::StoreOp>(Op)) {
-    auto LV = lvalueFor(Store.getAddr());
+    auto LV = lvalueFor(Store.getAddr(), !mlir::isa<mlir::LLVM::LLVMArrayType>(
+                                             Store.getValue().getType()));
     if (!LV)
       return LV.takeError();
     auto V = exprFor(Store.getValue(), PrecUnknown);
@@ -6052,7 +6101,7 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
                     ";");
       return Error::success();
     }
-    line(Ind, LV->Text + " = " + V->Text + ";");
+    emitAggregateCopy(Store.getValue().getType(), LV->Text, V->Text, Ind);
     return Error::success();
   }
 
