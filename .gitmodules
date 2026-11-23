@@ -2,3 +2,6 @@
 	path = third_party/llvm-project
 	url = https://github.com/farzonl/llvm-project.git
 	branch = enable_more_hlsl_exec_modes
+[submodule "third_party/spirv-headers"]
+	path = third_party/spirv-headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git

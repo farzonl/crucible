@@ -14,6 +14,8 @@
 #include "crucible/Diagnostic.h"
 #include "crucible/Dialect/CrucibleDialect.h"
 
+#include <spirv/unified1/spirv.hpp>
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -271,7 +273,7 @@ private:
         M, Ty, /*isConstant=*/false, GlobalValue::InternalLinkage,
         PoisonValue::get(Ty), Name, /*InsertBefore=*/nullptr,
         GlobalValue::NotThreadLocal, 7 /* Input */);
-    SV.Decorations.push_back({11u /* BuiltIn */, BuiltInId});
+    SV.Decorations.push_back({spv::DecorationBuiltIn, BuiltInId});
     SV.Referenced = true;
     ExtraBuiltInInputs[BuiltInId] = std::move(SV);
     return ExtraBuiltInInputs[BuiltInId].GV;
@@ -425,21 +427,21 @@ static unsigned getSPIRVImageDim(ResourceKind K) {
   switch (K) {
   case ResourceKind::Texture1D:
   case ResourceKind::Texture1DArray:
-    return 0; // Dim 1D
+    return spv::Dim1D;
   case ResourceKind::Texture2D:
   case ResourceKind::Texture2DArray:
   case ResourceKind::Texture2DMS:
   case ResourceKind::Texture2DMSArray:
-    return 1; // Dim 2D
+    return spv::Dim2D;
   case ResourceKind::Texture3D:
-    return 2; // Dim 3D
+    return spv::Dim3D;
   case ResourceKind::TextureCube:
   case ResourceKind::TextureCubeArray:
-    return 3; // Dim Cube
+    return spv::DimCube;
   case ResourceKind::TypedBuffer:
-    return 5; // Dim Buffer
+    return spv::DimBuffer;
   default:
-    return 1;
+    return spv::Dim2D;
   }
 }
 
@@ -469,7 +471,7 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
     // words so arbitrary byte offsets and mixed element types lower cleanly.
     Type *ArrTy = ArrayType::get(Type::getInt32Ty(Ctx), 0);
     return TargetExtType::get(Ctx, "spirv.VulkanBuffer", {ArrTy},
-                              {12u /* StorageBuffer */,
+                              {spv::StorageClassStorageBuffer,
                                IsWritable ? 1u : 0u});
   }
   case ResourceKind::CBuffer: {
@@ -477,7 +479,7 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
     Type *Vec4I32 = FixedVectorType::get(Type::getInt32Ty(Ctx), 4);
     Type *ArrTy = ArrayType::get(Vec4I32, NumVec4);
     return TargetExtType::get(Ctx, "spirv.VulkanBuffer", {ArrTy},
-                              {2u /* Uniform */, 0u /* NonWritable */});
+                              {spv::StorageClassUniform, 0u /* NonWritable */});
   }
   case ResourceKind::TypedBuffer:
   case ResourceKind::Texture1D:
@@ -490,10 +492,10 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
   case ResourceKind::Texture2DMSArray:
   case ResourceKind::TextureCubeArray: {
     Type *SampledTy = getComponentLLVMType(RB.ElementType);
-    unsigned Format = 0u; // Unknown
+    unsigned Format = spv::ImageFormatUnknown;
     if (IsWritable && AtomicImageBindings.contains(&RB)) {
       SampledTy = Type::getInt32Ty(Ctx);
-      Format = 33u; // R32ui (required by OpImageTexelPointer)
+      Format = spv::ImageFormatR32ui; // required by OpImageTexelPointer
     } else if (SampledTy->isHalfTy())
       SampledTy = Type::getFloatTy(Ctx);
     else if (SampledTy->isIntegerTy(16))
@@ -508,8 +510,8 @@ Type *SPIRVLowerer::getSPIRVResourceType(const ResourceBinding &RB) {
       // omits SampledCubeArray, causing checkSatisfiable() to abort on
       // OpTypeImage Dim=Cube Arrayed=1. Emit Dim=3D Arrayed=1 (unique, no extra
       // capability requirement) and patch Dim back to Cube + emit
-      // OpCapability SampledCubeArray (45) in the SPIR-V binary post-pass.
-      Dim = 2u; // Dim 3D sentinel
+      // OpCapability SampledCubeArray in the SPIR-V binary post-pass.
+      Dim = spv::Dim3D;
       UsedCubeArray = true;
     }
     unsigned MS = isMSResource(RB.Kind) ? 1u : 0u;
@@ -1769,17 +1771,17 @@ Error SPIRVLowerer::lowerAtomicBinOp(CallInst *CI) {
 
   // Image / TypedBuffer atomic via sentinel rewritten to OpImageTexelPointer +
   // OpAtomic* in the SPIR-V binary post-pass.
-  uint32_t SpvAtomicOp = 234u; // OpAtomicIAdd
+  uint32_t SpvAtomicOp = spv::OpAtomicIAdd;
   switch (static_cast<ir::AtomicOp>(OpC->getZExtValue())) {
-  case ir::AtomicOp::Add: SpvAtomicOp = 234u; break;
-  case ir::AtomicOp::And: SpvAtomicOp = 240u; break;
-  case ir::AtomicOp::Or:  SpvAtomicOp = 241u; break;
-  case ir::AtomicOp::Xor: SpvAtomicOp = 242u; break;
-  case ir::AtomicOp::SMin: SpvAtomicOp = 236u; break;
-  case ir::AtomicOp::SMax: SpvAtomicOp = 238u; break;
-  case ir::AtomicOp::UMin: SpvAtomicOp = 237u; break;
-  case ir::AtomicOp::UMax: SpvAtomicOp = 239u; break;
-  case ir::AtomicOp::Xchg: SpvAtomicOp = 229u; break;
+  case ir::AtomicOp::Add: SpvAtomicOp = spv::OpAtomicIAdd; break;
+  case ir::AtomicOp::And: SpvAtomicOp = spv::OpAtomicAnd; break;
+  case ir::AtomicOp::Or:  SpvAtomicOp = spv::OpAtomicOr; break;
+  case ir::AtomicOp::Xor: SpvAtomicOp = spv::OpAtomicXor; break;
+  case ir::AtomicOp::SMin: SpvAtomicOp = spv::OpAtomicSMin; break;
+  case ir::AtomicOp::SMax: SpvAtomicOp = spv::OpAtomicSMax; break;
+  case ir::AtomicOp::UMin: SpvAtomicOp = spv::OpAtomicUMin; break;
+  case ir::AtomicOp::UMax: SpvAtomicOp = spv::OpAtomicUMax; break;
+  case ir::AtomicOp::Xchg: SpvAtomicOp = spv::OpAtomicExchange; break;
   }
   unsigned Coords = textureCoordDims(RH.RB->Kind);
   SmallVector<Value *, 3> CoordVals;
@@ -1821,8 +1823,9 @@ Error SPIRVLowerer::lowerAtomicBinOp(CallInst *CI) {
     IRBuilder<> HB(HBB);
     HB.CreateRet(HelperFn->getArg(5));
   }
-  uint32_t Scope = 1u;   // Device
-  uint32_t Sem = 0x808u; // AcquireRelease | ImageMemory
+  uint32_t Scope = spv::ScopeDevice;
+  uint32_t Sem =
+      spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsImageMemoryMask;
   Value *Old = B.CreateCall(HelperFn, {Coord, B.getInt32(0), B.getInt32(Scope),
                                        B.getInt32(Sem), Val, KeepAlive});
   if (CI->getType()->isFloatTy())
@@ -1890,9 +1893,11 @@ Error SPIRVLowerer::lowerAtomicCompareExchange(CallInst *CI) {
       IRBuilder<> HB(HBB);
       HB.CreateRet(HelperFn->getArg(7));
     }
-    uint32_t Scope = 1u;       // Device
-    uint32_t EqSem = 0x808u;   // AcquireRelease | ImageMemory
-    uint32_t UneqSem = 0x802u; // Acquire | ImageMemory
+    uint32_t Scope = spv::ScopeDevice;
+    uint32_t EqSem = spv::MemorySemanticsAcquireReleaseMask |
+                     spv::MemorySemanticsImageMemoryMask;
+    uint32_t UneqSem =
+        spv::MemorySemanticsAcquireMask | spv::MemorySemanticsImageMemoryMask;
     Value *Old = B.CreateCall(
         HelperFn, {Coord, B.getInt32(0), B.getInt32(Scope), B.getInt32(EqSem),
                    B.getInt32(UneqSem), Val, Cmp, KeepAlive});
@@ -1918,10 +1923,10 @@ Error SPIRVLowerer::lowerAtomicCompareExchange(CallInst *CI) {
     Value *Dummy = HB.CreateAlignedLoad(I32Ty, HelperFn->getArg(0), Align(4));
     HB.CreateRet(Dummy);
   }
-  uint32_t Scope = 1u;  // Device
-  uint32_t MemSem = 0x40u; // UniformMemory
-  uint32_t EqSem = 0x8u /* AcquireRelease */ | MemSem;
-  uint32_t UneqSem = 0x2u /* Acquire */ | MemSem;
+  uint32_t Scope = spv::ScopeDevice;
+  uint32_t MemSem = spv::MemorySemanticsUniformMemoryMask;
+  uint32_t EqSem = spv::MemorySemanticsAcquireReleaseMask | MemSem;
+  uint32_t UneqSem = spv::MemorySemanticsAcquireMask | MemSem;
   Value *Old = B.CreateCall(
       HelperFn, {Ptr, B.getInt32(Scope), B.getInt32(EqSem),
                  B.getInt32(UneqSem), Val, Cmp});
@@ -2761,7 +2766,7 @@ void SPIRVLowerer::mergeHullPatchConstantFunc() {
   Function *BarFn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::spv_group_memory_barrier_with_group_sync);
   BB.CreateCall(BarFn);
-  GlobalVariable *InvGV = getOrCreateBuiltInInput(8u /* InvocationId */,
+  GlobalVariable *InvGV = getOrCreateBuiltInInput(spv::BuiltInInvocationId,
                                                   BB.getInt32Ty(),
                                                   "in_SV_OutputControlPointID");
   Value *InvId = BB.CreateLoad(BB.getInt32Ty(), InvGV);
@@ -2834,69 +2839,71 @@ void SPIRVLowerer::prepareStageInterface() {
       bool IsTessInner = false;
       switch (P.Kind) {
       case 1: // VertexID
-        BuiltIn = 42; // VertexIndex
+        BuiltIn = spv::BuiltInVertexIndex;
         break;
       case 2: // InstanceID
-        BuiltIn = 43; // InstanceIndex
+        BuiltIn = spv::BuiltInInstanceIndex;
         break;
       case 3: // Position
-        BuiltIn = (Reflect.Stage == ShaderStage::Pixel && !IsOutput) ? 15u : 0u;
+        BuiltIn = (Reflect.Stage == ShaderStage::Pixel && !IsOutput)
+                      ? spv::BuiltInFragCoord
+                      : spv::BuiltInPosition;
         break;
       case 4: // RenderTargetArrayIndex
-        BuiltIn = 9; // Layer
+        BuiltIn = spv::BuiltInLayer;
         break;
       case 5: // ViewPortArrayIndex
-        BuiltIn = 10; // ViewportIndex
+        BuiltIn = spv::BuiltInViewportIndex;
         UsedViewportIndex = true;
         if (IsOutput && (Reflect.Stage == ShaderStage::Vertex ||
                          Reflect.Stage == ShaderStage::Domain))
           UsedShaderViewportIndex = true;
         break;
       case 6: // ClipDistance
-        BuiltIn = 3;
+        BuiltIn = spv::BuiltInClipDistance;
         break;
       case 7: // CullDistance
-        BuiltIn = 4;
+        BuiltIn = spv::BuiltInCullDistance;
         break;
       case 10: // PrimitiveID
-        BuiltIn = 7;
+        BuiltIn = spv::BuiltInPrimitiveId;
         break;
       case 13: // IsFrontFace
-        BuiltIn = 17; // FrontFacing
+        BuiltIn = spv::BuiltInFrontFacing;
         IsBoolBI = true;
         break;
       case 14: // SampleIndex
-        BuiltIn = 18; // SampleId
+        BuiltIn = spv::BuiltInSampleId;
         break;
       case 15: // Coverage
-        BuiltIn = 20; // SampleMask
+        BuiltIn = spv::BuiltInSampleMask;
         break;
       case 17: // Depth
-        BuiltIn = 22; // FragDepth
+        BuiltIn = spv::BuiltInFragDepth;
         if (IsOutput)
           DepthOutputMode = 1u;
         break;
       case 18: // DepthLessEqual
-        BuiltIn = 22; // FragDepth
+        BuiltIn = spv::BuiltInFragDepth;
         if (IsOutput)
           DepthOutputMode = 3u;
         break;
       case 19: // DepthGreaterEqual
-        BuiltIn = 22; // FragDepth
+        BuiltIn = spv::BuiltInFragDepth;
         if (IsOutput)
           DepthOutputMode = 2u;
         break;
       case 20: // StencilRef
-        BuiltIn = 5014; // FragStencilRefEXT
+        BuiltIn = spv::BuiltInFragStencilRefEXT;
         if (IsOutput)
           UsedStencilExport = true;
         break;
       case 25: // TessFactor
-        BuiltIn = 11; // TessLevelOuter
+        BuiltIn = spv::BuiltInTessLevelOuter;
         IsTessOuter = true;
         break;
       case 26: // InsideTessFactor
-        BuiltIn = 12; // TessLevelInner
+        BuiltIn = spv::BuiltInTessLevelInner;
         IsTessInner = true;
         break;
       default:
@@ -2947,35 +2954,36 @@ void SPIRVLowerer::prepareStageInterface() {
       SV.GV = GV;
 
       if (BuiltIn) {
-        SV.Decorations.push_back({11u /* BuiltIn */, *BuiltIn});
+        SV.Decorations.push_back({spv::DecorationBuiltIn, *BuiltIn});
         if (Reflect.Stage == ShaderStage::Pixel && !IsOutput &&
-            (*BuiltIn == 9u /* Layer */ || *BuiltIn == 10u /* ViewportIndex */))
-          SV.Decorations.push_back({14u /* Flat */});
+            (*BuiltIn == spv::BuiltInLayer ||
+             *BuiltIn == spv::BuiltInViewportIndex))
+          SV.Decorations.push_back({spv::DecorationFlat});
       } else if (P.Kind == 16 /* Target */) {
-        SV.Decorations.push_back({30u /* Location */, P.SemanticIndex});
+        SV.Decorations.push_back({spv::DecorationLocation, P.SemanticIndex});
       } else {
-        SV.Decorations.push_back({30u /* Location */, NextLoc});
+        SV.Decorations.push_back({spv::DecorationLocation, NextLoc});
         NextLoc += Rows;
       }
       if (IsPatchConst)
-        SV.Decorations.push_back({15u /* Patch */});
+        SV.Decorations.push_back({spv::DecorationPatch});
 
       if (Reflect.Stage == ShaderStage::Pixel && !IsOutput && !BuiltIn) {
         bool IsInt = ScalarTy->isIntegerTy();
         if (IsInt || P.Interpolation == 1 /* Constant */)
-          SV.Decorations.push_back({14u /* Flat */});
+          SV.Decorations.push_back({spv::DecorationFlat});
         else if (P.Interpolation == 3 /* LinearCentroid */)
-          SV.Decorations.push_back({16u /* Centroid */});
+          SV.Decorations.push_back({spv::DecorationCentroid});
         else if (P.Interpolation == 4 /* LinearNoPerspective */)
-          SV.Decorations.push_back({13u /* NoPerspective */});
+          SV.Decorations.push_back({spv::DecorationNoPerspective});
         else if (P.Interpolation == 5 /* LinearNoPerspectiveCentroid */) {
-          SV.Decorations.push_back({13u /* NoPerspective */});
-          SV.Decorations.push_back({16u /* Centroid */});
+          SV.Decorations.push_back({spv::DecorationNoPerspective});
+          SV.Decorations.push_back({spv::DecorationCentroid});
         } else if (P.Interpolation == 6 /* LinearSample */)
-          SV.Decorations.push_back({17u /* Sample */});
+          SV.Decorations.push_back({spv::DecorationSample});
         else if (P.Interpolation == 7 /* LinearNoPerspectiveSample */) {
-          SV.Decorations.push_back({13u /* NoPerspective */});
-          SV.Decorations.push_back({17u /* Sample */});
+          SV.Decorations.push_back({spv::DecorationNoPerspective});
+          SV.Decorations.push_back({spv::DecorationSample});
         }
       }
 
@@ -3105,7 +3113,7 @@ Error SPIRVLowerer::lowerStoreOutput(CallInst *CI) {
   Indices.push_back(B.getInt32(0));
   if (SV.IsPerVertexArray) {
     GlobalVariable *InvGV = getOrCreateBuiltInInput(
-        8u /* InvocationId */, B.getInt32Ty(), "in_SV_OutputControlPointID");
+        spv::BuiltInInvocationId, B.getInt32Ty(), "in_SV_OutputControlPointID");
     Indices.push_back(B.CreateLoad(B.getInt32Ty(), InvGV));
     ElemTy = cast<ArrayType>(ElemTy)->getElementType();
   }
@@ -3427,7 +3435,7 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
       CI->replaceAllUsesWith(ConstantFP::get(CI->getType(), 0.0));
       return Error::success();
     case ir::SysValKind::PrimitiveId: {
-      GlobalVariable *GV = getOrCreateBuiltInInput(7u /* PrimitiveId */,
+      GlobalVariable *GV = getOrCreateBuiltInInput(spv::BuiltInPrimitiveId,
                                                    B.getInt32Ty(),
                                                    "in_SV_PrimitiveID");
       Value *V = B.CreateLoad(B.getInt32Ty(), GV);
@@ -3438,7 +3446,8 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
     }
     case ir::SysValKind::OutputControlPointId: {
       GlobalVariable *GV = getOrCreateBuiltInInput(
-          8u /* InvocationId */, B.getInt32Ty(), "in_SV_OutputControlPointID");
+          spv::BuiltInInvocationId, B.getInt32Ty(),
+          "in_SV_OutputControlPointID");
       Value *V = B.CreateLoad(B.getInt32Ty(), GV);
       if (V->getType() != CI->getType())
         V = B.CreateZExtOrTrunc(V, CI->getType());
@@ -3447,7 +3456,7 @@ Error SPIRVLowerer::lowerRaytracingOp(CallInst *CI, SpvOp Op) {
     }
     case ir::SysValKind::DomainLocation: {
       Type *Vec3F = FixedVectorType::get(B.getFloatTy(), 3);
-      GlobalVariable *GV = getOrCreateBuiltInInput(13u /* TessCoord */, Vec3F,
+      GlobalVariable *GV = getOrCreateBuiltInInput(spv::BuiltInTessCoord, Vec3F,
                                                    "in_SV_DomainLocation");
       Value *Coord = B.CreateLoad(Vec3F, GV);
       Value *Comp = B.CreateExtractElement(Coord, CI->getArgOperand(2));
@@ -3631,11 +3640,11 @@ void SPIRVLowerer::fixupExistingAtomics(Function &F) {
       HB.CreateRet(Dummy);
     }
     IRBuilder<> B(CX);
-    uint32_t Scope = (AS == 3) ? 2u /* Workgroup */ : 1u /* Device */;
-    uint32_t MemSem =
-        (AS == 3) ? 0x100u /* WorkgroupMemory */ : 0x40u /* UniformMemory */;
-    uint32_t EqSem = 0x8u /* AcquireRelease */ | MemSem;
-    uint32_t UneqSem = 0x2u /* Acquire */ | MemSem;
+    uint32_t Scope = (AS == 3) ? spv::ScopeWorkgroup : spv::ScopeDevice;
+    uint32_t MemSem = (AS == 3) ? spv::MemorySemanticsWorkgroupMemoryMask
+                                : spv::MemorySemanticsUniformMemoryMask;
+    uint32_t EqSem = spv::MemorySemanticsAcquireReleaseMask | MemSem;
+    uint32_t UneqSem = spv::MemorySemanticsAcquireMask | MemSem;
     Value *Old = B.CreateCall(
         HelperFn, {CX->getPointerOperand(), B.getInt32(Scope),
                    B.getInt32(EqSem), B.getInt32(UneqSem),
@@ -3811,56 +3820,58 @@ void SPIRVLowerer::configureEntryAndLinkage(StringRef StageName) {
           uint32_t InstCount =
               Reflect.Geometry ? std::max(1u, Reflect.Geometry->InstanceCount)
                                : 1u;
-          uint32_t InMode = 22u; // Triangles
+          uint32_t InMode = spv::ExecutionModeTriangles;
           if (InPrim == 1u)
-            InMode = 19u; // InputPoints
+            InMode = spv::ExecutionModeInputPoints;
           else if (InPrim == 2u)
-            InMode = 20u; // InputLines
+            InMode = spv::ExecutionModeInputLines;
           else if (InPrim == 6u)
-            InMode = 21u; // InputLinesAdjacency
+            InMode = spv::ExecutionModeInputLinesAdjacency;
           else if (InPrim == 7u)
-            InMode = 23u; // InputTrianglesAdjacency
-          uint32_t OutMode = 29u; // OutputTriangleStrip
+            InMode = spv::ExecutionModeInputTrianglesAdjacency;
+          uint32_t OutMode = spv::ExecutionModeOutputTriangleStrip;
           if (OutTopo == 1u)
-            OutMode = 27u; // OutputPoints
+            OutMode = spv::ExecutionModeOutputPoints;
           else if (OutTopo == 3u)
-            OutMode = 28u; // OutputLineStrip
+            OutMode = spv::ExecutionModeOutputLineStrip;
           addEM(InMode);
-          addEM(0u /* Invocations */, InstCount);
+          addEM(spv::ExecutionModeInvocations, InstCount);
           addEM(OutMode);
-          addEM(26u /* OutputVertices */, MaxVerts);
+          addEM(spv::ExecutionModeOutputVertices, MaxVerts);
         } else if (Reflect.Stage == ShaderStage::Hull) {
           uint32_t OutCPs =
               Reflect.Hull ? std::max(1u, Reflect.Hull->OutputControlPointCount)
                            : 3u;
-          addEM(26u /* OutputVertices */, OutCPs);
+          addEM(spv::ExecutionModeOutputVertices, OutCPs);
         } else {
           TessellationDomain Dom = Reflect.Domain
                                        ? Reflect.Domain->Domain
                                        : TessellationDomain::Triangle;
-          uint32_t DomMode = 22u; // Triangles
-          if (Dom == TessellationDomain::Quad) DomMode = 24u; // Quads
-          else if (Dom == TessellationDomain::Isoline) DomMode = 25u; // Isolines
+          uint32_t DomMode = spv::ExecutionModeTriangles;
+          if (Dom == TessellationDomain::Quad)
+            DomMode = spv::ExecutionModeQuads;
+          else if (Dom == TessellationDomain::Isoline)
+            DomMode = spv::ExecutionModeIsolines;
           addEM(DomMode);
 
-          uint32_t SpacingMode = 1u; // SpacingEqual
+          uint32_t SpacingMode = spv::ExecutionModeSpacingEqual;
           if (Opts.TessPartitioning ==
               static_cast<uint8_t>(TessellationPartitioning::FractionalEven))
-            SpacingMode = 2u;
+            SpacingMode = spv::ExecutionModeSpacingFractionalEven;
           else if (Opts.TessPartitioning ==
                    static_cast<uint8_t>(
                        TessellationPartitioning::FractionalOdd))
-            SpacingMode = 3u;
+            SpacingMode = spv::ExecutionModeSpacingFractionalOdd;
           addEM(SpacingMode);
 
-          uint32_t OrderMode = 4u; // VertexOrderCw
+          uint32_t OrderMode = spv::ExecutionModeVertexOrderCw;
           if (Opts.TessOutputPrimitive ==
               static_cast<uint8_t>(TessellationOutputPrimitive::TriangleCCW))
-            OrderMode = 5u; // VertexOrderCcw
+            OrderMode = spv::ExecutionModeVertexOrderCcw;
           addEM(OrderMode);
           if (Opts.TessOutputPrimitive ==
               static_cast<uint8_t>(TessellationOutputPrimitive::Point))
-            addEM(10u /* PointMode */);
+            addEM(spv::ExecutionModePointMode);
         }
       }
     } else if (!F.isDeclaration()) {
@@ -5142,31 +5153,24 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
-    if (Words[0] == 0x07230203u) {
-      constexpr uint16_t OpExtension = 10;
-      constexpr uint16_t OpCapability = 17;
-      constexpr uint32_t CapClipDistance = 32;
-      constexpr uint32_t CapCullDistance = 33;
-      constexpr uint32_t CapMultiViewport = 57;
-      constexpr uint32_t CapStencilExportEXT = 5013;
-      constexpr uint32_t CapShaderViewportIndex = 70;
-      constexpr uint32_t CapRuntimeDescriptorArray = 5302;
+    if (Words[0] == spv::MagicNumber) {
       bool HasClip = false, HasCull = false, HasMultiVP = false,
            HasShaderVP = false, HasStencilExp = false, HasRuntimeDescArr = false;
       size_t CapInsertPos = 5;
       for (size_t I = 5; I < NumWords;) {
-        uint32_t WC = Words[I] >> 16;
-        uint16_t Op = Words[I] & 0xFFFFu;
+        uint32_t WC = Words[I] >> spv::WordCountShift;
+        uint16_t Op = Words[I] & spv::OpCodeMask;
         if (WC == 0 || I + WC > NumWords)
           break;
-        if (Op == OpCapability && WC == 2) {
+        if (Op == spv::OpCapability && WC == 2) {
           uint32_t Cap = Words[I + 1];
-          if (Cap == CapClipDistance) HasClip = true;
-          if (Cap == CapCullDistance) HasCull = true;
-          if (Cap == CapMultiViewport) HasMultiVP = true;
-          if (Cap == CapShaderViewportIndex) HasShaderVP = true;
-          if (Cap == CapStencilExportEXT) HasStencilExp = true;
-          if (Cap == CapRuntimeDescriptorArray) HasRuntimeDescArr = true;
+          if (Cap == spv::CapabilityClipDistance) HasClip = true;
+          if (Cap == spv::CapabilityCullDistance) HasCull = true;
+          if (Cap == spv::CapabilityMultiViewport) HasMultiVP = true;
+          if (Cap == spv::CapabilityShaderViewportIndex) HasShaderVP = true;
+          if (Cap == spv::CapabilityStencilExportEXT) HasStencilExp = true;
+          if (Cap == spv::CapabilityRuntimeDescriptorArray)
+            HasRuntimeDescArr = true;
           CapInsertPos = I + WC;
         } else {
           break;
@@ -5175,25 +5179,29 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       }
       SmallVector<uint32_t, 16> ExtraCaps;
       auto pushCap = [&](uint32_t Cap) {
-        ExtraCaps.push_back((2u << 16) | OpCapability);
+        ExtraCaps.push_back((2u << spv::WordCountShift) | spv::OpCapability);
         ExtraCaps.push_back(Cap);
       };
-      if (Lowerer.usedClipDistance() && !HasClip) pushCap(CapClipDistance);
-      if (Lowerer.usedCullDistance() && !HasCull) pushCap(CapCullDistance);
-      if (Lowerer.usedViewportIndex() && !HasMultiVP) pushCap(CapMultiViewport);
+      if (Lowerer.usedClipDistance() && !HasClip)
+        pushCap(spv::CapabilityClipDistance);
+      if (Lowerer.usedCullDistance() && !HasCull)
+        pushCap(spv::CapabilityCullDistance);
+      if (Lowerer.usedViewportIndex() && !HasMultiVP)
+        pushCap(spv::CapabilityMultiViewport);
       if (Lowerer.usedShaderViewportIndex() && !HasShaderVP)
-        pushCap(CapShaderViewportIndex);
+        pushCap(spv::CapabilityShaderViewportIndex);
       if (Lowerer.usedStencilExport() && !HasStencilExp)
-        pushCap(CapStencilExportEXT);
+        pushCap(spv::CapabilityStencilExportEXT);
       if (Lowerer.usedRuntimeDescriptorArray() && !HasRuntimeDescArr)
-        pushCap(CapRuntimeDescriptorArray);
+        pushCap(spv::CapabilityRuntimeDescriptorArray);
 
       SmallVector<uint32_t, 16> ExtraExts;
       auto pushExt = [&](StringRef Name) {
         size_t StrBytes = Name.size() + 1;
         size_t StrWords = (StrBytes + 3) / 4;
         ExtraExts.push_back(
-            (static_cast<uint32_t>(1 + StrWords) << 16) | OpExtension);
+            (static_cast<uint32_t>(1 + StrWords) << spv::WordCountShift) |
+            spv::OpExtension);
         for (size_t W = 0; W < StrWords; ++W) {
           uint32_t Word = 0;
           for (size_t B = 0; B < 4; ++B) {
@@ -5226,29 +5234,26 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     uint32_t *Words = reinterpret_cast<uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
-    if (Words[0] == 0x07230203u) {
-      constexpr uint16_t OpCapability = 17;
-      constexpr uint16_t OpTypeImage = 25;
-      constexpr uint32_t CapSampledCubeArray = 45;
+    if (Words[0] == spv::MagicNumber) {
       bool HasCap = false;
       bool PatchedAny = false;
       size_t CapInsertPos = 5;
       bool InCaps = true;
       for (size_t I = 5; I < NumWords;) {
-        uint32_t WC = Words[I] >> 16;
-        uint16_t Op = Words[I] & 0xFFFFu;
+        uint32_t WC = Words[I] >> spv::WordCountShift;
+        uint16_t Op = Words[I] & spv::OpCodeMask;
         if (WC == 0 || I + WC > NumWords)
           break;
-        if (InCaps && Op == OpCapability && WC == 2) {
-          if (Words[I + 1] == CapSampledCubeArray)
+        if (InCaps && Op == spv::OpCapability && WC == 2) {
+          if (Words[I + 1] == spv::CapabilitySampledCubeArray)
             HasCap = true;
           CapInsertPos = I + WC;
         } else {
           InCaps = false;
         }
-        if (Op == OpTypeImage && WC >= 9 && Words[I + 3] == 2u /* 3D */ &&
+        if (Op == spv::OpTypeImage && WC >= 9 && Words[I + 3] == spv::Dim3D &&
             Words[I + 5] == 1u /* Arrayed */) {
-          Words[I + 3] = 3u; // Dim::Cube
+          Words[I + 3] = spv::DimCube;
           PatchedAny = true;
         }
         I += WC;
@@ -5257,8 +5262,8 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
         std::vector<uint32_t> Patched;
         Patched.reserve(NumWords + 2);
         Patched.insert(Patched.end(), Words, Words + CapInsertPos);
-        Patched.push_back((2u << 16) | OpCapability);
-        Patched.push_back(CapSampledCubeArray);
+        Patched.push_back((2u << spv::WordCountShift) | spv::OpCapability);
+        Patched.push_back(spv::CapabilitySampledCubeArray);
         Patched.insert(Patched.end(), Words + CapInsertPos, Words + NumWords);
         Result.assign(reinterpret_cast<const char *>(Patched.data()),
                       Patched.size() * 4);
@@ -5268,36 +5273,15 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
 
   // Rewrite sentinel __crucible_spv_arraylength.*, __crucible_spv_cmpxchg.*,
   // and __crucible_spv_img_{atomic,cmpxchg}.* calls into native SPIR-V
-  // OpArrayLength (68) / OpAtomicCompareExchange (230) / OpImageTexelPointer
-  // (98) + OpAtomic* and strip the stub functions.
+  // OpArrayLength / OpAtomicCompareExchange / OpImageTexelPointer + OpAtomic*
+  // and strip the stub functions.
   if (!Opts.EmitSPIRVAsm &&
       (Lowerer.usedArrayLength() || Lowerer.usedCmpXchg() ||
        Lowerer.usedImageAtomics() || Lowerer.usedGeometryStreamOps()) &&
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
-    if (Words[0] == 0x07230203u) {
-      constexpr uint16_t OpName = 5;
-      constexpr uint16_t OpTypeInt = 21;
-      constexpr uint16_t OpTypeRuntimeArray = 29;
-      constexpr uint16_t OpTypeStruct = 30;
-      constexpr uint16_t OpTypePointer = 32;
-      constexpr uint16_t OpFunction = 54;
-      constexpr uint16_t OpFunctionParameter = 55;
-      constexpr uint16_t OpFunctionEnd = 56;
-      constexpr uint16_t OpFunctionCall = 57;
-      constexpr uint16_t OpLoad = 61;
-      constexpr uint16_t OpArrayLength = 68;
-      constexpr uint16_t OpDecorate = 71;
-      constexpr uint16_t OpMemberDecorate = 72;
-      constexpr uint16_t OpCopyObject = 83;
-      constexpr uint16_t OpImageTexelPointer = 60;
-      constexpr uint16_t OpBitcast = 124;
-      constexpr uint16_t OpEmitVertex = 218;
-      constexpr uint16_t OpEndPrimitive = 219;
-      constexpr uint16_t OpAtomicCompareExchange = 230;
-      constexpr uint16_t OpLabel = 248;
-
+    if (Words[0] == spv::MagicNumber) {
       struct ImgHelperInfo {
         uint16_t SpvOp = 0;
         uint32_t Set = 0;
@@ -5318,11 +5302,11 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       DenseSet<uint32_t> DeadBitcasts;
       uint32_t UintTyId = 0;
       for (size_t I = 5; I < NumWords;) {
-        uint32_t WC = Words[I] >> 16;
-        uint16_t Op = Words[I] & 0xFFFFu;
+        uint32_t WC = Words[I] >> spv::WordCountShift;
+        uint16_t Op = Words[I] & spv::OpCodeMask;
         if (WC == 0 || I + WC > NumWords)
           break;
-        if (Op == OpName && WC >= 3) {
+        if (Op == spv::OpName && WC >= 3) {
           const char *Str = reinterpret_cast<const char *>(&Words[I + 2]);
           size_t MaxLen = (WC - 2) * 4;
           StringRef Name(Str, strnlen(Str, MaxLen));
@@ -5357,24 +5341,25 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             uint32_t SetNum = 0, BindNum = 0;
             if (Parts.size() >= 2 && !Parts[0].getAsInteger(10, SetNum) &&
                 !Parts[1].getAsInteger(10, BindNum)) {
-              ImgCmpXchgHelpersMap[Words[I + 1]] = {OpAtomicCompareExchange,
-                                                    SetNum, BindNum};
+              ImgCmpXchgHelpersMap[Words[I + 1]] = {
+                  spv::OpAtomicCompareExchange, SetNum, BindNum};
               HelperIds.insert(Words[I + 1]);
             }
           }
-        } else if ((Op == OpCopyObject || Op == OpBitcast) && WC == 4) {
+        } else if ((Op == spv::OpCopyObject || Op == spv::OpBitcast) &&
+                   WC == 4) {
           CopyOf[Words[I + 2]] = Words[I + 3];
-        } else if (Op == OpTypeInt && WC == 4 && Words[I + 2] == 32u &&
+        } else if (Op == spv::OpTypeInt && WC == 4 && Words[I + 2] == 32u &&
                    Words[I + 3] == 0u && UintTyId == 0) {
           UintTyId = Words[I + 1];
-        } else if (Op == OpTypeRuntimeArray && WC >= 3) {
+        } else if (Op == spv::OpTypeRuntimeArray && WC >= 3) {
           RuntimeArrays.insert(Words[I + 1]);
-        } else if (Op == OpDecorate && WC >= 3) {
-          if (Words[I + 2] == 2u /*Block*/)
+        } else if (Op == spv::OpDecorate && WC >= 3) {
+          if (Words[I + 2] == spv::DecorationBlock)
             BlockedStructs.insert(Words[I + 1]);
-          else if (Words[I + 2] == 33u /*Binding*/ && WC >= 4)
+          else if (Words[I + 2] == spv::DecorationBinding && WC >= 4)
             VarBinding[Words[I + 1]] = Words[I + 3];
-          else if (Words[I + 2] == 34u /*DescriptorSet*/ && WC >= 4)
+          else if (Words[I + 2] == spv::DecorationDescriptorSet && WC >= 4)
             VarSet[Words[I + 1]] = Words[I + 3];
         }
         I += WC;
@@ -5393,22 +5378,22 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
         DenseSet<uint32_t> RemovedIds = HelperIds;
         bool InHelper = false;
         for (size_t I = 5; I < NumWords;) {
-          uint32_t WC = Words[I] >> 16;
-          uint16_t Op = Words[I] & 0xFFFFu;
+          uint32_t WC = Words[I] >> spv::WordCountShift;
+          uint16_t Op = Words[I] & spv::OpCodeMask;
           if (WC == 0 || I + WC > NumWords)
             break;
           if (InHelper) {
-            if (Op == OpFunctionEnd) {
+            if (Op == spv::OpFunctionEnd) {
               InHelper = false;
-            } else if (Op == OpLabel && WC >= 2) {
+            } else if (Op == spv::OpLabel && WC >= 2) {
               RemovedIds.insert(Words[I + 1]);
-            } else if (Op == OpFunctionParameter && WC >= 3) {
+            } else if (Op == spv::OpFunctionParameter && WC >= 3) {
               RemovedIds.insert(Words[I + 2]);
             }
-          } else if (Op == OpFunction && WC >= 3 &&
+          } else if (Op == spv::OpFunction && WC >= 3 &&
                      HelperIds.contains(Words[I + 2])) {
             InHelper = true;
-          } else if (Op == OpTypeStruct && WC >= 3 &&
+          } else if (Op == spv::OpTypeStruct && WC >= 3 &&
                      !BlockedStructs.contains(Words[I + 1])) {
             for (uint32_t K = 2; K < WC; ++K) {
               if (RuntimeArrays.contains(Words[I + K])) {
@@ -5416,10 +5401,10 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
                 break;
               }
             }
-          } else if (Op == OpTypePointer && WC >= 4 &&
+          } else if (Op == spv::OpTypePointer && WC >= 4 &&
                      RemovedIds.contains(Words[I + 3])) {
             RemovedIds.insert(Words[I + 1]);
-          } else if (Op == OpFunctionCall && WC == 5 &&
+          } else if (Op == spv::OpFunctionCall && WC == 5 &&
                      ArrayLenHelperIds.contains(Words[I + 3])) {
             uint32_t Arg = Words[I + 4];
             if (CopyOf.contains(Arg))
@@ -5444,42 +5429,45 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
         bool SkippingFn = false;
         bool EmittedPtrImageUint = false;
         for (size_t I = 5; I < NumWords;) {
-          uint32_t WC = Words[I] >> 16;
-          uint16_t Op = Words[I] & 0xFFFFu;
+          uint32_t WC = Words[I] >> spv::WordCountShift;
+          uint16_t Op = Words[I] & spv::OpCodeMask;
           if (WC == 0 || I + WC > NumWords)
             break;
           if (SkippingFn) {
-            if (Op == OpFunctionEnd)
+            if (Op == spv::OpFunctionEnd)
               SkippingFn = false;
             I += WC;
             continue;
           }
-          if (Op == OpFunction && WC >= 3 && HelperIds.contains(Words[I + 2])) {
+          if (Op == spv::OpFunction && WC >= 3 &&
+              HelperIds.contains(Words[I + 2])) {
             SkippingFn = true;
             I += WC;
             continue;
           }
-          if ((Op == OpName || Op == OpDecorate || Op == OpMemberDecorate) &&
+          if ((Op == spv::OpName || Op == spv::OpDecorate ||
+               Op == spv::OpMemberDecorate) &&
               WC >= 2 && RemovedIds.contains(Words[I + 1])) {
             I += WC;
             continue;
           }
-          if ((Op == OpTypeStruct || Op == OpTypePointer) && WC >= 2 &&
-              RemovedIds.contains(Words[I + 1])) {
+          if ((Op == spv::OpTypeStruct || Op == spv::OpTypePointer) &&
+              WC >= 2 && RemovedIds.contains(Words[I + 1])) {
             I += WC;
             continue;
           }
-          if (Op == OpBitcast && WC == 4 && DeadBitcasts.contains(Words[I + 2])) {
+          if (Op == spv::OpBitcast && WC == 4 &&
+              DeadBitcasts.contains(Words[I + 2])) {
             I += WC;
             continue;
           }
-          if (Op == OpFunctionCall && WC == 5 &&
+          if (Op == spv::OpFunctionCall && WC == 5 &&
               ArrayLenHelperIds.contains(Words[I + 3])) {
             uint32_t StructPtr = Words[I + 4];
             for (auto It = CopyOf.find(StructPtr); It != CopyOf.end();
                  It = CopyOf.find(StructPtr))
               StructPtr = It->second;
-            Patched.push_back((5u << 16) | OpArrayLength);
+            Patched.push_back((5u << spv::WordCountShift) | spv::OpArrayLength);
             Patched.push_back(Words[I + 1]); // ResultType (uint)
             Patched.push_back(Words[I + 2]); // ResultId
             Patched.push_back(StructPtr);    // StructurePtr (OpVariable)
@@ -5487,9 +5475,10 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             I += WC;
             continue;
           }
-          if (Op == OpFunctionCall && WC == 10 &&
+          if (Op == spv::OpFunctionCall && WC == 10 &&
               CmpXchgHelperIds.contains(Words[I + 3])) {
-            Patched.push_back((9u << 16) | OpAtomicCompareExchange);
+            Patched.push_back((9u << spv::WordCountShift) |
+                              spv::OpAtomicCompareExchange);
             Patched.push_back(Words[I + 1]); // ResultType (uint)
             Patched.push_back(Words[I + 2]); // ResultId
             Patched.push_back(Words[I + 4]); // Pointer
@@ -5501,18 +5490,19 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             I += WC;
             continue;
           }
-          if (Op == OpFunctionCall && WC == 10 &&
+          if (Op == spv::OpFunctionCall && WC == 10 &&
               ImgAtomicHelpersMap.contains(Words[I + 3]) && NeedPtrImageUint) {
             const ImgHelperInfo &Info = ImgAtomicHelpersMap[Words[I + 3]];
             uint32_t ImgVarPtr = SetBindToVar.lookup({Info.Set, Info.Binding});
             uint32_t TexelPtrId = Bound++;
-            Patched.push_back((6u << 16) | OpImageTexelPointer);
+            Patched.push_back((6u << spv::WordCountShift) |
+                              spv::OpImageTexelPointer);
             Patched.push_back(PtrImageUintTyId);
             Patched.push_back(TexelPtrId);
             Patched.push_back(ImgVarPtr);
             Patched.push_back(Words[I + 4]); // Coordinate
             Patched.push_back(Words[I + 5]); // Sample (0)
-            Patched.push_back((7u << 16) | Info.SpvOp);
+            Patched.push_back((7u << spv::WordCountShift) | Info.SpvOp);
             Patched.push_back(Words[I + 1]); // ResultType (uint)
             Patched.push_back(Words[I + 2]); // ResultId
             Patched.push_back(TexelPtrId);   // Pointer (Image)
@@ -5522,18 +5512,20 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             I += WC;
             continue;
           }
-          if (Op == OpFunctionCall && WC == 12 &&
+          if (Op == spv::OpFunctionCall && WC == 12 &&
               ImgCmpXchgHelpersMap.contains(Words[I + 3]) && NeedPtrImageUint) {
             const ImgHelperInfo &Info = ImgCmpXchgHelpersMap[Words[I + 3]];
             uint32_t ImgVarPtr = SetBindToVar.lookup({Info.Set, Info.Binding});
             uint32_t TexelPtrId = Bound++;
-            Patched.push_back((6u << 16) | OpImageTexelPointer);
+            Patched.push_back((6u << spv::WordCountShift) |
+                              spv::OpImageTexelPointer);
             Patched.push_back(PtrImageUintTyId);
             Patched.push_back(TexelPtrId);
             Patched.push_back(ImgVarPtr);
             Patched.push_back(Words[I + 4]);  // Coordinate
             Patched.push_back(Words[I + 5]);  // Sample (0)
-            Patched.push_back((9u << 16) | OpAtomicCompareExchange);
+            Patched.push_back((9u << spv::WordCountShift) |
+                              spv::OpAtomicCompareExchange);
             Patched.push_back(Words[I + 1]);  // ResultType (uint)
             Patched.push_back(Words[I + 2]);  // ResultId
             Patched.push_back(TexelPtrId);    // Pointer (Image)
@@ -5545,26 +5537,27 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
             I += WC;
             continue;
           }
-          if (Op == OpFunctionCall && WC == 4 &&
+          if (Op == spv::OpFunctionCall && WC == 4 &&
               EmitVertexHelperIds.contains(Words[I + 3])) {
-            Patched.push_back((1u << 16) | OpEmitVertex);
+            Patched.push_back((1u << spv::WordCountShift) | spv::OpEmitVertex);
             I += WC;
             continue;
           }
-          if (Op == OpFunctionCall && WC == 4 &&
+          if (Op == spv::OpFunctionCall && WC == 4 &&
               EndPrimitiveHelperIds.contains(Words[I + 3])) {
-            Patched.push_back((1u << 16) | OpEndPrimitive);
+            Patched.push_back((1u << spv::WordCountShift) |
+                              spv::OpEndPrimitive);
             I += WC;
             continue;
           }
           for (uint32_t K = 0; K < WC; ++K)
             Patched.push_back(Words[I + K]);
-          if (NeedPtrImageUint && !EmittedPtrImageUint && Op == OpTypeInt &&
-              WC == 4 && Words[I + 1] == UintTyId) {
-            // Emit OpTypePointer %PtrImageUintTyId Image(11) %UintTyId
-            Patched.push_back((4u << 16) | OpTypePointer);
+          if (NeedPtrImageUint && !EmittedPtrImageUint &&
+              Op == spv::OpTypeInt && WC == 4 && Words[I + 1] == UintTyId) {
+            // Emit OpTypePointer %PtrImageUintTyId Image %UintTyId
+            Patched.push_back((4u << spv::WordCountShift) | spv::OpTypePointer);
             Patched.push_back(PtrImageUintTyId);
-            Patched.push_back(11u); // StorageClass::Image
+            Patched.push_back(spv::StorageClassImage);
             Patched.push_back(UintTyId);
             EmittedPtrImageUint = true;
           }
@@ -5583,16 +5576,14 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
-    if (Words[0] == 0x07230203u) {
-      constexpr uint16_t OpEntryPoint = 15;
-      constexpr uint16_t OpExecutionMode = 16;
+    if (Words[0] == spv::MagicNumber) {
       uint32_t EntryId = 0;
       for (size_t I = 5; I < NumWords;) {
-        uint32_t WC = Words[I] >> 16;
-        uint16_t Op = Words[I] & 0xFFFFu;
+        uint32_t WC = Words[I] >> spv::WordCountShift;
+        uint16_t Op = Words[I] & spv::OpCodeMask;
         if (WC == 0 || I + WC > NumWords)
           break;
-        if (Op == OpEntryPoint && WC >= 3) {
+        if (Op == spv::OpEntryPoint && WC >= 3) {
           EntryId = Words[I + 2];
           break;
         }
@@ -5605,34 +5596,36 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
           Patched.push_back(Words[I]);
         bool Inserted = false;
         for (size_t I = 5; I < NumWords;) {
-          uint32_t WC = Words[I] >> 16;
-          uint16_t Op = Words[I] & 0xFFFFu;
+          uint32_t WC = Words[I] >> spv::WordCountShift;
+          uint16_t Op = Words[I] & spv::OpCodeMask;
           if (WC == 0 || I + WC > NumWords)
             break;
           for (uint32_t K = 0; K < WC; ++K)
             Patched.push_back(Words[I + K]);
-          if (!Inserted && Op == OpExecutionMode && WC >= 2 &&
+          if (!Inserted && Op == spv::OpExecutionMode && WC >= 2 &&
               Words[I + 1] == EntryId) {
             if (Lowerer.getDepthOutputMode() != 0) {
-              // OpExecutionMode %entry DepthReplacing (12)
-              Patched.push_back((3u << 16) | OpExecutionMode);
+              Patched.push_back((3u << spv::WordCountShift) |
+                                spv::OpExecutionMode);
               Patched.push_back(EntryId);
-              Patched.push_back(12u);
+              Patched.push_back(spv::ExecutionModeDepthReplacing);
               if (Lowerer.getDepthOutputMode() == 2u) {
-                Patched.push_back((3u << 16) | OpExecutionMode);
+                Patched.push_back((3u << spv::WordCountShift) |
+                                  spv::OpExecutionMode);
                 Patched.push_back(EntryId);
-                Patched.push_back(14u); // DepthGreater
+                Patched.push_back(spv::ExecutionModeDepthGreater);
               } else if (Lowerer.getDepthOutputMode() == 3u) {
-                Patched.push_back((3u << 16) | OpExecutionMode);
+                Patched.push_back((3u << spv::WordCountShift) |
+                                  spv::OpExecutionMode);
                 Patched.push_back(EntryId);
-                Patched.push_back(15u); // DepthLess
+                Patched.push_back(spv::ExecutionModeDepthLess);
               }
             }
             if (Lowerer.usedStencilExport()) {
-              // OpExecutionMode %entry StencilRefReplacingEXT (5027)
-              Patched.push_back((3u << 16) | OpExecutionMode);
+              Patched.push_back((3u << spv::WordCountShift) |
+                                spv::OpExecutionMode);
               Patched.push_back(EntryId);
-              Patched.push_back(5027u);
+              Patched.push_back(spv::ExecutionModeStencilRefReplacingEXT);
             }
             Inserted = true;
           }
@@ -5651,21 +5644,18 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
       Result.size() >= 20 && (Result.size() % 4) == 0) {
     const uint32_t *Words = reinterpret_cast<const uint32_t *>(Result.data());
     size_t NumWords = Result.size() / 4;
-    if (Words[0] == 0x07230203u) {
-      constexpr uint16_t OpTypeInt = 21;
-      constexpr uint16_t OpConstant = 43;
-      constexpr uint16_t OpControlBarrier = 224;
+    if (Words[0] == spv::MagicNumber) {
       bool HasBarrier = false;
       uint32_t UintTyId = 0;
       for (size_t I = 5; I < NumWords;) {
-        uint32_t WC = Words[I] >> 16;
-        uint16_t Op = Words[I] & 0xFFFFu;
+        uint32_t WC = Words[I] >> spv::WordCountShift;
+        uint16_t Op = Words[I] & spv::OpCodeMask;
         if (WC == 0 || I + WC > NumWords)
           break;
-        if (Op == OpTypeInt && WC == 4 && Words[I + 2] == 32u &&
+        if (Op == spv::OpTypeInt && WC == 4 && Words[I + 2] == 32u &&
             Words[I + 3] == 0u && UintTyId == 0)
           UintTyId = Words[I + 1];
-        else if (Op == OpControlBarrier && WC == 4)
+        else if (Op == spv::OpControlBarrier && WC == 4)
           HasBarrier = true;
         I += WC;
       }
@@ -5680,30 +5670,30 @@ Expected<std::string> emitSPIRV(mlir::ModuleOp Mod, Reflection &Reflect,
           Patched.push_back(Words[I]);
         Patched[3] = Bound;
         for (size_t I = 5; I < NumWords;) {
-          uint32_t WC = Words[I] >> 16;
-          uint16_t Op = Words[I] & 0xFFFFu;
+          uint32_t WC = Words[I] >> spv::WordCountShift;
+          uint16_t Op = Words[I] & spv::OpCodeMask;
           if (WC == 0 || I + WC > NumWords)
             break;
-          if (Op == OpControlBarrier && WC == 4) {
+          if (Op == spv::OpControlBarrier && WC == 4) {
             Patched.push_back(Words[I]);
             Patched.push_back(Words[I + 1]); // Execution = Workgroup
-            Patched.push_back(InvocScopeId); // Memory = Invocation (4)
-            Patched.push_back(ZeroSemId);    // Semantics = None (0)
+            Patched.push_back(InvocScopeId); // Memory = Invocation
+            Patched.push_back(ZeroSemId);    // Semantics = None
             I += WC;
             continue;
           }
           for (uint32_t K = 0; K < WC; ++K)
             Patched.push_back(Words[I + K]);
-          if (!EmittedBarrierConsts && Op == OpTypeInt && WC == 4 &&
+          if (!EmittedBarrierConsts && Op == spv::OpTypeInt && WC == 4 &&
               Words[I + 1] == UintTyId) {
-            Patched.push_back((4u << 16) | OpConstant);
+            Patched.push_back((4u << spv::WordCountShift) | spv::OpConstant);
             Patched.push_back(UintTyId);
             Patched.push_back(InvocScopeId);
-            Patched.push_back(4u); // Scope::Invocation
-            Patched.push_back((4u << 16) | OpConstant);
+            Patched.push_back(spv::ScopeInvocation);
+            Patched.push_back((4u << spv::WordCountShift) | spv::OpConstant);
             Patched.push_back(UintTyId);
             Patched.push_back(ZeroSemId);
-            Patched.push_back(0u); // MemorySemantics::None
+            Patched.push_back(spv::MemorySemanticsMaskNone);
             EmittedBarrierConsts = true;
           }
           I += WC;

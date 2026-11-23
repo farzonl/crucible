@@ -10,6 +10,10 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Init third_party SPIRV-Headers submodule
+      shell: bash
+      run: git submodule update --init --depth 1 third_party/spirv-headers
+
     - name: Compute third_party LLVM revision
       id: submodule-rev
       shell: bash
