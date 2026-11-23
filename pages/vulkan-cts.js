@@ -28,7 +28,7 @@ if (typeof document !== "undefined") initializeCTS();
 
 async function initializeCTS() {
   const byId = id => document.getElementById(id);
-  const failureCodes = new Set(["Fail", "InternalError", "ResourceError", "Crash", "Timeout"]);
+  const failureCodes = new Set(["Fail", "InternalError", "ResourceError", "Crash", "Timeout", "CompilerError", "MetadataError"]);
   let latest, history, current, selected = "", sortField = "name", ascending = true;
   const paths = new Map();
   function theme(value) {
@@ -65,22 +65,29 @@ async function initializeCTS() {
     }
     for (const response of responses) if (!response.ok) throw new Error(`HTTP ${response.status}`);
     [latest, history] = await Promise.all(responses.map(response => response.json()));
-    if (!latest.tree || !Array.isArray(latest.tests) || !Array.isArray(history) || latest.total < 1) {
+    if (latest.measurementMode !== "crucible" || !latest.tree ||
+        !Array.isArray(latest.tests) || !Array.isArray(history) || latest.total < 1) {
       throw new Error("Invalid CTS data contract");
     }
+    const primary = latest;
     function index(node) { paths.set(node.path, node); (node.children || []).forEach(index); }
     index(latest.tree);
     byId("load-status").textContent = latest.timedOut ? "Time budget exceeded: this run is incomplete; missing results are marked NotRun." : "";
     byId("report").hidden = false;
-    for (const [label, value] of [
-      ["Pass rate", `${latest.passRate}%`], ["Selected", latest.total],
+    function renderStats() {
+      byId("stats").replaceChildren();
+      for (const [label, value] of [
+      [latest === primary ? "Crucible pass rate" : "Native reference rate", `${latest.passRate}%`], ["Selected", latest.total],
       ["Passed", latest.passed], ["Failed / errors", latest.failed],
       ["Unsupported", latest.unsupported], ["Warnings", latest.warnings], ["Unrun", latest.notRun],
+      ["Native reference", primary.reference ? `${primary.reference.passRate}%` : "Not available"],
     ]) {
       const card = document.createElement("div");
       card.append(textElement("strong", String(value)), textElement("span", label));
       byId("stats").append(card);
+      }
     }
+    renderStats();
     const metadata = byId("metadata");
     metadata.append(
       safeLink(`Commit ${latest.shortSha}`, `https://github.com/farzonl/crucible/commit/${latest.sha}`),
@@ -89,6 +96,7 @@ async function initializeCTS() {
       textElement("div", `Baseline: ${latest.baseline}`),
       safeLink(`CTS ${latest.ctsRevision}`, `https://github.com/KhronosGroup/VK-GL-CTS/commit/${latest.ctsRevision}`),
       textElement("div", `Caselist SHA-256: ${latest.caselistSha256}`),
+      textElement("div", latest.measurement),
       textElement("div", `Exit: ${latest.exitCode ?? "timeout"} | Budget: ${latest.timeoutSeconds}s`),
     );
     const invocation = document.createElement("details");
@@ -100,7 +108,7 @@ async function initializeCTS() {
       byId("status-filter").append(option);
     }
     function describe(node) {
-      if (node.code) return `${node.path}: ${node.code}. ${node.details}`;
+      if (node.code) return `${node.path}: ${node.code}${node.referenceCode ? ` (native ${node.referenceCode})` : ""}. ${node.details}`;
       return `${node.path}: ${node.passRate}% passed (${node.passed}/${node.total}), ${node.failed} failures, ${node.unsupported} unsupported, ${node.notRun} unrun`;
     }
     function selectTest(node) {
@@ -177,7 +185,11 @@ async function initializeCTS() {
         button.type = "button";
         button.onclick = () => { selected = test.name; byId("selection").textContent = `${test.name}: ${test.code}. ${test.details}`; renderTests(); };
         cell.append(button);
-        row.append(cell, textElement("td", test.code), textElement("td", test.details));
+        const compiler = test.compiler ?
+          ` Crucible shaders: ${test.compiler.compiled || 0}/${test.compiler.attempt || 0}.` : "";
+        row.append(cell, textElement("td", test.code),
+                   textElement("td", test.referenceCode || test.code),
+                   textElement("td", test.details + compiler));
         byId("test-rows").append(row);
       }
     }
@@ -214,10 +226,30 @@ async function initializeCTS() {
       initial = initial.children[0];
     }
     navigate(initial);
+    byId("measurement").disabled = !primary.reference;
+    byId("measurement").onchange = () => {
+      latest = byId("measurement").value === "reference" ?
+        { ...primary, ...primary.reference } : primary;
+      paths.clear();
+      index(latest.tree);
+      byId("status-filter").replaceChildren(textElement("option", "All statuses"));
+      byId("status-filter").firstChild.value = "";
+      const failures = textElement("option", "Failures only");
+      failures.value = "failures";
+      byId("status-filter").append(failures);
+      for (const [code, count] of Object.entries(latest.counts)) {
+        const option = textElement("option", `${code} (${count})`);
+        option.value = code;
+        byId("status-filter").append(option);
+      }
+      renderStats();
+      navigate(paths.get(current.path) || latest.tree);
+    };
     renderHistory();
     function renderHistory() {
-      const sameBaseline = history.filter(entry => entry.caselistSha256 === latest.caselistSha256 &&
-        entry.ctsRevision === latest.ctsRevision && entry.runtimeVersion === latest.runtimeVersion);
+      const sameBaseline = history.filter(entry => entry.measurementMode === "crucible" &&
+        entry.caselistSha256 === primary.caselistSha256 && entry.adapterVersion === primary.adapterVersion &&
+        entry.ctsRevision === primary.ctsRevision && entry.runtimeVersion === primary.runtimeVersion);
       const svg = byId("trend"), ns = "http://www.w3.org/2000/svg";
       function svgElement(tag, attributes, text = "") {
         const element = document.createElementNS(ns, tag);
@@ -245,6 +277,7 @@ async function initializeCTS() {
         cell.append(safeLink(entry.shortSha, `https://github.com/farzonl/crucible/commit/${entry.sha}`),
                     document.createTextNode(" / "), safeLink("run", entry.runUrl));
         row.append(cell, textElement("td", entry.timestamp), textElement("td", `${entry.passRate}%`),
+                   textElement("td", entry.reference ? `${entry.reference.passRate}%` : "Not available"),
                    textElement("td", String(entry.total)), textElement("td", `${entry.baseline} | ${entry.runtimeVersion}`));
         byId("history-rows").append(row);
       }

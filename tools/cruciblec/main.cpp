@@ -64,6 +64,17 @@ static cl::opt<std::string> EntryPoint("entry",
 static cl::opt<std::string> MSLStd("msl-std",
                                    cl::desc("MSL language standard (default metal3.1)"),
                                    cl::init("metal3.1"), cl::cat(CrucibleCat));
+static cl::opt<std::string> MSLEntryPoint(
+    "msl-entry", cl::desc("Override the emitted Metal function name"),
+    cl::cat(CrucibleCat));
+static cl::list<std::string> MSLBufferBindings(
+    "msl-buffer-binding",
+    cl::desc("Metal buffer ABI override: <space>,<register>,<index>"),
+    cl::cat(CrucibleCat));
+static cl::opt<bool> RequireMSLBufferBindings(
+    "require-msl-buffer-bindings",
+    cl::desc("Reject resources without an explicit Metal buffer ABI binding"),
+    cl::cat(CrucibleCat));
 static cl::opt<bool> FlushDenormsF32("ftz",
                                      cl::desc("Flush f32 denormals to zero around math builtins"),
                                      cl::cat(CrucibleCat));
@@ -140,6 +151,18 @@ int main(int argc, char **argv) {
   crucible::Options Opts;
   Opts.EntryPoint = EntryPoint;
   Opts.MSLStd = MSLStd;
+  Opts.MSLEntryPoint = MSLEntryPoint;
+  Opts.RequireMetalBufferBindings = RequireMSLBufferBindings;
+  for (const std::string &Binding : MSLBufferBindings) {
+    SmallVector<StringRef> Parts;
+    StringRef(Binding).split(Parts, ',');
+    crucible::MetalBufferBinding B;
+    if (Parts.size() != 3 || Parts[0].getAsInteger(10, B.Space) ||
+        Parts[1].getAsInteger(10, B.Register) ||
+        Parts[2].getAsInteger(10, B.Index))
+      return reportError("invalid --msl-buffer-binding: " + Binding);
+    Opts.MetalBufferBindings.push_back(B);
+  }
   Opts.FlushDenormsF32 = FlushDenormsF32;
   Opts.EmulateF64 = EmulateF64;
   Opts.DumpMLIR = DumpMLIR;

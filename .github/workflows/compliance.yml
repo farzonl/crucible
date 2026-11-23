@@ -11,6 +11,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      cts_only:
+        description: Run only the CTS compiler/reference validation
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -24,9 +29,10 @@ concurrency:
 jobs:
   vulkan-cts-macos:
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CTS_REVISION: 65fff6ac4d782ad42a490b007376e84159a113e3
+      MOLTENVK_REVISION: db66022459ffb663aa2b50f6b018bc2e124f5edf
     steps:
       - uses: actions/checkout@v4
       - name: Checkout pinned Vulkan CTS 1.3.9.0
@@ -38,8 +44,65 @@ jobs:
 
       - name: Install macOS Vulkan runtime and build tools
         run: |
-          brew install ninja molten-vk vulkan-loader
+          brew install ninja vulkan-loader
           python3 -m pip install --break-system-packages lxml
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
+
+      - name: Build Crucible compiler
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DCRUCIBLE_ENABLE_TESTS=OFF
+          cmake --build build --target cruciblec --parallel 3
+
+      - name: Checkout pinned MoltenVK 1.4.2
+        uses: actions/checkout@v4
+        with:
+          repository: KhronosGroup/MoltenVK
+          ref: db66022459ffb663aa2b50f6b018bc2e124f5edf
+          path: .cts/mvk
+
+      - name: Identify Xcode build environment
+        id: xcode
+        run: echo "version=$(xcodebuild -version | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore CTS-only MoltenVK runtime
+        id: mvk-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .cts/mvk/External
+            .cts/mvk/Package/Release
+          key: cts-mvk-${{ runner.os }}-${{ runner.arch }}-${{ env.MOLTENVK_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/cts_moltenvk_hook.h', 'scripts/prepare_cts_moltenvk.py') }}
+
+      - name: Build MoltenVK with fail-closed Crucible shader compiler hook
+        if: steps.mvk-cache.outputs.cache-hit != 'true'
+        run: |
+          python3 scripts/prepare_cts_moltenvk.py --source .cts/mvk
+          cd .cts/mvk
+          ./fetchDependencies --macos
+          make macos
+
+      - name: Save CTS-only MoltenVK runtime
+        if: steps.mvk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .cts/mvk/External
+            .cts/mvk/Package/Release
+          key: cts-mvk-${{ runner.os }}-${{ runner.arch }}-${{ env.MOLTENVK_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/cts_moltenvk_hook.h', 'scripts/prepare_cts_moltenvk.py') }}
+
+      - name: Verify compiler hook against the real pinned converter ABI
+        run: |
+          clang++ -std=c++17 -Wall -Wextra -Werror \
+            -I .cts/mvk/External/SPIRV-Cross \
+            -I .cts/mvk/MoltenVKShaderConverter/MoltenVKShaderConverter \
+            test/Inputs/cts_moltenvk_hook.cpp -o .cts/hook-test
+          .cts/hook-test "$GITHUB_WORKSPACE/build/tools/cruciblec/cruciblec" \
+            "$GITHUB_WORKSPACE/.cts/hook-test.trace"
 
       - name: Restore CTS build and pinned external dependencies
         id: cts-build-cache
@@ -67,26 +130,37 @@ jobs:
             .cts/build
           key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-v1
 
-      - name: Run bounded SPIR-V assembly baseline on native MoltenVK
+      - name: Run matched Crucible compiler and native reference CTS samples
         run: |
           python3 scripts/record_vulkan_cts.py select \
             --source .cts/src/external/vulkancts/mustpass/main/vk-default/spirv-assembly.txt \
-            --prefix dEQP-VK.spirv_assembly. --limit 256 \
+            --prefix dEQP-VK.spirv_assembly.instruction.compute. --limit 256 \
             --output cts-results/caselist.txt
-          export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          MVK_DIR="$GITHUB_WORKSPACE/.cts/mvk/Package/Release/MoltenVK/dynamic/dylib/macOS"
+          export VK_ICD_FILENAMES="$MVK_DIR/MoltenVK_icd.json"
           test -f "$VK_ICD_FILENAMES"
+          strings "$MVK_DIR/libMoltenVK.dylib" | grep -F "Crucible CTS:" >/dev/null
           export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
-          python3 scripts/record_vulkan_cts.py run \
+          COMMON=(python3 scripts/record_vulkan_cts.py run \
             --binary .cts/build/external/vulkancts/modules/vulkan/deqp-vk \
             --archive .cts/build/external/vulkancts/modules/vulkan \
             --library "$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib" \
-            --caselist cts-results/caselist.txt --qpa cts-results/results.qpa \
-            --metadata cts-results/metadata.json --timeout 900 \
+            --caselist cts-results/caselist.txt --timeout 900 \
             --sha "${{ github.sha }}" \
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --cts-revision "$CTS_REVISION" \
-            --runtime-version "$(brew list --versions molten-vk vulkan-loader | tr '\n' ';')" \
-            --baseline "vulkan-cts-1.3.9.0 spirv-assembly mustpass, evenly spaced 256 cases, fraction 0/1"
+            --runtime-version "MoltenVK@$MOLTENVK_REVISION;$(brew list --versions vulkan-loader);Xcode@${{ steps.xcode.outputs.version }}" \
+            --baseline "vulkan-cts-1.3.9.0 spirv-assembly compute mustpass, evenly spaced 256 cases, fraction 0/1")
+          "${COMMON[@]}" --qpa cts-results/reference.qpa \
+            --metadata cts-results/reference-metadata.json
+          "${COMMON[@]}" --compiler build/tools/cruciblec/cruciblec \
+            --qpa cts-results/results.qpa --metadata cts-results/metadata.json
+          python3 scripts/record_vulkan_cts.py record \
+            --qpa cts-results/results.qpa --caselist cts-results/caselist.txt \
+            --metadata cts-results/metadata.json \
+            --reference-qpa cts-results/reference.qpa \
+            --reference-metadata cts-results/reference-metadata.json \
+            --data-dir cts-results/data
 
       - name: Upload CTS QPA, exact caselist, and run metadata
         if: always()
@@ -97,6 +171,7 @@ jobs:
           if-no-files-found: warn
 
   compliance-dxil-to-metal:
+    if: inputs.cts_only != true
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -176,6 +251,7 @@ jobs:
           if-no-files-found: error
 
   compliance-spirv-to-metal:
+    if: inputs.cts_only != true
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -256,6 +332,7 @@ jobs:
           if-no-files-found: error
 
   compliance-dxil-to-spirv:
+    if: inputs.cts_only != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -337,7 +414,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv, compliance-spirv-to-metal, vulkan-cts-macos]
-    if: always() && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success' || needs.vulkan-cts-macos.result == 'success')
+    if: always() && github.ref == 'refs/heads/main' && inputs.cts_only != true && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success' || needs.vulkan-cts-macos.result == 'success')
     outputs:
       artifact_name: ${{ steps.set-artifact-name.outputs.artifact_name }}
     steps:
@@ -399,6 +476,8 @@ jobs:
           python3 scripts/record_vulkan_cts.py record \
             --qpa artifacts/results.qpa --caselist artifacts/caselist.txt \
             --metadata artifacts/metadata.json --data-dir _site/data \
+            --reference-qpa artifacts/reference.qpa \
+            --reference-metadata artifacts/reference-metadata.json \
             --history-cache .cts-history/history.json
 
       - name: Save historical CTS data cache

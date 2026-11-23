@@ -119,7 +119,7 @@ xychart-beta
 
 ## Building
 
-### Vulkan CTS baseline dashboard
+### Crucible Vulkan CTS compiler dashboard
 
 [Vulkan CTS dashboard](https://farzonl.github.io/crucible/vulkan-cts.html) adds a
 zoomable directory treemap: area represents selected test count, color represents
@@ -127,26 +127,44 @@ strict pass rate, and clicking/scrolling drills down to an individual test.
 Breadcrumbs, keyboard navigation, searchable/sortable results, and per-commit
 history are available in light and dark modes.
 
-The `vulkan-cts-macos` compliance job runs **native MoltenVK**, not Crucible's
-SPIR-V-to-Metal compiler. This is a platform baseline for #31, **not** evidence of
-Crucible CTS conformance or completion of #7. Routing CTS shaders through Crucible
-requires a separate Vulkan driver/compiler integration.
+The `vulkan-cts-macos` job measures **Crucible SPIR-V-to-MSL compilation and CTS
+GPU execution**, not just whether shader translation succeeds. A CTS-only
+MoltenVK build replaces each pipeline's shader source with Crucible's emitted
+MSL. MoltenVK/SPIRV-Cross still supplies runtime interface metadata and workgroup
+sizes, but its generated shader code is discarded. Compilation failures never
+fall back to native MSL. Identical cases also run through the same driver with
+the hook disabled, providing a separately labeled **native reference**, not a
+guaranteed upper bound or Crucible score.
 
 The initial baseline pins VK-GL-CTS `vulkan-cts-1.3.9.0` at
 `65fff6ac4d782ad42a490b007376e84159a113e3`. It deterministically selects at most
 256 evenly spaced, lexicographically sorted cases from
 `external/vulkancts/mustpass/main/vk-default/spirv-assembly.txt`, restricted to
-`dEQP-VK.spirv_assembly.*`. This is a bounded **sample**, not the full must-pass
-suite; it runs fraction 0/1 with a 900-second execution budget. A pinned CTS source
-also pins its fetched dependencies; Homebrew MoltenVK/loader versions and the
-exact invocation are recorded per run. macOS CI requires Xcode and a usable
-Metal-backed Vulkan adapter. The first real CI run must verify those assumptions.
+`dEQP-VK.spirv_assembly.instruction.compute.*`. This is a bounded **sample**, not
+the full must-pass suite; each track runs fraction 0/1 with a 900-second execution
+budget. The initial adapter supports direct-bound, single buffers (including
+push constants), remapping descriptor sets/bindings and the emitted entry name
+to MoltenVK's actual Metal ABI. Graphics, descriptor arrays, textures/samplers,
+specialization constants and auxiliary-buffer ABIs are not yet integrated.
+Adapter rejection is visible, rather than being hidden by native fallback.
+
+MoltenVK 1.4.2 is pinned at `db66022459ffb663aa2b50f6b018bc2e124f5edf`;
+its external dependencies and CTS dependencies are pinned by their sources.
+Loader and Xcode versions, the compiler path, adapter hash and exact invocation
+are recorded per run. Every case runs in a fresh process, with a separate
+compiler attribution trace and raw QPA. Shader compilation is limited to 30
+seconds; reaching the track budget terminates the entire process group.
 
 Local macOS reproduction (Xcode, CMake, Ninja, Python 3.10+):
 
-```sh
-brew install ninja molten-vk vulkan-loader
+```bash
+brew install ninja vulkan-loader
 python3 -m pip install lxml
+# First build Crucible using the normal build instructions below.
+git clone https://github.com/KhronosGroup/MoltenVK .cts/mvk
+git -C .cts/mvk checkout db66022459ffb663aa2b50f6b018bc2e124f5edf
+python3 scripts/prepare_cts_moltenvk.py --source .cts/mvk
+(cd .cts/mvk && ./fetchDependencies --macos && make macos)
 git clone https://github.com/KhronosGroup/VK-GL-CTS .cts/src
 git -C .cts/src checkout 65fff6ac4d782ad42a490b007376e84159a113e3
 python3 .cts/src/external/fetch_sources.py
@@ -154,37 +172,51 @@ cmake -S .cts/src -B .cts/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGE
 cmake --build .cts/build --target deqp-vk --parallel 3
 python3 scripts/record_vulkan_cts.py select \
   --source .cts/src/external/vulkancts/mustpass/main/vk-default/spirv-assembly.txt \
+  --prefix dEQP-VK.spirv_assembly.instruction.compute. \
   --limit 256 --output cts-results/caselist.txt
-export VK_ICD_FILENAMES="$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json"
+export VK_ICD_FILENAMES="$PWD/.cts/mvk/Package/Release/MoltenVK/dynamic/dylib/macOS/MoltenVK_icd.json"
 export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
-python3 scripts/record_vulkan_cts.py run \
+COMMON=(python3 scripts/record_vulkan_cts.py run \
   --binary .cts/build/external/vulkancts/modules/vulkan/deqp-vk \
   --archive .cts/build/external/vulkancts/modules/vulkan \
   --library "$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib" \
-  --caselist cts-results/caselist.txt --qpa cts-results/results.qpa \
-  --metadata cts-results/metadata.json --timeout 900 \
+  --caselist cts-results/caselist.txt --timeout 900 \
   --sha "$(git rev-parse HEAD)" --run-url https://github.com/farzonl/crucible/actions \
   --cts-revision 65fff6ac4d782ad42a490b007376e84159a113e3 \
-  --runtime-version "$(brew list --versions molten-vk vulkan-loader | tr '\n' ';')" \
-  --baseline "vulkan-cts-1.3.9.0 spirv-assembly sample 256, fraction 0/1"
+  --runtime-version "MoltenVK@db660224;$(brew list --versions vulkan-loader);$(xcodebuild -version | tr '\n' ';')" \
+  --baseline "vulkan-cts-1.3.9.0 spirv-assembly compute sample 256, fraction 0/1")
+"${COMMON[@]}" --qpa cts-results/reference.qpa --metadata cts-results/reference-metadata.json
+"${COMMON[@]}" --compiler build/tools/cruciblec/cruciblec \
+  --qpa cts-results/results.qpa --metadata cts-results/metadata.json
 python3 scripts/record_vulkan_cts.py record \
   --qpa cts-results/results.qpa --caselist cts-results/caselist.txt \
-  --metadata cts-results/metadata.json --data-dir pages/data
+  --metadata cts-results/metadata.json --data-dir pages/data \
+  --reference-qpa cts-results/reference.qpa \
+  --reference-metadata cts-results/reference-metadata.json
 ```
 
 `data/vulkan-cts/latest.json` contains run/commit/CTS/runtime metadata, status
-counts, individual `tests`, `failures`, and a recursively aggregated `tree`.
+counts, individual `tests` with compiler evidence and original CTS statuses,
+`failures`, a recursively aggregated `tree`, and a separate `reference` dataset.
 `history.json` keeps summary-only entries, replacing the same commit on rerun;
-`badge.json` is a Shields endpoint. Only `Pass` enters the numerator. Every
+`badge.json` is a Crucible-only Shields endpoint. Only a CTS `Pass` with at least
+one shader compilation, all attempted shaders successfully compiled, and no
+adapter/metadata/compiler failures enters the numerator. Every
 selected case enters the denominator: `NotSupported`, warnings, errors,
-`Pending`, and `NotRun` are kept separate. Interrupted records become
+`Pending`, and `NotRun` are kept separate. `CompilerError`, `MetadataError`,
+`AdapterUnsupported`, and `NotExercised` distinguish compiler rejection from
+adapter limitations or tests that never compile a shader. A run with no observed
+Crucible invocation cannot publish a compiler score. Interrupted records become
 `InternalError`, missing selected cases become `NotRun`, and empty/malformed QPA
 cannot publish a success score. Unselected CTS cases are never counted.
-History charts do not connect different caselist hashes, CTS revisions, or
-runtime versions. Both existing Pages publishers preserve the CTS JSON dataset.
+History charts do not connect different caselist hashes, CTS revisions, adapter
+hashes, or runtime versions. Both existing Pages publishers preserve the CTS JSON dataset.
 Build/history caches and raw QPA/caselist/metadata artifacts support reruns.
 
 Validate the recorder with `python3 -m unittest discover -s scripts -p 'test_vulkan_cts.py'`.
+For branch validation without publishing Pages, dispatch Compliance with
+`cts_only=true`. This tracking infrastructure does not complete #7 or claim full
+Vulkan conformance; remaining compiler and adapter gaps stay visible under #31.
 
 Requirements: **CMake ≥ 3.24**, **Ninja**, **LLVM + MLIR ≥ 16** (with the SPIR-V target enabled for `--target=spirv`), **`dxc`**, **`lit`**, and optionally **`spirv-val`** / **Vulkan SDK** (or MoltenVK / Mesa Lavapipe) and **Xcode CLT** (on macOS).
 

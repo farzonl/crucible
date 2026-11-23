@@ -1,6 +1,7 @@
 """Focused CTS parser, history, and Pages preservation regressions."""
 
 import io
+import argparse
 import json
 import tempfile
 import unittest
@@ -10,7 +11,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cts_data import preserve_cts_data
-from record_vulkan_cts import build_tree, parse_qpa, record, select_cases, summarize
+from record_vulkan_cts import (
+    build_tree, compiler_results, parse_qpa, record, run_cases, select_cases, summarize,
+)
+from prepare_cts_moltenvk import prepare
 import record_bench_history
 import record_offload_compliance
 
@@ -91,9 +95,12 @@ class CTSResultsTests(unittest.TestCase):
         other = data / "bench-history.json"
         other.write_text('[{"keep":true}]')
         cache = self.root / "cache.json"
-        metadata = {"sha": "abc1234", "timestamp": "2026-11-22T00:00:00Z"}
+        metadata = {"sha": "abc1234", "timestamp": "2026-11-22T00:00:00Z",
+                    "measurementMode": "crucible",
+                    "compilerEvidence": {name: {"attempt": 1, "compiled": 1}}}
         record(self.qpa, caselist, metadata, data, cache)
-        cache.write_text(json.dumps([{"sha": "older", "timestamp": "2026-11-21T00:00:00Z"}]))
+        cache.write_text(json.dumps([{"sha": "older", "timestamp": "2026-11-21T00:00:00Z",
+                                     "measurementMode": "crucible"}]))
         self.qpa.write_text(qpa_result(name, "Pass"))
         metadata["timestamp"] = "2026-11-22T01:00:00Z"
         latest = record(self.qpa, caselist, metadata, data, cache)
@@ -104,6 +111,110 @@ class CTSResultsTests(unittest.TestCase):
         self.assertNotIn("tree", history[-1])
         self.assertEqual(other.read_text(), '[{"keep":true}]')
         self.assertEqual(json.loads(cache.read_text()), history)
+
+    def test_native_pass_is_not_a_compiler_pass_without_complete_evidence(self) -> None:
+        names = [f"dEQP-VK.compute.case{i}" for i in range(6)]
+        tests = [{"name": name, "code": "Pass", "details": ""} for name in names]
+        evidence = {
+            names[0]: {"attempt": 2, "compiled": 2},
+            names[1]: {"attempt": 1, "failed": 1},
+            names[2]: {"adapter_failed": 1},
+            names[3]: {"metadata_failed": 1},
+            names[4]: {"attempt": 2, "compiled": 1},
+        }
+        result = compiler_results(tests, evidence)
+        self.assertEqual([test["code"] for test in result],
+                         ["Pass", "CompilerError", "AdapterUnsupported",
+                          "MetadataError", "NotExercised", "NotExercised"])
+        self.assertEqual(summarize(result)["passRate"], 16.67)
+        self.assertEqual([test["ctsCode"] for test in result], ["Pass"] * 6)
+        with self.assertRaises(ValueError):
+            compiler_results(tests, {"dEQP-VK.other": {}})
+
+    def test_reference_is_separate_and_must_match(self) -> None:
+        name = "dEQP-VK.compute.case"
+        caselist = self.root / "cases.txt"
+        caselist.write_text(name + "\n")
+        self.qpa.write_text(qpa_result(name, "Fail"))
+        native = self.root / "reference.qpa"
+        native.write_text(qpa_result(name, "Pass"))
+        import hashlib
+        metadata = {
+            "sha": "abc", "timestamp": "now", "measurementMode": "crucible",
+            "ctsRevision": "cts", "runtimeVersion": "mvk",
+            "compilerEvidence": {name: {"attempt": 1, "failed": 1}},
+        }
+        reference = {**metadata, "measurementMode": "reference", "timedOut": False,
+                     "caselistSha256": hashlib.sha256(caselist.read_bytes()).hexdigest()}
+        data = self.root / "data"
+        latest = record(self.qpa, caselist, metadata, data,
+                        reference_qpa=native, reference_metadata=reference)
+        self.assertEqual((latest["passRate"], latest["reference"]["passRate"]), (0, 100))
+        self.assertEqual(latest["tests"][0]["referenceCode"], "Pass")
+        self.assertEqual(latest["tree"]["passRate"], 0)
+        self.assertEqual(latest["reference"]["tree"]["passRate"], 100)
+        history = json.loads((data / "vulkan-cts/history.json").read_text())
+        self.assertNotIn("compilerEvidence", history[0])
+        self.assertNotIn("tree", history[0]["reference"])
+        self.assertNotIn("tests", history[0]["reference"])
+        reference["runtimeVersion"] = "different"
+        with self.assertRaises(ValueError):
+            record(self.qpa, caselist, metadata, data,
+                   reference_qpa=native, reference_metadata=reference)
+        with self.assertRaises(ValueError):
+            record(native, caselist, reference, data)
+
+    def test_runner_attributes_each_case_and_disables_hook_for_reference(self) -> None:
+        names = ["dEQP-VK.compute.first", "dEQP-VK.compute.second"]
+        caselist = self.root / "cases.txt"
+        caselist.write_text("\n".join(names) + "\n")
+        compiler = self.root / "cruciblec"
+        compiler.touch()
+        args = argparse.Namespace(
+            binary=compiler, archive=self.root, library=compiler, caselist=caselist,
+            qpa=self.qpa, metadata=self.root / "metadata.json", compiler=compiler,
+            timeout=10, sha="abc", run_url="https://github.com/test",
+            cts_revision="cts", runtime_version="mvk", baseline="sample",
+        )
+        environments = []
+
+        def execute(command: list[str], environment: dict[str, str], timeout: float) -> int:
+            environments.append(dict(environment))
+            options = dict(item.split("=", 1) for item in command[1:] if "=" in item)
+            name = options["--deqp-case"]
+            qpa = Path(options["--deqp-log-filename"])
+            self.assertFalse(qpa.exists())
+            qpa.write_text(qpa_result(name, "Pass"))
+            if "CRUCIBLE_CTS_TRACE" in environment:
+                Path(environment["CRUCIBLE_CTS_TRACE"]).write_text(
+                    "attempt\ncompiled\n" if name == names[0] else "attempt\nfailed\n")
+            return 0
+
+        with patch("record_vulkan_cts.execute_case", side_effect=execute):
+            metadata = run_cases(args)
+            primary = compiler_results(parse_qpa(self.qpa, names), metadata["compilerEvidence"])
+            self.assertEqual([test["code"] for test in primary], ["Pass", "CompilerError"])
+            self.assertNotEqual(environments[0]["CRUCIBLE_CTS_TRACE"],
+                                environments[1]["CRUCIBLE_CTS_TRACE"])
+            args.compiler = None
+            with patch.dict("os.environ", {"CRUCIBLE_CTS_COMPILER": "inherited",
+                                          "CRUCIBLE_CTS_TRACE": "inherited"}):
+                reference = run_cases(args)
+            self.assertEqual(reference["measurementMode"], "reference")
+            self.assertNotIn("CRUCIBLE_CTS_COMPILER", environments[-1])
+            self.assertNotIn("CRUCIBLE_CTS_TRACE", environments[-1])
+
+    def test_driver_patching_fails_if_pinned_integration_changes(self) -> None:
+        module = self.root / "MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm"
+        module.parent.mkdir(parents=True)
+        module.write_text('#include "MVKShaderModule.h"\n'
+                          'bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, '
+                          'shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);\n')
+        prepare(self.root)
+        self.assertIn("wasConverted = crucibleCTSCompile", module.read_text())
+        self.assertTrue(module.with_name("cts_moltenvk_hook.h").exists())
+        with self.assertRaises(ValueError):
+            prepare(self.root)
 
     def test_publishers_preserve_cts_and_surface_transport_errors(self) -> None:
         data = self.root / "data"

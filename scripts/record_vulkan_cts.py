@@ -4,8 +4,11 @@
 import argparse
 import hashlib
 import json
+import os
+import signal
 import shlex
 import subprocess
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
@@ -14,8 +17,11 @@ from pathlib import Path
 STATUSES = (
     "Pass", "Fail", "NotSupported", "QualityWarning", "CompatibilityWarning",
     "InternalError", "ResourceError", "Crash", "Timeout", "Pending", "NotRun",
+    "CompilerError", "MetadataError", "AdapterUnsupported", "NotExercised",
 )
-FAILURES = {"Fail", "InternalError", "ResourceError", "Crash", "Timeout"}
+FAILURES = {"Fail", "InternalError", "ResourceError", "Crash", "Timeout",
+            "CompilerError", "MetadataError"}
+TRACE_EVENTS = {"attempt", "compiled", "failed", "adapter_failed", "metadata_failed"}
 
 
 def read_cases(path: Path, active: frozenset[Path] = frozenset()) -> list[str]:
@@ -106,9 +112,9 @@ def summarize(tests: list[dict]) -> dict:
     return {
         "total": total, "passed": counts["Pass"],
         "failed": sum(counts[code] for code in FAILURES),
-        "unsupported": counts["NotSupported"],
+        "unsupported": counts["NotSupported"] + counts["AdapterUnsupported"],
         "warnings": counts["QualityWarning"] + counts["CompatibilityWarning"],
-        "notRun": counts["NotRun"] + counts["Pending"],
+        "notRun": counts["NotRun"] + counts["Pending"] + counts["NotExercised"],
         "passRate": round(100 * counts["Pass"] / total, 2) if total else None,
         "counts": {code: counts[code] for code in STATUSES},
     }
@@ -150,9 +156,60 @@ def build_tree(tests: list[dict]) -> dict:
     return root
 
 
+def compiler_results(tests: list[dict], evidence: dict) -> list[dict]:
+    unexpected = set(evidence) - {test["name"] for test in tests}
+    if unexpected:
+        raise ValueError(f"Compiler trace contains unexpected cases: {unexpected}")
+    for test in tests:
+        events = evidence.get(test["name"], {})
+        if set(events) - TRACE_EVENTS or any(
+                not isinstance(count, int) or count < 0 for count in events.values()):
+            raise ValueError(f"Invalid compiler trace for {test['name']}")
+        test.update(ctsCode=test["code"], compiler=events)
+        code = None
+        if events.get("adapter_failed"):
+            code = "AdapterUnsupported"
+        elif events.get("metadata_failed"):
+            code = "MetadataError"
+        elif events.get("failed"):
+            code = "CompilerError"
+        elif test["code"] == "Pass" and (
+                not events.get("attempt") or
+                events.get("compiled", 0) != events["attempt"]):
+            code = "NotExercised"
+        if code:
+            test["details"] = (f"{code}: CTS reported {test['ctsCode']}; "
+                               f"compiler trace {events}. {test['details']}")
+            test["code"] = code
+    return tests
+
+
 def record(qpa: Path, caselist: Path, metadata: dict, data_dir: Path,
-           cache: Path | None = None) -> dict:
-    tests = parse_qpa(qpa, read_cases(caselist))
+           cache: Path | None = None, reference_qpa: Path | None = None,
+           reference_metadata: dict | None = None) -> dict:
+    if metadata.get("measurementMode") != "crucible":
+        raise ValueError("Refusing to publish native CTS as a Crucible compiler score")
+    planned = read_cases(caselist)
+    tests = compiler_results(parse_qpa(qpa, planned), metadata["compilerEvidence"])
+    if not any(events.get("attempt") for events in metadata["compilerEvidence"].values()):
+        raise ValueError("No Crucible shader compilation was observed; refusing to publish a score")
+    caselist_hash = hashlib.sha256(caselist.read_bytes()).hexdigest()
+    reference = None
+    reference_tests = {}
+    if reference_qpa is not None:
+        if reference_metadata is None or reference_metadata.get("measurementMode") != "reference":
+            raise ValueError("Native reference metadata is required")
+        for key in ("sha", "ctsRevision", "runtimeVersion"):
+            if reference_metadata[key] != metadata[key]:
+                raise ValueError(f"Reference does not match compiler run: {key}")
+        if reference_metadata["caselistSha256"] != caselist_hash:
+            raise ValueError("Reference caselist does not match compiler run")
+        native = parse_qpa(reference_qpa, planned)
+        reference = {**summarize(native), "tree": build_tree(native), "tests": native,
+                     "timedOut": reference_metadata["timedOut"]}
+        reference_tests = {test["name"]: test for test in native}
+        for test in tests:
+            test["referenceCode"] = reference_tests[test["name"]]["code"]
     target = data_dir / "vulkan-cts"
     previous = {}
     for history_path in (target / "history.json", cache):
@@ -162,25 +219,33 @@ def record(qpa: Path, caselist: Path, metadata: dict, data_dir: Path,
         if not isinstance(history, list):
             raise ValueError("CTS history must be a JSON list")
         for old in history:
+            if old.get("measurementMode") != "crucible":
+                continue
             if (old["sha"] not in previous or
                     old["timestamp"] > previous[old["sha"]]["timestamp"]):
                 previous[old["sha"]] = old
     entry = {
-        **metadata, "schemaVersion": 1,
+        **{key: value for key, value in metadata.items() if key != "compilerEvidence"},
+        "schemaVersion": 2,
         "shortSha": metadata["sha"][:7],
-        "caselistSha256": hashlib.sha256(caselist.read_bytes()).hexdigest(),
-        "measurement": "Native MoltenVK Vulkan CTS; does not invoke Crucible",
+        "caselistSha256": caselist_hash,
+        "measurement": "CTS executes Crucible-generated MSL through MoltenVK; no native fallback",
         **summarize(tests),
     }
+    if reference:
+        entry["reference"] = {key: value for key, value in reference.items()
+                              if key not in ("tree", "tests")}
     history = [old for old in previous.values() if old["sha"] != entry["sha"]]
     history.append(entry)
     history.sort(key=lambda old: old["timestamp"])
     latest = {**entry, "tests": tests, "tree": build_tree(tests),
               "failures": [test for test in tests if test["code"] in FAILURES]}
+    if reference:
+        latest["reference"] = reference
     target.mkdir(parents=True, exist_ok=True)
     for name, value in (("history.json", history), ("latest.json", latest),
                         ("badge.json", {
-                            "schemaVersion": 1, "label": "Vulkan CTS (MoltenVK)",
+                            "schemaVersion": 1, "label": "Vulkan CTS (Crucible)",
                             "message": f"{entry['passRate']}%",
                             "color": "green" if entry["passRate"] >= 85 else "orange",
                         })):
@@ -189,6 +254,97 @@ def record(qpa: Path, caselist: Path, metadata: dict, data_dir: Path,
         cache.parent.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps(history), encoding="utf-8")
     return latest
+
+
+def execute_case(command: list[str], environment: dict[str, str], timeout: float) -> int | None:
+    # Killing the process group also terminates any in-flight compiler child.
+    with subprocess.Popen(command, env=environment, start_new_session=True) as process:
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            return None
+
+
+def run_cases(args: argparse.Namespace) -> dict:
+    planned = read_cases(args.caselist)
+    args.qpa.parent.mkdir(parents=True, exist_ok=True)
+    args.qpa.unlink(missing_ok=True)
+    environment = dict(os.environ)
+    environment.pop("CRUCIBLE_CTS_COMPILER", None)
+    environment.pop("CRUCIBLE_CTS_TRACE", None)
+    evidence = {}
+    metadata = {
+        "sha": args.sha, "runUrl": args.run_url,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "ctsRevision": args.cts_revision, "runtimeVersion": args.runtime_version,
+        "caselistSha256": hashlib.sha256(args.caselist.read_bytes()).hexdigest(),
+        "baseline": args.baseline, "platform": "macOS / MoltenVK",
+        "measurementMode": "crucible" if args.compiler else "reference",
+        "compilerEvidence": evidence, "timeoutSeconds": args.timeout,
+        "adapterVersion": hashlib.sha256(
+            Path(__file__).with_name("cts_moltenvk_hook.h").read_bytes() +
+            Path(__file__).with_name("prepare_cts_moltenvk.py").read_bytes()).hexdigest(),
+        "compiler": str(args.compiler.resolve()) if args.compiler else None,
+        "shaderTimeoutSeconds": 30,
+        "exitCode": 0, "timedOut": False,
+    }
+    if args.compiler:
+        environment["CRUCIBLE_CTS_COMPILER"] = str(args.compiler.resolve(strict=True))
+    deadline = time.monotonic() + args.timeout
+    case_dir = args.qpa.parent / ("crucible-cases" if args.compiler else "reference-cases")
+    case_dir.mkdir(exist_ok=True)
+    try:
+        for index, name in enumerate(planned):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                metadata["timedOut"] = True
+                break
+            case_qpa = case_dir / f"{index}.qpa"
+            trace = case_dir / f"{index}.trace"
+            case_qpa.unlink(missing_ok=True)
+            trace.unlink(missing_ok=True)
+            if args.compiler:
+                environment["CRUCIBLE_CTS_TRACE"] = str(trace.resolve())
+            command = [
+                str(args.binary.resolve()), f"--deqp-case={name}",
+                f"--deqp-archive-dir={args.archive.resolve()}",
+                f"--deqp-vk-library-path={args.library.resolve()}",
+                f"--deqp-log-filename={case_qpa.resolve()}",
+                "--deqp-log-images=disable", "--deqp-log-shader-sources=disable",
+            ]
+            metadata["invocation"] = shlex.join(command).replace(name, "<selected-case>")
+            exit_code = execute_case(command, environment, remaining)
+            metadata["exitCode"] = exit_code if exit_code != 0 else metadata["exitCode"]
+            if exit_code is None:
+                metadata["timedOut"] = True
+                print(f"CTS budget exceeded during {name}")
+                if not case_qpa.exists() or "#beginTestCaseResult" not in case_qpa.read_text():
+                    case_qpa.write_text(
+                        f"#beginTestCaseResult {name}\n#terminateTestCaseResult Timeout\n",
+                        encoding="utf-8")
+            if not case_qpa.exists():
+                raise RuntimeError(f"CTS produced no QPA for {name}; exit {exit_code}")
+            parsed = parse_qpa(case_qpa, [name])
+            with args.qpa.open("a", encoding="utf-8") as combined:
+                # Terminate an interrupted record before appending the next session.
+                text = case_qpa.read_text(encoding="utf-8", errors="replace")
+                combined.write(text + "\n")
+                if parsed[0]["details"] == "Incomplete QPA result: run interrupted":
+                    combined.write("#terminateTestCaseResult InternalError\n")
+            if args.compiler:
+                events = Counter(trace.read_text().splitlines()) if trace.exists() else Counter()
+                if set(events) - TRACE_EVENTS:
+                    raise ValueError(f"Unknown compiler trace events for {name}")
+                evidence[name] = dict(events)
+            if metadata["timedOut"]:
+                break
+    finally:
+        args.metadata.write_text(json.dumps(metadata), encoding="utf-8")
+    if not args.qpa.exists():
+        raise RuntimeError("CTS produced no QPA output")
+    return metadata
 
 
 def main() -> None:
@@ -201,6 +357,7 @@ def main() -> None:
     select.add_argument("--output", required=True, type=Path)
     run = commands.add_parser("run")
     run.add_argument("--binary", required=True, type=Path)
+    run.add_argument("--compiler", type=Path, help="Enable Crucible; omit only for the native reference")
     run.add_argument("--archive", required=True, type=Path)
     run.add_argument("--library", required=True, type=Path)
     run.add_argument("--caselist", required=True, type=Path)
@@ -218,6 +375,8 @@ def main() -> None:
     save.add_argument("--metadata", required=True, type=Path)
     save.add_argument("--data-dir", required=True, type=Path)
     save.add_argument("--history-cache", type=Path)
+    save.add_argument("--reference-qpa", required=True, type=Path)
+    save.add_argument("--reference-metadata", required=True, type=Path)
     args = parser.parse_args()
     if args.command == "select":
         cases = select_cases(args.source, args.prefix, args.limit)
@@ -227,38 +386,14 @@ def main() -> None:
     elif args.command == "run":
         if args.timeout < 1:
             parser.error("--timeout must be positive")
-        args.qpa.parent.mkdir(parents=True, exist_ok=True)
-        args.qpa.unlink(missing_ok=True)
-        command = [
-            str(args.binary.resolve()),
-            f"--deqp-caselist-file={args.caselist.resolve()}",
-            f"--deqp-archive-dir={args.archive.resolve()}",
-            f"--deqp-vk-library-path={args.library.resolve()}",
-            f"--deqp-log-filename={args.qpa.resolve()}",
-            "--deqp-log-images=disable", "--deqp-log-shader-sources=disable",
-        ]
-        metadata = {
-            "sha": args.sha, "runUrl": args.run_url,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "ctsRevision": args.cts_revision, "runtimeVersion": args.runtime_version,
-            "baseline": args.baseline, "platform": "macOS / MoltenVK",
-            "invocation": shlex.join(command), "timeoutSeconds": args.timeout,
-        }
-        try:
-            result = subprocess.run(command, timeout=args.timeout, check=False)
-            metadata.update(exitCode=result.returncode, timedOut=False)
-        except subprocess.TimeoutExpired:
-            print("CTS time budget exceeded; incomplete/unrun cases will be visible")
-            metadata.update(exitCode=None, timedOut=True)
-        args.metadata.write_text(json.dumps(metadata), encoding="utf-8")
-        if not args.qpa.exists():
-            raise RuntimeError("CTS produced no QPA output")
+        metadata = run_cases(args)
         if metadata["exitCode"] not in (0, None):
             print(f"CTS exited with {metadata['exitCode']}; recording actual QPA results")
     else:
         latest = record(args.qpa, args.caselist,
                         json.loads(args.metadata.read_text(encoding="utf-8")),
-                        args.data_dir, args.history_cache)
+                        args.data_dir, args.history_cache, args.reference_qpa,
+                        json.loads(args.reference_metadata.read_text(encoding="utf-8")))
         print(f"CTS: {latest['passed']}/{latest['total']} passed; "
               f"{latest['failed']} failed, {latest['notRun']} unrun")
 

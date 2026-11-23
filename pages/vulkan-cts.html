@@ -51,8 +51,11 @@
       <button id="theme" type="button">Toggle theme</button>
     </nav>
   </header>
-  <p class="notice"><strong>Native MoltenVK baseline, not Crucible compiler coverage.</strong>
-    These CTS shaders execute through MoltenVK directly. This bounded sample is not a conformance claim.
+  <p class="notice"><strong>Crucible compiler coverage, with a matched native MoltenVK reference.</strong>
+    CTS executes Crucible-generated MSL through MoltenVK, without native compiler fallback.
+    A pass requires successful Crucible compilation and a CTS <code>Pass</code>.
+    The initial adapter covers direct-binding compute; adapter limitations and tests that do not exercise the compiler are reported separately.
+    This bounded sample is not a conformance claim.
     Only <code>Pass</code> counts as passed; unsupported, warnings, errors, and unrun selected tests remain in the denominator.
     Unselected CTS tests are outside this baseline.</p>
   <p id="load-status" role="status">Loading CTS results...</p>
@@ -63,6 +66,7 @@
     </section>
     <section aria-labelledby="map-heading">
       <h2 id="map-heading">Coverage heatmap</h2>
+      <label>Measurement <select id="measurement"><option value="crucible">Crucible compiler (primary)</option><option value="reference">Native MoltenVK (reference)</option></select></label>
       <p class="muted">Area = selected test count. Color = directory pass rate.
         Click or scroll down over a tile to zoom in; scroll up or use breadcrumbs to zoom out.
         Keyboard: Tab then Enter. Select a test to inspect its result below.</p>
@@ -86,16 +90,16 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th><button id="sort-name" type="button">Test path (ascending)</button></th><th><button id="sort-status" type="button">Status</button></th><th>Details</th></tr></thead>
+          <thead><tr><th><button id="sort-name" type="button">Test path (ascending)</button></th><th><button id="sort-status" type="button">Status</button></th><th>Native reference</th><th>Details</th></tr></thead>
           <tbody id="test-rows"></tbody>
         </table>
       </div>
     </section>
     <section aria-labelledby="history-heading">
       <h2 id="history-heading">Pass-rate history</h2>
-      <p class="muted">The chart compares only runs with the latest caselist hash, CTS revision, and runtime version. All runs remain listed below.</p>
+      <p class="muted">The chart compares only Crucible runs with matching caselist hash, CTS revision, adapter version, and runtime version. The native reference is listed separately.</p>
       <svg id="trend" viewBox="0 0 1000 160" role="img" aria-label="Pass-rate history for the current baseline"></svg>
-      <div class="table-wrap"><table><thead><tr><th>Commit / run</th><th>Timestamp</th><th>Pass rate</th><th>Selected tests</th><th>Baseline</th></tr></thead><tbody id="history-rows"></tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Commit / run</th><th>Timestamp</th><th>Crucible</th><th>Native reference</th><th>Selected tests</th><th>Baseline</th></tr></thead><tbody id="history-rows"></tbody></table></div>
     </section>
   </div>
 </main>
