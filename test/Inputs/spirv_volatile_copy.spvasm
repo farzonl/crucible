@@ -1,0 +1,47 @@
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %array ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%array = OpTypeRuntimeArray %u32
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pu32 = OpTypePointer StorageBuffer %u32
+%plocal = OpTypePointer Function %u32
+%input = OpVariable %pblock StorageBuffer
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%three = OpConstant %u32 3
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%copy = OpVariable %plocal Function
+%in0 = OpAccessChain %pu32 %input %zero %zero
+%in1 = OpAccessChain %pu32 %input %zero %one
+%out0 = OpAccessChain %pu32 %output %zero %zero
+%out1 = OpAccessChain %pu32 %output %zero %one
+%out2 = OpAccessChain %pu32 %output %zero %two
+%out3 = OpAccessChain %pu32 %output %zero %three
+%before = OpLoad %u32 %out0 Volatile
+%unused = OpLoad %u32 %in1 Volatile
+OpCopyMemory %copy %in0 Volatile
+%local_value = OpLoad %u32 %copy Volatile
+%input_value = OpLoad %u32 %in0
+%sum = OpIAdd %u32 %local_value %input_value
+OpStore %out1 %sum Volatile
+OpCopyMemory %out0 %in1 None Volatile
+%twice = OpIAdd %u32 %before %before
+OpStore %out2 %twice
+OpCopyMemory %out3 %in0 Volatile None
+OpReturn
+OpFunctionEnd

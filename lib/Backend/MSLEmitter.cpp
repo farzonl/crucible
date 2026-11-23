@@ -2300,6 +2300,11 @@ Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
 //===----------------------------------------------------------------------===//
 
 static bool mayWriteMemory(mlir::Operation *Op) {
+  if (Op->hasAttr("crucible.volatile"))
+    return true;
+  if (auto Load = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
+      Load && Load.getVolatile_())
+    return true;
   if (Op->getNumRegions() > 0)
     return true; // conservative: nested control flow may contain writes
   if (mlir::isa<mlir::LLVM::StoreOp, mlir::LLVM::AtomicRMWOp,
@@ -2320,6 +2325,11 @@ static bool mayWriteMemory(mlir::Operation *Op) {
 }
 
 bool Emitter::shouldInline(mlir::Operation *Op) {
+  if (Op->hasAttr("crucible.volatile"))
+    return false;
+  if (auto Load = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
+      Load && Load.getVolatile_())
+    return false;
   if (isConstantLike(Op))
     return true;
 
@@ -2988,6 +2998,21 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return exprFor(Freeze.getOperand(), PrecUnknown);
 
   if (auto Load = mlir::dyn_cast<LoadOp>(Op)) {
+    if (Load.getVolatile_()) {
+      if (mlir::isa<mlir::VectorType>(Load.getType()))
+        return makeError("volatile LLVM vector loads are unsupported");
+      auto LV = lvalueFor(Load.getAddr());
+      auto AS = addrSpaceOf(Load.getAddr());
+      auto Ty = mslType(Load.getType());
+      if (!LV)
+        return LV.takeError();
+      if (!AS)
+        return AS.takeError();
+      if (!Ty)
+        return Ty.takeError();
+      return Expr{"*((volatile " + *AS + " " + *Ty + " *)&" + LV->Text +
+                      ")", PrecUnary};
+    }
     if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(Load.getType())) {
       std::string BaseName;
       if (auto AO = Load.getAddr().getDefiningOp<mlir::LLVM::AddressOfOp>()) {
@@ -3038,6 +3063,13 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   if (auto EE = mlir::dyn_cast<ExtractElementOp>(Op)) {
     if (auto *Prod = EE.getVector().getDefiningOp()) {
       if (auto Pos = constInt(EE.getPosition())) {
+        if (Prod->hasAttr("crucible.volatile")) {
+          auto It = ValueNames.find(EE.getVector());
+          if (It == ValueNames.end())
+            return makeError("volatile load used before materialization");
+          return Expr{It->second + "." + std::string(1, "xyzw"[*Pos & 3]),
+                      PrecPrimary};
+        }
         if (mlir::isa<ir::BufferLoadOp, ir::CBufferLoadOp,
                       ir::TexGetDimensionsOp>(Prod))
           return crucibleExtractExpr(Prod, static_cast<unsigned>(*Pos),
@@ -4178,7 +4210,10 @@ Expected<Expr> Emitter::crucibleExtractExpr(mlir::Operation *Producer,
     auto Index = bufferIndexExpr(*RS, BL.getIndex(), BL.getElementOffset(), Comp);
     if (!Index)
       return Index.takeError();
-    std::string Element = *RName + "[" + *Index + "]";
+    std::string Base = *RName;
+    if (BL->hasAttr("crucible.volatile"))
+      Base = "((volatile device " + RS->ElemType + " *)" + Base + ")";
+    std::string Element = Base + "[" + *Index + "]";
     if (Opts.BoundsCheckBuffers && R.BufferSizesMetalIndex != UINT32_MAX) {
       auto Bound = bufferBoundExpr(*RS, BL.getHandle());
       if (!Bound)
@@ -4323,6 +4358,8 @@ Error Emitter::emitBufferStore(ir::BufferStoreOp Store, unsigned Ind) {
   auto RName = resourceExpr(Store.getHandle());
   if (!RName)
     return RName.takeError();
+  if (Store->hasAttr("crucible.volatile"))
+    *RName = "((volatile device " + RS->ElemType + " *)" + *RName + ")";
   uint32_t Mask = static_cast<uint32_t>(Store.getMask());
   auto Vals = Store.getValues();
   for (unsigned Comp = 0; Comp < 4 && Comp < Vals.size(); ++Comp) {
@@ -5475,6 +5512,29 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return Error::success();
   }
 
+  if (auto BL = mlir::dyn_cast<ir::BufferLoadOp>(Op);
+      BL && BL->hasAttr("crucible.volatile")) {
+    if (BL.getStatus())
+      return makeError("volatile buffer load with residency is unsupported");
+    auto VecTy = mlir::cast<mlir::VectorType>(BL.getResult().getType());
+    auto Ty = mslType(VecTy);
+    if (!Ty)
+      return Ty.takeError();
+    std::string Name = freshName();
+    line(Ind, *Ty + " " + Name + " = " + *Ty + "(0);");
+    uint32_t Mask = BL.getMask().value_or(15);
+    for (unsigned I = 0; I < VecTy.getNumElements() && I < 4; ++I) {
+      if (!(Mask & (1u << I)))
+        continue;
+      auto E = crucibleExtractExpr(BL, I, VecTy.getElementType());
+      if (!E)
+        return E.takeError();
+      line(Ind, Name + "." + std::string(1, "xyzw"[I]) + " = " + E->Text + ";");
+    }
+    ValueNames[BL.getResult()] = Name;
+    return Error::success();
+  }
+
   if (mlir::isa<ir::BindResourceOp, ir::HeapResourceOp, ir::BufferLoadOp,
                 ir::CBufferLoadOp, ir::TexGetDimensionsOp,
                 ir::GetMeshPayloadOp>(Op))
@@ -5857,6 +5917,19 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     auto V = exprFor(Store.getValue(), PrecUnknown);
     if (!V)
       return V.takeError();
+    if (Store.getVolatile_()) {
+      auto AS = addrSpaceOf(Store.getAddr());
+      auto Ty = mslType(Store.getValue().getType());
+      if (!AS)
+        return AS.takeError();
+      if (!Ty)
+        return Ty.takeError();
+      if (mlir::isa<mlir::VectorType>(Store.getValue().getType()))
+        return makeError("volatile LLVM vector stores are unsupported");
+      line(Ind, "*((volatile " + *AS + " " + *Ty + " *)&" + LV->Text +
+                    ") = " + V->Text + ";");
+      return Error::success();
+    }
     mlir::Type PointeeTy;
     if (auto AO = Store.getAddr().getDefiningOp<mlir::LLVM::AddressOfOp>()) {
       auto Mod = Entry->getParentOfType<mlir::ModuleOp>();
@@ -6044,7 +6117,9 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
   // Pure value: inline single-use values; declare temporaries otherwise.
   if (shouldInline(Op))
     return Error::success();
-  if (Op->getNumResults() == 1 && Op->getResult(0).use_empty())
+  if (Op->getNumResults() == 1 && Op->getResult(0).use_empty() &&
+      !(mlir::isa<mlir::LLVM::LoadOp>(Op) &&
+        mlir::cast<mlir::LLVM::LoadOp>(Op).getVolatile_()))
     return Error::success(); // dead
   return emitTemp(Op, Ind);
 }

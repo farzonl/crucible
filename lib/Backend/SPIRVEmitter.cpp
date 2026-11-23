@@ -4465,6 +4465,8 @@ lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       continue;
     }
     if (auto COp = mlir::dyn_cast<ir::BufferLoadOp>(Op)) {
+      if (COp->hasAttr("crucible.volatile"))
+        return makeError("volatile buffer loads are unsupported by SPIR-V emission");
       mlir::Value ElemOff = COp.getElementOffset()
                                 ? COp.getElementOffset()
                                 : undefV(B, Loc, I32Ty);
@@ -4486,6 +4488,8 @@ lowerMLIRToSPIRVLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       continue;
     }
     if (auto COp = mlir::dyn_cast<ir::BufferStoreOp>(Op)) {
+      if (COp->hasAttr("crucible.volatile"))
+        return makeError("volatile buffer stores are unsupported by SPIR-V emission");
       mlir::Value ElemOff = COp.getElementOffset()
                                 ? COp.getElementOffset()
                                 : undefV(B, Loc, I32Ty);
