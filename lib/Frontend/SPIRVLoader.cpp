@@ -17,6 +17,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Endian.h"
 
 #include "mlir/Conversion/SPIRVToLLVM/SPIRVToLLVMPass.h"
@@ -38,6 +39,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/SPIRV/Deserialization.h"
+#include "mlir/Transforms/Passes.h"
 
 using namespace llvm;
 
@@ -53,6 +55,26 @@ bool isSPIRVBinary(MemoryBufferRef Buf) {
 }
 
 namespace {
+
+static Error preserveBufferMemoryAccess(
+    mlir::Operation *Dst, mlir::spirv::MemoryAccessAttr AccessAttr,
+    mlir::IntegerAttr Alignment) {
+  using MA = mlir::spirv::MemoryAccess;
+  auto Access = AccessAttr ? AccessAttr.getValue() : MA::None;
+  if (mlir::spirv::bitEnumContainsAny(
+          Access, ~(MA::Volatile | MA::Aligned | MA::Nontemporal)))
+    return makeError("unsupported SPIR-V buffer memory operands");
+  if (mlir::spirv::bitEnumContainsAny(Access, MA::Volatile))
+    Dst->setAttr("crucible.volatile", mlir::UnitAttr::get(Dst->getContext()));
+  if (Alignment) {
+    auto ScalarAlignment = Dst->getAttrOfType<mlir::IntegerAttr>("alignment");
+    Dst->setAttr("alignment",
+                 mlir::IntegerAttr::get(
+                     Alignment.getType(),
+                     std::min(Alignment.getInt(), ScalarAlignment.getInt())));
+  }
+  return Error::success();
+}
 
 struct BoundBufferInfo {
   size_t ReflectIndex = 0;
@@ -402,6 +424,23 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       mlir::ModuleOp::create(SpvMod->getLoc());
   TopMod->getBody()->push_back(SpvMod.release());
   auto SpvModule = *TopMod->getOps<mlir::spirv::ModuleOp>().begin();
+
+  // Shader ABI rewriting below operates on entry bodies, including helpers.
+  llvm::StringSet<> EntryNames;
+  for (auto EP : SpvModule.getOps<mlir::spirv::EntryPointOp>())
+    EntryNames.insert(EP.getFn());
+  for (auto Fn : SpvModule.getOps<mlir::spirv::FuncOp>())
+    if (!EntryNames.contains(Fn.getSymName()))
+      mlir::SymbolTable::setSymbolVisibility(
+          Fn, mlir::SymbolTable::Visibility::Private);
+  mlir::PassManager InlinePM(&Ctx);
+  // Narrow dot ops have an upstream verifier restriction removed by our
+  // lowering below. Verify the fully lowered module, not this intermediate IR.
+  InlinePM.enableVerifier(false);
+  InlinePM.addNestedPass<mlir::spirv::ModuleOp>(mlir::createInlinerPass());
+  InlinePM.addNestedPass<mlir::spirv::ModuleOp>(mlir::createSymbolDCEPass());
+  if (mlir::failed(InlinePM.run(*TopMod)))
+    return makeError("SPIR-V helper inlining failed");
 
   // 1. Extract entry point & execution mode into Reflection.
   Reflection Reflect;
@@ -839,6 +878,28 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   if (!EntryFn)
     return makeError("SPIR-V entry function '{0}' not found", Reflect.EntryName);
 
+  SmallVector<mlir::spirv::CopyMemoryOp, 8> Copies;
+  EntryFn.walk([&](mlir::spirv::CopyMemoryOp Copy) { Copies.push_back(Copy); });
+  for (auto Copy : Copies) {
+    auto Ty = mlir::cast<mlir::spirv::PointerType>(Copy.getSource().getType())
+                  .getPointeeType();
+    if (!mlir::isa<mlir::IntegerType, mlir::FloatType, mlir::VectorType>(Ty))
+      return makeError("SPIR-V buffer copy requires a scalar or vector pointee");
+    mlir::OpBuilder B(Copy);
+    auto SourceAccess = Copy.getSourceMemoryAccessAttr();
+    auto SourceAlignment = Copy.getSourceAlignmentAttr();
+    if (!SourceAccess) {
+      SourceAccess = Copy.getMemoryAccessAttr();
+      SourceAlignment = Copy.getAlignmentAttr();
+    }
+    auto Load = mlir::spirv::LoadOp::create(
+        B, Copy.getLoc(), Copy.getSource(), SourceAccess, SourceAlignment);
+    mlir::spirv::StoreOp::create(
+        B, Copy.getLoc(), Copy.getTarget(), Load.getResult(),
+        Copy.getMemoryAccessAttr(), Copy.getAlignmentAttr());
+    Copy.erase();
+  }
+
   // 2b. Fold spirv.SpecConstant + spirv.mlir.referenceof -> spirv.Constant.
   struct SpecConstInfo {
     uint32_t SpecId = 0;
@@ -1233,6 +1294,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                       ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                       ElemOff, B.getI32IntegerAttr(1),
                       B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                  if (auto E = preserveBufferMemoryAccess(
+                          LOp, Load.getMemoryAccessAttr(),
+                          Load.getAlignmentAttr()))
+                    return E;
                   auto Lane = mlir::LLVM::ExtractElementOp::create(
                       B, Loc, LOp.getResult(), ZeroC);
                   auto IdxC = mlir::LLVM::ConstantOp::create(
@@ -1266,6 +1331,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                     ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                     addByteOff(C * NextVecElemStride), B.getI32IntegerAttr(1),
                     B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                if (auto E = preserveBufferMemoryAccess(
+                        LOp, Load.getMemoryAccessAttr(),
+                        Load.getAlignmentAttr()))
+                  return E;
                 auto VC = mlir::LLVM::ExtractElementOp::create(
                     B, Loc, LOp.getResult(), ZeroC);
                 auto IdxC = mlir::LLVM::ConstantOp::create(
@@ -1280,6 +1349,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                   ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                   OffC, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
                   B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+              if (auto E = preserveBufferMemoryAccess(
+                      LoadOp, Load.getMemoryAccessAttr(),
+                      Load.getAlignmentAttr()))
+                return E;
               if (!VecTy) {
                 auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
                 ResultVal = mlir::LLVM::ExtractElementOp::create(
@@ -1337,13 +1410,17 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                       mlir::LLVM::ExtractElementOp::create(B, Loc, ColV, IdxC);
                   SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
                   Vals[0] = Lane;
-                  ir::BufferStoreOp::create(
+                  auto SOp = ir::BufferStoreOp::create(
                       B, Loc, Handle,
                       ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                       addByteOff(Col * ColStep +
                                  static_cast<uint32_t>(Row) * RowStep),
                       Vals, B.getI32IntegerAttr(1),
                       B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                  if (auto E = preserveBufferMemoryAccess(
+                          SOp, Store.getMemoryAccessAttr(),
+                          Store.getAlignmentAttr()))
+                    return E;
                 }
               }
               Store.erase();
@@ -1364,12 +1441,16 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                 SmallVector<mlir::Value, 4> Vals(4, Undef.getResult());
                 Vals[0] = mlir::LLVM::ExtractElementOp::create(B, Loc, StoreVal,
                                                                IdxC);
-                ir::BufferStoreOp::create(
+                auto SOp = ir::BufferStoreOp::create(
                     B, Loc, Handle,
                     ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                     addByteOff(C * NextVecElemStride), Vals,
                     B.getI32IntegerAttr(1),
                     B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+                if (auto E = preserveBufferMemoryAccess(
+                        SOp, Store.getMemoryAccessAttr(),
+                        Store.getAlignmentAttr()))
+                  return E;
               }
               Store.erase();
               continue;
@@ -1386,11 +1467,14 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                                                IdxC);
               }
             }
-            ir::BufferStoreOp::create(
+            auto SOp = ir::BufferStoreOp::create(
                 B, Loc, Handle,
                 ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                 OffC, Vals, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
                 B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+            if (auto E = preserveBufferMemoryAccess(
+                    SOp, Store.getMemoryAccessAttr(), Store.getAlignmentAttr()))
+              return E;
             Store.erase();
           } else {
             // Structured buffer atomics -> crucible.buffer_atomic.

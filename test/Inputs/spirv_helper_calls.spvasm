@@ -1,0 +1,47 @@
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %output
+OpExecutionMode %main LocalSize 1 1 1
+OpName %x "gl_MaxViewports"
+OpDecorate %array ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 0
+%void = OpTypeVoid
+%u32 = OpTypeInt 32 0
+%void_fn = OpTypeFunction %void
+%value_fn = OpTypeFunction %u32 %u32
+%array = OpTypeRuntimeArray %u32
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pu32 = OpTypePointer StorageBuffer %u32
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%seven = OpConstant %u32 7
+%noop = OpFunction %void None %void_fn
+%noop_entry = OpLabel
+OpReturn
+OpFunctionEnd
+%increment = OpFunction %u32 None %value_fn
+%arg = OpFunctionParameter %u32
+%increment_entry = OpLabel
+%sum = OpIAdd %u32 %arg %one
+OpReturnValue %sum
+OpFunctionEnd
+%write = OpFunction %void None %void_fn
+%write_entry = OpLabel
+%first = OpAccessChain %pu32 %output %zero %zero
+OpStore %first %seven
+OpReturn
+OpFunctionEnd
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+%ignored = OpFunctionCall %void %noop
+%effect = OpFunctionCall %void %write
+%x = OpFunctionCall %u32 %increment %seven
+%second = OpAccessChain %pu32 %output %zero %one
+OpStore %second %x
+OpReturn
+OpFunctionEnd

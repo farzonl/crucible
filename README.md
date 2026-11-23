@@ -157,6 +157,13 @@ case-by-case in [#144](https://github.com/farzonl/crucible/issues/144).
 Byte-sized Metal buffer elements retain their one-byte storage stride, including
 packed vectors and byte offsets; stores do not widen into adjacent elements.
 
+SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
+`OpCopyMemory` is expanded into typed loads and stores with separate source and
+target memory operands. Volatile Metal buffer loads are materialized in source
+order (including unused reads), and volatile scalar local accesses and buffer
+stores use volatile-qualified pointers. Aggregate copies, volatile LLVM vector
+accesses, and volatile buffer re-emission to SPIR-V remain explicitly unsupported.
+
 MoltenVK 1.4.2 is pinned at `db66022459ffb663aa2b50f6b018bc2e124f5edf`;
 its external dependencies and CTS dependencies are pinned by their sources.
 Loader and Xcode versions, the compiler path, adapter hash and exact invocation

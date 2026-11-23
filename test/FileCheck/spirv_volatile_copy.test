@@ -1,0 +1,17 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_volatile_copy.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv --dump-mlir -o %t.metal 2>&1 | FileCheck %s --check-prefix=IR
+# RUN: FileCheck %s --input-file=%t.metal
+# IR: "crucible.buffer_load"{{.*}}crucible.volatile
+# IR: llvm.store volatile
+# IR: llvm.load volatile
+# CHECK: [[LOAD:v[0-9]+]].x = ((volatile device uint *)
+# CHECK: uint [[SNAP:v[0-9]+]] = [[LOAD]].x;
+# CHECK: {{v[0-9]+}}.x = ((volatile device uint *){{.*}})[1u];
+# CHECK: {{v[0-9]+}}.x = ((volatile device uint *){{.*}})[0u];
+# CHECK: *((volatile thread uint *)&
+# CHECK: *((volatile thread uint *)&
+# CHECK: ((volatile device uint *){{.*}})[1u] =
+# CHECK: [2u] = [[SNAP]] + [[SNAP]];
+# CHECK: ((volatile device uint *){{.*}})[3u] =
