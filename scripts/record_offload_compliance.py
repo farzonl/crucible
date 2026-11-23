@@ -26,7 +26,7 @@ def category_for_test(test_name: str) -> str:
 
 def normalize_test_name(name: str) -> str:
     name = name.split("::", 1)[-1].strip().replace("\\", "/")
-    name = name.rsplit("/", 1)[-1]
+    name = name.lstrip("./")
     if name.endswith(".test"):
         name = name[:-5]
     return name
@@ -214,7 +214,14 @@ def parse_xunit_tests(xml_text: str) -> list:
     root = ET.fromstring(xml_text)
     tests = []
     for testcase in root.iter("testcase"):
-        name = normalize_test_name(testcase.get("name", ""))
+        raw_name = testcase.get("name", "")
+        classname = testcase.get("classname", "")
+        if "/" not in raw_name and "\\" not in raw_name and classname:
+            # llvm-lit xUnit sets classname like "OffloadTest-d3d12.Feature/HLSLLib" or "OffloadTest-d3d12.WaveOps"
+            rel_dir = classname.split(".", 1)[-1] if "." in classname else ""
+            if rel_dir:
+                raw_name = f"{rel_dir}/{raw_name}"
+        name = normalize_test_name(raw_name)
         if not name:
             continue
         if testcase.find("failure") is not None:
@@ -225,6 +232,24 @@ def parse_xunit_tests(xml_text: str) -> list:
             status = "pass"
         tests.append({"name": name, "status": status})
     return sorted(tests, key=lambda test: test["name"])
+
+
+def summarize_external_tests(tests: list) -> dict:
+    total = len(tests)
+    passed = sum(1 for t in tests if t.get("status") == "pass")
+    failed = sum(1 for t in tests if t.get("status") == "fail")
+    xfail = sum(1 for t in tests if t.get("status") == "xfail")
+    unsupported = sum(1 for t in tests if t.get("status") == "unsupported")
+    pass_rate = round((100.0 * passed / total), 2) if total > 0 else 0.0
+    return {
+        "total": total,
+        "executed": passed + failed + xfail,
+        "passed": passed,
+        "failed": failed,
+        "xfail": xfail,
+        "unsupported": unsupported,
+        "passRate": pass_rate,
+    }
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -314,10 +339,6 @@ def fetch_external_comparisons() -> dict:
             )
             artifact_data = github_api_json(artifacts_url)
             if artifact_data:
-                token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-                headers = {"User-Agent": "Crucible-Compliance-CI"}
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
                 for artifact in artifact_data.get("artifacts", []):
                     name = artifact.get("name", "")
                     if artifact.get("expired") or not name.startswith("test-results-"):
@@ -359,7 +380,7 @@ def fetch_external_comparisons() -> dict:
             "runId": run_id,
             "runUrl": run.get("html_url", ""),
             "updatedAt": run.get("updated_at", ""),
-            "results": {},
+            "results": summarize_external_tests(tests) if tests else {},
             "tests": tests,
         })
     return comparisons
@@ -463,8 +484,6 @@ def main() -> None:
                 "passRate": summary["passRate"],
                 "elapsed": summary["elapsed"],
                 "categories": summary["categories"],
-                "failures": summary["failures"],
-                "tests": summary["tests"],
             }
             history = [h for h in history if h.get("sha") != args.sha]
             history.append(entry)
