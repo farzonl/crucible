@@ -1,0 +1,8 @@
+# REQUIRES: gpu, spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_modf_struct.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 1,1,1 --groups 1,1,1 --buffer 0:f32:4:-1.5,2.75,-3,0 --buffer 1:f32:12:zero | FileCheck %s --check-prefix=FINITE
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 1,1,1 --groups 1,1,1 --buffer 0:f32:4:0x80000000,0x7f800000,0xff800000,0 --buffer 1:u32:12:zero | FileCheck %s --check-prefix=SPECIAL
+# FINITE: buffer1: -0.5 0.75 -0 0 -1 2 -3 0 -0.5 -1 0.75 2
+# SPECIAL: buffer1: 2147483648 0 2147483648 0 2147483648 2139095040 4286578688 0 2147483648 2147483648 0 2139095040

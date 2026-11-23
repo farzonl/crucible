@@ -1,0 +1,9 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_modf_struct.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# CHECK: kernel void main0(
+# CHECK-DAG: trunc(
+# CHECK-DAG: fmod(
+# CHECK-DAG: HUGE_VALF

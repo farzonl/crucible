@@ -183,6 +183,10 @@ value before updating the selected member. Array loads preserve value snapshots,
 and whole-array stores copy elements rather than aliasing local storage.
 Nested extraction follows typed struct/array member paths and separates vector
 lane indexing from aggregate indexing.
+GLSL `ModfStruct` is normalized before SPIR-V deserialization into truncation,
+remainder by one and an explicit signed-zero infinity case. Scalar/vector
+fractional and whole-number results retain the input sign, including negative
+zero and negative integral inputs.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

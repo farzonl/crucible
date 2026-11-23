@@ -1,0 +1,100 @@
+OpCapability Shader
+OpCapability Float16
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %input %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %array ArrayStride 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%half = OpTypeFloat 16
+%uint = OpTypeInt 32 0
+%v4float = OpTypeVector %float 4
+%v4half = OpTypeVector %half 4
+%pair = OpTypeStruct %v4float %v4float
+%half_pair = OpTypeStruct %v4half %v4half
+%scalar_pair = OpTypeStruct %float %float
+%array = OpTypeRuntimeArray %float
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pfloat = OpTypePointer StorageBuffer %float
+%input = OpVariable %pblock StorageBuffer
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%three = OpConstant %uint 3
+%four = OpConstant %uint 4
+%five = OpConstant %uint 5
+%six = OpConstant %uint 6
+%seven = OpConstant %uint 7
+%eight = OpConstant %uint 8
+%nine = OpConstant %uint 9
+%ten = OpConstant %uint 10
+%eleven = OpConstant %uint 11
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%in0 = OpAccessChain %pfloat %input %zero %zero
+%in1 = OpAccessChain %pfloat %input %zero %one
+%in2 = OpAccessChain %pfloat %input %zero %two
+%in3 = OpAccessChain %pfloat %input %zero %three
+%a = OpLoad %float %in0
+%b = OpLoad %float %in1
+%c = OpLoad %float %in2
+%d = OpLoad %float %in3
+%v = OpCompositeConstruct %v4float %a %b %c %d
+%result = OpExtInst %pair %glsl ModfStruct %v
+%fraction = OpCompositeExtract %v4float %result 0
+%whole = OpCompositeExtract %v4float %result 1
+%f0 = OpCompositeExtract %float %fraction 0
+%f1 = OpCompositeExtract %float %fraction 1
+%f2 = OpCompositeExtract %float %fraction 2
+%f3 = OpCompositeExtract %float %fraction 3
+%w0 = OpCompositeExtract %float %whole 0
+%w1 = OpCompositeExtract %float %whole 1
+%w2 = OpCompositeExtract %float %whole 2
+%w3 = OpCompositeExtract %float %whole 3
+%h = OpFConvert %v4half %v
+%hr = OpExtInst %half_pair %glsl ModfStruct %h
+%hf = OpCompositeExtract %v4half %hr 0
+%hw = OpCompositeExtract %v4half %hr 1
+%hf0 = OpCompositeExtract %half %hf 0
+%hw0 = OpCompositeExtract %half %hw 0
+%fhf0 = OpFConvert %float %hf0
+%fhw0 = OpFConvert %float %hw0
+%sr = OpExtInst %scalar_pair %glsl ModfStruct %b
+%sf = OpCompositeExtract %float %sr 0
+%sw = OpCompositeExtract %float %sr 1
+%out0 = OpAccessChain %pfloat %output %zero %zero
+%out1 = OpAccessChain %pfloat %output %zero %one
+%out2 = OpAccessChain %pfloat %output %zero %two
+%out3 = OpAccessChain %pfloat %output %zero %three
+%out4 = OpAccessChain %pfloat %output %zero %four
+%out5 = OpAccessChain %pfloat %output %zero %five
+%out6 = OpAccessChain %pfloat %output %zero %six
+%out7 = OpAccessChain %pfloat %output %zero %seven
+%out8 = OpAccessChain %pfloat %output %zero %eight
+%out9 = OpAccessChain %pfloat %output %zero %nine
+%out10 = OpAccessChain %pfloat %output %zero %ten
+%out11 = OpAccessChain %pfloat %output %zero %eleven
+OpStore %out0 %f0
+OpStore %out1 %f1
+OpStore %out2 %f2
+OpStore %out3 %f3
+OpStore %out4 %w0
+OpStore %out5 %w1
+OpStore %out6 %w2
+OpStore %out7 %w3
+OpStore %out8 %fhf0
+OpStore %out9 %fhw0
+OpStore %out10 %sf
+OpStore %out11 %sw
+OpReturn
+OpFunctionEnd
