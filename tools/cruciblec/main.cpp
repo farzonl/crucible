@@ -73,7 +73,15 @@ static cl::list<std::string> MSLBufferBindings(
     cl::cat(CrucibleCat));
 static cl::opt<bool> RequireMSLBufferBindings(
     "require-msl-buffer-bindings",
-    cl::desc("Reject resources without an explicit Metal buffer ABI binding"),
+    cl::desc("Reject resources without an explicit Metal ABI binding in their namespace"),
+    cl::cat(CrucibleCat));
+static cl::list<std::string> MSLTextureBindings(
+    "msl-texture-binding",
+    cl::desc("Metal texture ABI override: <space>,<register>,<index>"),
+    cl::cat(CrucibleCat));
+static cl::list<std::string> MSLSamplerBindings(
+    "msl-sampler-binding",
+    cl::desc("Metal sampler ABI override: <space>,<register>,<index>"),
     cl::cat(CrucibleCat));
 static cl::opt<bool> FlushDenormsF32("ftz",
                                      cl::desc("Flush f32 denormals to zero around math builtins"),
@@ -153,16 +161,31 @@ int main(int argc, char **argv) {
   Opts.MSLStd = MSLStd;
   Opts.MSLEntryPoint = MSLEntryPoint;
   Opts.RequireMetalBufferBindings = RequireMSLBufferBindings;
-  for (const std::string &Binding : MSLBufferBindings) {
-    SmallVector<StringRef> Parts;
-    StringRef(Binding).split(Parts, ',');
-    crucible::MetalBufferBinding B;
-    if (Parts.size() != 3 || Parts[0].getAsInteger(10, B.Space) ||
-        Parts[1].getAsInteger(10, B.Register) ||
-        Parts[2].getAsInteger(10, B.Index))
-      return reportError("invalid --msl-buffer-binding: " + Binding);
-    Opts.MetalBufferBindings.push_back(B);
-  }
+  auto ParseMetalBindings = [&](const cl::list<std::string> &List,
+                                std::vector<crucible::MetalResourceBinding> &Out,
+                                StringRef Flag) -> Error {
+    for (const std::string &Binding : List) {
+      SmallVector<StringRef> Parts;
+      StringRef(Binding).split(Parts, ',');
+      crucible::MetalResourceBinding B;
+      if (Parts.size() != 3 || Parts[0].getAsInteger(10, B.Space) ||
+          Parts[1].getAsInteger(10, B.Register) ||
+          Parts[2].getAsInteger(10, B.Index))
+        return createStringError(inconvertibleErrorCode(),
+                                 "invalid " + Flag + ": " + Binding);
+      Out.push_back(B);
+    }
+    return Error::success();
+  };
+  if (Error E = ParseMetalBindings(MSLBufferBindings, Opts.MetalBufferBindings,
+                                  "--msl-buffer-binding"))
+    return reportError(toString(std::move(E)));
+  if (Error E = ParseMetalBindings(MSLTextureBindings, Opts.MetalTextureBindings,
+                                  "--msl-texture-binding"))
+    return reportError(toString(std::move(E)));
+  if (Error E = ParseMetalBindings(MSLSamplerBindings, Opts.MetalSamplerBindings,
+                                  "--msl-sampler-binding"))
+    return reportError(toString(std::move(E)));
   Opts.FlushDenormsF32 = FlushDenormsF32;
   Opts.EmulateF64 = EmulateF64;
   Opts.DumpMLIR = DumpMLIR;

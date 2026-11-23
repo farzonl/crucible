@@ -10,7 +10,7 @@ MSLResourceBinding::MSLResourceBinding() {}
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 3); // cruciblec, trace path
+    assert(argc == 4); // cruciblec, trace path, image SPIR-V
     // Valid SPIR-V 1.3: main writes 1.0 to storage buffer set 0, binding 0.
     std::vector<uint32_t> spirv = {
         0x07230203, 0x00010300, 0, 15, 0,
@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
     assert(result.msl.find("kernel void cts_main(") != std::string::npos);
     assert(result.msl.find("[[buffer(7)]]") != std::string::npos);
     assert(result.msl.find("native sentinel") == std::string::npos);
-    config.resourceBindings[0].resourceBinding.basetype = SPIRV_CROSS_NAMESPACE::SPIRType::Image;
+    config.resourceBindings[0].resourceBinding.basetype = SPIRV_CROSS_NAMESPACE::SPIRType::AccelerationStructure;
     result.msl = "native sentinel";
     assert(!crucibleCTSCompile(spirv, config, result));
     assert(result.msl.empty());
@@ -73,6 +73,39 @@ int main(int argc, char **argv) {
     assert(!crucibleCTSCompile(spirv, config, result));
     assert(result.msl.empty());
     config.resourceBindings[0].resourceBinding.count = 1;
+    {
+        std::ifstream stream(argv[3], std::ios::binary | std::ios::ate);
+        assert(stream);
+        auto bytes = stream.tellg();
+        assert(bytes > 0 && bytes % sizeof(uint32_t) == 0);
+        std::vector<uint32_t> imageSpirv(bytes / sizeof(uint32_t));
+        stream.seekg(0);
+        stream.read(reinterpret_cast<char *>(imageSpirv.data()), bytes);
+        assert(stream);
+        auto imageConfig = config;
+        imageConfig.resourceBindings.clear();
+        using Base = SPIRV_CROSS_NAMESPACE::SPIRType;
+        for (uint32_t binding = 0; binding < 5; ++binding) {
+            auto imageResource = resource;
+            auto& b = imageResource.resourceBinding;
+            b.binding = binding;
+            b.count = 1;
+            b.basetype = binding == 0 ? Base::SampledImage :
+                         binding == 1 || binding == 3 ? Base::Image :
+                         binding == 2 ? Base::Sampler : Base::Struct;
+            b.msl_texture = binding == 0 ? 5 : binding == 1 ? 6 : 7;
+            b.msl_sampler = binding == 0 ? 3 : 4;
+            b.msl_buffer = 7;
+            imageConfig.resourceBindings.push_back(imageResource);
+        }
+        assert(crucibleCTSCompile(imageSpirv, imageConfig, result));
+        for (auto attribute : {"texture(5)", "texture(6)", "texture(7)",
+                               "sampler(3)", "sampler(4)", "buffer(7)"})
+            assert(result.msl.find(attribute) != std::string::npos);
+        imageConfig.resourceBindings[0].requiresConstExprSampler = true;
+        assert(!crucibleCTSCompile(imageSpirv, imageConfig, result));
+        assert(result.msl.empty());
+    }
     result.msl = "native sentinel";
     setenv("CRUCIBLE_CTS_COMPILER", "/bin/false", 1);
     assert(!crucibleCTSCompile(spirv, config, result));
