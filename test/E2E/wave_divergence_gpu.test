@@ -1,0 +1,14 @@
+# Each loop iteration has exactly one active lane in each subgroup.
+# REQUIRES: gpu
+
+# RUN: %dxc -T cs_6_5 -E main -Fo %t.dxil %S/../Inputs/wave_divergence.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal --metallib %t.metallib
+# RUN: %crucible-run --lib %t.metallib --entry main0 --threads 64,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:u32:64:zero | FileCheck %s --check-prefix=COUNT
+# RUN: %dxc -T cs_6_5 -E collectives -Fo %t.ops.dxil %S/../Inputs/wave_divergence.hlsl
+# RUN: %cruciblec %t.ops.dxil -o %t.ops.metal --metallib %t.ops.metallib
+# RUN: %crucible-run --lib %t.ops.metallib --entry collectives --threads 64,1,1 \
+# RUN:   --groups 1,1,1 --buffer 0:u32:64:zero | FileCheck %s --check-prefix=OPS
+
+# COUNT: buffer0:{{( 1){64}$}}
+# OPS: buffer0:{{( 4){64}$}}

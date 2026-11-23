@@ -70,6 +70,11 @@ flowchart LR
     Res --> SPVOut --> Vulkan
 ```
 
+Wave votes, ballots, active/prefix bit counts, first-lane queries, and
+multi-prefix operations depend on the currently active lanes. Their MLIR
+operations retain conservative effects to prevent optimization from moving or
+merging them across divergent control flow.
+
 ---
 
 ## Benchmarks & Compliance

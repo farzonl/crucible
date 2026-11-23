@@ -1,0 +1,27 @@
+# Wave operations must stay inside divergent control flow after LICM.
+
+# RUN: %dxc -T cs_6_5 -E main -Fo %t.dxil %S/../Inputs/wave_divergence.hlsl
+# RUN: %cruciblec %t.dxil -o %t.metal
+# RUN: FileCheck %s --check-prefix=COUNT --input-file=%t.metal
+# RUN: %dxc -T cs_6_5 -E collectives -Fo %t.ops.dxil %S/../Inputs/wave_divergence.hlsl
+# RUN: %cruciblec %t.ops.dxil --dump-mlir -o %t.ops.metal 2>&1 | FileCheck %s --check-prefix=OPS
+
+# COUNT-LABEL: kernel void main0(
+# COUNT-NOT: simd_sum(
+# COUNT: do {
+# COUNT-NOT: simd_sum(
+# COUNT: if (
+# COUNT: simd_sum(uint(true))
+# COUNT: } while (
+
+# OPS-LABEL: func.func @collectives(
+# OPS-NOT: "crucible.wave_
+# OPS: scf.while
+# OPS-NOT: "crucible.wave_
+# OPS: scf.if
+# OPS-DAG: "crucible.wave_is_first_lane"
+# OPS-DAG: "crucible.wave_vote"
+# OPS-DAG: "crucible.wave_vote"
+# OPS-DAG: "crucible.wave_ballot"
+# OPS-DAG: "crucible.wave_multi_prefix"
+# OPS: scf.yield
