@@ -36,6 +36,11 @@ struct BufferSpec {
   bool IsUniform = false;
 };
 
+struct SpecializationSpec {
+  std::vector<VkSpecializationMapEntry> Entries;
+  std::vector<uint8_t> Data{0};
+};
+
 [[noreturn]] void fail(const std::string &Msg) {
   fprintf(stderr, "crucible-vk-run: error: %s\n", Msg.c_str());
   exit(1);
@@ -61,6 +66,33 @@ std::vector<std::string> split(const std::string &S, char Sep) {
     Start = Pos + 1;
   }
   return Parts;
+}
+
+SpecializationSpec parseSpecialization(const std::string &Arg) {
+  SpecializationSpec Spec;
+  if (Arg == "default")
+    return Spec;
+  for (const auto &Part : split(Arg, ',')) {
+    auto Pair = split(Part, ':');
+    char *End = nullptr;
+    unsigned long ID = strtoul(Pair[0].c_str(), &End, 10);
+    if (Pair.size() != 2 || Pair[0].empty() || *End || ID > UINT32_MAX ||
+        Pair[1].empty() || Pair[1].size() % 2)
+      fail("bad specialization (want id:hexbytes[,id:hexbytes] or default)");
+    VkSpecializationMapEntry Entry{static_cast<uint32_t>(ID),
+                                   static_cast<uint32_t>(Spec.Data.size()),
+                                   Pair[1].size() / 2};
+    for (size_t I = 0; I < Pair[1].size(); I += 2) {
+      auto Byte = Pair[1].substr(I, 2);
+      if (Byte.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos)
+        fail("bad specialization byte '" + Byte + "'");
+      Spec.Data.push_back(
+          static_cast<uint8_t>(strtoul(Byte.c_str(), nullptr, 16)));
+    }
+    Spec.Entries.push_back(Entry);
+    Spec.Data.push_back(0);
+  }
+  return Spec;
 }
 
 BufferSpec parseBufferSpec(const std::string &Arg, bool IsUniform) {
@@ -161,6 +193,7 @@ int main(int argc, char **argv) {
   std::string Entry = "main";
   uint32_t Groups[3] = {1, 1, 1};
   std::vector<BufferSpec> Specs;
+  std::vector<SpecializationSpec> Specializations;
 
   for (int I = 1; I < argc; ++I) {
     std::string Arg = argv[I];
@@ -180,6 +213,8 @@ int main(int argc, char **argv) {
       Specs.push_back(parseBufferSpec(needVal(), /*IsUniform=*/false));
     else if (Arg == "--cbuffer")
       Specs.push_back(parseBufferSpec(needVal(), /*IsUniform=*/true));
+    else if (Arg == "--specialization")
+      Specializations.push_back(parseSpecialization(needVal()));
     else
       fail("unknown argument '" + Arg + "'");
   }
@@ -350,10 +385,29 @@ int main(int argc, char **argv) {
   CPCI.stage.module = ShaderMod;
   CPCI.stage.pName = Entry.c_str();
   CPCI.layout = PipeLayout;
-  VkPipeline Pipeline = VK_NULL_HANDLE;
-  checkVk(vkCreateComputePipelines(Device, VK_NULL_HANDLE, 1, &CPCI, nullptr,
-                                   &Pipeline),
-          "vkCreateComputePipelines");
+  VkPipelineCache PipelineCache = VK_NULL_HANDLE;
+  if (!Specializations.empty()) {
+    VkPipelineCacheCreateInfo CacheCI{};
+    CacheCI.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    checkVk(vkCreatePipelineCache(Device, &CacheCI, nullptr, &PipelineCache),
+            "vkCreatePipelineCache");
+  }
+  std::vector<VkPipeline> Pipelines;
+  size_t Variants = Specializations.empty() ? 1 : Specializations.size();
+  for (size_t I = 0; I < Variants; ++I) {
+    VkSpecializationInfo Info{};
+    if (!Specializations.empty()) {
+      auto &Spec = Specializations[I];
+      Info = {static_cast<uint32_t>(Spec.Entries.size()), Spec.Entries.data(),
+              Spec.Data.size(), Spec.Data.data()};
+      CPCI.stage.pSpecializationInfo = &Info;
+    }
+    VkPipeline Pipeline = VK_NULL_HANDLE;
+    checkVk(vkCreateComputePipelines(Device, PipelineCache, 1, &CPCI, nullptr,
+                                     &Pipeline),
+            "vkCreateComputePipelines");
+    Pipelines.push_back(Pipeline);
+  }
 
   std::vector<VkDescriptorPoolSize> PoolSizes;
   if (NumStorage > 0)
@@ -399,6 +453,7 @@ int main(int argc, char **argv) {
 
   VkCommandPoolCreateInfo CmdPoolCI{};
   CmdPoolCI.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  CmdPoolCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
   CmdPoolCI.queueFamilyIndex = ComputeQF;
   VkCommandPool CmdPool = VK_NULL_HANDLE;
   checkVk(vkCreateCommandPool(Device, &CmdPoolCI, nullptr, &CmdPool),
@@ -413,36 +468,53 @@ int main(int argc, char **argv) {
   checkVk(vkAllocateCommandBuffers(Device, &CBAI, &CmdBuf),
           "vkAllocateCommandBuffers");
 
-  VkCommandBufferBeginInfo CBBI{};
-  CBBI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-  CBBI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  checkVk(vkBeginCommandBuffer(CmdBuf, &CBBI), "vkBeginCommandBuffer");
-  vkCmdBindPipeline(CmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, Pipeline);
-  vkCmdBindDescriptorSets(CmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, PipeLayout, 0,
-                          1, &DSet, 0, nullptr);
-  vkCmdDispatch(CmdBuf, Groups[0], Groups[1], Groups[2]);
-  checkVk(vkEndCommandBuffer(CmdBuf), "vkEndCommandBuffer");
+  for (size_t I = 0; I < Pipelines.size(); ++I) {
+    if (I) {
+      checkVk(vkResetCommandBuffer(CmdBuf, 0), "vkResetCommandBuffer");
+      for (const auto &AB : Bufs) {
+        void *Mapped = nullptr;
+        checkVk(vkMapMemory(Device, AB.Memory, 0, AB.SizeBytes, 0, &Mapped),
+                "vkMapMemory");
+        fillBuffer(AB.Spec, Mapped);
+        vkUnmapMemory(Device, AB.Memory);
+      }
+    }
+    if (!Specializations.empty())
+      printf("variant%zu:\n", I);
+    VkCommandBufferBeginInfo CBBI{};
+    CBBI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    CBBI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    checkVk(vkBeginCommandBuffer(CmdBuf, &CBBI), "vkBeginCommandBuffer");
+    vkCmdBindPipeline(CmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, Pipelines[I]);
+    vkCmdBindDescriptorSets(CmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, PipeLayout,
+                            0, 1, &DSet, 0, nullptr);
+    vkCmdDispatch(CmdBuf, Groups[0], Groups[1], Groups[2]);
+    checkVk(vkEndCommandBuffer(CmdBuf), "vkEndCommandBuffer");
 
-  VkSubmitInfo SI{};
-  SI.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-  SI.commandBufferCount = 1;
-  SI.pCommandBuffers = &CmdBuf;
-  checkVk(vkQueueSubmit(Queue, 1, &SI, VK_NULL_HANDLE), "vkQueueSubmit");
-  checkVk(vkQueueWaitIdle(Queue), "vkQueueWaitIdle");
+    VkSubmitInfo SI{};
+    SI.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    SI.commandBufferCount = 1;
+    SI.pCommandBuffers = &CmdBuf;
+    checkVk(vkQueueSubmit(Queue, 1, &SI, VK_NULL_HANDLE), "vkQueueSubmit");
+    checkVk(vkQueueWaitIdle(Queue), "vkQueueWaitIdle");
 
-  for (const AllocatedBuffer &AB : Bufs) {
-    if (AB.Spec.IsUniform)
-      continue;
-    void *Mapped = nullptr;
-    checkVk(vkMapMemory(Device, AB.Memory, 0, AB.SizeBytes, 0, &Mapped),
-            "vkMapMemory");
-    printBuffer(AB.Spec, Mapped);
-    vkUnmapMemory(Device, AB.Memory);
+    for (const AllocatedBuffer &AB : Bufs) {
+      if (AB.Spec.IsUniform)
+        continue;
+      void *Mapped = nullptr;
+      checkVk(vkMapMemory(Device, AB.Memory, 0, AB.SizeBytes, 0, &Mapped),
+              "vkMapMemory");
+      printBuffer(AB.Spec, Mapped);
+      vkUnmapMemory(Device, AB.Memory);
+    }
   }
 
   vkDestroyCommandPool(Device, CmdPool, nullptr);
   vkDestroyDescriptorPool(Device, DPool, nullptr);
-  vkDestroyPipeline(Device, Pipeline, nullptr);
+  for (auto Pipeline : Pipelines)
+    vkDestroyPipeline(Device, Pipeline, nullptr);
+  if (PipelineCache)
+    vkDestroyPipelineCache(Device, PipelineCache, nullptr);
   vkDestroyShaderModule(Device, ShaderMod, nullptr);
   vkDestroyPipelineLayout(Device, PipeLayout, nullptr);
   vkDestroyDescriptorSetLayout(Device, DSL, nullptr);

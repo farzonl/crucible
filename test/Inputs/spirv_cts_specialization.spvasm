@@ -1,0 +1,52 @@
+; Pipeline variants must update both shader values and the actual workgroup size.
+; CHECK: variant0:
+; CHECK-NEXT: buffer0: 22 22 0 0 0 0 0 0
+; CHECK: variant1:
+; CHECK-NEXT: buffer0: 40 40 40 40 0 0 0 0
+; CHECK: variant2:
+; CHECK-NEXT: buffer0: 60 0 0 0 0 0 0 0
+; CHECK: variant3:
+; CHECK-NEXT: buffer0: 22 22 0 0 0 0 0 0
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %workgroup BuiltIn WorkgroupSize
+OpDecorate %value SpecId 7
+OpDecorate %size SpecId 8
+OpDecorate %flag SpecId 9
+OpDecorate %array ArrayStride 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%v3uint = OpTypeVector %uint 3
+%input = OpTypePointer Input %v3uint
+%array = OpTypeRuntimeArray %uint
+%block = OpTypeStruct %array
+%storage = OpTypePointer StorageBuffer %block
+%element = OpTypePointer StorageBuffer %uint
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%value = OpSpecConstant %uint 20
+%size = OpSpecConstant %uint 2
+%flag = OpSpecConstantTrue %bool
+%workgroup = OpSpecConstantComposite %v3uint %size %one %one
+%sum = OpSpecConstantOp %uint IAdd %value %two
+%gid = OpVariable %input Input
+%output = OpVariable %storage StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3uint %gid
+%x = OpCompositeExtract %uint %id 0
+%selected = OpSelect %uint %flag %sum %value
+%ptr = OpAccessChain %element %output %zero %x
+OpStore %ptr %selected
+OpReturn
+OpFunctionEnd

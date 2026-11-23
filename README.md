@@ -149,8 +149,16 @@ separate explicit `--msl-texture-binding` and `--msl-sampler-binding` overrides
 (`space,register,index`), including both slots of combined image samplers.
 `--require-msl-buffer-bindings` requires all reflected resources to have explicit
 slots in their respective buffer, texture, or sampler namespace.
-Graphics, descriptor arrays, constexpr samplers, specialization constants and
-auxiliary-buffer ABIs are not yet integrated.
+For specialized pipelines, the CTS adapter applies `VkSpecializationInfo` IDs,
+byte offsets and scalar sizes to a pipeline-local SPIR-V copy. The installed
+`spirv-opt` freezes constants and folds derived operations/composites before
+both metadata extraction and Crucible compilation, preserving defaults and
+specialized workgroup dimensions. Specialized libraries bypass the unspecialized
+cache; the native-reference path is unchanged. Set `CRUCIBLE_CTS_SPIRV_OPT` to
+override the optimizer executable (otherwise `spirv-opt` is resolved on `PATH`).
+Unsupported specialization forms fail explicitly rather than ignoring overrides.
+Graphics, descriptor arrays, constexpr samplers and auxiliary-buffer ABIs are
+not yet integrated.
 Adapter rejection is visible, rather than being hidden by native fallback.
 
 SPIR-V integer dot products include packed and unpacked `SDotAccSat`,

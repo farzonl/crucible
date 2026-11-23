@@ -14,10 +14,42 @@ def prepare(source: Path) -> None:
     include = '#include "MVKShaderModule.h"\n'
     call = ("bool wasConverted = _spvConverter.convert(*pShaderConfig, conversionResult, "
             "shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL);")
+    pipeline = "\tMVKShaderLibrary* mvkLib = _directMSLLibrary;"
     if ("cts_moltenvk_hook.h" in text or
-            text.count(include) != 1 or text.count(call) != 1):
+            text.count(include) != 1 or text.count(call) != 1 or
+            text.count(pipeline) != 1):
         raise ValueError("Pinned MoltenVK shader-module integration points changed")
     text = text.replace(include, include + '#include "cts_moltenvk_hook.h"\n')
+    text = text.replace(pipeline, """
+    if (std::getenv("CRUCIBLE_CTS_COMPILER") &&
+        (pSpecializationInfo || crucibleCTSHasSpecialization(_spvConverter.getSPIRV()))) {
+        // Pipeline-local compilation avoids reusing variants from the unspecialized cache.
+        if (pipeline->shouldFailOnPipelineCompileRequired()) { return MVKMTLFunctionNull; }
+        std::vector<uint32_t> specialized;
+        SPIRVToMSLConversionResult conversionResult;
+        if (!crucibleCTSSpecialize(_spvConverter.getSPIRV(), pSpecializationInfo,
+                                  specialized, conversionResult.resultLog)) {
+            reportError(VK_ERROR_INITIALIZATION_FAILED, "%s", conversionResult.resultLog.c_str());
+            return MVKMTLFunctionNull;
+        }
+        SPIRVToMSLConverter converter;
+        converter.setSPIRV(specialized);
+        if (!converter.convert(*pShaderConfig, conversionResult)) {
+            conversionResult.msl.clear();
+            if (!crucibleCTSTrace("metadata_failed")) {
+                conversionResult.resultLog += "\\\\nCannot write compiler attribution trace\\\\n";
+            }
+            reportError(VK_ERROR_INITIALIZATION_FAILED, "%s", conversionResult.resultLog.c_str());
+            return MVKMTLFunctionNull;
+        }
+        if (!crucibleCTSCompile(specialized, *pShaderConfig, conversionResult)) {
+            reportError(VK_ERROR_INITIALIZATION_FAILED, "%s", conversionResult.resultLog.c_str());
+            return MVKMTLFunctionNull;
+        }
+        MVKShaderLibrary library(this, conversionResult);
+        return library.getMTLFunction(nullptr, pShaderFeedback, this);
+    }
+""" + pipeline)
     text = text.replace(call, call + """
     if (std::getenv("CRUCIBLE_CTS_COMPILER")) {
         if (wasConverted) {

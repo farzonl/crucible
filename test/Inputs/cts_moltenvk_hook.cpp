@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 // Standalone adapter regression using the pinned upstream converter headers.
+#include <vulkan/vulkan.h>
 #include <SPIRVToMSLConverter.h>
 #include "../../scripts/cts_moltenvk_hook.h"
 #include <cassert>
@@ -10,7 +11,7 @@ MSLResourceBinding::MSLResourceBinding() {}
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 4); // cruciblec, trace path, image SPIR-V
+    assert(argc == 5); // cruciblec, trace path, image SPIR-V, specialization SPIR-V
     // Valid SPIR-V 1.3: main writes 1.0 to storage buffer set 0, binding 0.
     std::vector<uint32_t> spirv = {
         0x07230203, 0x00010300, 0, 15, 0,
@@ -73,6 +74,113 @@ int main(int argc, char **argv) {
     assert(!crucibleCTSCompile(spirv, config, result));
     assert(result.msl.empty());
     config.resourceBindings[0].resourceBinding.count = 1;
+    for (auto scalar : {std::pair<uint32_t, uint32_t>{20, 1}, {21, 8}, {21, 16},
+                        {21, 64}, {22, 16}, {22, 32}, {22, 64}}) {
+        uint32_t opcode = scalar.first, width = scalar.second;
+        auto source = spirv;
+        source[3] = 17;
+        uint32_t capability = opcode == 20 || width == 32 ? 1 :
+                              opcode == 22 ? (width == 16 ? 9 : 10) :
+                              width == 8 ? 39 : width == 16 ? 22 : 11;
+        if (capability != 1)
+            source.insert(source.begin() + 5, {(2u << 16) | 17u, capability});
+        // Decorations precede type declarations.
+        size_t type = 5;
+        while ((source[type] & 0xffff) != 19)
+            type += source[type] >> 16;
+        source.insert(source.begin() + type, {(4u << 16) | 71u, 16, 1, 42});
+        size_t function = 5;
+        while ((source[function] & 0xffff) != 54)
+            function += source[function] >> 16;
+        std::vector<uint32_t> declarations;
+        uint32_t typeID = width == 32 ? 3 : 15;
+        if (width != 32) {
+            declarations = {((opcode == 20 ? 2u : opcode == 21 ? 4u : 3u) << 16) | opcode, 15};
+            if (opcode != 20) { declarations.push_back(width); }
+            if (opcode == 21) { declarations.push_back(1); }
+        }
+        if (width == 1)
+            declarations.insert(declarations.end(), {(3u << 16) | 49u, typeID, 16});
+        else {
+            declarations.insert(declarations.end(),
+                                {((width == 64 ? 5u : 4u) << 16) | 50u, typeID, 16, 0});
+            if (width == 64) { declarations.push_back(0); }
+        }
+        source.insert(source.begin() + function, declarations.begin(), declarations.end());
+        uint64_t bits = width == 1 ? 1 : width == 64 ? 0xbff4000012345678ull :
+                        width == 32 ? 0xc0200000 : width == 16 ? 0xbc00 : 0x80;
+        uint8_t bytes[9] = {};
+        size_t size = width == 1 ? 4 : width / 8;
+        std::memcpy(bytes + 1, &bits, size);
+        VkSpecializationMapEntry entry{42, 1, size};
+        VkSpecializationInfo info{1, &entry, sizeof(bytes), bytes};
+        std::vector<uint32_t> specialized;
+        std::string log;
+        if (!crucibleCTSSpecialize(source, &info, specialized, log)) {
+            std::fprintf(stderr, "scalar opcode %u width %u: %s", opcode, width, log.c_str());
+            std::abort();
+        }
+        bool found = false;
+        for (size_t i = 5; i < specialized.size(); i += specialized[i] >> 16) {
+            uint32_t op = specialized[i] & 0xffff;
+            if ((op == 41 || op == 43) && specialized[i + 2] == 16) {
+                if (width == 1)
+                    assert(op == 41);
+                else {
+                    uint64_t actual = specialized[i + 3];
+                    if (width == 64) { actual |= uint64_t(specialized[i + 4]) << 32; }
+                    // Signed narrow integers may have their unused high bits extended.
+                    uint64_t mask = width == 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+                    assert((actual & mask) == bits);
+                }
+                found = true;
+            }
+        }
+        assert(found);
+    }
+    {
+        std::ifstream stream(argv[4], std::ios::binary | std::ios::ate);
+        assert(stream);
+        auto bytes = stream.tellg();
+        assert(bytes > 0 && bytes % sizeof(uint32_t) == 0);
+        std::vector<uint32_t> source(bytes / sizeof(uint32_t)), defaults, variant;
+        stream.seekg(0);
+        stream.read(reinterpret_cast<char*>(source.data()), bytes);
+        assert(stream);
+        std::string log;
+        assert(crucibleCTSHasSpecialization(source));
+        assert(crucibleCTSSpecialize(source, nullptr, defaults, log));
+        assert(!crucibleCTSHasSpecialization(defaults));
+        assert(crucibleCTSCompile(defaults, config, result));
+        assert(result.msl.find("22u") != std::string::npos);
+        // Deliberately unaligned offsets and shuffled IDs, including an unused ID.
+        uint8_t data[17] = {};
+        uint32_t value = 40, size = 4;
+        std::memcpy(data + 1, &value, 4);
+        std::memcpy(data + 6, &size, 4);
+        VkSpecializationMapEntry entries[] = {{9, 11, 4}, {8, 6, 4},
+                                             {7, 1, 4}, {1234, 16, 1}};
+        VkSpecializationInfo info{4, entries, sizeof(data), data};
+        assert(crucibleCTSSpecialize(source, &info, variant, log));
+        assert(variant != defaults);
+        assert(crucibleCTSCompile(variant, config, result));
+        assert(result.msl.find("40u") != std::string::npos);
+        assert(crucibleCTSSpecialize(source, nullptr, variant, log));
+        assert(variant == defaults);
+        entries[0].size = 1;
+        assert(!crucibleCTSSpecialize(source, &info, variant, log));
+        assert(variant.empty());
+        entries[0].size = 4;
+        entries[0].offset = 15;
+        assert(!crucibleCTSSpecialize(source, &info, variant, log));
+        entries[0].offset = 11;
+        entries[0].constantID = 7;
+        assert(!crucibleCTSSpecialize(source, &info, variant, log));
+        setenv("CRUCIBLE_CTS_SPIRV_OPT", "/bin/false", 1);
+        assert(!crucibleCTSSpecialize(source, nullptr, variant, log));
+        assert(variant.empty());
+        unsetenv("CRUCIBLE_CTS_SPIRV_OPT");
+    }
     {
         std::ifstream stream(argv[3], std::ios::binary | std::ios::ate);
         assert(stream);
