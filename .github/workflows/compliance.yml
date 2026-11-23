@@ -31,15 +31,15 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 90
     env:
-      CTS_REVISION: 65fff6ac4d782ad42a490b007376e84159a113e3
+      CTS_REVISION: 0d18b347943e5e843529a05c95220e27fe30c538
       MOLTENVK_REVISION: db66022459ffb663aa2b50f6b018bc2e124f5edf
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout pinned Vulkan CTS 1.3.9.0
+      - name: Checkout pinned Vulkan CTS 1.4.7.1
         uses: actions/checkout@v4
         with:
           repository: KhronosGroup/VK-GL-CTS
-          ref: 65fff6ac4d782ad42a490b007376e84159a113e3
+          ref: 0d18b347943e5e843529a05c95220e27fe30c538
           path: .cts/src
 
       - name: Install macOS Vulkan runtime and build tools
@@ -77,13 +77,15 @@ jobs:
             .cts/mvk/External
             .cts/mvk/Package/Release
           key: cts-mvk-${{ runner.os }}-${{ runner.arch }}-${{ env.MOLTENVK_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/cts_moltenvk_hook.h', 'scripts/prepare_cts_moltenvk.py') }}
+          restore-keys: |
+            cts-mvk-${{ runner.os }}-${{ runner.arch }}-${{ env.MOLTENVK_REVISION }}-${{ steps.xcode.outputs.version }}-
 
       - name: Build MoltenVK with fail-closed Crucible shader compiler hook
         if: steps.mvk-cache.outputs.cache-hit != 'true'
         run: |
           python3 scripts/prepare_cts_moltenvk.py --source .cts/mvk
           cd .cts/mvk
-          ./fetchDependencies --macos
+          ./fetchDependencies --macos --keep-cache
           make macos
 
       - name: Save CTS-only MoltenVK runtime
@@ -111,12 +113,11 @@ jobs:
           path: |
             .cts/src/external
             .cts/build
-          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/prepare_vulkan_cts.py') }}
+          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-${{ steps.xcode.outputs.version }}-v2
 
       - name: Fetch pinned CTS dependencies and build deqp-vk
         if: steps.cts-build-cache.outputs.cache-hit != 'true'
         run: |
-          python3 scripts/prepare_vulkan_cts.py --source .cts/src
           python3 .cts/src/external/fetch_sources.py
           cmake -S .cts/src -B .cts/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGET=osx
@@ -129,7 +130,7 @@ jobs:
           path: |
             .cts/src/external
             .cts/build
-          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-${{ steps.xcode.outputs.version }}-${{ hashFiles('scripts/prepare_vulkan_cts.py') }}
+          key: vulkan-cts-${{ runner.os }}-${{ runner.arch }}-${{ env.CTS_REVISION }}-${{ steps.xcode.outputs.version }}-v2
 
       - name: Run matched Crucible compiler and native reference CTS samples
         run: |
@@ -151,7 +152,7 @@ jobs:
             --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --cts-revision "$CTS_REVISION" \
             --runtime-version "MoltenVK@$MOLTENVK_REVISION;$(brew list --versions vulkan-loader);Xcode@${{ steps.xcode.outputs.version }}" \
-            --baseline "vulkan-cts-1.3.9.0 spirv-assembly compute mustpass, evenly spaced 256 cases, fraction 0/1")
+            --baseline "vulkan-cts-1.4.7.1 spirv-assembly compute mustpass, evenly spaced 256 cases, fraction 0/1")
           "${COMMON[@]}" --qpa cts-results/reference.qpa \
             --metadata cts-results/reference-metadata.json
           "${COMMON[@]}" --compiler build/tools/cruciblec/cruciblec \

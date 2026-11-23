@@ -64,6 +64,15 @@ int main(int argc, char **argv) {
     assert(result.msl.find("kernel void cts_main(") != std::string::npos);
     assert(result.msl.find("[[buffer(7)]]") != std::string::npos);
     assert(result.msl.find("native sentinel") == std::string::npos);
+    config.resourceBindings[0].resourceBinding.basetype = SPIRV_CROSS_NAMESPACE::SPIRType::Image;
+    result.msl = "native sentinel";
+    assert(!crucibleCTSCompile(spirv, config, result));
+    assert(result.msl.empty());
+    config.resourceBindings[0].resourceBinding.basetype = SPIRV_CROSS_NAMESPACE::SPIRType::Struct;
+    config.resourceBindings[0].resourceBinding.count = 2;
+    assert(!crucibleCTSCompile(spirv, config, result));
+    assert(result.msl.empty());
+    config.resourceBindings[0].resourceBinding.count = 1;
     result.msl = "native sentinel";
     setenv("CRUCIBLE_CTS_COMPILER", "/bin/false", 1);
     assert(!crucibleCTSCompile(spirv, config, result));

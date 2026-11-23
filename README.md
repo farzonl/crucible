@@ -136,8 +136,8 @@ fall back to native MSL. Identical cases also run through the same driver with
 the hook disabled, providing a separately labeled **native reference**, not a
 guaranteed upper bound or Crucible score.
 
-The initial baseline pins VK-GL-CTS `vulkan-cts-1.3.9.0` at
-`65fff6ac4d782ad42a490b007376e84159a113e3`. It deterministically selects at most
+The initial baseline pins VK-GL-CTS `vulkan-cts-1.4.7.1` at
+`0d18b347943e5e843529a05c95220e27fe30c538`. It deterministically selects at most
 256 evenly spaced, lexicographically sorted cases from
 `external/vulkancts/mustpass/main/vk-default/spirv-assembly.txt`, restricted to
 `dEQP-VK.spirv_assembly.instruction.compute.*`. This is a bounded **sample**, not
@@ -152,8 +152,7 @@ MoltenVK 1.4.2 is pinned at `db66022459ffb663aa2b50f6b018bc2e124f5edf`;
 its external dependencies and CTS dependencies are pinned by their sources.
 Loader and Xcode versions, the compiler path, adapter hash and exact invocation
 are recorded per run, along with the actual Vulkan physical device and runtime
-configuration. The driver advertises Vulkan **1.3** because this CTS revision's
-version graph cannot negotiate 1.4. Metal argument buffers are disabled in both
+configuration. Vulkan 1.4 is negotiated normally. Metal argument buffers are disabled in both
 tracks to match the adapter's direct-binding ABI. Every case runs in a fresh process, with a separate
 compiler attribution trace and raw QPA. Shader compilation is limited to 30
 seconds; reaching the track budget terminates the entire process group.
@@ -169,8 +168,7 @@ git -C .cts/mvk checkout db66022459ffb663aa2b50f6b018bc2e124f5edf
 python3 scripts/prepare_cts_moltenvk.py --source .cts/mvk
 (cd .cts/mvk && ./fetchDependencies --macos && make macos)
 git clone https://github.com/KhronosGroup/VK-GL-CTS .cts/src
-git -C .cts/src checkout 65fff6ac4d782ad42a490b007376e84159a113e3
-python3 scripts/prepare_vulkan_cts.py --source .cts/src
+git -C .cts/src checkout 0d18b347943e5e843529a05c95220e27fe30c538
 python3 .cts/src/external/fetch_sources.py
 cmake -S .cts/src -B .cts/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDEQP_TARGET=osx
 cmake --build .cts/build --target deqp-vk --parallel 3
@@ -186,9 +184,9 @@ COMMON=(python3 scripts/record_vulkan_cts.py run \
   --library "$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib" \
   --caselist cts-results/caselist.txt --timeout 900 \
   --sha "$(git rev-parse HEAD)" --run-url https://github.com/farzonl/crucible/actions \
-  --cts-revision 65fff6ac4d782ad42a490b007376e84159a113e3 \
+  --cts-revision 0d18b347943e5e843529a05c95220e27fe30c538 \
   --runtime-version "MoltenVK@db660224;$(brew list --versions vulkan-loader);$(xcodebuild -version | tr '\n' ';')" \
-  --baseline "vulkan-cts-1.3.9.0 spirv-assembly compute sample 256, fraction 0/1")
+  --baseline "vulkan-cts-1.4.7.1 spirv-assembly compute sample 256, fraction 0/1")
 "${COMMON[@]}" --qpa cts-results/reference.qpa --metadata cts-results/reference-metadata.json
 "${COMMON[@]}" --compiler build/tools/cruciblec/cruciblec \
   --qpa cts-results/results.qpa --metadata cts-results/metadata.json
@@ -216,9 +214,6 @@ cannot publish a success score. Unselected CTS cases are never counted.
 History charts do not connect different caselist hashes, CTS revisions, adapter
 hashes, devices, runtime configurations, or runtime versions. Both existing Pages publishers preserve the CTS JSON dataset.
 Build/history caches and raw QPA/caselist/metadata artifacts support reruns.
-The pinned CTS source receives a syntax-only compatibility patch removing four
-redundant C++ `template` qualifiers rejected by newer Xcode Clang; test behavior
-and the selected caselist are unchanged.
 
 Validate the recorder with `python3 -m unittest discover -s scripts -p 'test_vulkan_cts.py'`.
 For branch validation without publishing Pages, dispatch Compliance with

@@ -96,9 +96,13 @@ static bool crucibleCTSCompile(const std::vector<uint32_t>& spirv,
     for (const auto& resource : config.resourceBindings) {
         const auto& b = resource.resourceBinding;
         if (b.stage != config.options.entryPointStage) { continue; }
-        if (resource.requiresConstExprSampler) {
+        using BaseType = SPIRV_CROSS_NAMESPACE::SPIRType;
+        if (resource.requiresConstExprSampler || b.count > 1 ||
+            b.basetype == BaseType::Image || b.basetype == BaseType::SampledImage ||
+            b.basetype == BaseType::Sampler || b.basetype == BaseType::AccelerationStructure) {
             cleanup();
-            return fail("immutable samplers are not supported by the adapter", "adapter_failed");
+            return fail("descriptor arrays and non-buffer resources are not supported by the adapter",
+                        "adapter_failed");
         }
         // Crucible's SPIR-V loader represents PushConstant with space ~1u.
         uint32_t space = b.desc_set == ~0u ? ~1u : b.desc_set;

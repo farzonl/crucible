@@ -23,8 +23,6 @@ FAILURES = {"Fail", "InternalError", "ResourceError", "Crash", "Timeout",
             "CompilerError", "MetadataError"}
 TRACE_EVENTS = {"attempt", "compiled", "failed", "adapter_failed", "metadata_failed"}
 RUNTIME_CONFIGURATION = {
-    # CTS 1.3.9's version DAG does not know Vulkan 1.4; negotiating it returns 0.
-    "MVK_CONFIG_API_VERSION_TO_ADVERTISE": str((1 << 22) | (3 << 12)),
     "MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS": "0",
     "MVK_CONFIG_LOG_LEVEL": "1",
 }
