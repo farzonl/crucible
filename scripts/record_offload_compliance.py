@@ -2,9 +2,14 @@
 """Parse llvm-lit JSON results and update multi-track GitHub Pages compliance history."""
 
 import argparse
+import io
 import json
+import os
 import shutil
+import urllib.error
+import urllib.parse
 import urllib.request
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +33,7 @@ def parse_lit_json(path: Path) -> dict:
         lambda: {"passed": 0, "failed": 0, "xfail": 0, "unsupported": 0}
     )
     failures = []
+    tests_out = []
 
     for t in tests:
         name = t.get("name", "")
@@ -37,21 +43,29 @@ def parse_lit_json(path: Path) -> dict:
         if code in ("PASS", "FLAKYPASS"):
             counts["PASS"] += 1
             categories[cat]["passed"] += 1
+            test_status = "pass"
         elif code in ("XFAIL",):
             counts["XFAIL"] += 1
             categories[cat]["xfail"] += 1
+            test_status = "xfail"
         elif code in ("UNSUPPORTED",):
             counts["UNSUPPORTED"] += 1
             categories[cat]["unsupported"] += 1
+            test_status = "unsupported"
         else:
             counts["FAIL"] += 1
             categories[cat]["failed"] += 1
+            test_status = "fail"
             failures.append({
                 "name": name.split("::", 1)[-1].strip(),
                 "category": cat,
                 "code": code,
                 "elapsed": round(float(t.get("elapsed", 0.0)), 3),
             })
+        tests_out.append({
+            "name": name.split("::", 1)[-1].strip(),
+            "status": test_status,
+        })
 
     total = len(tests)
     executed = counts["PASS"] + counts["FAIL"] + counts["XFAIL"]
@@ -81,6 +95,7 @@ def parse_lit_json(path: Path) -> dict:
         "elapsed": round(float(data.get("elapsed", 0.0)), 2),
         "categories": cat_list,
         "failures": sorted(failures, key=lambda x: x["name"]),
+        "tests": sorted(tests_out, key=lambda x: x["name"]),
     }
 
 
@@ -148,6 +163,137 @@ def parse_track_spec(spec: str) -> tuple[str, str, Path]:
             f"invalid --track-lit '{spec}' (expected id=label=path)"
         )
     return parts[0].strip(), parts[1].strip(), Path(parts[2].strip())
+
+
+def github_api_json(url: str) -> dict | None:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Crucible-Compliance-CI",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        print(f"Warning: external GitHub data unavailable from {url}: {exc}")
+        return None
+
+
+def normalize_external_tests(data: dict) -> list:
+    tests = []
+    for test in data.get("tests", []):
+        name = str(test.get("name", "")).split("::", 1)[-1].strip()
+        code = str(test.get("code", "UNKNOWN"))
+        if code in ("PASS", "FLAKYPASS"):
+            status = "pass"
+        elif code == "XFAIL":
+            status = "xfail"
+        elif code == "UNSUPPORTED":
+            status = "unsupported"
+        else:
+            status = "fail"
+        if name:
+            tests.append({"name": name, "status": status})
+    return sorted(tests, key=lambda test: test["name"])
+
+
+def fetch_external_comparisons() -> dict:
+    summary_url = (
+        "https://raw.githubusercontent.com/farzonl/"
+        "offload-test-suite-badges/badges/summary.json"
+    )
+    summary = fetch_json(summary_url)
+    workflows = summary.get("workflows", {}) if isinstance(summary, dict) else {}
+    comparisons = {
+        "generatedAt": summary.get("generatedAt", "") if isinstance(summary, dict) else "",
+        "repository": "llvm/offload-test-suite",
+        "runs": [],
+    }
+
+    preferred_keys = (
+        "windows-intel-dxc-vk",
+        "windows-amd-dxc-lavapipe",
+        "windows-intel-clang-vk",
+        "windows-amd-clang-lavapipe",
+        "macos-dxc-mtl",
+        "macos-clang-mtl",
+        "windows-intel-dxc-d3d12",
+        "windows-nvidia-dxc-d3d12",
+        "windows-amd-dxc-d3d12",
+        "windows-intel-clang-d3d12",
+        "windows-nvidia-clang-d3d12",
+        "windows-amd-clang-d3d12",
+    )
+    for key in preferred_keys:
+        workflow = workflows.get(key)
+        if not isinstance(workflow, dict):
+            continue
+        run_id = workflow.get("runId")
+        tests = []
+        if run_id:
+            artifacts_url = (
+                f"https://api.github.com/repos/llvm/offload-test-suite/"
+                f"actions/runs/{run_id}/artifacts?per_page=100"
+            )
+            artifact_data = github_api_json(artifacts_url)
+            if artifact_data:
+                token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+                headers = {"User-Agent": "Crucible-Compliance-CI"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                for artifact in artifact_data.get("artifacts", []):
+                    name = artifact.get("name", "")
+                    if artifact.get("expired") or not name.startswith("test-results-"):
+                        continue
+                    dl_url = artifact.get("archive_download_url")
+                    if not dl_url:
+                        continue
+                    try:
+                        req = urllib.request.Request(dl_url, headers=headers)
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            raw_zip = resp.read()
+                        with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+                            for member in zf.namelist():
+                                if not member.endswith("testresults.json"):
+                                    continue
+                                lit_data = json.loads(
+                                    zf.read(member).decode("utf-8")
+                                )
+                                candidate = normalize_external_tests(lit_data)
+                                if len(candidate) > len(tests):
+                                    tests = candidate
+                    except (urllib.error.HTTPError, urllib.error.URLError,
+                            TimeoutError, zipfile.BadZipFile, json.JSONDecodeError,
+                            UnicodeDecodeError):
+                        continue
+
+        platform = "vulkan" if "-vk" in key or "-lavapipe" in key else (
+            "metal" if "-mtl" in key else "directx"
+        )
+        if "-dxc-" in key:
+            compiler = "DXC"
+        elif "-clang-" in key:
+            compiler = "Clang"
+        else:
+            compiler = workflow.get("label", "")
+        label = f"{workflow.get('label', compiler)} · {key.replace('-', ' ').title()}"
+        comparisons["runs"].append({
+            "id": key,
+            "workflow": workflow.get("workflow", f"{key}.yaml"),
+            "label": label,
+            "platform": platform,
+            "compiler": compiler,
+            "runId": run_id,
+            "runUrl": workflow.get("runUrl", ""),
+            "updatedAt": workflow.get("updatedAt", ""),
+            "results": workflow.get("results", {}),
+            "tests": tests,
+        })
+    return comparisons
 
 
 def main() -> None:
@@ -248,11 +394,13 @@ def main() -> None:
                 "passRate": summary["passRate"],
                 "elapsed": summary["elapsed"],
                 "categories": summary["categories"],
+                "failures": summary["failures"],
+                "tests": summary["tests"],
             }
             history = [h for h in history if h.get("sha") != args.sha]
             history.append(entry)
             history.sort(key=lambda h: h.get("timestamp", ""))
-            entry = {**entry, "failures": summary["failures"]}
+            entry = {**entry, "failures": summary["failures"], "tests": summary["tests"]}
 
         if cache_file:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
@@ -334,6 +482,10 @@ def main() -> None:
 
     with open(data_dir / "tracks.json", "w", encoding="utf-8") as f:
         json.dump(tracks_manifest, f, indent=2)
+
+    comparisons = fetch_external_comparisons()
+    with open(data_dir / "comparisons.json", "w", encoding="utf-8") as f:
+        json.dump(comparisons, f, indent=2)
 
     if args.pages_url:
         for fname in ("history.json", "latest.json", "badge.json"):

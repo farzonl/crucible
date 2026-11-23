@@ -495,6 +495,61 @@
     .track-switcher select:hover {
       border-color: var(--accent);
     }
+
+    .comparison-card {
+      display: grid;
+      gap: 0.9rem;
+    }
+
+    .comparison-controls {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      flex-wrap: wrap;
+    }
+
+    .comparison-controls label {
+      color: var(--muted);
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    .comparison-controls select {
+      max-width: 100%;
+      min-width: min(100%, 28rem);
+      padding: 0.55rem 2.25rem 0.55rem 0.8rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    .comparison-controls input {
+      accent-color: var(--accent);
+    }
+
+    .status-pass { color: var(--pass); }
+    .status-fail { color: var(--fail); }
+    .status-xfail { color: var(--xfail); }
+    .status-unsupported { color: var(--muted); }
+
+    .difference-crucible-better {
+      background: color-mix(in srgb, var(--pass) 10%, transparent);
+    }
+
+    .difference-external-better {
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+    }
+
+    .diff-counts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
   </style>
 </head>
 <body>
@@ -538,6 +593,35 @@
         <div class="kpi-value" id="kpi-unsupported">—</div>
         <div class="kpi-sub" id="kpi-total">Total discovered: —</div>
       </article>
+    </section>
+
+    <section class="card comparison-card" aria-labelledby="comparison-title" id="comparison-section" hidden>
+      <div class="card-header">
+        <h2 id="comparison-title">Compare Against an Official Run</h2>
+        <a id="comparison-run-link" class="meta-pill" href="#" target="_blank" rel="noopener" hidden>External run →</a>
+      </div>
+      <div class="comparison-controls">
+        <label for="comparison-select">Offload test suite run</label>
+        <select id="comparison-select"></select>
+        <label>
+          <input id="comparison-differences-only" type="checkbox" checked>
+          Differing behavior only
+        </label>
+      </div>
+      <div id="comparison-counts" class="diff-counts"></div>
+      <div tabindex="0" role="region" aria-label="Test behavior comparison" class="table-wrapper">
+        <table class="category-table">
+          <thead>
+            <tr>
+              <th scope="col">Test</th>
+              <th scope="col">Crucible</th>
+              <th scope="col">External run</th>
+              <th scope="col">Difference</th>
+            </tr>
+          </thead>
+          <tbody id="comparison-tbody"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card chart-card" aria-labelledby="trend-title">
@@ -988,6 +1072,131 @@
 
     let availableTracks = [];
     let currentTrackId = "dxil-to-metal";
+    let externalRuns = [];
+    let currentCrucibleTests = [];
+
+    function statusLabel(status) {
+      const labels = {
+        pass: "PASS",
+        fail: "FAIL",
+        xfail: "XFAIL",
+        unsupported: "UNSUPPORTED",
+      };
+      return labels[status] || "UNKNOWN";
+    }
+
+    function statusMarkup(status) {
+      const label = statusLabel(status);
+      return `<span class="status-${escapeHtml(status)}">● ${escapeHtml(label)}</span>`;
+    }
+
+    function behaviorFor(status) {
+      if (status === "pass") return "pass";
+      if (status === "unsupported") return "unsupported";
+      if (status === "xfail") return "xfail";
+      return "fail";
+    }
+
+    function compatibleExternalRuns(trackId) {
+      if (trackId === "dxil-to-spirv") {
+        return externalRuns.filter(run => run.platform === "vulkan");
+      }
+      if (trackId === "spirv-to-metal") {
+        return externalRuns.filter(run => run.platform === "metal");
+      }
+      return externalRuns.filter(run =>
+        run.platform === "metal" || run.platform === "directx"
+      );
+    }
+
+    function renderComparison() {
+      const section = document.getElementById("comparison-section");
+      const select = document.getElementById("comparison-select");
+      if (!section || !select) return;
+
+      const candidates = compatibleExternalRuns(currentTrackId);
+      section.hidden = candidates.length === 0;
+      if (!candidates.length) return;
+
+      if (select.dataset.track !== currentTrackId) {
+        select.innerHTML = candidates.map(run =>
+          `<option value="${escapeHtml(run.id)}">${escapeHtml(run.label)} — ${Number(run.results?.passRate || 0).toFixed(1)}%</option>`
+        ).join("");
+        select.dataset.track = currentTrackId;
+      } else {
+        const stillVisible = candidates.some(run => run.id === select.value);
+        if (!stillVisible) select.value = candidates[0].id;
+      }
+
+      const run = candidates.find(item => item.id === select.value) || candidates[0];
+      if (select.value !== run.id) select.value = run.id;
+      const link = document.getElementById("comparison-run-link");
+      if (link) {
+        link.hidden = !run.runUrl;
+        link.href = run.runUrl || "#";
+      }
+
+      if (!run.tests?.length) {
+        document.getElementById("comparison-counts").textContent =
+          "Test-level artifact data is unavailable for this run.";
+        document.getElementById("comparison-tbody").innerHTML =
+          '<tr><td colspan="4">No downloadable testresults.json was found.</td></tr>';
+        return;
+      }
+
+      const externalByName = new Map(run.tests.map(test => [test.name, test.status]));
+      const crucibleByName = new Map(currentCrucibleTests.map(test => [test.name, test.status]));
+      const names = new Set([...crucibleByName.keys(), ...externalByName.keys()]);
+      const differencesOnly = document.getElementById("comparison-differences-only").checked;
+
+      let differing = 0;
+      let crucibleBetter = 0;
+      let externalBetter = 0;
+      const rows = [];
+      [...names].sort().forEach(name => {
+        const cStatus = crucibleByName.get(name) || "unsupported";
+        const eStatus = externalByName.get(name) || "unsupported";
+        const cBehavior = behaviorFor(cStatus);
+        const eBehavior = behaviorFor(eStatus);
+        const differs = cBehavior !== eBehavior;
+        if (differs) {
+          differing++;
+          if (cBehavior === "pass" && eBehavior !== "pass") crucibleBetter++;
+          if (eBehavior === "pass" && cBehavior !== "pass") externalBetter++;
+        }
+        if (!differs && differencesOnly) return;
+        if (differs) {
+          const rowClass = cBehavior === "pass" && eBehavior !== "pass"
+            ? "difference-crucible-better"
+            : (eBehavior === "pass" && cBehavior !== "pass"
+              ? "difference-external-better"
+              : "");
+          rows.push(`
+            <tr class="${rowClass}">
+              <th scope="row">${escapeHtml(name)}</th>
+              <td>${statusMarkup(cStatus)}</td>
+              <td>${statusMarkup(eStatus)}</td>
+              <td>${cBehavior === "pass" && eBehavior !== "pass" ? "Crucible passes" : eBehavior === "pass" && cBehavior !== "pass" ? "External passes" : "Different status"}</td>
+            </tr>`);
+        } else {
+          rows.push(`
+            <tr>
+              <th scope="row">${escapeHtml(name)}</th>
+              <td>${statusMarkup(cStatus)}</td>
+              <td>${statusMarkup(eStatus)}</td>
+              <td>Same behavior</td>
+            </tr>`);
+        }
+      });
+
+      document.getElementById("comparison-counts").innerHTML =
+        `<span><strong>${differing}</strong> differing behaviors</span>` +
+        `<span><strong>${crucibleBetter}</strong> Crucible-only passes</span>` +
+        `<span><strong>${externalBetter}</strong> external-only passes</span>`;
+      document.getElementById("comparison-tbody").innerHTML = rows.length
+        ? rows.join("")
+        : '<tr><td colspan="4">No differing behavior for the selected run.</td></tr>';
+    }
 
     async function loadTrack(trackId) {
       currentTrackId = trackId;
@@ -1000,6 +1209,17 @@
         historyData = normalizeHistory(Array.isArray(json) && json.length ? json : FALLBACK_HISTORY);
       } catch {
         historyData = normalizeHistory(FALLBACK_HISTORY);
+      }
+
+      currentCrucibleTests = [];
+      if (track?.latestUrl) {
+        try {
+          const latestResp = await fetch(track.latestUrl, { cache: "no-store" });
+          if (latestResp.ok) {
+            const latest = await latestResp.json();
+            currentCrucibleTests = Array.isArray(latest.tests) ? latest.tests : [];
+          }
+        } catch {}
       }
 
       if (track) {
@@ -1020,6 +1240,7 @@
 
       selectedIndex = historyData.length - 1;
       selectCommit(selectedIndex);
+      renderComparison();
     }
 
     function renderTrackSwitcher() {
@@ -1044,6 +1265,23 @@
           if (Array.isArray(parsed) && parsed.length) availableTracks = parsed;
         }
       } catch {}
+
+      try {
+        const cr = await fetch("data/comparisons.json", { cache: "no-store" });
+        if (cr.ok) {
+          const parsed = await cr.json();
+          externalRuns = Array.isArray(parsed.runs) ? parsed.runs : [];
+        }
+      } catch {}
+
+      const comparisonSelect = document.getElementById("comparison-select");
+      if (comparisonSelect) {
+        comparisonSelect.addEventListener("change", renderComparison);
+      }
+      const differencesOnly = document.getElementById("comparison-differences-only");
+      if (differencesOnly) {
+        differencesOnly.addEventListener("change", renderComparison);
+      }
 
       const params = new URLSearchParams(window.location.search);
       const requested = params.get("track");
