@@ -72,17 +72,29 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
                    });
 
   uint32_t NextBuffer = 0, NextTexture = 0, NextSampler = 0;
-  std::map<std::pair<uint32_t, uint32_t>, uint32_t> BufferOverrides;
-  for (const MetalBufferBinding &B : Opts.MetalBufferBindings) {
-    if (B.Index >= 31)
-      return makeError("Metal buffer ABI index {0} exceeds the buffer slot limit",
-                       B.Index);
-    if (!BufferOverrides.emplace(std::make_pair(B.Space, B.Register), B.Index)
-             .second)
-      return makeError("duplicate Metal buffer ABI binding ({0}, {1})",
-                       B.Space, B.Register);
-  }
-  std::set<uint32_t> ExplicitSlots;
+  using Overrides = std::map<std::pair<uint32_t, uint32_t>, uint32_t>;
+  Overrides BufferOverrides, TextureOverrides, SamplerOverrides;
+  auto Collect = [&](const std::vector<MetalResourceBinding> &Bindings,
+                     Overrides &Map, const char *Kind, uint32_t Limit) -> llvm::Error {
+    for (const auto &B : Bindings) {
+      if (B.Index >= Limit)
+        return makeError("Metal {0} ABI index {1} exceeds the {0} slot limit",
+                         Kind, B.Index);
+      if (!Map.emplace(std::make_pair(B.Space, B.Register), B.Index).second)
+        return makeError("duplicate Metal {0} ABI binding ({1}, {2})",
+                         Kind, B.Space, B.Register);
+    }
+    return llvm::Error::success();
+  };
+  if (auto E = Collect(Opts.MetalBufferBindings, BufferOverrides, "buffer", 31))
+    return E;
+  if (auto E = Collect(Opts.MetalTextureBindings, TextureOverrides, "texture", 128))
+    return E;
+  if (auto E = Collect(Opts.MetalSamplerBindings, SamplerOverrides, "sampler", 16))
+    return E;
+  bool ExplicitABI = Opts.RequireMetalBufferBindings || !BufferOverrides.empty() ||
+                     !TextureOverrides.empty() || !SamplerOverrides.empty();
+  std::set<uint32_t> BufferSlots, TextureSlots, SamplerSlots;
   for (ResourceBinding *RB : Order) {
     if (RB->RangeSize == 0xFFFFFFFFu) {
       for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
@@ -97,22 +109,29 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
       return makeError("resource '{0}': unbounded descriptor arrays with "
                        "dynamic indexing are not supported yet",
                        RB->Name);
-    auto Override = BufferOverrides.find({RB->Space, RB->LowerBound});
-    if (Override != BufferOverrides.end()) {
-      if (!isBufferLike(*RB) || RB->RangeSize != 1 || RB->HasCounter)
+    bool Sampler = RB->Class == ResourceClass::Sampler;
+    bool Texture = isTexture(*RB);
+    auto &Map = Sampler ? SamplerOverrides : Texture ? TextureOverrides : BufferOverrides;
+    auto &Slots = Sampler ? SamplerSlots : Texture ? TextureSlots : BufferSlots;
+    auto &Next = Sampler ? NextSampler : Texture ? NextTexture : NextBuffer;
+    const char *Kind = Sampler ? "sampler" : Texture ? "texture" : "buffer";
+    auto Override = Map.find({RB->Space, RB->LowerBound});
+    if (Override != Map.end()) {
+      if ((!Sampler && !Texture && !isBufferLike(*RB)) ||
+          RB->RangeSize != 1 || RB->HasCounter)
         return makeError("resource '{0}': explicit Metal ABI supports only "
-                         "single buffer bindings without counters", RB->Name);
-      if (!ExplicitSlots.insert(Override->second).second)
-        return makeError("Metal buffer ABI slot {0} is used by multiple resources",
-                         Override->second);
+                         "single resources without counters", RB->Name);
+      if (!Slots.insert(Override->second).second)
+        return makeError("Metal {0} ABI slot {1} is used by multiple resources",
+                         Kind, Override->second);
       RB->MetalIndex = Override->second;
-      NextBuffer = std::max(NextBuffer, RB->MetalIndex + 1);
+      Next = std::max(Next, RB->MetalIndex + 1);
       continue;
     }
-    if (Opts.RequireMetalBufferBindings || !BufferOverrides.empty())
-      return makeError("resource '{0}': missing explicit Metal buffer ABI "
-                       "binding ({1}, {2})",
-                       RB->Name, RB->Space, RB->LowerBound);
+    if (ExplicitABI)
+      return makeError("resource '{0}': missing explicit Metal {1} ABI "
+                       "binding ({2}, {3})",
+                       RB->Name, Kind, RB->Space, RB->LowerBound);
     if (RB->Class == ResourceClass::Sampler) {
       RB->MetalIndex = NextSampler;
       NextSampler += RB->RangeSize;
@@ -143,7 +162,7 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts) {
     }
   }
   if ((NeedsBufferSizes || R.HasInstanceContribution) &&
-      (Opts.RequireMetalBufferBindings || !BufferOverrides.empty()))
+      ExplicitABI)
     return makeError("explicit Metal buffer ABI does not support Crucible's "
                      "auxiliary buffers");
   if (NeedsBufferSizes)

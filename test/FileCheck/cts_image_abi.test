@@ -1,0 +1,25 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_image_abi.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal --reflect %t.json --require-msl-buffer-bindings --msl-texture-binding=0,0,5 --msl-sampler-binding=0,0,3 --msl-texture-binding=0,1,6 --msl-sampler-binding=0,2,4 --msl-texture-binding=0,3,7 --msl-buffer-binding=0,4,7
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: not %cruciblec %t.spv --msl-texture-binding=0,0,128 2>&1 | FileCheck %s --check-prefix=TEXTURE-LIMIT
+# RUN: not %cruciblec %t.spv --msl-sampler-binding=0,0,16 2>&1 | FileCheck %s --check-prefix=SAMPLER-LIMIT
+# RUN: not %cruciblec %t.spv --msl-texture-binding=0,0,1 --msl-texture-binding=0,0,2 2>&1 | FileCheck %s --check-prefix=DUPLICATE
+# RUN: not %cruciblec %t.spv --msl-sampler-binding=bad 2>&1 | FileCheck %s --check-prefix=INVALID
+# RUN: not %cruciblec %t.spv --require-msl-buffer-bindings --msl-texture-binding=0,0,5 --msl-texture-binding=0,1,6 --msl-texture-binding=0,3,7 --msl-buffer-binding=0,4,7 2>&1 | FileCheck %s --check-prefix=MISSING
+# RUN: not %cruciblec %t.spv --msl-texture-binding=0,0,5 --msl-texture-binding=0,1,5 --msl-texture-binding=0,3,7 --msl-buffer-binding=0,4,7 2>&1 | FileCheck %s --check-prefix=COLLISION
+# CHECK-DAG: texture2d<float{{.*}} [[COMBINED:spirv_var_[0-9]+]] {{\[\[}}texture(5){{\]\]}}
+# CHECK-DAG: texture2d<float{{.*}} [[SEPARATE:spirv_var_[0-9]+]] {{\[\[}}texture(6){{\]\]}}
+# CHECK-DAG: texture2d<float, access::read_write> {{.*}} {{\[\[}}texture(7){{\]\]}}
+# CHECK-DAG: sampler [[CSAMP:spirv_var_[0-9]+_sampler]] {{\[\[}}sampler(3){{\]\]}}
+# CHECK-DAG: sampler [[SSAMP:spirv_var_[0-9]+]] {{\[\[}}sampler(4){{\]\]}}
+# CHECK-DAG: device float* {{.*}} {{\[\[}}buffer(7){{\]\]}}
+# CHECK: [[COMBINED]].sample([[CSAMP]]
+# CHECK: [[SEPARATE]].sample([[SSAMP]]
+# TEXTURE-LIMIT: exceeds the texture slot limit
+# SAMPLER-LIMIT: exceeds the sampler slot limit
+# DUPLICATE: duplicate Metal texture ABI binding (0, 0)
+# INVALID: invalid --msl-sampler-binding
+# MISSING: missing explicit Metal sampler ABI binding
+# COLLISION: Metal texture ABI slot 5 is used by multiple resources

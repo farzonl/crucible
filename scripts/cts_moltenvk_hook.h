@@ -98,16 +98,21 @@ static bool crucibleCTSCompile(const std::vector<uint32_t>& spirv,
         if (b.stage != config.options.entryPointStage) { continue; }
         using BaseType = SPIRV_CROSS_NAMESPACE::SPIRType;
         if (resource.requiresConstExprSampler || b.count > 1 ||
-            b.basetype == BaseType::Image || b.basetype == BaseType::SampledImage ||
-            b.basetype == BaseType::Sampler || b.basetype == BaseType::AccelerationStructure) {
+            b.basetype == BaseType::AccelerationStructure) {
             cleanup();
-            return fail("descriptor arrays and non-buffer resources are not supported by the adapter",
+            return fail("descriptor arrays, constexpr samplers and acceleration structures are not supported by the adapter",
                         "adapter_failed");
         }
         // Crucible's SPIR-V loader represents PushConstant with space ~1u.
         uint32_t space = b.desc_set == ~0u ? ~1u : b.desc_set;
-        arguments.push_back("--msl-buffer-binding=" + std::to_string(space) + "," +
-                            std::to_string(b.binding) + "," + std::to_string(b.msl_buffer));
+        auto binding = std::to_string(space) + "," + std::to_string(b.binding) + ",";
+        if (b.basetype == BaseType::Image || b.basetype == BaseType::SampledImage)
+            arguments.push_back("--msl-texture-binding=" + binding + std::to_string(b.msl_texture));
+        if (b.basetype == BaseType::Sampler || b.basetype == BaseType::SampledImage)
+            arguments.push_back("--msl-sampler-binding=" + binding + std::to_string(b.msl_sampler));
+        if (b.basetype != BaseType::Image && b.basetype != BaseType::SampledImage &&
+            b.basetype != BaseType::Sampler)
+            arguments.push_back("--msl-buffer-binding=" + binding + std::to_string(b.msl_buffer));
     }
     std::vector<char *> argv;
     for (auto& argument : arguments) { argv.push_back(&argument[0]); }

@@ -1,0 +1,61 @@
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %combined %image %sampler %storage %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %combined DescriptorSet 0
+OpDecorate %combined Binding 0
+OpDecorate %image DescriptorSet 0
+OpDecorate %image Binding 1
+OpDecorate %sampler DescriptorSet 0
+OpDecorate %sampler Binding 2
+OpDecorate %storage DescriptorSet 0
+OpDecorate %storage Binding 3
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %array ArrayStride 16
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%u32 = OpTypeInt 32 0
+%v2f32 = OpTypeVector %f32 2
+%v4f32 = OpTypeVector %f32 4
+%v2u32 = OpTypeVector %u32 2
+%image_type = OpTypeImage %f32 2D 0 0 0 1 Unknown
+%storage_type = OpTypeImage %f32 2D 0 0 0 2 Rgba32f
+%sampled_type = OpTypeSampledImage %image_type
+%sampler_type = OpTypeSampler
+%pcombined = OpTypePointer UniformConstant %sampled_type
+%pimage = OpTypePointer UniformConstant %image_type
+%psampler = OpTypePointer UniformConstant %sampler_type
+%pstorage = OpTypePointer UniformConstant %storage_type
+%array = OpTypeRuntimeArray %v4f32
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pvalue = OpTypePointer StorageBuffer %v4f32
+%combined = OpVariable %pcombined UniformConstant
+%image = OpVariable %pimage UniformConstant
+%sampler = OpVariable %psampler UniformConstant
+%storage = OpVariable %pstorage UniformConstant
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %u32 0
+%fzero = OpConstant %f32 0
+%half = OpConstant %f32 0.5
+%uv = OpConstantComposite %v2f32 %half %half
+%pixel = OpConstantComposite %v2u32 %zero %zero
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%c = OpLoad %sampled_type %combined
+%i = OpLoad %image_type %image
+%s = OpLoad %sampler_type %sampler
+%rw = OpLoad %storage_type %storage
+%pair = OpSampledImage %sampled_type %i %s
+%a = OpImageSampleExplicitLod %v4f32 %c %uv Lod %fzero
+%b = OpImageSampleExplicitLod %v4f32 %pair %uv Lod %fzero
+%sum = OpFAdd %v4f32 %a %b
+OpImageWrite %rw %pixel %sum
+%ptr = OpAccessChain %pvalue %output %zero %zero
+OpStore %ptr %sum
+OpReturn
+OpFunctionEnd

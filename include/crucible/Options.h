@@ -41,11 +41,12 @@ struct ArraySizeOverride {
   uint32_t Size = 1;
 };
 
-struct MetalBufferBinding {
+struct MetalResourceBinding {
   uint32_t Space = 0;
   uint32_t Register = 0;
   uint32_t Index = 0;
 };
+using MetalBufferBinding = MetalResourceBinding;
 
 /// DXC-style Vulkan register shift override (-fvk-b/t/u/s-shift).
 struct VulkanRegisterShift {
@@ -81,6 +82,8 @@ struct Options {
   /// Explicit Metal ABI used by external Vulkan runtimes.
   std::string MSLEntryPoint;
   std::vector<MetalBufferBinding> MetalBufferBindings;
+  std::vector<MetalResourceBinding> MetalTextureBindings;
+  std::vector<MetalResourceBinding> MetalSamplerBindings;
   bool RequireMetalBufferBindings = false;
 
   /// Flush f32 denormals to signed zero around math builtins (D3D12 FTZ).

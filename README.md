@@ -142,10 +142,15 @@ The initial baseline pins VK-GL-CTS `vulkan-cts-1.4.7.1` at
 `external/vulkancts/mustpass/main/vk-default/spirv-assembly.txt`, restricted to
 `dEQP-VK.spirv_assembly.instruction.compute.*`. This is a bounded **sample**, not
 the full must-pass suite; each track runs fraction 0/1 with a 900-second execution
-budget. The initial adapter supports direct-bound, single buffers (including
+budget. The adapter supports direct-bound, single buffers (including
 push constants), remapping descriptor sets/bindings and the emitted entry name
-to MoltenVK's actual Metal ABI. Graphics, descriptor arrays, textures/samplers,
-specialization constants and auxiliary-buffer ABIs are not yet integrated.
+to MoltenVK's actual Metal ABI. Single sampled/storage images and samplers use
+separate explicit `--msl-texture-binding` and `--msl-sampler-binding` overrides
+(`space,register,index`), including both slots of combined image samplers.
+`--require-msl-buffer-bindings` requires all reflected resources to have explicit
+slots in their respective buffer, texture, or sampler namespace.
+Graphics, descriptor arrays, constexpr samplers, specialization constants and
+auxiliary-buffer ABIs are not yet integrated.
 Adapter rejection is visible, rather than being hidden by native fallback.
 
 SPIR-V integer dot products include packed and unpacked `SDotAccSat`,
