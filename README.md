@@ -216,6 +216,11 @@ shaders emit Metal safe-math and contraction-off pragmas, preserving strict
 subtraction semantics even when the runtime's default compilation enables fast
 math. Relaxed SPIR-V flags remain permissions; computing stricter results is
 intentional. Ordinary shaders retain their existing compilation mode.
+Strict float16/32 `Modf` and `ModfStruct` share sign-restoring decomposition,
+including NaNs, infinities and negative-zero fractional/whole results. `Modf`
+writes the whole-number pointer result as well as returning the fraction.
+GLSL `Fma` retains explicitly fused rounding, including half precision, under
+the strict source mode; float16/32 conversions are also supported.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

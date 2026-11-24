@@ -86,7 +86,9 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
       HasControls |= Words[I + 1] == spv::CapabilityFloatControls2;
     }
     if ((Op == spv::OpTypeFloat && N == 3) ||
-        (Op == spv::OpTypeInt && N == 4) || (Op == spv::OpTypeVector && N == 4))
+        (Op == spv::OpTypeInt && N == 4) ||
+        (Op == spv::OpTypeVector && N == 4) ||
+        (Op == spv::OpTypeStruct && N >= 2))
       Types[Words[I + 1]] =
           SmallVector<uint32_t>(Words.begin() + I, Words.begin() + I + N);
     if (Op == spv::OpTypeBool && N == 2)
@@ -107,6 +109,20 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
   if (!HasControls)
     return Error::success();
   RequiresStrictFP = true;
+  auto IsSupportedFloat = [&](uint32_t Ty) {
+    auto T = Types.find(Ty);
+    if (T == Types.end())
+      return false;
+    if ((T->second[0] & 0xffff) == spv::OpTypeVector) {
+      if (T->second[3] < 2 || T->second[3] > 4)
+        return false;
+      T = Types.find(T->second[2]);
+      if (T == Types.end())
+        return false;
+    }
+    return (T->second[0] & 0xffff) == spv::OpTypeFloat &&
+           (T->second[2] == 16 || T->second[2] == 32);
+  };
 
   SmallVector<uint32_t> NewCapabilities, Declarations, Body;
   uint32_t NextID = Words[3];
@@ -352,7 +368,30 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
         Emit(Body, Ordered ? spv::OpLogicalAnd : spv::OpLogicalOr,
              {Words[I + 1], Words[I + 2], Equal, Nan});
       }
+    } else if (Op == spv::OpExtInst && N >= 6 &&
+               GLSLImports.contains(Words[I + 3]) &&
+               ((N == 8 && Words[I + 4] == GLSLstd450Fma) ||
+                (N == 7 && Words[I + 4] == GLSLstd450Modf) ||
+                (N == 6 && Words[I + 4] == GLSLstd450ModfStruct))) {
+      uint32_t Ty = Words[I + 1];
+      if (Words[I + 4] == GLSLstd450ModfStruct) {
+        auto T = Types.find(Ty);
+        if (T == Types.end() || (T->second[0] & 0xffff) != spv::OpTypeStruct ||
+            T->second.size() != 4 || T->second[2] != T->second[3])
+          return makeError("invalid FloatControls2 ModfStruct result type");
+        Ty = T->second[2];
+      }
+      if (!IsSupportedFloat(Ty))
+        return makeError(
+            "FloatControls2 math requires scalar/vector float16/32");
+      Body.append(Words.begin() + I, Words.begin() + I + N);
     } else {
+      if (Op == spv::OpFSub && !IsSupportedFloat(Words[I + 1]))
+        return makeError("FloatControls2 subtraction requires float16/32");
+      if (Op == spv::OpFConvert &&
+          (!IsSupportedFloat(Words[I + 1]) ||
+           !IsSupportedFloat(ValueTypes.lookup(Words[I + 3]))))
+        return makeError("FloatControls2 conversion requires float16/32");
       switch (Op) {
       case spv::OpCapability:
       case spv::OpExtension:
@@ -418,6 +457,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
       case spv::OpSConvert:
       case spv::OpIAdd:
       case spv::OpFSub:
+      case spv::OpFConvert:
       case spv::OpISub:
       case spv::OpIMul:
       case spv::OpIEqual:
@@ -590,7 +630,8 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
     }
     if (Op == spv::OpExtInst && Count >= 5 &&
         GLSLImports.contains(Words[I + 3]) &&
-        Words[I + 4] == GLSLstd450ModfStruct)
+        (Words[I + 4] == GLSLstd450ModfStruct ||
+         Words[I + 4] == GLSLstd450Modf))
       HasModf = true;
     I += Count;
   }
@@ -613,20 +654,26 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
     uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
     if (Op != spv::OpExtInst || Count < 5 ||
         !GLSLImports.contains(Words[I + 3]) ||
-        Words[I + 4] != GLSLstd450ModfStruct) {
+        (Words[I + 4] != GLSLstd450ModfStruct &&
+         Words[I + 4] != GLSLstd450Modf)) {
       Body.append(Words.begin() + I, Words.begin() + I + Count);
       I += Count;
       continue;
     }
-    if (Count != 6 || NextID > UINT32_MAX - 64)
-      return makeError("malformed or oversized SPIR-V ModfStruct");
-    auto Struct = Types.find(Words[I + 1]);
-    if (Struct == Types.end() ||
-        TypeKinds[Struct->first] != spv::OpTypeStruct ||
-        Struct->second.size() != 3 || Struct->second[1] != Struct->second[2])
-      return makeError(
-          "ModfStruct requires two matching floating-point members");
-    uint32_t Ty = Struct->second[1], ScalarTy = Ty, Lanes = 1;
+    bool PointerResult = Words[I + 4] == GLSLstd450Modf;
+    if (Count != (PointerResult ? 7 : 6) || NextID > UINT32_MAX - 64)
+      return makeError("malformed or oversized SPIR-V Modf");
+    uint32_t Ty = Words[I + 1];
+    if (!PointerResult) {
+      auto Struct = Types.find(Ty);
+      if (Struct == Types.end() ||
+          TypeKinds[Struct->first] != spv::OpTypeStruct ||
+          Struct->second.size() != 3 || Struct->second[1] != Struct->second[2])
+        return makeError(
+            "ModfStruct requires two matching floating-point members");
+      Ty = Struct->second[1];
+    }
+    uint32_t ScalarTy = Ty, Lanes = 1;
     auto Type = Types.find(Ty);
     if (Type == Types.end())
       return makeError("unknown ModfStruct member type");
@@ -746,8 +793,13 @@ static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
     uint32_t WholeBits = NextID++;
     Emit(Body, spv::OpBitcast, {C.UInt, WholeBits, Whole});
     uint32_t ResultWhole = CopySign(WholeBits);
-    Emit(Body, spv::OpCompositeConstruct,
-         {Words[I + 1], Words[I + 2], ResultFraction, ResultWhole});
+    if (PointerResult) {
+      Emit(Body, spv::OpStore, {Words[I + 6], ResultWhole});
+      Emit(Body, spv::OpCopyObject, {Ty, Words[I + 2], ResultFraction});
+    } else {
+      Emit(Body, spv::OpCompositeConstruct,
+           {Words[I + 1], Words[I + 2], ResultFraction, ResultWhole});
+    }
     I += Count;
   }
   // Generated types/constants must precede all function definitions.

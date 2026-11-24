@@ -1,0 +1,12 @@
+# REQUIRES: spirv-assembler, spirv-tools, spirv-float-controls2
+# RUN: awk '/^%%main =/ {print "%%fz = OpConstant %%f32 0\n%%hz = OpConstant %%f16 0\n%%vz = OpConstantComposite %%v2f32 %%fz %%fz"} {print}' %S/../Inputs/spirv_float_controls2.spvasm | sed 's/FAbs %%a$/Fma %%a %%b %%fz/; s/FAbs %%ah$/Fma %%ah %%bh %%hz/; s/FAbs %%va$/Fma %%va %%vb %%vz/' > %t.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# CHECK: #pragma METAL fp math_mode(safe)
+# CHECK-NEXT: #pragma METAL fp contract(off)
+# CHECK: kernel void
+# CHECK: fma(
+# CHECK: fma(
+# CHECK: fma(
