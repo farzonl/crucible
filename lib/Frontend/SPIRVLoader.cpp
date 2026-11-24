@@ -372,7 +372,12 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
                GLSLImports.contains(Words[I + 3]) &&
                ((N == 8 && Words[I + 4] == GLSLstd450Fma) ||
                 (N == 7 && Words[I + 4] == GLSLstd450Modf) ||
-                (N == 6 && Words[I + 4] == GLSLstd450ModfStruct))) {
+                (N == 7 && Words[I + 4] == GLSLstd450Atan2) ||
+                (N == 6 && (Words[I + 4] == GLSLstd450ModfStruct ||
+                            Words[I + 4] == GLSLstd450Acosh ||
+                            Words[I + 4] == GLSLstd450Cosh ||
+                            Words[I + 4] == GLSLstd450Exp ||
+                            Words[I + 4] == GLSLstd450Log2)))) {
       uint32_t Ty = Words[I + 1];
       if (Words[I + 4] == GLSLstd450ModfStruct) {
         auto T = Types.find(Ty);
@@ -3987,13 +3992,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                   mlir::spirv::SDotOp, mlir::spirv::UDotOp,
                   mlir::spirv::SUDotOp, mlir::spirv::SDotAccSatOp,
                   mlir::spirv::UDotAccSatOp, mlir::spirv::SUDotAccSatOp,
-                  mlir::spirv::GLFSignOp,
-                  mlir::spirv::GLSSignOp, mlir::spirv::GLLengthOp,
-                  mlir::spirv::GLDistanceOp, mlir::spirv::GLCrossOp,
-                  mlir::spirv::GLReflectOp, mlir::spirv::GLSmoothStepOp,
-                  mlir::spirv::GLPackHalf2x16Op,
+                  mlir::spirv::GLFSignOp, mlir::spirv::GLSSignOp,
+                  mlir::spirv::GLLengthOp, mlir::spirv::GLDistanceOp,
+                  mlir::spirv::GLCrossOp, mlir::spirv::GLReflectOp,
+                  mlir::spirv::GLSmoothStepOp, mlir::spirv::GLPackHalf2x16Op,
                   mlir::spirv::GLUnpackHalf2x16Op, mlir::spirv::GLFindILsbOp,
-                  mlir::spirv::GLFindUMsbOp, mlir::spirv::GLFindSMsbOp>(Op))
+                  mlir::spirv::GLFindUMsbOp, mlir::spirv::GLFindSMsbOp>(Op) ||
+        (Reflect.RequiresStrictFP && mlir::isa<mlir::spirv::GLAcoshOp>(Op)))
       GLMathOps.push_back(Op);
   });
   for (mlir::Operation *Op : GLMathOps) {
@@ -4051,7 +4056,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       return Splat;
     };
 
-    if (auto At2 = mlir::dyn_cast<mlir::spirv::GLAtan2Op>(Op)) {
+    if (auto Acosh = mlir::dyn_cast<mlir::spirv::GLAcoshOp>(Op)) {
+      // Retain the robust builtin instead of log(x + sqrt(x*x - 1)), which
+      // overflows for large finite inputs and mishandles negative infinity.
+      auto Rep = mlir::math::AcoshOp::create(B, Loc, Acosh.getOperand());
+      Acosh.replaceAllUsesWith(Rep.getResult());
+      Acosh.erase();
+    } else if (auto At2 = mlir::dyn_cast<mlir::spirv::GLAtan2Op>(Op)) {
       auto Rep = mlir::math::Atan2Op::create(B, Loc, At2->getOperand(0),
                                              At2->getOperand(1));
       At2.replaceAllUsesWith(Rep.getResult());
@@ -4088,8 +4099,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Dot.erase();
     } else if (mlir::isa<mlir::spirv::SDotOp, mlir::spirv::UDotOp,
                          mlir::spirv::SUDotOp, mlir::spirv::SDotAccSatOp,
-                         mlir::spirv::UDotAccSatOp,
-                         mlir::spirv::SUDotAccSatOp>(Op)) {
+                         mlir::spirv::UDotAccSatOp, mlir::spirv::SUDotAccSatOp>(
+                   Op)) {
       bool Saturating = Op->getNumOperands() == 3;
       bool Signed1 =
           mlir::isa<mlir::spirv::SDotOp, mlir::spirv::SUDotOp,
