@@ -11,7 +11,7 @@ MSLResourceBinding::MSLResourceBinding() {}
 }
 
 int main(int argc, char **argv) {
-    assert(argc == 5); // cruciblec, trace path, image SPIR-V, specialization SPIR-V
+    assert(argc == 6); // cruciblec, trace, image, specialization, physical SPIR-V
     // Valid SPIR-V 1.3: main writes 1.0 to storage buffer set 0, binding 0.
     std::vector<uint32_t> spirv = {
         0x07230203, 0x00010300, 0, 15, 0,
@@ -213,6 +213,24 @@ int main(int argc, char **argv) {
         imageConfig.resourceBindings[0].requiresConstExprSampler = true;
         assert(!crucibleCTSCompile(imageSpirv, imageConfig, result));
         assert(result.msl.empty());
+    }
+    {
+        std::ifstream stream(argv[5], std::ios::binary | std::ios::ate);
+        assert(stream);
+        auto bytes = stream.tellg();
+        assert(bytes > 0 && bytes % sizeof(uint32_t) == 0);
+        std::vector<uint32_t> physicalSpirv(bytes / sizeof(uint32_t));
+        stream.seekg(0);
+        stream.read(reinterpret_cast<char *>(physicalSpirv.data()), bytes);
+        assert(stream);
+        result.resultInfo.usesPhysicalStorageBufferAddressesCapability = true;
+        result.msl = "native sentinel";
+        assert(crucibleCTSCompile(physicalSpirv, config, result));
+        assert(result.resultInfo.usesPhysicalStorageBufferAddressesCapability);
+        assert(result.msl.find("[[buffer(7)]]") != std::string::npos);
+        assert(result.msl.find("device float") != std::string::npos);
+        assert(result.msl.find("native sentinel") == std::string::npos);
+        result.resultInfo.usesPhysicalStorageBufferAddressesCapability = false;
     }
     result.msl = "native sentinel";
     setenv("CRUCIBLE_CTS_COMPILER", "/bin/false", 1);

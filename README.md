@@ -160,6 +160,15 @@ Unsupported specialization forms fail explicitly rather than ignoring overrides.
 Graphics, descriptor arrays, constexpr samplers and auxiliary-buffer ABIs are
 not yet integrated.
 Adapter rejection is visible, rather than being hidden by native fallback.
+Physical-storage-buffer scalar reads/writes can consume 64-bit GPU addresses
+from read-only storage-buffer address tables. Struct member offsets and explicit
+array strides are retained through pointer selection and byte-address arithmetic.
+MoltenVK's physical-address metadata continues to declare addressable buffers
+resident; Crucible does not substitute host addresses or native shader code.
+Aliasing is preserved without `restrict` qualifiers. This path currently requires
+naturally aligned scalar accesses; pointer arithmetic via `OpPtrAccessChain`,
+pointer-valued stores, matrices, vectors and additional memory operands fail
+explicitly rather than being accepted with incorrect layouts.
 
 SPIR-V integer dot products include packed and unpacked `SDotAccSat`,
 `SUDotAccSat`, and `UDotAccSat`, lowered to Metal saturating addition after

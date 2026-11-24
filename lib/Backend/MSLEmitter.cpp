@@ -2242,6 +2242,18 @@ Expected<std::string> Emitter::addrSpaceOf(mlir::Value Ptr) {
 
 Expected<Expr> Emitter::lvalueFor(mlir::Value Ptr, bool DecayArray) {
   mlir::Operation *Def = Ptr.getDefiningOp();
+  if (auto Cast = mlir::dyn_cast_or_null<mlir::LLVM::IntToPtrOp>(Def)) {
+    auto Ty = Cast->getAttrOfType<mlir::TypeAttr>("crucible.physical_type");
+    if (!Ty)
+      return makeError("integer-to-pointer cast lacks physical access type");
+    auto T = mslType(Ty.getValue());
+    auto Address = exprFor(Cast.getArg(), PrecUnknown);
+    if (!T)
+      return T.takeError();
+    if (!Address)
+      return Address.takeError();
+    return Expr{"*((device " + *T + " *)(" + Address->Text + "))", PrecUnary};
+  }
   if (!Def) {
     auto It = ValueNames.find(Ptr);
     if (It != ValueNames.end())
@@ -2379,7 +2391,7 @@ static bool mayWriteMemory(mlir::Operation *Op) {
 }
 
 bool Emitter::shouldInline(mlir::Operation *Op) {
-  if (Op->hasAttr("crucible.volatile"))
+  if (Op->hasAttr("crucible.volatile") || Op->hasAttr("crucible.address_table"))
     return false;
   if (auto Load = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
       Load && Load.getVolatile_())
@@ -2389,7 +2401,7 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
 
   // Pointer producers are always folded into the lvalue they feed.
   if (mlir::isa<mlir::LLVM::GEPOp, mlir::LLVM::AddressOfOp,
-                ir::GetMeshPayloadOp>(Op))
+                mlir::LLVM::IntToPtrOp, ir::GetMeshPayloadOp>(Op))
     return true;
 
   // Trivial GPU builtin reads & resource handles: never materialized directly.
@@ -6396,6 +6408,10 @@ Expected<std::string> Emitter::kernelSignature() {
     Sep();
     OS << "    CrucibleStageIn stageIn [[stage_in]]";
   }
+  bool HasPhysicalPointers = false;
+  Entry.walk([&](mlir::LLVM::IntToPtrOp Cast) {
+    HasPhysicalPointers |= Cast->hasAttr("crucible.physical_type");
+  });
   for (const ResState *RS : Sorted) {
     const ResourceBinding &RB = *RS->RB;
     Sep();
@@ -6501,10 +6517,10 @@ Expected<std::string> Emitter::kernelSignature() {
     const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
                             : RB.Class == ResourceClass::UAV ? "device "
                                                              : "constant ";
-    const char *RestrictQual =
-        (RB.Class != ResourceClass::CBV && !RB.GloballyCoherent)
-            ? "__restrict "
-            : "";
+    const char *RestrictQual = (RB.Class != ResourceClass::CBV &&
+                                !RB.GloballyCoherent && !HasPhysicalPointers)
+                                   ? "__restrict "
+                                   : "";
     if (RB.RangeSize == 1) {
       OS << "    " << PtrPrefix << RS->ElemType << "* " << RestrictQual
          << RS->ParamName << " [[buffer(" << RB.MetalIndex << ")]]";

@@ -225,7 +225,6 @@ static bool crucibleCTSCompile(const std::vector<uint32_t>& spirv,
         info.needsBufferSizeBuffer || info.needsDynamicOffsetBuffer ||
         info.needsInputThreadgroupMem || info.needsDispatchBaseBuffer ||
         info.needsViewRangeBuffer || info.needsDrawId ||
-        info.usesPhysicalStorageBufferAddressesCapability ||
         !info.specializationMacros.empty()) {
         return fail("unsupported runtime ABI (initial adapter is direct-binding compute)",
                     "adapter_failed");
