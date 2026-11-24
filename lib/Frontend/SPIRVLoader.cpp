@@ -550,8 +550,9 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
 static Error expandFmaKHR(SmallVectorImpl<uint32_t> &Words) {
   if (Words.size() < 5)
     return makeError("truncated SPIR-V header");
-  bool HasFma = false;
+  bool HasFma = false, HasLdexp = false;
   uint32_t GLSL = 0;
+  DenseSet<uint32_t> GLSLImports;
   DenseSet<uint32_t> Float32Types;
   auto IsString = [](ArrayRef<uint32_t> Words, StringRef Text) {
     StringRef Bytes(reinterpret_cast<const char *>(Words.data()),
@@ -566,14 +567,44 @@ static Error expandFmaKHR(SmallVectorImpl<uint32_t> &Words) {
     if (Op == spv::OpFmaKHR)
       HasFma = true;
     if (Op == spv::OpExtInstImport && Count >= 3 &&
-        IsString(ArrayRef(Words).slice(I + 2, Count - 2), "GLSL.std.450"))
+        IsString(ArrayRef(Words).slice(I + 2, Count - 2), "GLSL.std.450")) {
       GLSL = Words[I + 1];
+      GLSLImports.insert(GLSL);
+    }
+    if (Op == spv::OpExtInst && Count == 7 &&
+        GLSLImports.contains(Words[I + 3]) && Words[I + 4] == GLSLstd450Ldexp)
+      HasLdexp = true;
     if (Op == spv::OpTypeFloat && Count == 3 && Words[I + 2] == 32)
       Float32Types.insert(Words[I + 1]);
     if (Op == spv::OpTypeVector && Count == 4 &&
         Float32Types.contains(Words[I + 2]) && Words[I + 3] >= 2 &&
         Words[I + 3] <= 4)
       Float32Types.insert(Words[I + 1]);
+    I += Count;
+  }
+  if (!HasFma && !HasLdexp)
+    return Error::success();
+
+  // Both intrinsics support the same float32 execution-mode subset.
+  StringRef Instruction = HasFma ? "FmaKHR" : "ldexp";
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (Op == spv::OpExecutionMode && Count >= 3) {
+      uint32_t Mode = Words[I + 2];
+      if (Mode == spv::ExecutionModeRoundingModeRTZ ||
+          Mode == spv::ExecutionModeDenormPreserve ||
+          Mode == spv::ExecutionModeDenormFlushToZero ||
+          Mode == spv::ExecutionModeSignedZeroInfNanPreserve ||
+          (Mode == spv::ExecutionModeRoundingModeRTE &&
+           (Count != 4 || Words[I + 3] != 32)))
+        return makeError("unsupported floating-point execution mode for {0}",
+                         Instruction);
+    }
+    if (Op == spv::OpDecorate && Count == 4 &&
+        Words[I + 2] == spv::DecorationFPRoundingMode &&
+        Words[I + 3] != spv::FPRoundingModeRTE)
+      return makeError("unsupported floating-point rounding decoration for {0}",
+                       Instruction);
     I += Count;
   }
   if (!HasFma)
@@ -600,22 +631,6 @@ static Error expandFmaKHR(SmallVectorImpl<uint32_t> &Words) {
       I += Count;
       continue;
     }
-    if (Op == spv::OpExecutionMode && Count >= 3) {
-      uint32_t Mode = Words[I + 2];
-      if (Mode == spv::ExecutionModeRoundingModeRTZ ||
-          Mode == spv::ExecutionModeDenormPreserve ||
-          Mode == spv::ExecutionModeDenormFlushToZero ||
-          Mode == spv::ExecutionModeSignedZeroInfNanPreserve ||
-          (Mode == spv::ExecutionModeRoundingModeRTE &&
-           (Count != 4 || Words[I + 3] != 32)))
-        return makeError(
-            "unsupported floating-point execution mode for FmaKHR");
-    }
-    if (Op == spv::OpDecorate && Count == 4 &&
-        Words[I + 2] == spv::DecorationFPRoundingMode &&
-        Words[I + 3] != spv::FPRoundingModeRTE)
-      return makeError(
-          "unsupported floating-point rounding decoration for FmaKHR");
     if (Op == spv::OpMemoryModel && AddImport) {
       Normalized.append({(6u << 16) | spv::OpExtInstImport, GLSL, 0x4c534c47,
                          0x6474732e, 0x3035342e, 0});

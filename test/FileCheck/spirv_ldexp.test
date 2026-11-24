@@ -1,0 +1,32 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_ldexp.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: awk 'BEGIN {print "OpCapability RoundingModeRTE"} /^OpExecutionMode %%main LocalSize/ {print "OpExecutionMode %%main RoundingModeRTE 32"} {print}' %S/../Inputs/spirv_ldexp.spvasm > %t.rte.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.rte.spvasm -o %t.rte.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.rte.spv
+# RUN: %cruciblec %t.rte.spv -o %t.rte.metal
+# RUN: FileCheck %s --input-file=%t.rte.metal
+# RUN: sed 's/RoundingModeRTE/RoundingModeRTZ/g' %t.rte.spvasm > %t.rtz.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.rtz.spvasm -o %t.rtz.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.rtz.spv
+# RUN: not %cruciblec %t.rtz.spv -o %t.rtz.metal 2>&1 | FileCheck %s --check-prefix=REJECT
+# RUN: awk '/^OpMemoryModel/ {print "%%other = OpExtInstImport \"GLSL.std.450\""} {print}' %t.rtz.spvasm > %t.imports.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.imports.spvasm -o %t.imports.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.imports.spv
+# RUN: not %cruciblec %t.imports.spv -o %t.imports.metal 2>&1 | FileCheck %s --check-prefix=REJECT
+# RUN: %cruciblec %t.spv --ftz -o %t.ftz.metal
+# RUN: FileCheck %s --input-file=%t.ftz.metal --check-prefix=FTZ
+# CHECK: static inline T crucible_ldexp(T x, I e) {
+# CHECK-NEXT: #pragma METAL fp math_mode(safe)
+# CHECK-NEXT: return ldexp(x, e);
+# CHECK: kernel void
+# CHECK-DAG: int(clamp(as_type<long>
+# CHECK-DAG: long(-512), long(512)
+# CHECK-DAG: int2(clamp(as_type<long2>
+# CHECK-DAG: long2(-512), long2(512)
+# CHECK-DAG: clamp(as_type<int>
+# CHECK-DAG: clamp(as_type<int2>
+# REJECT: unsupported floating-point execution mode for ldexp
+# FTZ: crucible_ftz(crucible_ldexp(crucible_ftz(

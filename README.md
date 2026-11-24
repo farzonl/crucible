@@ -235,6 +235,13 @@ and subtraction, preserving the positive-zero determinant of negative-zero
 diagonal inputs. Other determinant dimensions remain explicitly unsupported.
 Scalar/vector `Reflect` reuses the unfused dot/product/subtraction lowering;
 safe source math preserves NaNs from infinity multiplied by zero.
+GLSL `Ldexp`/LLVM `ldexp` supports scalar/vector float32 with signed int32/int64
+exponents in default or RTE mode. Exponents clamp in their original signed width
+to a float32-safe range before narrowing to Metal's int32 parameter, so large
+int64 values cannot wrap into small exponents. A locally safe-math helper keeps
+zeros, infinities and NaNs intact without changing unrelated shader arithmetic.
+Explicit denormal/preservation modes and non-RTE rounding remain unsupported;
+default-mode subnormal results may flush to signed zero on Metal.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

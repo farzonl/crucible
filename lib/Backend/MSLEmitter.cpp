@@ -163,6 +163,12 @@ StringRef helperSource(StringRef Name) {
            "  uint4 u = as_type<uint4>(v) & 0xFFu;\n"
            "  return u.x | (u.y << 8u) | (u.z << 16u) | (u.w << 24u);\n"
            "}\n";
+  if (Name == "crucible_ldexp")
+    return "template <typename T, typename I>\n"
+           "static inline T crucible_ldexp(T x, I e) {\n"
+           "#pragma METAL fp math_mode(safe)\n"
+           "  return ldexp(x, e);\n"
+           "}\n";
   if (Name == "crucible_ftz")
     return "static inline float crucible_ftz(float x) {\n"
            "  return (as_type<uint>(x) & 0x7f800000u) == 0u\n"
@@ -3563,6 +3569,44 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return Expr{mathFunctionName(Fn) + "(" + A->Text + ", " + B->Text + ")",
                 PrecPrimary};
   };
+  if (auto Scale = mlir::dyn_cast<mlir::LLVM::LoadExpOp>(Op)) {
+    mlir::Type Ty = Scale.getType(), ExpTy = Scale.getExp().getType();
+    if (!isF32OrF32Vec(Ty))
+      return makeError("ldexp supports only scalar/vector float32");
+    auto VT = mlir::dyn_cast<mlir::VectorType>(Ty);
+    auto EV = mlir::dyn_cast<mlir::VectorType>(ExpTy);
+    if ((VT && (!EV || VT.getNumElements() != EV.getNumElements())) ||
+        (!VT && EV))
+      return makeError("ldexp operand shapes must match");
+    mlir::Type Integer = EV ? EV.getElementType() : ExpTy;
+    if (!Integer.isInteger(32) && !Integer.isInteger(64))
+      return makeError("ldexp requires integer32/64 exponents");
+    auto X = exprFor(Scale.getVal(), PrecUnknown);
+    auto E = exprFor(Scale.getExp(), PrecUnknown);
+    if (!X)
+      return X.takeError();
+    if (!E)
+      return E.takeError();
+    std::string Suffix = VT ? std::to_string(VT.getNumElements()) : "";
+    std::string Int = "int" + Suffix;
+    std::string Signed = (Integer.isInteger(64) ? "long" : "int") + Suffix;
+    // Beyond +/-512 every finite nonzero float32 over/underflows, even
+    // subnormals. Clamp while still signed/full-width, before narrowing.
+    std::string Exponent = "clamp(" + signedView(ExpTy, E->Text) + ", " +
+                           Signed + "(-512), " + Signed + "(512))";
+    if (Integer.isInteger(64))
+      Exponent = Int + "(" + Exponent + ")";
+    requireHelper("crucible_ldexp");
+    std::string Value = X->Text;
+    if (Opts.FlushDenormsF32) {
+      requireHelper("crucible_ftz");
+      Value = "crucible_ftz(" + Value + ")";
+    }
+    std::string Call = "crucible_ldexp(" + Value + ", " + Exponent + ")";
+    if (Opts.FlushDenormsF32)
+      Call = "crucible_ftz(" + Call + ")";
+    return Expr{Call, PrecPrimary};
+  }
   if (mlir::isa<mlir::math::AcoshOp>(Op))
     return emitUnaryCall("acosh");
   if (mlir::isa<mlir::LLVM::FAbsOp, mlir::math::AbsFOp>(Op))
