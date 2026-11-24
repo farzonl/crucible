@@ -2589,6 +2589,9 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
   if (auto Info = binOpInfo(Op)) {
     mlir::Type T = Op->getResult(0).getType();
     int LPrec = Info->Prec == PrecShift ? PrecMul : Info->Prec;
+    // Metal requires parentheses around comparisons used in bitwise operands.
+    if (Info->Prec >= PrecOr && Info->Prec <= PrecAnd)
+      LPrec = PrecShift;
     auto L = exprFor(Op->getOperand(0), Info->Signed ? PrecUnknown : LPrec);
     if (!L)
       return L.takeError();
@@ -6838,6 +6841,9 @@ Expected<std::string> Emitter::run() {
      << "#include <metal_stdlib>\n"
      << "using namespace metal;\n"
      << (UsesRaytracing ? "using namespace metal::raytracing;\n\n" : "\n");
+  if (R.RequiresStrictFP)
+    OS << "#pragma METAL fp math_mode(safe)\n"
+       << "#pragma METAL fp contract(off)\n\n";
   for (const std::string &H : HelperOrder)
     OS << helperSource(H) << "\n";
   if (!StructDecls.empty())

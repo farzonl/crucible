@@ -1,0 +1,24 @@
+# REQUIRES: spirv-assembler, spirv-tools, spirv-float-controls2
+# RUN: sed 's/ FAbs / RoundEven /g' %S/../Inputs/spirv_float_controls2.spvasm > %t.round.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.round.spvasm -o %t.round.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.round.spv
+# RUN: %cruciblec %t.round.spv -o %t.round.metal
+# RUN: FileCheck %s --input-file=%t.round.metal
+# RUN: sed 's/ FAbs / Floor /g' %S/../Inputs/spirv_float_controls2.spvasm > %t.floor.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.floor.spvasm -o %t.floor.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.floor.spv
+# RUN: %cruciblec %t.floor.spv -o %t.floor.metal
+# RUN: FileCheck %s --input-file=%t.floor.metal
+# RUN: sed 's/FAbs %a$/NMin %a %b/; s/FAbs %ah$/NMin %ah %bh/; s/FAbs %va$/NMin %va %vb/' %S/../Inputs/spirv_float_controls2.spvasm > %t.min.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.min.spvasm -o %t.min.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.min.spv
+# RUN: %cruciblec %t.min.spv -o %t.min.metal
+# RUN: FileCheck %s --input-file=%t.min.metal
+# RUN: sed 's/OpExtInst %f32 %glsl FAbs %a$/OpFSub %f32 %a %b/; s/OpExtInst %f16 %glsl FAbs %ah$/OpFSub %f16 %ah %bh/; s/OpExtInst %v2f32 %glsl FAbs %va$/OpFSub %v2f32 %va %vb/' %S/../Inputs/spirv_float_controls2.spvasm > %t.sub.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.sub.spvasm -o %t.sub.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.sub.spv
+# RUN: %cruciblec %t.sub.spv -o %t.sub.metal
+# RUN: FileCheck %s --input-file=%t.sub.metal
+# CHECK: #pragma METAL fp math_mode(safe)
+# CHECK-NEXT: #pragma METAL fp contract(off)
+# CHECK: kernel void

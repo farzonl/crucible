@@ -63,7 +63,8 @@ bool isSPIRVBinary(MemoryBufferRef Buf) {
 
 namespace {
 
-static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
+static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
+                                  bool &RequiresStrictFP) {
   if (Words.size() < 5)
     return makeError("truncated SPIR-V header");
   bool HasControls = false;
@@ -105,6 +106,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
   }
   if (!HasControls)
     return Error::success();
+  RequiresStrictFP = true;
 
   SmallVector<uint32_t> NewCapabilities, Declarations, Body;
   uint32_t NextID = Words[3];
@@ -117,10 +119,23 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
     uint32_t UInt, Bool, Zero, AbsMask, Infinity;
   };
   DenseMap<uint32_t, BitTypes> Cached;
+  auto ConstantFor = [&](uint32_t UInt, uint32_t Width, uint32_t Lanes,
+                         uint32_t Bits) {
+    uint32_t ID = NextID++;
+    Emit(Declarations, spv::OpConstant, {UIntTypes[Width], ID, Bits});
+    if (Lanes != 1) {
+      uint32_t Vector = NextID++;
+      SmallVector<uint32_t> Args{UInt, Vector};
+      Args.append(Lanes, ID);
+      Emit(Declarations, spv::OpConstantComposite, Args);
+      return Vector;
+    }
+    return ID;
+  };
   constexpr uint32_t ValidFlags = 0x7000f;
   // Relaxations are permissions, not requirements. These operations implement
-  // the strictest mode using only integer bit patterns, independent of Metal
-  // fast math. Other FP operations remain rejected, not silently relaxed.
+  // the strictest mode using integer bit patterns or explicitly safe Metal
+  // arithmetic. Other FP operations remain rejected, not silently relaxed.
   for (size_t I = 5; I < Words.size();) {
     uint32_t N = Words[I] >> 16;
     auto Op = static_cast<spv::Op>(Words[I] & 0xffff);
@@ -159,12 +174,19 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
     bool Abs = Op == spv::OpExtInst && N == 6 &&
                GLSLImports.contains(Words[I + 3]) &&
                Words[I + 4] == GLSLstd450FAbs;
+    bool Rounding = Op == spv::OpExtInst && N == 6 &&
+                    GLSLImports.contains(Words[I + 3]) &&
+                    (Words[I + 4] == GLSLstd450RoundEven ||
+                     Words[I + 4] == GLSLstd450Floor);
+    bool Min = Op == spv::OpExtInst && N == 7 &&
+               GLSLImports.contains(Words[I + 3]) &&
+               Words[I + 4] == GLSLstd450NMin;
     bool Compare = Op == spv::OpFOrdEqual || Op == spv::OpFUnordEqual ||
                    Op == spv::OpFOrdNotEqual || Op == spv::OpFUnordNotEqual;
-    if (Abs || Compare) {
-      if ((Compare && N != 5) || NextID > UINT32_MAX - 64)
+    if (Abs || Rounding || Min || Compare) {
+      if ((Compare && N != 5) || NextID > UINT32_MAX - 256)
         return makeError("malformed or oversized FloatControls2 operation");
-      uint32_t Ty = Abs ? Words[I + 1] : ValueTypes.lookup(Words[I + 3]);
+      uint32_t Ty = Compare ? ValueTypes.lookup(Words[I + 3]) : Words[I + 1];
       auto T = Types.find(Ty);
       if (T == Types.end())
         return makeError("unknown FloatControls2 floating-point type");
@@ -207,16 +229,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
           Bool = FindVector(BoolTy);
         }
         auto Constant = [&](uint32_t Bits) {
-          uint32_t ID = NextID++;
-          Emit(Declarations, spv::OpConstant, {UIntTypes[Width], ID, Bits});
-          if (Lanes != 1) {
-            uint32_t Vector = NextID++;
-            SmallVector<uint32_t> Args{UInt, Vector};
-            Args.append(Lanes, ID);
-            Emit(Declarations, spv::OpConstantComposite, Args);
-            return Vector;
-          }
-          return ID;
+          return ConstantFor(UInt, Width, Lanes, Bits);
         };
         Cached[Ty] = {UInt, Bool, Constant(0),
                       Constant(Width == 16 ? 0x7fff : 0x7fffffff),
@@ -233,10 +246,93 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
         Emit(Body, O, {Type, ID, A, B});
         return ID;
       };
-      uint32_t A = Unary(spv::OpBitcast, C.UInt, Words[I + (Abs ? 5 : 3)]);
+      auto Select = [&](uint32_t Cond, uint32_t A, uint32_t B) {
+        uint32_t ID = NextID++;
+        Emit(Body, spv::OpSelect, {C.UInt, ID, Cond, A, B});
+        return ID;
+      };
+      auto Constant = [&](uint32_t Bits) {
+        return ConstantFor(C.UInt, S->second[2], Lanes, Bits);
+      };
+      uint32_t A = Unary(spv::OpBitcast, C.UInt, Words[I + (Compare ? 3 : 5)]);
       uint32_t MagA = Binary(spv::OpBitwiseAnd, C.UInt, A, C.AbsMask);
       if (Abs) {
         Emit(Body, spv::OpBitcast, {Ty, Words[I + 2], MagA});
+      } else if (Rounding) {
+        uint32_t Mantissa = S->second[2] == 16 ? 10 : 23;
+        uint32_t Bias = S->second[2] == 16 ? 15 : 127;
+        uint32_t One = Constant(1), Mant = Constant(Mantissa);
+        uint32_t Exp = Binary(spv::OpShiftRightLogical, C.UInt, MagA, Mant);
+        uint32_t BiasC = Constant(Bias), Limit = Constant(Bias + Mantissa);
+        uint32_t Small = Binary(spv::OpULessThan, C.Bool, Exp, BiasC);
+        uint32_t Fractional = Binary(spv::OpULessThan, C.Bool, Exp, Limit);
+        uint32_t Range = Binary(spv::OpLogicalAnd, C.Bool, Fractional,
+                                Unary(spv::OpLogicalNot, C.Bool, Small));
+        // Select a safe shift even for zeros, subnormals, NaNs and infinities.
+        uint32_t Shift =
+            Select(Range, Binary(spv::OpISub, C.UInt, Limit, Exp), One);
+        uint32_t Unit = Binary(spv::OpShiftLeftLogical, C.UInt, One, Shift);
+        uint32_t Mask = Binary(spv::OpISub, C.UInt, Unit, One);
+        uint32_t Fraction = Binary(spv::OpBitwiseAnd, C.UInt, MagA, Mask);
+        uint32_t Whole = Binary(spv::OpBitwiseAnd, C.UInt, A,
+                                Unary(spv::OpNot, C.UInt, Mask));
+        uint32_t Sign =
+            Binary(spv::OpBitwiseAnd, C.UInt, A,
+                   Constant(S->second[2] == 16 ? 0x8000 : 0x80000000));
+        uint32_t OneBits = Constant(Bias << Mantissa);
+        uint32_t SmallBits, Increment;
+        if (Words[I + 4] == GLSLstd450RoundEven) {
+          uint32_t Half = Binary(spv::OpShiftRightLogical, C.UInt, Unit, One);
+          uint32_t Greater =
+              Binary(spv::OpUGreaterThan, C.Bool, Fraction, Half);
+          uint32_t Tie = Binary(spv::OpIEqual, C.Bool, Fraction, Half);
+          uint32_t OddBits = Binary(
+              spv::OpBitwiseAnd, C.UInt,
+              Binary(spv::OpShiftRightLogical, C.UInt, Whole, Shift), One);
+          uint32_t Odd = Binary(spv::OpINotEqual, C.Bool, OddBits, C.Zero);
+          Increment = Binary(spv::OpLogicalOr, C.Bool, Greater,
+                             Binary(spv::OpLogicalAnd, C.Bool, Tie, Odd));
+          uint32_t AboveHalf = Binary(spv::OpUGreaterThan, C.Bool, MagA,
+                                      Constant((Bias - 1) << Mantissa));
+          SmallBits = Binary(spv::OpBitwiseOr, C.UInt, Sign,
+                             Select(AboveHalf, OneBits, C.Zero));
+        } else {
+          uint32_t Negative = Binary(spv::OpINotEqual, C.Bool, Sign, C.Zero);
+          uint32_t HasFraction =
+              Binary(spv::OpINotEqual, C.Bool, Fraction, C.Zero);
+          Increment = Binary(spv::OpLogicalAnd, C.Bool, Negative, HasFraction);
+          uint32_t Nonzero = Binary(spv::OpINotEqual, C.Bool, MagA, C.Zero);
+          SmallBits = Binary(
+              spv::OpBitwiseOr, C.UInt, Sign,
+              Select(Binary(spv::OpLogicalAnd, C.Bool, Negative, Nonzero),
+                     OneBits, C.Zero));
+        }
+        uint32_t Rounded =
+            Binary(spv::OpIAdd, C.UInt, Whole, Select(Increment, Unit, C.Zero));
+        uint32_t Bits =
+            Select(Small, SmallBits, Select(Fractional, Rounded, A));
+        Emit(Body, spv::OpBitcast, {Ty, Words[I + 2], Bits});
+      } else if (Min) {
+        uint32_t B = Unary(spv::OpBitcast, C.UInt, Words[I + 6]);
+        uint32_t MagB = Binary(spv::OpBitwiseAnd, C.UInt, B, C.AbsMask);
+        uint32_t NegA = Binary(spv::OpUGreaterThan, C.Bool, A, C.AbsMask);
+        uint32_t NegB = Binary(spv::OpUGreaterThan, C.Bool, B, C.AbsMask);
+        uint32_t SameSign = Binary(spv::OpLogicalEqual, C.Bool, NegA, NegB);
+        uint32_t Asc = Binary(spv::OpULessThan, C.Bool, MagA, MagB);
+        uint32_t Desc = Binary(spv::OpUGreaterThan, C.Bool, MagA, MagB);
+        uint32_t OrderedLess = NextID++;
+        Emit(Body, spv::OpSelect, {C.Bool, OrderedLess, NegA, Desc, Asc});
+        uint32_t Less = NextID++;
+        Emit(Body, spv::OpSelect, {C.Bool, Less, SameSign, OrderedLess, NegA});
+        uint32_t Zeros = Binary(spv::OpLogicalAnd, C.Bool,
+                                Binary(spv::OpIEqual, C.Bool, MagA, C.Zero),
+                                Binary(spv::OpIEqual, C.Bool, MagB, C.Zero));
+        uint32_t Bits = Select(Zeros, Binary(spv::OpBitwiseOr, C.UInt, A, B),
+                               Select(Less, A, B));
+        uint32_t NanA = Binary(spv::OpUGreaterThan, C.Bool, MagA, C.Infinity);
+        uint32_t NanB = Binary(spv::OpUGreaterThan, C.Bool, MagB, C.Infinity);
+        Bits = Select(NanB, A, Select(NanA, B, Bits));
+        Emit(Body, spv::OpBitcast, {Ty, Words[I + 2], Bits});
       } else {
         uint32_t B = Unary(spv::OpBitcast, C.UInt, Words[I + 4]);
         uint32_t MagB = Binary(spv::OpBitwiseAnd, C.UInt, B, C.AbsMask);
@@ -321,6 +417,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
       case spv::OpUConvert:
       case spv::OpSConvert:
       case spv::OpIAdd:
+      case spv::OpFSub:
       case spv::OpISub:
       case spv::OpIMul:
       case spv::OpIEqual:
@@ -1026,7 +1123,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   const char *Raw = Buf.getBufferStart();
   for (size_t I = 0; I < NumWords; ++I)
     Words[I] = support::endian::read32le(Raw + I * 4);
-  if (Error E = expandFloatControls2(Words))
+  bool RequiresStrictFP = false;
+  if (Error E = expandFloatControls2(Words, RequiresStrictFP))
     return std::move(E);
   if (Error E = expandFmaKHR(Words))
     return std::move(E);
@@ -1066,6 +1164,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
 
   // 1. Extract entry point & execution mode into Reflection.
   Reflection Reflect;
+  Reflect.RequiresStrictFP = RequiresStrictFP;
   mlir::spirv::EntryPointOp SelectedEP;
   for (auto EP : SpvModule.getOps<mlir::spirv::EntryPointOp>()) {
     if (EntryOverride.empty() || EP.getFn() == EntryOverride) {
