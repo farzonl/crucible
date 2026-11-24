@@ -23,7 +23,11 @@
 #include <vector>
 
 namespace crucible_run {
-namespace {
+// Keep COM interface types in a named namespace with external linkage. Placing
+// pure-virtual interfaces in an anonymous namespace makes GCC -fdevirtualize
+// treat the hierarchy as closed to this TU and devirtualize calls directly to
+// __cxa_pure_virtual.
+namespace d3d12_abi {
 
 using HRESULT = int32_t;
 using UINT = uint32_t;
@@ -327,6 +331,11 @@ using PFN_D3D12CreateDevice = HRESULT (*)(IUnknown *, uint32_t, REFIID,
 using PFN_D3D12SerializeRootSignature =
     HRESULT (*)(const D3D12_ROOT_SIGNATURE_DESC *, uint32_t, ID3D10Blob **,
                 ID3D10Blob **);
+
+} // namespace d3d12_abi
+
+namespace {
+using namespace d3d12_abi;
 
 void checkHr(HRESULT Hr, const char *What) {
   if (Hr < 0) {
