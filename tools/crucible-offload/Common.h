@@ -53,6 +53,11 @@ llvm::Expected<llvm::SmallVector<std::unique_ptr<offloadtest::Device>>>
 createVulkanDevices(const offloadtest::DeviceConfig &Config);
 #endif
 
+#ifdef CRUCIBLE_HAS_D3D12_OFFLOAD
+llvm::Expected<llvm::SmallVector<std::unique_ptr<offloadtest::Device>>>
+createD3D12Devices(const offloadtest::DeviceConfig &Config);
+#endif
+
 } // namespace crucible_offload
 
 #endif // CRUCIBLE_OFFLOAD_COMMON_H

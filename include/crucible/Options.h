@@ -23,6 +23,8 @@ enum class TargetBackend : uint8_t {
   MSL,
   /// Vulkan SPIR-V binary or assembly via LLVM's SPIR-V backend.
   SPIRV,
+  /// DirectX Intermediate Language (DXIL) container or assembly via LLVM's DirectX backend.
+  DXIL,
 };
 
 /// How resources are bound in the emitted MSL.
@@ -74,6 +76,13 @@ struct Options {
 
   /// Optional DXC-style Vulkan register shifts (--vk-b/t/u/s-shift).
   std::vector<VulkanRegisterShift> VulkanRegisterShifts;
+
+  /// When targeting DXIL, emit human-readable DXIL LLVM IR assembly instead of
+  /// a DXContainer binary.
+  bool EmitDXILAsm = false;
+
+  /// Target Shader Model version for the LLVM DirectX backend (e.g. "6.6").
+  std::string ShaderModel = "6.6";
 
   /// Entry point to compile when the container exports multiple (libraries).
   /// Empty selects the sole entry point.

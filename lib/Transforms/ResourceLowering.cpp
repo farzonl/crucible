@@ -353,4 +353,54 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
   return llvm::Error::success();
 }
 
+llvm::Error assignDXILBindings(Reflection &R, const Options &Opts) {
+  // Preserve explicit (Class, Space, LowerBound) register assignments when
+  // they do not collide (e.g. SPIR-V DescriptorSet -> space, Binding ->
+  // register within each class). Resolve unbounded array overrides if given.
+  std::map<std::pair<ResourceClass, uint32_t>, std::set<uint32_t>> UsedRegs;
+  for (ResourceBinding &RB : R.Resources) {
+    if (RB.RangeSize == 0xFFFFFFFFu) {
+      for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
+        if (O.Class == RB.Class && O.Space == RB.Space &&
+            O.Register == RB.LowerBound && O.Size > 0) {
+          RB.RangeSize = O.Size;
+          break;
+        }
+      }
+    }
+    if (RB.RangeSize == 0)
+      return makeError("resource '{0}': zero-sized descriptor array is invalid",
+                       RB.Name);
+    auto &Used = UsedRegs[{RB.Class, RB.Space}];
+    uint32_t Count = (RB.RangeSize == 0xFFFFFFFFu) ? 1u : RB.RangeSize;
+    bool Collides = false;
+    for (uint32_t I = 0; I < Count; ++I) {
+      if (Used.count(RB.LowerBound + I)) {
+        Collides = true;
+        break;
+      }
+    }
+    if (Collides) {
+      uint32_t Cand = 0;
+      while (true) {
+        bool Free = true;
+        for (uint32_t I = 0; I < Count; ++I) {
+          if (Used.count(Cand + I)) {
+            Free = false;
+            Cand = Cand + I + 1;
+            break;
+          }
+        }
+        if (Free) {
+          RB.LowerBound = Cand;
+          break;
+        }
+      }
+    }
+    for (uint32_t I = 0; I < Count; ++I)
+      Used.insert(RB.LowerBound + I);
+  }
+  return llvm::Error::success();
+}
+
 } // namespace crucible

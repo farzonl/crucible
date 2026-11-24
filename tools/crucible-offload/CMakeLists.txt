@@ -53,6 +53,9 @@ endif()
 if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   list(APPEND CRUCIBLE_OFFLOAD_SOURCES VulkanDevice.cpp)
 endif()
+if(CRUCIBLE_NACELLE_LIB AND CRUCIBLE_HAS_DIRECTX)
+  list(APPEND CRUCIBLE_OFFLOAD_SOURCES D3D12Device.cpp)
+endif()
 
 add_library(crucible-offload-device STATIC ${CRUCIBLE_OFFLOAD_SOURCES})
 target_link_libraries(crucible-offload-device PUBLIC
@@ -76,6 +79,18 @@ if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   target_compile_definitions(crucible-offload-device PRIVATE CRUCIBLE_HAS_VULKAN_OFFLOAD=1)
   target_include_directories(crucible-offload-device PRIVATE ${CRUCIBLE_VULKAN_INCLUDE_DIR})
   target_link_libraries(crucible-offload-device PUBLIC ${CRUCIBLE_VULKAN_LIB})
+endif()
+
+if(CRUCIBLE_NACELLE_LIB AND CRUCIBLE_HAS_DIRECTX)
+  target_compile_definitions(crucible-offload-device PRIVATE
+    CRUCIBLE_HAS_D3D12_OFFLOAD=1
+    CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
+  target_include_directories(crucible-offload-device PRIVATE
+    "${CRUCIBLE_OFFLOAD_SUITE_DIR}/third-party/DirectX-Headers/include"
+    "${CRUCIBLE_OFFLOAD_SUITE_DIR}/third-party/DirectX-Headers/include/wsl/stubs")
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(crucible-offload-device PUBLIC dl)
+  endif()
 endif()
 
 find_package(PNG REQUIRED)
@@ -121,6 +136,12 @@ foreach(tool offloader api-query)
     target_link_options(${tool} PRIVATE
       "-Wl,--exclude-libs,ALL"
       "-Wl,--version-script=${_crucible_hide_llvm_map}")
+  endif()
+  if(APPLE)
+    # Hide LLVM/MLIR symbols from offloader/api-query's dynamic symbol table so
+    # dynamically loaded runtimes (e.g. libnacelle_d3d12.dylib linked against a
+    # different LLVM version) never interpose into Crucible's LLVM 24 symbols.
+    target_link_options(${tool} PRIVATE "-Wl,-exported_symbol,_main")
   endif()
   if(APPLE AND CRUCIBLE_VULKAN_LIB)
     get_filename_component(_vk_lib_dir "${CRUCIBLE_VULKAN_LIB}" DIRECTORY)

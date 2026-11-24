@@ -7,6 +7,7 @@
 
 #include "crucible/Compiler.h"
 
+#include "Backend/DXILEmitter.h"
 #include "Backend/MSLEmitter.h"
 #include "Backend/SPIRVEmitter.h"
 #include "Frontend/Frontend.h"
@@ -115,5 +116,68 @@ Expected<SPIRVCompileResult> compileDXILToSPIRV(MemoryBufferRef DXIL,
 Expected<CompileResult> compileDXILToMSL(MemoryBufferRef DXIL,
                                          const Options &Opts) {
   return compileToMSL(DXIL, Opts);
+}
+
+Expected<DXILCompileResult> compileToDXIL(MemoryBufferRef Input,
+                                          const Options &Opts) {
+  if (isSPIRVBinary(Input) || isMLIRText(Input)) {
+    mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
+    auto Loaded = isSPIRVBinary(Input)
+                      ? loadSPIRV(Input, MCtx, Opts.EntryPoint,
+                                  Opts.SpecConstants)
+                      : loadMLIR(Input, MCtx, Opts.EntryPoint);
+    if (!Loaded)
+      return Loaded.takeError();
+
+    // Lower any frontend dx.op.* calls into Crucible's unified MLIR contract
+    // (gpu.* + math.* + llvm.* + crucible.*).
+    lowerDXILToLayer1(*Loaded->Module);
+
+    if (Error E = assignDXILBindings(Loaded->Reflect, Opts))
+      return std::move(E);
+
+    if (Opts.DumpMLIR) {
+      (*Loaded->Module).print(llvm::errs());
+      llvm::errs() << "\n";
+    }
+
+    auto Out = emitDXIL(*Loaded->Module, Loaded->Reflect, Opts);
+    if (!Out)
+      return Out.takeError();
+
+    DXILCompileResult Result;
+    Result.Output = std::move(*Out);
+    Result.IsAssembly = Opts.EmitDXILAsm;
+    Result.Reflect = std::move(Loaded->Reflect);
+    return Result;
+  }
+
+  LLVMContext Ctx;
+  auto Shader = loadDXIL(Input, Ctx, Opts.EntryPoint);
+  if (!Shader)
+    return Shader.takeError();
+
+  if (Error E = assignDXILBindings(Shader->Reflect, Opts))
+    return std::move(E);
+
+  mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
+  auto Mod = importDXILToMLIR(*Shader, MCtx);
+  if (!Mod)
+    return Mod.takeError();
+
+  if (Opts.DumpMLIR) {
+    (*Mod)->print(llvm::errs());
+    llvm::errs() << "\n";
+  }
+
+  auto Out = emitDXIL(**Mod, Shader->Reflect, Opts);
+  if (!Out)
+    return Out.takeError();
+
+  DXILCompileResult Result;
+  Result.Output = std::move(*Out);
+  Result.IsAssembly = Opts.EmitDXILAsm;
+  Result.Reflect = std::move(Shader->Reflect);
+  return Result;
 }
 } // namespace crucible

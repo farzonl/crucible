@@ -37,10 +37,15 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
 
   SmallVector<std::unique_ptr<offloadtest::Device>> Devices;
   SmallVector<std::unique_ptr<offloadtest::Device>> NativeVulkanDevices;
+  const bool IsD3D12Runtime = Runtime.equals_insensitive("d3d12") ||
+                              Runtime.equals_insensitive("dxil") ||
+                              Runtime.equals_insensitive("nacelle");
 #ifdef CRUCIBLE_HAS_VULKAN_OFFLOAD
-  if (Error E = initializeVulkanDevices(Config, NativeVulkanDevices))
-    logAllUnhandledErrors(std::move(E), errs(),
-                          "crucible-offload: native Vulkan discovery: ");
+  if (!IsD3D12Runtime) {
+    if (Error E = initializeVulkanDevices(Config, NativeVulkanDevices))
+      logAllUnhandledErrors(std::move(E), errs(),
+                            "crucible-offload: native Vulkan discovery: ");
+  }
 #endif
   if (Runtime.equals_insensitive("metal")) {
 #ifdef CRUCIBLE_HAS_METAL_OFFLOAD
@@ -72,12 +77,28 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
         "CRUCIBLE_OFFLOAD_RUNTIME=vulkan requested, but Vulkan runtime is not "
         "built");
 #endif
+  } else if (Runtime.equals_insensitive("d3d12") ||
+             Runtime.equals_insensitive("dxil") ||
+             Runtime.equals_insensitive("nacelle")) {
+#ifdef CRUCIBLE_HAS_D3D12_OFFLOAD
+    auto D3D12Devices = crucible_offload::createD3D12Devices(Config);
+    if (!D3D12Devices)
+      return D3D12Devices.takeError();
+    for (auto &D : *D3D12Devices)
+      Devices.push_back(std::move(D));
+#else
+    return createStringError(
+        std::errc::not_supported,
+        "CRUCIBLE_OFFLOAD_RUNTIME=d3d12 requested, but Nacelle D3D12 runtime "
+        "is not built");
+#endif
   }
 
   else {
     return createStringError(
         std::errc::invalid_argument,
-        "unknown CRUCIBLE_OFFLOAD_RUNTIME='%s' (expected 'metal' or 'vulkan')",
+        "unknown CRUCIBLE_OFFLOAD_RUNTIME='%s' (expected 'metal', 'vulkan', "
+        "or 'd3d12')",
         Runtime.str().c_str());
   }
 

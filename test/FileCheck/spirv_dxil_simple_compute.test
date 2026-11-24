@@ -1,0 +1,19 @@
+# SPIR-V -> DXIL test for simple compute shader (StorageBuffer + ThreadId).
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/simple_compute.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv --reflect %t.json | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+# RUN: FileCheck %s --check-prefix=REFLECT --input-file=%t.json
+
+# CHECK: define void @main()
+# CHECK: @dx.op.threadId.i32(i32 93, i32 0)
+# CHECK: @dx.op.rawBufferLoad
+# CHECK: fmul
+# CHECK: fadd
+# CHECK: @dx.op.rawBufferStore
+# CHECK: !dx.shaderModel = !{{{![0-9]+}}}
+
+# REFLECT: "class": "uav"
+# REFLECT: "register": 0
+# REFLECT: "space": 0

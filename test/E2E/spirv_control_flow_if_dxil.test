@@ -1,0 +1,11 @@
+# End-to-end SPIR-V -> DXIL -> Nacelle D3D12 execution test with divergent CFG.
+# REQUIRES: directx-backend, nacelle-d3d12
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/control_flow_if.hlsl
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+# RUN: %nacelle-compile --cs %t.dxil --emit-scf > /dev/null
+# RUN: %crucible-run --backend d3d12 --dxil %t.dxil --groups 1,1,1 \
+# RUN:   --buffer 0:f32:8:iota | FileCheck %s
+
+# x < 2 ? x * 3 : min(x, 10) on [0..7] -> [0, 3, 2, 3, 4, 5, 6, 7]
+# CHECK: buffer0: 0 3 2 3 4 5 6 7

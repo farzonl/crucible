@@ -25,15 +25,21 @@ static cl::OptionCategory CrucibleCat("cruciblec options");
 static cl::opt<std::string> InputFile(cl::Positional, cl::Required,
                                       cl::desc("<input .dxil or .spv>"),
                                       cl::cat(CrucibleCat));
-static cl::opt<std::string> OutputFile("o", cl::desc("Output file (.metal or .spv, defaults to stdout)"),
+static cl::opt<std::string> OutputFile("o", cl::desc("Output file (.metal, .spv, or .dxil, defaults to stdout)"),
                                        cl::value_desc("path"),
                                        cl::cat(CrucibleCat));
 static cl::opt<std::string> TargetOpt("target",
-                                      cl::desc("Target backend: msl (default) or spirv"),
+                                      cl::desc("Target backend: msl (default), spirv, or dxil"),
                                       cl::init("msl"), cl::cat(CrucibleCat));
 static cl::opt<bool> EmitSPIRVAsm("spv-asm",
                                   cl::desc("Emit SPIR-V assembly text instead of binary words (--target=spirv)"),
                                   cl::cat(CrucibleCat));
+static cl::opt<bool> EmitDXILAsm("dxil-asm",
+                                 cl::desc("Emit DXIL LLVM IR assembly text instead of a DXContainer binary (--target=dxil)"),
+                                 cl::cat(CrucibleCat));
+static cl::opt<std::string> ShaderModel("shader-model",
+                                        cl::desc("Target DirectX Shader Model for DXIL backend (default 6.6)"),
+                                        cl::init("6.6"), cl::cat(CrucibleCat));
 static cl::opt<std::string> VulkanVersion("vulkan-version",
                                           cl::desc("Vulkan target environment for SPIR-V backend (default vulkan1.3)"),
                                           cl::init("vulkan1.3"), cl::cat(CrucibleCat));
@@ -195,6 +201,30 @@ int main(int argc, char **argv) {
   Opts.StageAsCompute = StageAsCompute;
   Opts.EmitSPIRVAsm = EmitSPIRVAsm;
   Opts.VulkanVersion = VulkanVersion;
+  Opts.EmitDXILAsm = EmitDXILAsm;
+  Opts.ShaderModel = ShaderModel;
+
+  if (TargetOpt == "dxil" || TargetOpt == "directx") {
+    Opts.Target = crucible::TargetBackend::DXIL;
+    if (!MetallibFile.empty())
+      return reportError("--metallib cannot be used with --target=dxil");
+
+    auto Result =
+        crucible::compileToDXIL((*BufOrErr)->getMemBufferRef(), Opts);
+    if (!Result)
+      return reportError(Result.takeError());
+
+    if (OutputFile.empty() || OutputFile == "-") {
+      outs().write(Result->Output.data(), Result->Output.size());
+    } else if (Error E = writeFile(OutputFile, Result->Output)) {
+      return reportError(std::move(E));
+    }
+
+    if (!ReflectFile.empty())
+      if (Error E = writeFile(ReflectFile, Result->Reflect.toJSON()))
+        return reportError(std::move(E));
+    return 0;
+  }
 
   if (TargetOpt == "spirv") {
     Opts.Target = crucible::TargetBackend::SPIRV;
@@ -255,7 +285,7 @@ int main(int argc, char **argv) {
 
   if (TargetOpt != "msl")
     return reportError("unknown --target '" + TargetOpt +
-                       "' (expected 'msl' or 'spirv')");
+                       "' (expected 'msl', 'spirv', or 'dxil')");
 
   auto Result =
       crucible::compileToMSL((*BufOrErr)->getMemBufferRef(), Opts);

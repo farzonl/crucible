@@ -30,10 +30,10 @@ using namespace crucible_run;
 namespace {
 
 [[noreturn]] void printUsageAndFail() {
-  fail("usage: crucible-run [--backend metal|vulkan] "
-       "[--lib <metallib> | --spv <file.spv>] --entry <kernel> "
-       "[--threads x,y,z] [--groups x,y,z] --buffer i:type:count:init ... "
-       "[--cbuffer i:type:count:init ...] "
+  fail("usage: crucible-run [--backend metal|vulkan|d3d12] "
+       "[--lib <metallib> | --spv <file.spv> | --dxil <file.dxil>] "
+       "[--entry <kernel>] [--threads x,y,z] [--groups x,y,z] "
+       "--buffer i:type:count:init ... [--cbuffer i:type:count:init ...] "
        "[--specialization id:hexbytes|default ...] "
        "[--iters N --warmup W --bench-json] [--ir-ab i0,i1,...]");
 }
@@ -41,6 +41,8 @@ namespace {
 std::string normalizeBackend(const std::string &B) {
   if (B == "vk")
     return "vulkan";
+  if (B == "dxil" || B == "dx" || B == "nacelle")
+    return "d3d12";
   return B;
 }
 
@@ -67,6 +69,8 @@ int main(int argc, char **argv) {
       Opts.LibPath = Next();
     } else if (Arg == "--spv") {
       Opts.SpvPath = Next();
+    } else if (Arg == "--dxil") {
+      Opts.DxilPath = Next();
     } else if (Arg == "--entry") {
       Opts.Entry = Next();
     } else if (Arg == "--threads") {
@@ -99,12 +103,17 @@ int main(int argc, char **argv) {
 
   std::string Backend = normalizeBackend(Opts.Backend);
   if (Backend.empty()) {
-    if (!Opts.LibPath.empty() && !Opts.SpvPath.empty())
-      fail("both --lib and --spv specified; pass --backend explicitly");
+    int Inputs = (!Opts.LibPath.empty() ? 1 : 0) +
+                 (!Opts.SpvPath.empty() ? 1 : 0) +
+                 (!Opts.DxilPath.empty() ? 1 : 0);
+    if (Inputs > 1)
+      fail("multiple shader inputs specified; pass --backend explicitly");
     if (!Opts.LibPath.empty())
       Backend = "metal";
     else if (!Opts.SpvPath.empty())
       Backend = "vulkan";
+    else if (!Opts.DxilPath.empty())
+      Backend = "d3d12";
     else
       printUsageAndFail();
   }
@@ -126,5 +135,15 @@ int main(int argc, char **argv) {
 #endif
   }
 
-  fail("unknown backend '" + Opts.Backend + "' (expected 'metal' or 'vulkan')");
+  if (Backend == "d3d12") {
+#ifdef CRUCIBLE_RUN_HAS_D3D12
+    return runD3D12(Opts);
+#else
+    fail("backend 'd3d12' is not built (Nacelle D3D12 runtime not found at "
+         "configure time)");
+#endif
+  }
+
+  fail("unknown backend '" + Opts.Backend +
+       "' (expected 'metal', 'vulkan', or 'd3d12')");
 }
