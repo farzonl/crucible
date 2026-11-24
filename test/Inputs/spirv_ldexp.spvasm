@@ -1,0 +1,104 @@
+OpCapability Shader
+OpCapability Int64
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid %input %exponents %output
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %floats ArrayStride 4
+OpDecorate %longs ArrayStride 8
+OpDecorate %uints ArrayStride 4
+OpDecorate %float_block Block
+OpMemberDecorate %float_block 0 Offset 0
+OpDecorate %long_block Block
+OpMemberDecorate %long_block 0 Offset 0
+OpDecorate %uint_block Block
+OpMemberDecorate %uint_block 0 Offset 0
+OpDecorate %input DescriptorSet 0
+OpDecorate %input Binding 0
+OpDecorate %exponents DescriptorSet 0
+OpDecorate %exponents Binding 1
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%i32 = OpTypeInt 32 1
+%i64 = OpTypeInt 64 1
+%f32 = OpTypeFloat 32
+%v2f = OpTypeVector %f32 2
+%v2i = OpTypeVector %i32 2
+%v2l = OpTypeVector %i64 2
+%v3u = OpTypeVector %u32 3
+%floats = OpTypeRuntimeArray %f32
+%longs = OpTypeRuntimeArray %i64
+%uints = OpTypeRuntimeArray %u32
+%float_block = OpTypeStruct %floats
+%long_block = OpTypeStruct %longs
+%uint_block = OpTypeStruct %uints
+%pfblock = OpTypePointer StorageBuffer %float_block
+%plblock = OpTypePointer StorageBuffer %long_block
+%publock = OpTypePointer StorageBuffer %uint_block
+%pf = OpTypePointer StorageBuffer %f32
+%pl = OpTypePointer StorageBuffer %i64
+%pu = OpTypePointer StorageBuffer %u32
+%pg = OpTypePointer Input %v3u
+%gid = OpVariable %pg Input
+%input = OpVariable %pfblock StorageBuffer
+%exponents = OpVariable %plblock StorageBuffer
+%output = OpVariable %publock StorageBuffer
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%three = OpConstant %u32 3
+%four = OpConstant %u32 4
+%five = OpConstant %u32 5
+%six = OpConstant %u32 6
+%n2i = OpConstant %i32 -2
+%n2l = OpConstant %i64 -2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3u %gid
+%idx = OpCompositeExtract %u32 %id 0
+%xp = OpAccessChain %pf %input %zero %idx
+%ep = OpAccessChain %pl %exponents %zero %idx
+%x = OpLoad %f32 %xp
+%e = OpLoad %i64 %ep
+%ei = OpSConvert %i32 %e
+%vx = OpCompositeConstruct %v2f %x %x
+%ve = OpCompositeConstruct %v2l %e %n2l
+%vi = OpCompositeConstruct %v2i %ei %n2i
+%r64 = OpExtInst %f32 %glsl Ldexp %x %e
+%v64 = OpExtInst %v2f %glsl Ldexp %vx %ve
+%r32 = OpExtInst %f32 %glsl Ldexp %x %ei
+%v32 = OpExtInst %v2f %glsl Ldexp %vx %vi
+%r1 = OpCompositeExtract %f32 %v64 0
+%r2 = OpCompositeExtract %f32 %v64 1
+%r4 = OpCompositeExtract %f32 %v32 0
+%r5 = OpCompositeExtract %f32 %v32 1
+%b0 = OpBitcast %u32 %r64
+%b1 = OpBitcast %u32 %r1
+%b2 = OpBitcast %u32 %r2
+%b3 = OpBitcast %u32 %r32
+%b4 = OpBitcast %u32 %r4
+%b5 = OpBitcast %u32 %r5
+%base = OpIMul %u32 %idx %six
+%i1 = OpIAdd %u32 %base %one
+%i2 = OpIAdd %u32 %base %two
+%i3 = OpIAdd %u32 %base %three
+%i4 = OpIAdd %u32 %base %four
+%i5 = OpIAdd %u32 %base %five
+%p0 = OpAccessChain %pu %output %zero %base
+%p1 = OpAccessChain %pu %output %zero %i1
+%p2 = OpAccessChain %pu %output %zero %i2
+%p3 = OpAccessChain %pu %output %zero %i3
+%p4 = OpAccessChain %pu %output %zero %i4
+%p5 = OpAccessChain %pu %output %zero %i5
+OpStore %p0 %b0
+OpStore %p1 %b1
+OpStore %p2 %b2
+OpStore %p3 %b3
+OpStore %p4 %b4
+OpStore %p5 %b5
+OpReturn
+OpFunctionEnd
