@@ -1,0 +1,15 @@
+# REQUIRES: spirv-assembler, spirv-tools, spirv-float-controls2
+# RUN: awk 'BEGIN {print "OpCapability FloatControls2"} /^%%glsl =/ {print "OpExtension \"SPV_KHR_float_controls2\""} /^OpExecutionMode %%main LocalSize/ {print; print "OpExecutionModeId %%main FPFastMathDefault %%float %%flags\nOpExecutionModeId %%main FPFastMathDefault %%half %%flags"; next} /^%%main =/ {print "%%flags = OpConstant %%uint 0"} {print}' %S/../Inputs/spirv_modf_struct.spvasm > %t.struct.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.struct.spvasm -o %t.struct.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.struct.spv
+# RUN: %cruciblec %t.struct.spv -o %t.struct.metal
+# RUN: FileCheck %s --input-file=%t.struct.metal
+# RUN: awk '/^%%main =/ {print "%%pv = OpTypePointer Function %%v4float\n%%ph = OpTypePointer Function %%v4half\n%%ps = OpTypePointer Function %%float"} /^%%entry =/ {print; print "%%wv = OpVariable %%pv Function\n%%wh = OpVariable %%ph Function\n%%ws = OpVariable %%ps Function"; next} /^%%result =/ {print "%%fraction = OpExtInst %%v4float %%glsl Modf %%v %%wv"; next} /^%%fraction =/ {next} /^%%whole =/ {print "%%whole = OpLoad %%v4float %%wv"; next} /^%%hr =/ {print "%%hf = OpExtInst %%v4half %%glsl Modf %%h %%wh"; next} /^%%hf =/ {next} /^%%hw =/ {print "%%hw = OpLoad %%v4half %%wh"; next} /^%%sr =/ {print "OpStore %%ws %%b\n%%alias = OpLoad %%float %%ws\n%%sf = OpExtInst %%float %%glsl Modf %%alias %%ws"; next} /^%%sf =/ {next} /^%%sw =/ {print "%%sw = OpLoad %%float %%ws"; next} {print}' %t.struct.spvasm > %t.ptr.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.ptr.spvasm -o %t.ptr.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.ptr.spv
+# RUN: %cruciblec %t.ptr.spv -o %t.ptr.metal
+# RUN: FileCheck %s --input-file=%t.ptr.metal
+# CHECK: #pragma METAL fp math_mode(safe)
+# CHECK-NEXT: #pragma METAL fp contract(off)
+# CHECK: kernel void
+# CHECK: fmod(
