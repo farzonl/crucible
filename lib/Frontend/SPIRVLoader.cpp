@@ -88,6 +88,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
     if ((Op == spv::OpTypeFloat && N == 3) ||
         (Op == spv::OpTypeInt && N == 4) ||
         (Op == spv::OpTypeVector && N == 4) ||
+        (Op == spv::OpTypeMatrix && N == 4) ||
         (Op == spv::OpTypeStruct && N >= 2))
       Types[Words[I + 1]] =
           SmallVector<uint32_t>(Words.begin() + I, Words.begin() + I + N);
@@ -155,6 +156,17 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
   for (size_t I = 5; I < Words.size();) {
     uint32_t N = Words[I] >> 16;
     auto Op = static_cast<spv::Op>(Words[I] & 0xffff);
+    if (Op == spv::OpExecutionMode && N >= 3 &&
+        (Words[I + 2] == spv::ExecutionModeDenormPreserve ||
+         Words[I + 2] == spv::ExecutionModeDenormFlushToZero ||
+         Words[I + 2] == spv::ExecutionModeRoundingModeRTZ))
+      return makeError(
+          "unsupported floating-point execution mode in FloatControls2");
+    if (Op == spv::OpDecorate && N == 4 &&
+        Words[I + 2] == spv::DecorationFPRoundingMode &&
+        Words[I + 3] != spv::FPRoundingModeRTE)
+      return makeError(
+          "unsupported floating-point rounding decoration in FloatControls2");
     if (Op == spv::OpCapability && N == 2 &&
         Words[I + 1] == spv::CapabilityFloatControls2) {
       I += N;
@@ -199,7 +211,33 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
                Words[I + 4] == GLSLstd450NMin;
     bool Compare = Op == spv::OpFOrdEqual || Op == spv::OpFUnordEqual ||
                    Op == spv::OpFOrdNotEqual || Op == spv::OpFUnordNotEqual;
-    if (Abs || Rounding || Min || Compare) {
+    bool Determinant = Op == spv::OpExtInst && N == 6 &&
+                       GLSLImports.contains(Words[I + 3]) &&
+                       Words[I + 4] == GLSLstd450Determinant;
+    if (Determinant) {
+      uint32_t Ty = Words[I + 1], Matrix = Words[I + 5];
+      auto M = Types.find(ValueTypes.lookup(Matrix));
+      if (M == Types.end() || (M->second[0] & 0xffff) != spv::OpTypeMatrix ||
+          M->second[3] != 2)
+        return makeError("FloatControls2 determinant requires a 2x2 matrix");
+      auto V = Types.find(M->second[2]);
+      if (V == Types.end() || (V->second[0] & 0xffff) != spv::OpTypeVector ||
+          V->second[3] != 2 || V->second[2] != Ty || !IsSupportedFloat(Ty))
+        return makeError("FloatControls2 determinant requires float16/32");
+      if (NextID > UINT32_MAX - 8)
+        return makeError("oversized FloatControls2 determinant");
+      SmallVector<uint32_t, 4> Elements;
+      for (uint32_t Column = 0; Column != 2; ++Column)
+        for (uint32_t Row = 0; Row != 2; ++Row) {
+          uint32_t ID = NextID++;
+          Emit(Body, spv::OpCompositeExtract, {Ty, ID, Matrix, Column, Row});
+          Elements.push_back(ID);
+        }
+      uint32_t Diagonal = NextID++, Cross = NextID++;
+      Emit(Body, spv::OpFMul, {Ty, Diagonal, Elements[0], Elements[3]});
+      Emit(Body, spv::OpFMul, {Ty, Cross, Elements[1], Elements[2]});
+      Emit(Body, spv::OpFSub, {Ty, Words[I + 2], Diagonal, Cross});
+    } else if (Abs || Rounding || Min || Compare) {
       if ((Compare && N != 5) || NextID > UINT32_MAX - 256)
         return makeError("malformed or oversized FloatControls2 operation");
       uint32_t Ty = Compare ? ValueTypes.lookup(Words[I + 3]) : Words[I + 1];
@@ -372,7 +410,13 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
                GLSLImports.contains(Words[I + 3]) &&
                ((N == 8 && Words[I + 4] == GLSLstd450Fma) ||
                 (N == 7 && Words[I + 4] == GLSLstd450Modf) ||
-                (N == 6 && Words[I + 4] == GLSLstd450ModfStruct))) {
+                (N == 7 && Words[I + 4] == GLSLstd450Atan2) ||
+                (N == 7 && Words[I + 4] == GLSLstd450Reflect) ||
+                (N == 6 && (Words[I + 4] == GLSLstd450ModfStruct ||
+                            Words[I + 4] == GLSLstd450Acosh ||
+                            Words[I + 4] == GLSLstd450Cosh ||
+                            Words[I + 4] == GLSLstd450Exp ||
+                            Words[I + 4] == GLSLstd450Log2)))) {
       uint32_t Ty = Words[I + 1];
       if (Words[I + 4] == GLSLstd450ModfStruct) {
         auto T = Types.find(Ty);
@@ -3987,13 +4031,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                   mlir::spirv::SDotOp, mlir::spirv::UDotOp,
                   mlir::spirv::SUDotOp, mlir::spirv::SDotAccSatOp,
                   mlir::spirv::UDotAccSatOp, mlir::spirv::SUDotAccSatOp,
-                  mlir::spirv::GLFSignOp,
-                  mlir::spirv::GLSSignOp, mlir::spirv::GLLengthOp,
-                  mlir::spirv::GLDistanceOp, mlir::spirv::GLCrossOp,
-                  mlir::spirv::GLReflectOp, mlir::spirv::GLSmoothStepOp,
-                  mlir::spirv::GLPackHalf2x16Op,
+                  mlir::spirv::GLFSignOp, mlir::spirv::GLSSignOp,
+                  mlir::spirv::GLLengthOp, mlir::spirv::GLDistanceOp,
+                  mlir::spirv::GLCrossOp, mlir::spirv::GLReflectOp,
+                  mlir::spirv::GLSmoothStepOp, mlir::spirv::GLPackHalf2x16Op,
                   mlir::spirv::GLUnpackHalf2x16Op, mlir::spirv::GLFindILsbOp,
-                  mlir::spirv::GLFindUMsbOp, mlir::spirv::GLFindSMsbOp>(Op))
+                  mlir::spirv::GLFindUMsbOp, mlir::spirv::GLFindSMsbOp>(Op) ||
+        (Reflect.RequiresStrictFP && mlir::isa<mlir::spirv::GLAcoshOp>(Op)))
       GLMathOps.push_back(Op);
   });
   for (mlir::Operation *Op : GLMathOps) {
@@ -4051,7 +4095,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       return Splat;
     };
 
-    if (auto At2 = mlir::dyn_cast<mlir::spirv::GLAtan2Op>(Op)) {
+    if (auto Acosh = mlir::dyn_cast<mlir::spirv::GLAcoshOp>(Op)) {
+      // Retain the robust builtin instead of log(x + sqrt(x*x - 1)), which
+      // overflows for large finite inputs and mishandles negative infinity.
+      auto Rep = mlir::math::AcoshOp::create(B, Loc, Acosh.getOperand());
+      Acosh.replaceAllUsesWith(Rep.getResult());
+      Acosh.erase();
+    } else if (auto At2 = mlir::dyn_cast<mlir::spirv::GLAtan2Op>(Op)) {
       auto Rep = mlir::math::Atan2Op::create(B, Loc, At2->getOperand(0),
                                              At2->getOperand(1));
       At2.replaceAllUsesWith(Rep.getResult());
@@ -4088,8 +4138,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Dot.erase();
     } else if (mlir::isa<mlir::spirv::SDotOp, mlir::spirv::UDotOp,
                          mlir::spirv::SUDotOp, mlir::spirv::SDotAccSatOp,
-                         mlir::spirv::UDotAccSatOp,
-                         mlir::spirv::SUDotAccSatOp>(Op)) {
+                         mlir::spirv::UDotAccSatOp, mlir::spirv::SUDotAccSatOp>(
+                   Op)) {
       bool Saturating = Op->getNumOperands() == 3;
       bool Signed1 =
           mlir::isa<mlir::spirv::SDotOp, mlir::spirv::SUDotOp,

@@ -3536,25 +3536,35 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
              VT.getNumElements() <= 4;
     return false;
   };
+  auto mathFunctionName = [&](StringRef Fn) {
+    bool Precise = R.RequiresStrictFP &&
+                   isF32OrF32Vec(Op->getResult(0).getType()) &&
+                   (Fn == "acosh" || Fn == "cosh" || Fn == "exp" ||
+                    Fn == "log2" || Fn == "atan2");
+    return Precise ? ("precise::" + Fn).str() : Fn.str();
+  };
   auto emitUnaryCall = [&](StringRef Fn) -> Expected<Expr> {
     auto A = exprFor(Op->getOperand(0), PrecUnknown);
     if (!A)
       return A.takeError();
+    std::string Name = mathFunctionName(Fn);
     if (Opts.FlushDenormsF32 && isF32OrF32Vec(Op->getResult(0).getType())) {
       requireHelper("crucible_ftz");
-      return Expr{("crucible_ftz(" + Fn + "(crucible_ftz(" + A->Text + ")))")
-                      .str(),
+      return Expr{"crucible_ftz(" + Name + "(crucible_ftz(" + A->Text + ")))",
                   PrecPrimary};
     }
-    return Expr{(Fn + "(" + A->Text + ")").str(), PrecPrimary};
+    return Expr{Name + "(" + A->Text + ")", PrecPrimary};
   };
   auto emitBinaryCall = [&](StringRef Fn) -> Expected<Expr> {
     auto A = exprFor(Op->getOperand(0), PrecUnknown);
     auto B = exprFor(Op->getOperand(1), PrecUnknown);
     if (!A || !B)
       return makeError("invalid binary math operand");
-    return Expr{(Fn + "(" + A->Text + ", " + B->Text + ")").str(), PrecPrimary};
+    return Expr{mathFunctionName(Fn) + "(" + A->Text + ", " + B->Text + ")",
+                PrecPrimary};
   };
+  if (mlir::isa<mlir::math::AcoshOp>(Op))
+    return emitUnaryCall("acosh");
   if (mlir::isa<mlir::LLVM::FAbsOp, mlir::math::AbsFOp>(Op))
     return emitUnaryCall("fabs");
   if (mlir::isa<mlir::math::IsNaNOp>(Op))
