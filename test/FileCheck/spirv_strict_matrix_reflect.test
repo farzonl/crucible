@@ -1,0 +1,20 @@
+# REQUIRES: spirv-assembler, spirv-tools, spirv-float-controls2
+# RUN: awk '/^%%main =/ {print "%%vh = OpTypeVector %%f16 2\n%%mh = OpTypeMatrix %%vh 2"} /^%%abs =/ {print "%%c0 = OpCompositeConstruct %%v2f32 %%a %%b\n%%c1 = OpCompositeConstruct %%v2f32 %%b %%a\n%%m = OpCompositeConstruct %%m2f32 %%c0 %%c1"; print "%%abs = OpExtInst %%f32 %%glsl Determinant %%m"; next} /^%%habs =/ {print "%%hc0 = OpCompositeConstruct %%vh %%ah %%bh\n%%hc1 = OpCompositeConstruct %%vh %%bh %%ah\n%%hm = OpCompositeConstruct %%mh %%hc0 %%hc1"; print "%%habs = OpExtInst %%f16 %%glsl Determinant %%hm"; next} /^%%vabs =/ {print "%%vabs = OpCompositeConstruct %%v2f32 %%abs %%abs"; next} {print}' %S/../Inputs/spirv_float_controls2.spvasm > %t.det.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.det.spvasm -o %t.det.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.det.spv
+# RUN: %cruciblec %t.det.spv -o %t.det.metal
+# RUN: FileCheck %s --input-file=%t.det.metal
+# RUN: awk '/^%%main =/ {print "%%fz = OpConstant %%f32 0\n%%fm = OpConstant %%f32 -1\n%%normal = OpConstantComposite %%v2f32 %%fz %%fm"} {print}' %S/../Inputs/spirv_float_controls2.spvasm | sed 's/FAbs %%a$/Reflect %%a %%b/; s/FAbs %%ah$/Reflect %%ah %%bh/; s/FAbs %%va$/Reflect %%va %%normal/' > %t.reflect.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.reflect.spvasm -o %t.reflect.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.reflect.spv
+# RUN: %cruciblec %t.reflect.spv -o %t.reflect.metal
+# RUN: FileCheck %s --input-file=%t.reflect.metal
+# RUN: awk '/^%%main =/ {print "%%v3f = OpTypeVector %%f32 3\n%%m3f = OpTypeMatrix %%v3f 3"} /^%%abs =/ {print "%%col = OpCompositeConstruct %%v3f %%a %%b %%a\n%%matrix = OpCompositeConstruct %%m3f %%col %%col %%col\n%%abs = OpExtInst %%f32 %%glsl Determinant %%matrix"; next} {print}' %S/../Inputs/spirv_float_controls2.spvasm > %t.large.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.large.spvasm -o %t.large.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.large.spv
+# RUN: not %cruciblec %t.large.spv -o %t.large.metal 2>&1 | FileCheck %s --check-prefix=REJECT
+# CHECK: #pragma METAL fp math_mode(safe)
+# CHECK-NEXT: #pragma METAL fp contract(off)
+# CHECK: kernel void
+# CHECK-NOT: fma(
+# REJECT: FloatControls2 determinant requires a 2x2 matrix
