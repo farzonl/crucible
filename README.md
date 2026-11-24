@@ -210,6 +210,12 @@ fast math. Default/per-instruction fast-math flags grant relaxations, so this
 subset deliberately uses the stricter result instead. Other operations in these
 modules fail explicitly; removing unsupported floating-point requirements is not
 used to claim CTS passes.
+The subset also implements `RoundEven`, `Floor` and `NMin` using integer
+bit patterns, including tie-to-even and signed-zero handling. FloatControls2
+shaders emit Metal safe-math and contraction-off pragmas, preserving strict
+subtraction semantics even when the runtime's default compilation enables fast
+math. Relaxed SPIR-V flags remain permissions; computing stricter results is
+intentional. Ordinary shaders retain their existing compilation mode.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

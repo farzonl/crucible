@@ -6838,6 +6838,9 @@ Expected<std::string> Emitter::run() {
      << "#include <metal_stdlib>\n"
      << "using namespace metal;\n"
      << (UsesRaytracing ? "using namespace metal::raytracing;\n\n" : "\n");
+  if (R.RequiresStrictFP)
+    OS << "#pragma METAL fp math_mode(safe)\n"
+       << "#pragma METAL fp contract(off)\n\n";
   for (const std::string &H : HelperOrder)
     OS << helperSource(H) << "\n";
   if (!StructDecls.empty())

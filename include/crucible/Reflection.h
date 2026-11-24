@@ -204,6 +204,7 @@ struct Reflection {
   std::optional<MeshInterface> Mesh;
   std::optional<AmplificationInterface> Amplification;
   bool HasBufferDimensions = false;
+  bool RequiresStrictFP = false;
   uint32_t BufferSizesMetalIndex = UINT32_MAX;
   bool HasInstanceContribution = false;
   uint32_t InstanceContributionMetalIndex = UINT32_MAX;
