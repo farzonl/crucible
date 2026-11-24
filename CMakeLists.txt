@@ -49,16 +49,28 @@ separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND "${LLVM_DEFINITIONS}")
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS_LIST})
 
+if("DirectX" IN_LIST LLVM_TARGETS_TO_BUILD)
+  set(CRUCIBLE_HAS_DIRECTX 1)
+  message(STATUS "LLVM DirectX target enabled")
+else()
+  set(CRUCIBLE_HAS_DIRECTX 0)
+  message(STATUS "LLVM DirectX target not available in ${LLVM_DIR}")
+endif()
+
 # Prefer the monolithic LLVM dylib when present (Homebrew ships one and its
 # MLIR static archives depend on it); mixing it with static component
 # archives duplicates LLVM globals and crashes at runtime.
 if(TARGET LLVM)
   set(CRUCIBLE_LLVM_LIBS LLVM)
 else()
-  llvm_map_components_to_libnames(CRUCIBLE_LLVM_LIBS
+  set(_crucible_llvm_components
     Core Object BitReader IRReader BinaryFormat Support TargetParser
     Analysis Passes TransformUtils ScalarOpts
     SPIRVCodeGen SPIRVDesc SPIRVInfo CodeGen Target MC AsmPrinter)
+  if(CRUCIBLE_HAS_DIRECTX)
+    list(APPEND _crucible_llvm_components DirectXCodeGen DirectXDesc DirectXInfo)
+  endif()
+  llvm_map_components_to_libnames(CRUCIBLE_LLVM_LIBS ${_crucible_llvm_components})
 endif()
 
 # MLIR is used to lift the unstructured DXIL CFG into structured scf.if /
@@ -123,7 +135,28 @@ if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   message(STATUS "Found Vulkan/MoltenVK: ${CRUCIBLE_VULKAN_LIB}")
 endif()
 
-if(APPLE OR (CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB))
+# Optional Nacelle D3D12 software runtime for testing DXIL output on macOS/Linux.
+set(CRUCIBLE_NACELLE_DIR "" CACHE PATH
+    "Path to extracted Nacelle release directory (bin/, lib/, include/)")
+if(NOT CRUCIBLE_NACELLE_DIR)
+  if(EXISTS "${CMAKE_SOURCE_DIR}/.toolchains/nacelle/lib")
+    set(CRUCIBLE_NACELLE_DIR "${CMAKE_SOURCE_DIR}/.toolchains/nacelle")
+  endif()
+endif()
+if(CRUCIBLE_NACELLE_DIR)
+  find_program(NACELLE_COMPILE_EXECUTABLE nacelle-compile
+    HINTS "${CRUCIBLE_NACELLE_DIR}/bin" NO_DEFAULT_PATH)
+  find_library(CRUCIBLE_NACELLE_LIB NAMES nacelle_d3d12 libnacelle_d3d12.dylib libnacelle_d3d12.so
+    HINTS "${CRUCIBLE_NACELLE_DIR}/lib" NO_DEFAULT_PATH)
+  if(NACELLE_COMPILE_EXECUTABLE)
+    message(STATUS "Found nacelle-compile: ${NACELLE_COMPILE_EXECUTABLE}")
+  endif()
+  if(CRUCIBLE_NACELLE_LIB)
+    message(STATUS "Found Nacelle D3D12 runtime: ${CRUCIBLE_NACELLE_LIB}")
+  endif()
+endif()
+
+if(APPLE OR (CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB) OR CRUCIBLE_NACELLE_LIB)
   add_subdirectory(tools/crucible-run)
 endif()
 

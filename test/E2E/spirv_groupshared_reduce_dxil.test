@@ -1,0 +1,10 @@
+# End-to-end SPIR-V -> DXIL -> Nacelle D3D12 execution test with groupshared reduction.
+# REQUIRES: directx-backend, nacelle-d3d12
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/groupshared_reduce.hlsl
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+# RUN: %nacelle-compile --cs %t.dxil --emit-scf > /dev/null
+# RUN: %crucible-run --backend d3d12 --dxil %t.dxil --groups 1,1,1 \
+# RUN:   --buffer 0:u32:1:zero | FileCheck %s
+
+# CHECK: buffer0: 2016

@@ -65,6 +65,26 @@ struct VulkanRuntimeCaps {
   bool SupportsRaytracing = false;
 };
 
+struct D3D12BackendCaps {
+  std::string AdapterName;
+  std::string DriverName;
+  uint32_t VendorID = 0;
+  uint32_t DeviceID = 0;
+  std::string HighestShaderModel = "6.0";
+  bool DoublePrecisionFloatShaderOps = false;
+  bool Int64ShaderOps = false;
+  bool Native16BitShaderOpsSupported = false;
+  bool WaveOps = false;
+  uint32_t WaveLaneCountMin = 0;
+  uint32_t WaveLaneCountMax = 0;
+  bool AtomicInt64OnTypedResourceSupported = false;
+  bool AtomicInt64OnGroupSharedSupported = false;
+  uint32_t ResourceBindingTier = 1;
+  uint32_t TiledResourcesTier = 0;
+  bool MeshShaderSupported = false;
+  bool RaytracingSupported = false;
+};
+
 struct CrucibleEmulationCaps {
   bool EmulateF64 = false;
   bool EmulateInt64Atomics = false;
@@ -85,6 +105,10 @@ void applyVulkanEmulationOverrides(offloadtest::Capabilities &Caps,
 offloadtest::Capabilities
 buildDirectXCapsFromVulkan(const VulkanBackendCaps &VK,
                            const VulkanRuntimeCaps &Runtime,
+                           const CrucibleEmulationCaps &Emul);
+
+offloadtest::Capabilities
+buildVulkanCapsFromDirectX(const D3D12BackendCaps &DX,
                            const CrucibleEmulationCaps &Emul);
 
 std::string formatVulkanDeviceDescription(llvm::StringRef DeviceName,

@@ -49,6 +49,22 @@ struct SPIRVCompileResult {
 llvm::Expected<SPIRVCompileResult>
 compileDXILToSPIRV(llvm::MemoryBufferRef DXIL, const Options &Opts = {});
 
+struct DXILCompileResult {
+  /// Compiled DXContainer binary (when Opts.EmitDXILAsm == false) or
+  /// human-readable DXIL IR assembly (when Opts.EmitDXILAsm == true).
+  std::string Output;
+  /// True when Output contains human-readable DXIL IR assembly text.
+  bool IsAssembly = false;
+  /// Binding reflection for the host runtime.
+  Reflection Reflect;
+};
+
+/// Translate a shader binary (SPIR-V, standalone MLIR, or DXIL) into
+/// DirectX Intermediate Language (DXContainer binary or DXIL IR assembly)
+/// using LLVM 24's DirectX backend, plus binding reflection.
+llvm::Expected<DXILCompileResult>
+compileToDXIL(llvm::MemoryBufferRef Input, const Options &Opts = {});
+
 } // namespace crucible
 
 #endif // CRUCIBLE_COMPILER_H

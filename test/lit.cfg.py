@@ -27,6 +27,16 @@ if config.crucible_run:
 if getattr(config, "crucible_has_vulkan", False) and config.crucible_run and os.path.exists(config.crucible_run):
     config.available_features.add("vulkan-gpu")
 
+if getattr(config, "crucible_has_directx", False):
+    config.available_features.add("directx-backend")
+
+if getattr(config, "nacelle_compile", "") and os.path.exists(config.nacelle_compile):
+    config.substitutions.append(("%nacelle-compile", config.nacelle_compile))
+    config.available_features.add("nacelle-compile")
+
+if getattr(config, "crucible_has_nacelle", False) and config.crucible_run and os.path.exists(config.crucible_run):
+    config.available_features.add("nacelle-d3d12")
+
 if config.crucible_offload:
     config.substitutions.append(("%offloader", f'"{config.crucible_offload}" -api=dx'))
     config.substitutions.append(("%api_query", f'"{config.crucible_api_query}"'))

@@ -32,6 +32,10 @@ llvm::Error assignMetalBindings(Reflection &R, const Options &Opts);
 /// register).
 llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts);
 
+/// Validate and normalize DirectX register bindings (class, space, register)
+/// for every resource range when targeting LLVM's DirectX backend.
+llvm::Error assignDXILBindings(Reflection &R, const Options &Opts);
+
 /// A shader whose CFG has been lifted into structured MLIR scf.if / scf.while
 /// regions ready for source emission.
 struct StructurizedShader {

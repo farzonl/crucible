@@ -1,0 +1,10 @@
+# SPIR-V -> DXIL test: math intrinsics.
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/intrinsics_math.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+
+# CHECK: define void @main()
+# CHECK: @dx.op.unary.f32
+# CHECK: @dx.op.rawBufferStore

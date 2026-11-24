@@ -10,6 +10,7 @@ add_library(crucible STATIC
   Transforms/ResourceLowering.cpp
   Transforms/CFGStructurizer.cpp
   Transforms/DXILToLayer1.cpp
+  Backend/DXILEmitter.cpp
   Backend/MSLEmitter.cpp
   Backend/SPIRVEmitter.cpp
 )
@@ -21,5 +22,6 @@ target_include_directories(crucible PUBLIC
 target_include_directories(crucible PRIVATE
   $<BUILD_INTERFACE:${CRUCIBLE_SPIRV_HEADERS_INCLUDE_DIR}>
 )
+target_compile_definitions(crucible PRIVATE CRUCIBLE_HAS_DIRECTX=${CRUCIBLE_HAS_DIRECTX})
 target_compile_options(crucible PRIVATE ${CRUCIBLE_COMMON_FLAGS})
 target_link_libraries(crucible PUBLIC crucible_dialect ${CRUCIBLE_MLIR_LIBS} ${CRUCIBLE_LLVM_LIBS})

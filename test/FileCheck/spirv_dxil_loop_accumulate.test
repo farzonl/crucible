@@ -1,0 +1,12 @@
+# SPIR-V -> DXIL test: structured loop with nested continue (verified via nacelle-compile).
+# REQUIRES: directx-backend, nacelle-compile
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/loop_accumulate.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+# RUN: %nacelle-compile --cs %t.dxil --emit-scf > /dev/null
+
+# CHECK: define void @main()
+# CHECK: @dx.op.threadId.i32(i32 93, i32 0)
+# CHECK: @dx.op.rawBufferLoad
+# CHECK: @dx.op.rawBufferStore

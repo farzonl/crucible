@@ -51,12 +51,35 @@ jobs:
       - name: Setup third_party LLVM/MLIR
         uses: ./.github/actions/setup-llvm
 
+      - name: Restore Nacelle v0.0.3 cache
+        id: cache-nacelle
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/nacelle
+          key: crucible-nacelle-${{ runner.os }}-${{ runner.arch }}-v0.0.3
+
+      - name: Download Nacelle v0.0.3 (Linux x64)
+        if: steps.cache-nacelle.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .toolchains/nacelle
+          curl -fsSL "https://github.com/farzonl/Nacelle/releases/download/v0.0.3/nacelle-0.0.3-linux-x64.tar.gz" -o /tmp/nacelle.tar.gz
+          tar -xzf /tmp/nacelle.tar.gz --strip-components=1 -C .toolchains/nacelle
+          rm -f /tmp/nacelle.tar.gz
+
+      - name: Save Nacelle v0.0.3 cache
+        if: steps.cache-nacelle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/nacelle
+          key: crucible-nacelle-${{ runner.os }}-${{ runner.arch }}-v0.0.3
+
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DCRUCIBLE_NACELLE_DIR="${{ github.workspace }}/.toolchains/nacelle" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
 
@@ -117,12 +140,35 @@ jobs:
       - name: Setup third_party LLVM/MLIR
         uses: ./.github/actions/setup-llvm
 
+      - name: Restore Nacelle v0.0.3 cache
+        id: cache-nacelle
+        uses: actions/cache/restore@v4
+        with:
+          path: .toolchains/nacelle
+          key: crucible-nacelle-${{ runner.os }}-${{ runner.arch }}-v0.0.3
+
+      - name: Download Nacelle v0.0.3 (macOS arm64)
+        if: steps.cache-nacelle.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .toolchains/nacelle
+          curl -fsSL "https://github.com/farzonl/Nacelle/releases/download/v0.0.3/nacelle-0.0.3-macos-arm64.tar.gz" -o /tmp/nacelle.tar.gz
+          tar -xzf /tmp/nacelle.tar.gz --strip-components=1 -C .toolchains/nacelle
+          rm -f /tmp/nacelle.tar.gz
+
+      - name: Save Nacelle v0.0.3 cache
+        if: steps.cache-nacelle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .toolchains/nacelle
+          key: crucible-nacelle-${{ runner.os }}-${{ runner.arch }}-v0.0.3
+
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir" \
+            -DCRUCIBLE_NACELLE_DIR="${{ github.workspace }}/.toolchains/nacelle" \
             -DDXC_EXECUTABLE="${{ github.workspace }}/.sdk/bin/dxc" \
             -DLLVM_EXTERNAL_LIT="$(which lit)"
 

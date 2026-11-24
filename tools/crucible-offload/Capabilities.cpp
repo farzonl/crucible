@@ -177,6 +177,48 @@ Capabilities buildDirectXCapsFromVulkan(const VulkanBackendCaps &VK,
   return Caps;
 }
 
+Capabilities buildVulkanCapsFromDirectX(const D3D12BackendCaps &DX,
+                                        const CrucibleEmulationCaps &Emul) {
+  Capabilities Caps;
+  const bool HasF64 = DX.DoublePrecisionFloatShaderOps || Emul.EmulateF64;
+  const bool HasInt64AtomicsBuf =
+      DX.AtomicInt64OnTypedResourceSupported || Emul.EmulateInt64Atomics;
+  const bool HasInt64AtomicsShared =
+      DX.AtomicInt64OnGroupSharedSupported || Emul.EmulateInt64Atomics;
+
+  Caps.try_emplace("shaderFloat16",
+                   makeCapability("shaderFloat16",
+                                  DX.Native16BitShaderOpsSupported));
+  Caps.try_emplace("shaderInt16",
+                   makeCapability("shaderInt16",
+                                  DX.Native16BitShaderOpsSupported));
+  Caps.try_emplace("shaderInt64",
+                   makeCapability("shaderInt64", DX.Int64ShaderOps));
+  Caps.try_emplace("shaderFloat64", makeCapability("shaderFloat64", HasF64));
+  Caps.try_emplace("shaderResourceMinLod",
+                   makeCapability("shaderResourceMinLod",
+                                  DX.TiledResourcesTier >= 2));
+  Caps.try_emplace("runtimeDescriptorArray",
+                   makeCapability("runtimeDescriptorArray",
+                                  DX.ResourceBindingTier >= 3));
+  Caps.try_emplace("descriptorBindingPartiallyBound",
+                   makeCapability("descriptorBindingPartiallyBound",
+                                  DX.ResourceBindingTier >= 3));
+  Caps.try_emplace("shaderSubgroupExtendedTypes",
+                   makeCapability("shaderSubgroupExtendedTypes", DX.WaveOps));
+  Caps.try_emplace("shaderBufferFloat32Atomics",
+                   makeCapability("shaderBufferFloat32Atomics", true));
+  Caps.try_emplace("shaderSharedFloat32Atomics",
+                   makeCapability("shaderSharedFloat32Atomics", true));
+  Caps.try_emplace("shaderBufferInt64Atomics",
+                   makeCapability("shaderBufferInt64Atomics",
+                                  HasInt64AtomicsBuf));
+  Caps.try_emplace("shaderSharedInt64Atomics",
+                   makeCapability("shaderSharedInt64Atomics",
+                                  HasInt64AtomicsShared));
+  return Caps;
+}
+
 std::string formatVulkanDeviceDescription(StringRef DeviceName,
                                           StringRef DriverName) {
   if (DriverName.empty() || DeviceName.contains_insensitive(DriverName))

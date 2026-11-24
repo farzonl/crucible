@@ -1,0 +1,11 @@
+# SPIR-V -> DXIL test: wave / subgroup operations.
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.1 -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/wave_ops.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+
+# CHECK: define void @main()
+# CHECK: @dx.op.waveActiveOp
+# CHECK: @dx.op.waveReadLaneFirst
+# CHECK: @dx.op.rawBufferStore

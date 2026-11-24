@@ -1,0 +1,12 @@
+# SPIR-V -> DXIL test: groupshared memory + workgroup barrier reduction.
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/groupshared_reduce.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+
+# CHECK: addrspace(3) global
+# CHECK: define void @main()
+# CHECK: @dx.op.flattenedThreadIdInGroup.i32(i32 96)
+# CHECK: @dx.op.barrier(i32 80,
+# CHECK: @dx.op.rawBufferStore

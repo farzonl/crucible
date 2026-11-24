@@ -24,9 +24,10 @@ struct BufferSpec {
 };
 
 struct RunnerOptions {
-  std::string Backend; // metal, vulkan (empty = auto-detect from input)
+  std::string Backend; // metal, vulkan, d3d12/dxil (empty = auto-detect from input)
   std::string LibPath;
   std::string SpvPath;
+  std::string DxilPath;
   std::string Entry;
   uint32_t Threads[3] = {1, 1, 1};
   uint32_t Groups[3] = {1, 1, 1};
@@ -56,6 +57,10 @@ int runMetal(const RunnerOptions &Opts);
 
 #ifdef CRUCIBLE_RUN_HAS_VULKAN
 int runVulkan(const RunnerOptions &Opts);
+#endif
+
+#ifdef CRUCIBLE_RUN_HAS_D3D12
+int runD3D12(const RunnerOptions &Opts);
 #endif
 
 } // namespace crucible_run
