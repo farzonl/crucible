@@ -15,7 +15,9 @@
 #include "crucible/Dialect/CrucibleDialect.h"
 
 #include "spirv/unified1/GLSL.std.450.h"
+#define SPV_ENABLE_UTILITY_CODE
 #include "spirv/unified1/spirv.hpp"
+#undef SPV_ENABLE_UTILITY_CODE
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -60,6 +62,309 @@ bool isSPIRVBinary(MemoryBufferRef Buf) {
 }
 
 namespace {
+
+static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words) {
+  if (Words.size() < 5)
+    return makeError("truncated SPIR-V header");
+  bool HasControls = false;
+  DenseMap<uint32_t, SmallVector<uint32_t>> Types;
+  DenseMap<uint32_t, uint32_t> ValueTypes, Constants, UIntTypes;
+  DenseSet<uint32_t> GLSLImports, Capabilities;
+  uint32_t BoolTy = 0;
+  auto IsString = [](ArrayRef<uint32_t> W, StringRef S) {
+    StringRef Bytes(reinterpret_cast<const char *>(W.data()), W.size() * 4);
+    return Bytes.size() > S.size() && Bytes.starts_with(S) &&
+           Bytes[S.size()] == '\0';
+  };
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t N = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (!N || N > Words.size() - I)
+      return makeError("malformed SPIR-V instruction");
+    if (Op == spv::OpCapability && N == 2) {
+      Capabilities.insert(Words[I + 1]);
+      HasControls |= Words[I + 1] == spv::CapabilityFloatControls2;
+    }
+    if ((Op == spv::OpTypeFloat && N == 3) ||
+        (Op == spv::OpTypeInt && N == 4) || (Op == spv::OpTypeVector && N == 4))
+      Types[Words[I + 1]] =
+          SmallVector<uint32_t>(Words.begin() + I, Words.begin() + I + N);
+    if (Op == spv::OpTypeBool && N == 2)
+      BoolTy = Words[I + 1];
+    if (Op == spv::OpTypeInt && N == 4 && Words[I + 3] == 0)
+      UIntTypes[Words[I + 2]] = Words[I + 1];
+    if (Op == spv::OpConstant && N == 4)
+      Constants[Words[I + 2]] = Words[I + 3];
+    if (Op == spv::OpExtInstImport && N >= 3 &&
+        IsString(ArrayRef(Words).slice(I + 2, N - 2), "GLSL.std.450"))
+      GLSLImports.insert(Words[I + 1]);
+    bool HasResult, HasType;
+    spv::HasResultAndType(static_cast<spv::Op>(Op), &HasResult, &HasType);
+    if (HasResult && HasType && N >= 3)
+      ValueTypes[Words[I + 2]] = Words[I + 1];
+    I += N;
+  }
+  if (!HasControls)
+    return Error::success();
+
+  SmallVector<uint32_t> NewCapabilities, Declarations, Body;
+  uint32_t NextID = Words[3];
+  auto Emit = [](SmallVectorImpl<uint32_t> &Out, spv::Op Op,
+                 ArrayRef<uint32_t> Args) {
+    Out.push_back(((Args.size() + 1) << 16) | Op);
+    Out.append(Args.begin(), Args.end());
+  };
+  struct BitTypes {
+    uint32_t UInt, Bool, Zero, AbsMask, Infinity;
+  };
+  DenseMap<uint32_t, BitTypes> Cached;
+  constexpr uint32_t ValidFlags = 0x7000f;
+  // Relaxations are permissions, not requirements. These operations implement
+  // the strictest mode using only integer bit patterns, independent of Metal
+  // fast math. Other FP operations remain rejected, not silently relaxed.
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t N = Words[I] >> 16;
+    auto Op = static_cast<spv::Op>(Words[I] & 0xffff);
+    if (Op == spv::OpCapability && N == 2 &&
+        Words[I + 1] == spv::CapabilityFloatControls2) {
+      I += N;
+      continue;
+    }
+    if (Op == spv::OpExtension && IsString(ArrayRef(Words).slice(I + 1, N - 1),
+                                           "SPV_KHR_float_controls2")) {
+      I += N;
+      continue;
+    }
+    if (Op == spv::OpExecutionModeId && N >= 3 &&
+        Words[I + 2] == spv::ExecutionModeFPFastMathDefault) {
+      if (N != 5 || !Types.contains(Words[I + 3]) ||
+          (Types[Words[I + 3]][0] & 0xffff) != spv::OpTypeFloat ||
+          !Constants.contains(Words[I + 4]) ||
+          (Constants[Words[I + 4]] & ~ValidFlags))
+        return makeError("invalid FloatControls2 default fast-math mode");
+      auto C = Types.find(ValueTypes.lookup(Words[I + 4]));
+      if (C == Types.end() || (C->second[0] & 0xffff) != spv::OpTypeInt ||
+          C->second[2] != 32)
+        return makeError(
+            "FloatControls2 default flags require an integer32 constant");
+      I += N;
+      continue;
+    }
+    if (Op == spv::OpDecorate && N >= 3 &&
+        Words[I + 2] == spv::DecorationFPFastMathMode) {
+      if (N != 4 || (Words[I + 3] & ~ValidFlags))
+        return makeError("invalid FloatControls2 fast-math decoration");
+      I += N;
+      continue;
+    }
+    bool Abs = Op == spv::OpExtInst && N == 6 &&
+               GLSLImports.contains(Words[I + 3]) &&
+               Words[I + 4] == GLSLstd450FAbs;
+    bool Compare = Op == spv::OpFOrdEqual || Op == spv::OpFUnordEqual ||
+                   Op == spv::OpFOrdNotEqual || Op == spv::OpFUnordNotEqual;
+    if (Abs || Compare) {
+      if ((Compare && N != 5) || NextID > UINT32_MAX - 64)
+        return makeError("malformed or oversized FloatControls2 operation");
+      uint32_t Ty = Abs ? Words[I + 1] : ValueTypes.lookup(Words[I + 3]);
+      auto T = Types.find(Ty);
+      if (T == Types.end())
+        return makeError("unknown FloatControls2 floating-point type");
+      uint32_t Scalar = Ty, Lanes = 1;
+      if ((T->second[0] & 0xffff) == spv::OpTypeVector) {
+        Scalar = T->second[2];
+        Lanes = T->second[3];
+      }
+      auto S = Types.find(Scalar);
+      if (S == Types.end() || (S->second[0] & 0xffff) != spv::OpTypeFloat ||
+          (S->second[2] != 16 && S->second[2] != 32) || Lanes > 4)
+        return makeError(
+            "FloatControls2 bitwise operations require float16/32");
+      if (!Cached.contains(Ty)) {
+        uint32_t Width = S->second[2], UInt = UIntTypes.lookup(Width);
+        if (!UInt) {
+          UInt = NextID++;
+          Emit(Declarations, spv::OpTypeInt, {UInt, Width, 0});
+          UIntTypes[Width] = UInt;
+        }
+        if (Width == 16 && Capabilities.insert(spv::CapabilityInt16).second)
+          Emit(NewCapabilities, spv::OpCapability, {spv::CapabilityInt16});
+        if (!BoolTy) {
+          BoolTy = NextID++;
+          Emit(Declarations, spv::OpTypeBool, {BoolTy});
+        }
+        uint32_t Bool = BoolTy;
+        if (Lanes != 1) {
+          auto FindVector = [&](uint32_t Elem) {
+            for (const auto &KV : Types)
+              if ((KV.second[0] & 0xffff) == spv::OpTypeVector &&
+                  KV.second[2] == Elem && KV.second[3] == Lanes)
+                return KV.first;
+            uint32_t ID = NextID++;
+            Emit(Declarations, spv::OpTypeVector, {ID, Elem, Lanes});
+            Types[ID] = {(4u << 16) | spv::OpTypeVector, ID, Elem, Lanes};
+            return ID;
+          };
+          UInt = FindVector(UInt);
+          Bool = FindVector(BoolTy);
+        }
+        auto Constant = [&](uint32_t Bits) {
+          uint32_t ID = NextID++;
+          Emit(Declarations, spv::OpConstant, {UIntTypes[Width], ID, Bits});
+          if (Lanes != 1) {
+            uint32_t Vector = NextID++;
+            SmallVector<uint32_t> Args{UInt, Vector};
+            Args.append(Lanes, ID);
+            Emit(Declarations, spv::OpConstantComposite, Args);
+            return Vector;
+          }
+          return ID;
+        };
+        Cached[Ty] = {UInt, Bool, Constant(0),
+                      Constant(Width == 16 ? 0x7fff : 0x7fffffff),
+                      Constant(Width == 16 ? 0x7c00 : 0x7f800000)};
+      }
+      auto C = Cached[Ty];
+      auto Unary = [&](spv::Op O, uint32_t Type, uint32_t A) {
+        uint32_t ID = NextID++;
+        Emit(Body, O, {Type, ID, A});
+        return ID;
+      };
+      auto Binary = [&](spv::Op O, uint32_t Type, uint32_t A, uint32_t B) {
+        uint32_t ID = NextID++;
+        Emit(Body, O, {Type, ID, A, B});
+        return ID;
+      };
+      uint32_t A = Unary(spv::OpBitcast, C.UInt, Words[I + (Abs ? 5 : 3)]);
+      uint32_t MagA = Binary(spv::OpBitwiseAnd, C.UInt, A, C.AbsMask);
+      if (Abs) {
+        Emit(Body, spv::OpBitcast, {Ty, Words[I + 2], MagA});
+      } else {
+        uint32_t B = Unary(spv::OpBitcast, C.UInt, Words[I + 4]);
+        uint32_t MagB = Binary(spv::OpBitwiseAnd, C.UInt, B, C.AbsMask);
+        uint32_t NanA = Binary(spv::OpUGreaterThan, C.Bool, MagA, C.Infinity);
+        uint32_t NanB = Binary(spv::OpUGreaterThan, C.Bool, MagB, C.Infinity);
+        uint32_t Nan = Binary(spv::OpLogicalOr, C.Bool, NanA, NanB);
+        uint32_t ZeroA = Binary(spv::OpIEqual, C.Bool, MagA, C.Zero);
+        uint32_t ZeroB = Binary(spv::OpIEqual, C.Bool, MagB, C.Zero);
+        uint32_t Zeros = Binary(spv::OpLogicalAnd, C.Bool, ZeroA, ZeroB);
+        uint32_t Same = Binary(spv::OpIEqual, C.Bool, A, B);
+        uint32_t Equal = Binary(spv::OpLogicalOr, C.Bool, Same, Zeros);
+        if (Op == spv::OpFOrdNotEqual || Op == spv::OpFUnordNotEqual)
+          Equal = Unary(spv::OpLogicalNot, C.Bool, Equal);
+        bool Ordered = Op == spv::OpFOrdEqual || Op == spv::OpFOrdNotEqual;
+        if (Ordered)
+          Nan = Unary(spv::OpLogicalNot, C.Bool, Nan);
+        Emit(Body, Ordered ? spv::OpLogicalAnd : spv::OpLogicalOr,
+             {Words[I + 1], Words[I + 2], Equal, Nan});
+      }
+    } else {
+      switch (Op) {
+      case spv::OpCapability:
+      case spv::OpExtension:
+      case spv::OpExtInstImport:
+      case spv::OpMemoryModel:
+      case spv::OpEntryPoint:
+      case spv::OpExecutionMode:
+      case spv::OpName:
+      case spv::OpMemberName:
+      case spv::OpString:
+      case spv::OpSource:
+      case spv::OpSourceExtension:
+      case spv::OpSourceContinued:
+      case spv::OpLine:
+      case spv::OpNoLine:
+      case spv::OpDecorate:
+      case spv::OpMemberDecorate:
+      case spv::OpTypeVoid:
+      case spv::OpTypeBool:
+      case spv::OpTypeInt:
+      case spv::OpTypeFloat:
+      case spv::OpTypeVector:
+      case spv::OpTypeMatrix:
+      case spv::OpTypeArray:
+      case spv::OpTypeRuntimeArray:
+      case spv::OpTypeStruct:
+      case spv::OpTypePointer:
+      case spv::OpTypeFunction:
+      case spv::OpConstant:
+      case spv::OpConstantTrue:
+      case spv::OpConstantFalse:
+      case spv::OpConstantComposite:
+      case spv::OpConstantNull:
+      case spv::OpUndef:
+      case spv::OpVariable:
+      case spv::OpLoad:
+      case spv::OpStore:
+      case spv::OpAccessChain:
+      case spv::OpInBoundsAccessChain:
+      case spv::OpFunction:
+      case spv::OpFunctionParameter:
+      case spv::OpFunctionEnd:
+      case spv::OpFunctionCall:
+      case spv::OpReturn:
+      case spv::OpReturnValue:
+      case spv::OpLabel:
+      case spv::OpSelectionMerge:
+      case spv::OpLoopMerge:
+      case spv::OpBranch:
+      case spv::OpBranchConditional:
+      case spv::OpSwitch:
+      case spv::OpPhi:
+      case spv::OpSelect:
+      case spv::OpCopyObject:
+      case spv::OpCompositeConstruct:
+      case spv::OpCompositeExtract:
+      case spv::OpCompositeInsert:
+      case spv::OpVectorShuffle:
+      case spv::OpVectorExtractDynamic:
+      case spv::OpVectorInsertDynamic:
+      case spv::OpBitcast:
+      case spv::OpUConvert:
+      case spv::OpSConvert:
+      case spv::OpIAdd:
+      case spv::OpISub:
+      case spv::OpIMul:
+      case spv::OpIEqual:
+      case spv::OpINotEqual:
+      case spv::OpULessThan:
+      case spv::OpUGreaterThan:
+      case spv::OpSLessThan:
+      case spv::OpSGreaterThan:
+      case spv::OpLogicalAnd:
+      case spv::OpLogicalOr:
+      case spv::OpLogicalNot:
+      case spv::OpBitwiseAnd:
+      case spv::OpBitwiseOr:
+      case spv::OpBitwiseXor:
+      case spv::OpShiftLeftLogical:
+      case spv::OpShiftRightLogical:
+        Body.append(Words.begin() + I, Words.begin() + I + N);
+        break;
+      default:
+        return makeError(
+            "unsupported operation {0} in FloatControls2 strict subset",
+            static_cast<uint32_t>(Op));
+      }
+    }
+    I += N;
+  }
+  SmallVector<uint32_t> Normalized(Words.begin(), Words.begin() + 5);
+  Normalized[3] = NextID;
+  Normalized.append(NewCapabilities);
+  bool Inserted = false;
+  for (size_t I = 0; I < Body.size();) {
+    uint32_t N = Body[I] >> 16;
+    if (!Inserted && (Body[I] & 0xffff) == spv::OpFunction) {
+      Normalized.append(Declarations);
+      Inserted = true;
+    }
+    Normalized.append(Body.begin() + I, Body.begin() + I + N);
+    I += N;
+  }
+  if (!Inserted && !Declarations.empty())
+    return makeError("missing function for FloatControls2 declarations");
+  Words.assign(Normalized.begin(), Normalized.end());
+  return Error::success();
+}
 
 static Error expandFmaKHR(SmallVectorImpl<uint32_t> &Words) {
   if (Words.size() < 5)
@@ -721,6 +1026,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   const char *Raw = Buf.getBufferStart();
   for (size_t I = 0; I < NumWords; ++I)
     Words[I] = support::endian::read32le(Raw + I * 4);
+  if (Error E = expandFloatControls2(Words))
+    return std::move(E);
   if (Error E = expandFmaKHR(Words))
     return std::move(E);
   if (Error E = expandModfStruct(Words))
