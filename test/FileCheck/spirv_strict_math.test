@@ -5,10 +5,15 @@
 # RUN: %spirv-val --target-env vulkan1.3 %t.atan.spv
 # RUN: %cruciblec %t.atan.spv -o %t.atan.metal
 # RUN: FileCheck %s --input-file=%t.atan.metal
+# RUN: awk 'BEGIN {print "OpCapability DenormPreserve"} /^OpExecutionMode %%main LocalSize/ {print "OpExecutionMode %%main DenormPreserve 32"} {print}' %S/../Inputs/spirv_float_controls2.spvasm > %t.denorm.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.denorm.spvasm -o %t.denorm.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.denorm.spv
+# RUN: not %cruciblec %t.denorm.spv -o %t.denorm.metal 2>&1 | FileCheck %s --check-prefix=REJECT
 # CHECK: #pragma METAL fp math_mode(safe)
 # CHECK-NEXT: #pragma METAL fp contract(off)
 # CHECK: kernel void
 # CHECK-NOT: sqrt(
+# REJECT: unsupported floating-point execution mode in FloatControls2
 # CHECK: precise::
 # CHECK: precise::
 # CHECK-NOT: sqrt(

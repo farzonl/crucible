@@ -227,6 +227,9 @@ select Metal's `precise::` variants; safe arithmetic alone does not select these
 variants. Half calls use the native half-precision functions. GPU regressions
 check finite results against the documented 4-ULP float32 (6-ULP `Atan2`) and
 1-ULP half bounds, as well as NaNs, infinities, domain boundaries and signed zeros.
+Default-mode subnormal math results may flush to signed zero on Metal.
+Explicit denormal execution modes and non-RTE rounding remain unsupported and
+fail explicitly rather than silently inheriting these defaults.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and
