@@ -203,6 +203,13 @@ Round-toward-zero and explicit denormal/signed-zero-infinity-NaN preservation
 modes on these modules are rejected until their semantics are implemented.
 FMA regression assembly requires SPIRV-Tools with `FMAKHR` support; older
 assemblers explicitly report those tests as unsupported.
+`FloatControls2` has a strict subset for scalar/vector float16/float32
+equality/inequality and GLSL `FAbs`. Integer bit-pattern lowering preserves NaN
+classification, infinities, both zero signs and subnormals independently of Metal
+fast math. Default/per-instruction fast-math flags grant relaxations, so this
+subset deliberately uses the stricter result instead. Other operations in these
+modules fail explicitly; removing unsupported floating-point requirements is not
+used to claim CTS passes.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

@@ -40,14 +40,18 @@ if getattr(config, "spirv_val", "") and os.path.exists(config.spirv_val):
     if getattr(config, "spirv_as", "") and os.path.exists(config.spirv_as):
         config.substitutions.append(("%spirv-as", config.spirv_as))
         config.available_features.add("spirv-assembler")
-        if subprocess.run(
-            [config.spirv_as, "-o", os.devnull],
-            input="OpCapability FMAKHR\n",
-            text=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        ).returncode == 0:
-            config.available_features.add("spirv-fma-khr")
+        for capability, feature in (
+            ("FMAKHR", "spirv-fma-khr"),
+            ("FloatControls2", "spirv-float-controls2"),
+        ):
+            if subprocess.run(
+                [config.spirv_as, "-o", os.devnull],
+                input=f"OpCapability {capability}\n",
+                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0:
+                config.available_features.add(feature)
 
 # Feature flags:
 #   metal-tools -- Apple's `xcrun metal` toolchain is available, so emitted

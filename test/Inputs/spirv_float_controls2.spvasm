@@ -1,0 +1,126 @@
+OpCapability Shader
+OpCapability Float16
+OpCapability Int16
+OpCapability FloatControls2
+OpExtension "SPV_KHR_float_controls2"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid %input0 %input1 %output
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionModeId %main FPFastMathDefault %f32 %flags
+OpExecutionModeId %main FPFastMathDefault %f16 %flags
+OpDecorate %oeq FPFastMathMode NotInf|AllowContract|AllowReassoc|AllowTransform
+OpDecorate %une FPFastMathMode None
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %array ArrayStride 4
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %input0 DescriptorSet 0
+OpDecorate %input0 Binding 0
+OpDecorate %input1 DescriptorSet 0
+OpDecorate %input1 Binding 1
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 2
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%u16 = OpTypeInt 16 0
+%f32 = OpTypeFloat 32
+%f16 = OpTypeFloat 16
+%v2f32 = OpTypeVector %f32 2
+%m2f32 = OpTypeMatrix %v2f32 2
+%v2bool = OpTypeVector %bool 2
+%v3u32 = OpTypeVector %u32 3
+%array = OpTypeRuntimeArray %u32
+%block = OpTypeStruct %array
+%pblock = OpTypePointer StorageBuffer %block
+%pu32 = OpTypePointer StorageBuffer %u32
+%pgid = OpTypePointer Input %v3u32
+%gid = OpVariable %pgid Input
+%input0 = OpVariable %pblock StorageBuffer
+%input1 = OpVariable %pblock StorageBuffer
+%output = OpVariable %pblock StorageBuffer
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%three = OpConstant %u32 3
+%four = OpConstant %u32 4
+%five = OpConstant %u32 5
+%six = OpConstant %u32 6
+%seven = OpConstant %u32 7
+%eight = OpConstant %u32 8
+%nine = OpConstant %u32 9
+%ten = OpConstant %u32 10
+%flags = OpConstant %u32 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3u32 %gid
+%x = OpCompositeExtract %u32 %id 0
+%ap = OpAccessChain %pu32 %input0 %zero %x
+%bp = OpAccessChain %pu32 %input1 %zero %x
+%abits = OpLoad %u32 %ap
+%bbits = OpLoad %u32 %bp
+%a = OpBitcast %f32 %abits
+%b = OpBitcast %f32 %bbits
+%oeq = OpFOrdEqual %bool %a %b
+%ueq = OpFUnordEqual %bool %a %b
+%oneq = OpFOrdNotEqual %bool %a %b
+%une = OpFUnordNotEqual %bool %a %b
+%abs = OpExtInst %f32 %glsl FAbs %a
+%absbits = OpBitcast %u32 %abs
+%ahbits = OpUConvert %u16 %abits
+%bhbits = OpUConvert %u16 %bbits
+%ah = OpBitcast %f16 %ahbits
+%bh = OpBitcast %f16 %bhbits
+%heq = OpFOrdEqual %bool %ah %bh
+%hne = OpFUnordNotEqual %bool %ah %bh
+%habs = OpExtInst %f16 %glsl FAbs %ah
+%habsbits = OpBitcast %u16 %habs
+%hwide = OpUConvert %u32 %habsbits
+%va = OpCompositeConstruct %v2f32 %a %b
+%vb = OpCompositeConstruct %v2f32 %b %a
+%veq = OpFOrdEqual %v2bool %va %vb
+%eq1 = OpCompositeExtract %bool %veq 1
+%vabs = OpExtInst %v2f32 %glsl FAbs %va
+%abs1 = OpCompositeExtract %f32 %vabs 1
+%vabsbits = OpBitcast %u32 %abs1
+%r0 = OpSelect %u32 %oeq %one %zero
+%r1 = OpSelect %u32 %ueq %one %zero
+%r2 = OpSelect %u32 %oneq %one %zero
+%r3 = OpSelect %u32 %une %one %zero
+%r5 = OpSelect %u32 %heq %one %zero
+%r6 = OpSelect %u32 %hne %one %zero
+%r8 = OpSelect %u32 %eq1 %one %zero
+%base = OpIMul %u32 %x %ten
+%i1 = OpIAdd %u32 %base %one
+%i2 = OpIAdd %u32 %base %two
+%i3 = OpIAdd %u32 %base %three
+%i4 = OpIAdd %u32 %base %four
+%i5 = OpIAdd %u32 %base %five
+%i6 = OpIAdd %u32 %base %six
+%i7 = OpIAdd %u32 %base %seven
+%i8 = OpIAdd %u32 %base %eight
+%i9 = OpIAdd %u32 %base %nine
+%p0 = OpAccessChain %pu32 %output %zero %base
+%p1 = OpAccessChain %pu32 %output %zero %i1
+%p2 = OpAccessChain %pu32 %output %zero %i2
+%p3 = OpAccessChain %pu32 %output %zero %i3
+%p4 = OpAccessChain %pu32 %output %zero %i4
+%p5 = OpAccessChain %pu32 %output %zero %i5
+%p6 = OpAccessChain %pu32 %output %zero %i6
+%p7 = OpAccessChain %pu32 %output %zero %i7
+%p8 = OpAccessChain %pu32 %output %zero %i8
+%p9 = OpAccessChain %pu32 %output %zero %i9
+OpStore %p0 %r0
+OpStore %p1 %r1
+OpStore %p2 %r2
+OpStore %p3 %r3
+OpStore %p4 %absbits
+OpStore %p5 %r5
+OpStore %p6 %r6
+OpStore %p7 %hwide
+OpStore %p8 %r8
+OpStore %p9 %vabsbits
+OpReturn
+OpFunctionEnd

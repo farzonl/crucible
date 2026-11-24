@@ -1,0 +1,24 @@
+# REQUIRES: spirv-assembler, spirv-tools, spirv-float-controls2
+# RUN: %spirv-as --target-env vulkan1.3 %S/../Inputs/spirv_float_controls2.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: sed 's/%flags = OpConstant %u32 0/%flags = OpConstant %u32 458767/' %S/../Inputs/spirv_float_controls2.spvasm > %t.relaxed.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.relaxed.spvasm -o %t.relaxed.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.relaxed.spv
+# RUN: %cruciblec %t.relaxed.spv -o %t.relaxed.metal
+# RUN: FileCheck %s --input-file=%t.relaxed.metal
+# RUN: sed 's/ FAbs / Exp /g' %S/../Inputs/spirv_float_controls2.spvasm > %t.exp.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.exp.spvasm -o %t.exp.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.exp.spv
+# RUN: not %cruciblec %t.exp.spv -o %t.exp.metal 2>&1 | FileCheck %s --check-prefix=REJECT
+# CHECK-NOT: isnan(
+# CHECK-NOT: abs(
+# CHECK: & 2147483647u
+# CHECK: ushort(
+# CHECK: as_type<uint2>
+# CHECK: > 2139095040u
+# CHECK: > ushort(31744u)
+# CHECK-NOT: isnan(
+# CHECK-NOT: abs(
+# REJECT: unsupported operation 12 in FloatControls2 strict subset
