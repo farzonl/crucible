@@ -46,6 +46,12 @@ if(CRUCIBLE_NACELLE_LIB)
   target_compile_definitions(crucible-run PRIVATE
     CRUCIBLE_RUN_HAS_D3D12=1
     CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
+  target_include_directories(crucible-run PRIVATE
+    "${CMAKE_SOURCE_DIR}/third_party/DirectX-Headers/include")
+  if(NOT WIN32)
+    target_include_directories(crucible-run PRIVATE
+      "${CMAKE_SOURCE_DIR}/third_party/DirectX-Headers/include/wsl/stubs")
+  endif()
   if(UNIX AND NOT APPLE)
     target_link_libraries(crucible-run PRIVATE dl)
   endif()

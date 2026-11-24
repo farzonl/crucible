@@ -86,8 +86,11 @@ if(CRUCIBLE_NACELLE_LIB AND CRUCIBLE_HAS_DIRECTX)
     CRUCIBLE_HAS_D3D12_OFFLOAD=1
     CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
   target_include_directories(crucible-offload-device PRIVATE
-    "${CRUCIBLE_OFFLOAD_SUITE_DIR}/third-party/DirectX-Headers/include"
-    "${CRUCIBLE_OFFLOAD_SUITE_DIR}/third-party/DirectX-Headers/include/wsl/stubs")
+    "${CMAKE_SOURCE_DIR}/third_party/DirectX-Headers/include")
+  if(NOT WIN32)
+    target_include_directories(crucible-offload-device PRIVATE
+      "${CMAKE_SOURCE_DIR}/third_party/DirectX-Headers/include/wsl/stubs")
+  endif()
   if(UNIX AND NOT APPLE)
     target_link_libraries(crucible-offload-device PUBLIC dl)
   endif()

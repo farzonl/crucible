@@ -16,6 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout DirectX-Headers submodule
+        run: git submodule update --init --depth 1 third_party/DirectX-Headers
+
       - name: Restore DXC SDK cache
         id: cache-sdk
         uses: actions/cache/restore@v4
@@ -103,6 +106,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout DirectX-Headers submodule
+        run: git submodule update --init --depth 1 third_party/DirectX-Headers
 
       - name: Restore DXC SDK cache
         id: cache-sdk
