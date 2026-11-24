@@ -21,6 +21,7 @@
 
 #include "Common.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -55,7 +56,10 @@ int main(int argc, char **argv) {
         fail("missing value for " + Arg);
       return argv[I];
     };
-    if (Arg == "--backend") {
+    if (Arg == "--version") {
+      printf("crucible-run version %s\n", CRUCIBLE_VERSION);
+      return 0;
+    } else if (Arg == "--backend") {
       Opts.Backend = Next();
     } else if (Arg.rfind("--backend=", 0) == 0) {
       Opts.Backend = Arg.substr(sizeof("--backend=") - 1);
