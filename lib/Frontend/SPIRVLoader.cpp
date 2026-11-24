@@ -155,6 +155,17 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
   for (size_t I = 5; I < Words.size();) {
     uint32_t N = Words[I] >> 16;
     auto Op = static_cast<spv::Op>(Words[I] & 0xffff);
+    if (Op == spv::OpExecutionMode && N >= 3 &&
+        (Words[I + 2] == spv::ExecutionModeDenormPreserve ||
+         Words[I + 2] == spv::ExecutionModeDenormFlushToZero ||
+         Words[I + 2] == spv::ExecutionModeRoundingModeRTZ))
+      return makeError(
+          "unsupported floating-point execution mode in FloatControls2");
+    if (Op == spv::OpDecorate && N == 4 &&
+        Words[I + 2] == spv::DecorationFPRoundingMode &&
+        Words[I + 3] != spv::FPRoundingModeRTE)
+      return makeError(
+          "unsupported floating-point rounding decoration in FloatControls2");
     if (Op == spv::OpCapability && N == 2 &&
         Words[I + 1] == spv::CapabilityFloatControls2) {
       I += N;

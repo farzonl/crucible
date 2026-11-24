@@ -48,6 +48,10 @@ def check_value(actual: int, expected: float, width: int, tolerance: int) -> Non
     if rounded & mask in (0, infinity):
         assert actual == rounded, (actual, rounded, width)
         return
+    # No DenormPreserve mode is requested; Metal may flush subnormal results.
+    minimum_normal = 0x0400 if width == 16 else 0x00800000
+    if 0 < rounded & mask < minimum_normal and actual == rounded & sign:
+        return
     assert actual & mask < infinity, (actual, rounded, width)
 
     def ordered(bits: int) -> int:
