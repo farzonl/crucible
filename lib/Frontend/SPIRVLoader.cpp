@@ -14,7 +14,10 @@
 #include "crucible/Diagnostic.h"
 #include "crucible/Dialect/CrucibleDialect.h"
 
+#include "spirv/unified1/GLSL.std.450.h"
+#include "spirv/unified1/spirv.hpp"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -57,6 +60,306 @@ bool isSPIRVBinary(MemoryBufferRef Buf) {
 }
 
 namespace {
+
+static Error expandFmaKHR(SmallVectorImpl<uint32_t> &Words) {
+  if (Words.size() < 5)
+    return makeError("truncated SPIR-V header");
+  bool HasFma = false;
+  uint32_t GLSL = 0;
+  DenseSet<uint32_t> Float32Types;
+  auto IsString = [](ArrayRef<uint32_t> Words, StringRef Text) {
+    StringRef Bytes(reinterpret_cast<const char *>(Words.data()),
+                    Words.size() * sizeof(uint32_t));
+    return Bytes.size() > Text.size() && Bytes.starts_with(Text) &&
+           Bytes[Text.size()] == '\0';
+  };
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (!Count || Count > Words.size() - I)
+      return makeError("malformed SPIR-V instruction");
+    if (Op == spv::OpFmaKHR)
+      HasFma = true;
+    if (Op == spv::OpExtInstImport && Count >= 3 &&
+        IsString(ArrayRef(Words).slice(I + 2, Count - 2), "GLSL.std.450"))
+      GLSL = Words[I + 1];
+    if (Op == spv::OpTypeFloat && Count == 3 && Words[I + 2] == 32)
+      Float32Types.insert(Words[I + 1]);
+    if (Op == spv::OpTypeVector && Count == 4 &&
+        Float32Types.contains(Words[I + 2]) && Words[I + 3] >= 2 &&
+        Words[I + 3] <= 4)
+      Float32Types.insert(Words[I + 1]);
+    I += Count;
+  }
+  if (!HasFma)
+    return Error::success();
+
+  SmallVector<uint32_t> Normalized(Words.begin(), Words.begin() + 5);
+  bool AddImport = !GLSL;
+  if (AddImport) {
+    if (Words[3] == UINT32_MAX)
+      return makeError("SPIR-V ID bound is too large for FmaKHR normalization");
+    GLSL = Normalized[3]++;
+  }
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (Op == spv::OpCapability && Count == 2 &&
+        Words[I + 1] == spv::CapabilityFMAKHR) {
+      // The core operation is implemented as LLVM fma via GLSL Fma, not
+      // discarded as an unknown capability. LLVM/Metal retain fused rounding.
+      I += Count;
+      continue;
+    }
+    if (Op == spv::OpExtension && Count >= 2 &&
+        IsString(ArrayRef(Words).slice(I + 1, Count - 1), "SPV_KHR_fma")) {
+      I += Count;
+      continue;
+    }
+    if (Op == spv::OpExecutionMode && Count >= 3) {
+      uint32_t Mode = Words[I + 2];
+      if (Mode == spv::ExecutionModeRoundingModeRTZ ||
+          Mode == spv::ExecutionModeDenormPreserve ||
+          Mode == spv::ExecutionModeDenormFlushToZero ||
+          Mode == spv::ExecutionModeSignedZeroInfNanPreserve ||
+          (Mode == spv::ExecutionModeRoundingModeRTE &&
+           (Count != 4 || Words[I + 3] != 32)))
+        return makeError(
+            "unsupported floating-point execution mode for FmaKHR");
+    }
+    if (Op == spv::OpDecorate && Count == 4 &&
+        Words[I + 2] == spv::DecorationFPRoundingMode &&
+        Words[I + 3] != spv::FPRoundingModeRTE)
+      return makeError(
+          "unsupported floating-point rounding decoration for FmaKHR");
+    if (Op == spv::OpMemoryModel && AddImport) {
+      Normalized.append({(6u << 16) | spv::OpExtInstImport, GLSL, 0x4c534c47,
+                         0x6474732e, 0x3035342e, 0});
+      AddImport = false;
+    }
+    if (Op == spv::OpFmaKHR) {
+      if (Count != 6 || !Float32Types.contains(Words[I + 1]))
+        return makeError("FmaKHR supports only scalar/vector float32");
+      Normalized.append({(8u << 16) | spv::OpExtInst, Words[I + 1],
+                         Words[I + 2], GLSL, GLSLstd450Fma, Words[I + 3],
+                         Words[I + 4], Words[I + 5]});
+    } else {
+      Normalized.append(Words.begin() + I, Words.begin() + I + Count);
+    }
+    I += Count;
+  }
+  if (AddImport)
+    return makeError("missing SPIR-V memory model for FmaKHR normalization");
+  Words.assign(Normalized.begin(), Normalized.end());
+  return Error::success();
+}
+
+// Normalize the GLSL aggregate operation missing from MLIR's deserializer.
+static Error expandModfStruct(SmallVectorImpl<uint32_t> &Words) {
+  if (Words.size() < 5)
+    return makeError("truncated SPIR-V header");
+  DenseMap<uint32_t, SmallVector<uint32_t, 4>> Types;
+  DenseMap<uint32_t, uint32_t> TypeKinds;
+  DenseSet<uint32_t> GLSLImports;
+  DenseSet<uint32_t> Capabilities;
+  DenseMap<uint32_t, uint32_t> UnsignedTypes;
+  uint32_t BoolTy = 0;
+  bool HasModf = false;
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (!Count || Count > Words.size() - I)
+      return makeError("malformed SPIR-V instruction");
+    if (Op == spv::OpExtInstImport && Count >= 3) {
+      StringRef Name(reinterpret_cast<const char *>(&Words[I + 2]),
+                     (Count - 2) * sizeof(uint32_t));
+      if (Name.starts_with(StringRef("GLSL.std.450\0", 13)))
+        GLSLImports.insert(Words[I + 1]);
+    }
+    if (Op == spv::OpTypeBool && Count == 2)
+      BoolTy = Words[I + 1];
+    if (Op == spv::OpCapability && Count == 2)
+      Capabilities.insert(Words[I + 1]);
+    if (Op == spv::OpTypeInt && Count == 4 && Words[I + 3] == 0)
+      UnsignedTypes[Words[I + 2]] = Words[I + 1];
+    if ((Op == spv::OpTypeFloat && Count == 3) ||
+        (Op == spv::OpTypeVector && Count == 4) ||
+        (Op == spv::OpTypeStruct && Count >= 2)) {
+      Types[Words[I + 1]] = SmallVector<uint32_t, 4>(Words.begin() + I + 1,
+                                                     Words.begin() + I + Count);
+      TypeKinds[Words[I + 1]] = Op;
+    }
+    if (Op == spv::OpExtInst && Count >= 5 &&
+        GLSLImports.contains(Words[I + 3]) &&
+        Words[I + 4] == GLSLstd450ModfStruct)
+      HasModf = true;
+    I += Count;
+  }
+  if (!HasModf)
+    return Error::success();
+
+  SmallVector<uint32_t> NewCapabilities, Declarations, Body;
+  uint32_t NextID = Words[3];
+  auto Emit = [](SmallVectorImpl<uint32_t> &Out, spv::Op Op,
+                 ArrayRef<uint32_t> Args) {
+    Out.push_back(((Args.size() + 1) << 16) | Op);
+    Out.append(Args.begin(), Args.end());
+  };
+  struct Constants {
+    uint32_t Bool, UInt, Zero, SignMask, AbsMask, Infinity, One;
+  };
+  DenseMap<uint32_t, Constants> Cached;
+  DenseMap<uint32_t, uint32_t> BoolVectors;
+  for (size_t I = 5; I < Words.size();) {
+    uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+    if (Op != spv::OpExtInst || Count < 5 ||
+        !GLSLImports.contains(Words[I + 3]) ||
+        Words[I + 4] != GLSLstd450ModfStruct) {
+      Body.append(Words.begin() + I, Words.begin() + I + Count);
+      I += Count;
+      continue;
+    }
+    if (Count != 6 || NextID > UINT32_MAX - 64)
+      return makeError("malformed or oversized SPIR-V ModfStruct");
+    auto Struct = Types.find(Words[I + 1]);
+    if (Struct == Types.end() ||
+        TypeKinds[Struct->first] != spv::OpTypeStruct ||
+        Struct->second.size() != 3 || Struct->second[1] != Struct->second[2])
+      return makeError(
+          "ModfStruct requires two matching floating-point members");
+    uint32_t Ty = Struct->second[1], ScalarTy = Ty, Lanes = 1;
+    auto Type = Types.find(Ty);
+    if (Type == Types.end())
+      return makeError("unknown ModfStruct member type");
+    if (TypeKinds[Ty] == spv::OpTypeVector) {
+      ScalarTy = Type->second[1];
+      Lanes = Type->second[2];
+    }
+    auto Scalar = Types.find(ScalarTy);
+    if (Scalar == Types.end() || TypeKinds[ScalarTy] != spv::OpTypeFloat ||
+        Scalar->second.size() != 2 ||
+        (Scalar->second[1] != 16 && Scalar->second[1] != 32 &&
+         Scalar->second[1] != 64) ||
+        Lanes < 1 || Lanes > 4)
+      return makeError("unsupported ModfStruct floating-point type");
+    if (!Cached.contains(Ty)) {
+      if (!BoolTy) {
+        BoolTy = NextID++;
+        Emit(Declarations, spv::OpTypeBool, {BoolTy});
+      }
+      uint32_t Bool = BoolTy;
+      if (Lanes != 1) {
+        auto It = llvm::find_if(Types, [&](const auto &KV) {
+          return TypeKinds[KV.first] == spv::OpTypeVector &&
+                 KV.second[1] == BoolTy && KV.second[2] == Lanes;
+        });
+        if (BoolVectors.contains(Lanes)) {
+          Bool = BoolVectors[Lanes];
+        } else if (It != Types.end()) {
+          Bool = It->first;
+        } else {
+          Bool = NextID++;
+          Emit(Declarations, spv::OpTypeVector, {Bool, BoolTy, Lanes});
+        }
+        BoolVectors[Lanes] = Bool;
+      }
+      uint32_t Width = Scalar->second[1];
+      uint32_t UIntScalar = UnsignedTypes.lookup(Width);
+      if (!UIntScalar) {
+        UIntScalar = NextID++;
+        Emit(Declarations, spv::OpTypeInt, {UIntScalar, Width, 0});
+        UnsignedTypes[Width] = UIntScalar;
+        auto Capability = Width == 16   ? spv::CapabilityInt16
+                          : Width == 64 ? spv::CapabilityInt64
+                                        : spv::CapabilityShader;
+        if (Capabilities.insert(Capability).second)
+          Emit(NewCapabilities, spv::OpCapability,
+               {static_cast<uint32_t>(Capability)});
+      }
+      uint32_t UInt = UIntScalar;
+      if (Lanes != 1) {
+        auto It = llvm::find_if(Types, [&](const auto &KV) {
+          return TypeKinds[KV.first] == spv::OpTypeVector &&
+                 KV.second[1] == UIntScalar && KV.second[2] == Lanes;
+        });
+        if (It != Types.end()) {
+          UInt = It->first;
+        } else {
+          UInt = NextID++;
+          Emit(Declarations, spv::OpTypeVector, {UInt, UIntScalar, Lanes});
+        }
+      }
+      auto Constant = [&](uint32_t ScalarType, uint32_t ValueType,
+                          uint64_t Bits) {
+        uint32_t ID = NextID++;
+        SmallVector<uint32_t, 4> Args{ScalarType, ID,
+                                      static_cast<uint32_t>(Bits)};
+        if (Width == 64)
+          Args.push_back(Bits >> 32);
+        Emit(Declarations, spv::OpConstant, Args);
+        if (Lanes == 1)
+          return ID;
+        uint32_t VectorID = NextID++;
+        SmallVector<uint32_t, 6> Elements{ValueType, VectorID};
+        Elements.append(Lanes, ID);
+        Emit(Declarations, spv::OpConstantComposite, Elements);
+        return VectorID;
+      };
+      uint64_t One = Width == 16   ? 0x3c00ull
+                     : Width == 32 ? 0x3f800000ull
+                                   : 0x3ff0000000000000ull;
+      uint64_t SignMask = uint64_t(1) << (Width - 1);
+      uint64_t Infinity = Width == 16   ? 0x7c00ull
+                          : Width == 32 ? 0x7f800000ull
+                                        : 0x7ff0000000000000ull;
+      Cached[Ty] = {Bool,
+                    UInt,
+                    Constant(UIntScalar, UInt, 0),
+                    Constant(UIntScalar, UInt, SignMask),
+                    Constant(UIntScalar, UInt, SignMask - 1),
+                    Constant(UIntScalar, UInt, Infinity),
+                    Constant(ScalarTy, Ty, One)};
+    }
+    auto C = Cached[Ty];
+    uint32_t X = Words[I + 5], Whole = NextID++, Fraction = NextID++,
+             Bits = NextID++, Sign = NextID++, Abs = NextID++,
+             Infinite = NextID++, FractionBits = NextID++,
+             FiniteFraction = NextID++;
+    Emit(Body, spv::OpExtInst, {Ty, Whole, Words[I + 3], GLSLstd450Trunc, X});
+    Emit(Body, spv::OpFRem, {Ty, Fraction, X, C.One});
+    Emit(Body, spv::OpBitcast, {C.UInt, Bits, X});
+    Emit(Body, spv::OpBitwiseAnd, {C.UInt, Sign, Bits, C.SignMask});
+    Emit(Body, spv::OpBitwiseAnd, {C.UInt, Abs, Bits, C.AbsMask});
+    Emit(Body, spv::OpIEqual, {C.Bool, Infinite, Abs, C.Infinity});
+    Emit(Body, spv::OpBitcast, {C.UInt, FractionBits, Fraction});
+    Emit(Body, spv::OpSelect,
+         {C.UInt, FiniteFraction, Infinite, C.Zero, FractionBits});
+    // Metal fmod can lose the sign of zero. Restore signs using input bits,
+    // including the whole-number result for negative zero and |x| < 1.
+    auto CopySign = [&](uint32_t ValueBits) {
+      uint32_t Magnitude = NextID++, Signed = NextID++, Result = NextID++;
+      Emit(Body, spv::OpBitwiseAnd, {C.UInt, Magnitude, ValueBits, C.AbsMask});
+      Emit(Body, spv::OpBitwiseOr, {C.UInt, Signed, Magnitude, Sign});
+      Emit(Body, spv::OpBitcast, {Ty, Result, Signed});
+      return Result;
+    };
+    uint32_t ResultFraction = CopySign(FiniteFraction);
+    uint32_t WholeBits = NextID++;
+    Emit(Body, spv::OpBitcast, {C.UInt, WholeBits, Whole});
+    uint32_t ResultWhole = CopySign(WholeBits);
+    Emit(Body, spv::OpCompositeConstruct,
+         {Words[I + 1], Words[I + 2], ResultFraction, ResultWhole});
+    I += Count;
+  }
+  // Generated types/constants must precede all function definitions.
+  size_t Function = 0;
+  while (Function < Body.size() && (Body[Function] & 0xffff) != spv::OpFunction)
+    Function += Body[Function] >> 16;
+  Words.resize(5);
+  Words[3] = NextID;
+  Words.append(NewCapabilities.begin(), NewCapabilities.end());
+  Words.append(Body.begin(), Body.begin() + Function);
+  Words.append(Declarations.begin(), Declarations.end());
+  Words.append(Body.begin() + Function, Body.end());
+  return Error::success();
+}
 
 static Error preserveBufferMemoryAccess(
     mlir::Operation *Dst, mlir::spirv::MemoryAccessAttr AccessAttr,
@@ -413,6 +716,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   const char *Raw = Buf.getBufferStart();
   for (size_t I = 0; I < NumWords; ++I)
     Words[I] = support::endian::read32le(Raw + I * 4);
+  if (Error E = expandFmaKHR(Words))
+    return std::move(E);
+  if (Error E = expandModfStruct(Words))
+    return std::move(E);
 
   // Keep CFG as plain spirv.Branch / spirv.BranchConditional so
   // ConvertSPIRVToLLVM + LiftControlFlowToSCF handle all control flow.

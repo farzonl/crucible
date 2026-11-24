@@ -183,6 +183,17 @@ value before updating the selected member. Array loads preserve value snapshots,
 and whole-array stores copy elements rather than aliasing local storage.
 Nested extraction follows typed struct/array member paths and separates vector
 lane indexing from aggregate indexing.
+GLSL `ModfStruct` is normalized before SPIR-V deserialization into truncation,
+remainder by one and bitwise infinity/sign handling. Scalar/vector fractional
+and whole-number results retain the input sign, including negative zero and
+negative integral inputs, even when Metal arithmetic loses a zero sign.
+Core `OpFmaKHR` supports scalar/vector float32 with default or explicit
+round-to-nearest-even mode, lowered through LLVM FMA to Metal's correctly
+rounded `fma` builtin. It never becomes a separately rounded multiply and add.
+Round-toward-zero and explicit denormal/signed-zero-infinity-NaN preservation
+modes on these modules are rejected until their semantics are implemented.
+FMA regression assembly requires SPIRV-Tools with `FMAKHR` support; older
+assemblers explicitly report those tests as unsupported.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and
