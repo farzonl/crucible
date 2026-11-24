@@ -88,6 +88,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
     if ((Op == spv::OpTypeFloat && N == 3) ||
         (Op == spv::OpTypeInt && N == 4) ||
         (Op == spv::OpTypeVector && N == 4) ||
+        (Op == spv::OpTypeMatrix && N == 4) ||
         (Op == spv::OpTypeStruct && N >= 2))
       Types[Words[I + 1]] =
           SmallVector<uint32_t>(Words.begin() + I, Words.begin() + I + N);
@@ -210,7 +211,33 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
                Words[I + 4] == GLSLstd450NMin;
     bool Compare = Op == spv::OpFOrdEqual || Op == spv::OpFUnordEqual ||
                    Op == spv::OpFOrdNotEqual || Op == spv::OpFUnordNotEqual;
-    if (Abs || Rounding || Min || Compare) {
+    bool Determinant = Op == spv::OpExtInst && N == 6 &&
+                       GLSLImports.contains(Words[I + 3]) &&
+                       Words[I + 4] == GLSLstd450Determinant;
+    if (Determinant) {
+      uint32_t Ty = Words[I + 1], Matrix = Words[I + 5];
+      auto M = Types.find(ValueTypes.lookup(Matrix));
+      if (M == Types.end() || (M->second[0] & 0xffff) != spv::OpTypeMatrix ||
+          M->second[3] != 2)
+        return makeError("FloatControls2 determinant requires a 2x2 matrix");
+      auto V = Types.find(M->second[2]);
+      if (V == Types.end() || (V->second[0] & 0xffff) != spv::OpTypeVector ||
+          V->second[3] != 2 || V->second[2] != Ty || !IsSupportedFloat(Ty))
+        return makeError("FloatControls2 determinant requires float16/32");
+      if (NextID > UINT32_MAX - 8)
+        return makeError("oversized FloatControls2 determinant");
+      SmallVector<uint32_t, 4> Elements;
+      for (uint32_t Column = 0; Column != 2; ++Column)
+        for (uint32_t Row = 0; Row != 2; ++Row) {
+          uint32_t ID = NextID++;
+          Emit(Body, spv::OpCompositeExtract, {Ty, ID, Matrix, Column, Row});
+          Elements.push_back(ID);
+        }
+      uint32_t Diagonal = NextID++, Cross = NextID++;
+      Emit(Body, spv::OpFMul, {Ty, Diagonal, Elements[0], Elements[3]});
+      Emit(Body, spv::OpFMul, {Ty, Cross, Elements[1], Elements[2]});
+      Emit(Body, spv::OpFSub, {Ty, Words[I + 2], Diagonal, Cross});
+    } else if (Abs || Rounding || Min || Compare) {
       if ((Compare && N != 5) || NextID > UINT32_MAX - 256)
         return makeError("malformed or oversized FloatControls2 operation");
       uint32_t Ty = Compare ? ValueTypes.lookup(Words[I + 3]) : Words[I + 1];
@@ -384,6 +411,7 @@ static Error expandFloatControls2(SmallVectorImpl<uint32_t> &Words,
                ((N == 8 && Words[I + 4] == GLSLstd450Fma) ||
                 (N == 7 && Words[I + 4] == GLSLstd450Modf) ||
                 (N == 7 && Words[I + 4] == GLSLstd450Atan2) ||
+                (N == 7 && Words[I + 4] == GLSLstd450Reflect) ||
                 (N == 6 && (Words[I + 4] == GLSLstd450ModfStruct ||
                             Words[I + 4] == GLSLstd450Acosh ||
                             Words[I + 4] == GLSLstd450Cosh ||

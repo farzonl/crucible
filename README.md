@@ -230,6 +230,11 @@ check finite results against the documented 4-ULP float32 (6-ULP `Atan2`) and
 Default-mode subnormal math results may flush to signed zero on Metal.
 Explicit denormal execution modes and non-RTE rounding remain unsupported and
 fail explicitly rather than silently inheriting these defaults.
+Strict float16/32 2x2 `Determinant` expands to ordered diagonal/cross products
+and subtraction, preserving the positive-zero determinant of negative-zero
+diagonal inputs. Other determinant dimensions remain explicitly unsupported.
+Scalar/vector `Reflect` reuses the unfused dot/product/subtraction lowering;
+safe source math preserves NaNs from infinity multiplied by zero.
 
 SPIR-V helpers are inlined before entry-point resource lowering. Scalar/vector
 `OpCopyMemory` is expanded into typed loads and stores with separate source and

@@ -17,7 +17,18 @@ def encode(value: float, width: int) -> int:
     return int.from_bytes(packed, "little")
 
 
-def reference(operation: str, a: float, b: float) -> float:
+def reference(operation: str, a: float, b: float, width: int = 32) -> float:
+    if operation in ("Determinant", "Reflect", "ReflectY"):
+        def rounded(value: float) -> float:
+            return decode(encode(value, width), width)
+
+        if operation == "Determinant":
+            return rounded(rounded(a * a) - rounded(b * b))
+        if operation == "ReflectY":
+            dot = rounded(rounded(0.0 * a) + rounded(-1.0 * b))
+            return rounded(b - rounded(rounded(2.0 * dot) * -1.0))
+        dot = rounded(b * a)
+        return rounded(a - rounded(rounded(2.0 * dot) * b))
     if operation == "Atan2":
         return math.atan2(a, b)
     if math.isnan(a):
@@ -73,10 +84,22 @@ def check(operation: str, a_bits: list[int], b_bits: list[int], values: list[int
             int(a == b), int(a == b or nan), int(a != b and not nan),
             int(a != b or nan), int(ah == bh), int(ah != bh or hnan), int(a == b),
         ], (i, v)
-        tolerance = 6 if operation == "Atan2" else 4
+        if operation in ("Determinant", "Reflect"):
+            tolerance = 0
+        else:
+            tolerance = 6 if operation == "Atan2" else 4
         check_value(v[4], reference(operation, a, b), 32, tolerance)
-        check_value(v[7], reference(operation, ah, bh), 16, 1)
-        check_value(v[9], reference(operation, b, a), 32, tolerance)
+        check_value(
+            v[7], reference(operation, ah, bh, 16), 16,
+            0 if tolerance == 0 else 1,
+        )
+        if operation == "Determinant":
+            vector_result = reference(operation, a, b)
+        elif operation == "Reflect":
+            vector_result = reference("ReflectY", a, b)
+        else:
+            vector_result = reference(operation, b, a)
+        check_value(v[9], vector_result, 32, tolerance)
 
 
 if __name__ == "__main__":
