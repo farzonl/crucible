@@ -6408,6 +6408,10 @@ Expected<std::string> Emitter::kernelSignature() {
     Sep();
     OS << "    CrucibleStageIn stageIn [[stage_in]]";
   }
+  bool HasPhysicalPointers = false;
+  Entry.walk([&](mlir::LLVM::IntToPtrOp Cast) {
+    HasPhysicalPointers |= Cast->hasAttr("crucible.physical_type");
+  });
   for (const ResState *RS : Sorted) {
     const ResourceBinding &RB = *RS->RB;
     Sep();
@@ -6513,12 +6517,10 @@ Expected<std::string> Emitter::kernelSignature() {
     const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
                             : RB.Class == ResourceClass::UAV ? "device "
                                                              : "constant ";
-    const char *RestrictQual =
-        (RB.Class != ResourceClass::CBV && !RB.GloballyCoherent &&
-         !Entry->getParentOfType<mlir::ModuleOp>()->hasAttr(
-             "crucible.physical_addresses"))
-            ? "__restrict "
-            : "";
+    const char *RestrictQual = (RB.Class != ResourceClass::CBV &&
+                                !RB.GloballyCoherent && !HasPhysicalPointers)
+                                   ? "__restrict "
+                                   : "";
     if (RB.RangeSize == 1) {
       OS << "    " << PtrPrefix << RS->ElemType << "* " << RestrictQual
          << RS->ParamName << " [[buffer(" << RB.MetalIndex << ")]]";

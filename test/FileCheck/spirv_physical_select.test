@@ -7,9 +7,9 @@
 # RUN: %spirv-as --target-env vulkan1.1 %t.volatile.spvasm -o %t.volatile.spv
 # RUN: %spirv-val --target-env vulkan1.1 %t.volatile.spv
 # RUN: not %cruciblec %t.volatile.spv -o %t.volatile.metal 2>&1 | FileCheck %s --check-prefix=REJECT
-# CHECK: device ulong* {{[^*]*}}{{\[\[}}buffer(2){{\]\]}}
+# CHECK: device ulong* [[TABLE:[A-Za-z_][A-Za-z_0-9]*]] {{\[\[}}buffer(2){{\]\]}}
 # CHECK-NOT: __restrict
-# CHECK: ulong {{.*}} =
+# CHECK-COUNT-3: ulong {{.*}} =
 # CHECK: *((device float *)(
 # CHECK: ?
 # REJECT: physical scalar accesses require natural explicit alignment

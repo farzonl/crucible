@@ -1746,8 +1746,6 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                   ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                   OffC, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
                   B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
-              if (Info.IsAddressTable)
-                LoadOp->setAttr("crucible.address_table", B.getUnitAttr());
               if (auto E = preserveBufferMemoryAccess(
                       LoadOp, Load.getMemoryAccessAttr(),
                       Load.getAlignmentAttr()))
@@ -1756,6 +1754,9 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                 auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
                 ResultVal = mlir::LLVM::ExtractElementOp::create(
                     B, Loc, LoadOp.getResult(), ZeroC);
+                if (Info.IsAddressTable)
+                  ResultVal.getDefiningOp()->setAttr("crucible.address_table",
+                                                     B.getUnitAttr());
               } else {
                 mlir::Type SignlessVecTy = makeSignless(VecTy, B);
                 mlir::Value Vec = mlir::LLVM::UndefOp::create(B, Loc, SignlessVecTy);
@@ -2878,9 +2879,6 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         llvm::any_of(Op->getResultTypes(), IsPhysical))
       PhysicalOps.push_back(Op);
   });
-  if (!PhysicalOps.empty())
-    (*TopMod)->setAttr("crucible.physical_addresses",
-                       mlir::UnitAttr::get(&Ctx));
   for (auto *Op : PhysicalOps) {
     if (mlir::isa<mlir::UnrealizedConversionCastOp>(Op))
       continue;
