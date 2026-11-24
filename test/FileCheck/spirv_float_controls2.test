@@ -8,10 +8,10 @@
 # RUN: %spirv-val --target-env vulkan1.3 %t.relaxed.spv
 # RUN: %cruciblec %t.relaxed.spv -o %t.relaxed.metal
 # RUN: FileCheck %s --input-file=%t.relaxed.metal
-# RUN: sed 's/ FAbs / Exp /g' %S/../Inputs/spirv_float_controls2.spvasm > %t.exp.spvasm
-# RUN: %spirv-as --target-env vulkan1.3 %t.exp.spvasm -o %t.exp.spv
-# RUN: %spirv-val --target-env vulkan1.3 %t.exp.spv
-# RUN: not %cruciblec %t.exp.spv -o %t.exp.metal 2>&1 | FileCheck %s --check-prefix=REJECT
+# RUN: sed 's/ FAbs / Sin /g' %S/../Inputs/spirv_float_controls2.spvasm > %t.unsupported.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.unsupported.spvasm -o %t.unsupported.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.unsupported.spv
+# RUN: not %cruciblec %t.unsupported.spv -o %t.unsupported.metal 2>&1 | FileCheck %s --check-prefix=REJECT
 # CHECK-NOT: isnan(
 # CHECK-NOT: abs(
 # CHECK: & 2147483647u

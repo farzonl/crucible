@@ -1,0 +1,14 @@
+# REQUIRES: spirv-assembler, spirv-tools, spirv-float-controls2
+# RUN: bash -o pipefail -c 'for op in Acosh Cosh Exp Log2; do sed "s/ FAbs / $op /g" %S/../Inputs/spirv_float_controls2.spvasm > %t.$op.spvasm; %spirv-as --target-env vulkan1.3 %t.$op.spvasm -o %t.$op.spv && %spirv-val --target-env vulkan1.3 %t.$op.spv && %cruciblec %t.$op.spv -o %t.$op.metal && FileCheck %s --input-file=%t.$op.metal || exit 1; done'
+# RUN: sed 's/FAbs %%a$/Atan2 %%a %%b/; s/FAbs %%ah$/Atan2 %%ah %%bh/; s/FAbs %%va$/Atan2 %%va %%vb/' %S/../Inputs/spirv_float_controls2.spvasm > %t.atan.spvasm
+# RUN: %spirv-as --target-env vulkan1.3 %t.atan.spvasm -o %t.atan.spv
+# RUN: %spirv-val --target-env vulkan1.3 %t.atan.spv
+# RUN: %cruciblec %t.atan.spv -o %t.atan.metal
+# RUN: FileCheck %s --input-file=%t.atan.metal
+# CHECK: #pragma METAL fp math_mode(safe)
+# CHECK-NEXT: #pragma METAL fp contract(off)
+# CHECK: kernel void
+# CHECK-NOT: sqrt(
+# CHECK: precise::
+# CHECK: precise::
+# CHECK-NOT: sqrt(
