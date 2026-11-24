@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package (e.g. v0.0.1; defaults to ref name)'
+        required: false
+        type: string
+        default: ''
+      publish:
+        description: 'Publish GitHub Release (leave false for a dry-run build)'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark GitHub Release as prerelease'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            os: ubuntu-latest
+          - platform: macos-arm64
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v$(sed -n 's/^project(crucible VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches CMake project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          CMAKE_VER="$(sed -n 's/^project(crucible VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+          TAG_VER="${{ steps.version.outputs.version }}"
+          TAG_BASE="${TAG_VER%%-*}"
+          if [ "${CMAKE_VER}" != "${TAG_BASE}" ]; then
+            echo "Error: tag version (${TAG_VER}) does not match CMakeLists.txt project version (${CMAKE_VER})"
+            exit 1
+          fi
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl ninja-build cmake libvulkan-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCRUCIBLE_ENABLE_TESTS=OFF \
+            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/stage/crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}" \
+            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir"
+
+      - name: Build
+        run: cmake --build build --target cruciblec crucible-run --parallel
+
+      - name: Install and stage release archive
+        shell: bash
+        run: |
+          cmake --install build
+          STAGE_DIR="stage/crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}"
+          cp LICENSE README.md "${STAGE_DIR}/"
+          "${STAGE_DIR}/bin/cruciblec" --version
+          "${STAGE_DIR}/bin/crucible-run" --version
+          mkdir -p dist
+          ARCHIVE="crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.tar.gz"
+          tar -C stage -czf "dist/${ARCHIVE}" "crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v$(sed -n 's/^project(crucible VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)"
+          fi
+
+          EXTRA_FLAGS=()
+          if [ "${{ inputs.prerelease }}" = "true" ] || [[ "${TAG}" == *-* ]]; then
+            EXTRA_FLAGS+=(--prerelease)
+          fi
+
+          gh release create "${TAG}" dist/*.tar.gz dist/SHA256SUMS.txt \
+            --title "Crucible ${TAG}" \
+            --generate-notes \
+            "${EXTRA_FLAGS[@]}"

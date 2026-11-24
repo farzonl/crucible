@@ -1,3 +1,5 @@
 add_executable(cruciblec main.cpp)
+target_compile_definitions(cruciblec PRIVATE CRUCIBLE_VERSION="${PROJECT_VERSION}")
 target_compile_options(cruciblec PRIVATE ${CRUCIBLE_COMMON_FLAGS})
 target_link_libraries(cruciblec PRIVATE crucible)
+install(TARGETS cruciblec RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

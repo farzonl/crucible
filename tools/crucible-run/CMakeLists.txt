@@ -14,6 +14,8 @@ if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
 endif()
 
 add_executable(crucible-run ${CRUCIBLE_RUN_SOURCES})
+target_compile_definitions(crucible-run PRIVATE CRUCIBLE_VERSION="${PROJECT_VERSION}")
+install(TARGETS crucible-run RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(APPLE)
   target_compile_definitions(crucible-run PRIVATE CRUCIBLE_RUN_HAS_METAL=1)

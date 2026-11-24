@@ -147,9 +147,12 @@ static Error buildMetallib(StringRef MSLPath, StringRef OutPath,
 
 int main(int argc, char **argv) {
   InitLLVM X(argc, argv);
+  cl::SetVersionPrinter([](raw_ostream &OS) {
+    OS << "cruciblec version " << CRUCIBLE_VERSION << "\n";
+  });
   cl::HideUnrelatedOptions(CrucibleCat);
   cl::ParseCommandLineOptions(
-      argc, argv, "crucible: DXIL to Metal Shading Language compiler\n");
+      argc, argv, "crucible: DXIL/SPIR-V to Metal & SPIR-V compiler\n");
 
   auto BufOrErr = MemoryBuffer::getFileOrSTDIN(InputFile);
   if (!BufOrErr)
