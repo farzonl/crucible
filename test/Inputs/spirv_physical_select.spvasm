@@ -1,0 +1,63 @@
+OpCapability Shader
+OpCapability PhysicalStorageBufferAddresses
+OpExtension "SPV_KHR_physical_storage_buffer"
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %main "main" %gid
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %values ArrayStride 4
+OpDecorate %pf32 ArrayStride 4
+OpDecorate %buffer Block
+OpMemberDecorate %buffer 0 Offset 0
+OpDecorate %addresses Block
+OpMemberDecorate %addresses 0 Offset 0
+OpMemberDecorate %addresses 1 Offset 8
+OpMemberDecorate %addresses 2 Offset 16
+OpMemberDecorate %addresses 3 Offset 24
+OpDecorate %descriptor DescriptorSet 0
+OpDecorate %descriptor Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%u32 = OpTypeInt 32 0
+%f32 = OpTypeFloat 32
+%v3u32 = OpTypeVector %u32 3
+%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%three = OpConstant %u32 3
+%four = OpConstant %u32 4
+%fzero = OpConstant %f32 0
+%values = OpTypeArray %f32 %four
+%buffer = OpTypeStruct %values
+%pbuffer = OpTypePointer PhysicalStorageBuffer %buffer
+%pf32 = OpTypePointer PhysicalStorageBuffer %f32
+%addresses = OpTypeStruct %pbuffer %pbuffer %pbuffer %pbuffer
+%paddresses = OpTypePointer StorageBuffer %addresses
+%ppbuffer = OpTypePointer StorageBuffer %pbuffer
+%pgid = OpTypePointer Input %v3u32
+%gid = OpVariable %pgid Input
+%descriptor = OpVariable %paddresses StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id = OpLoad %v3u32 %gid
+%x = OpCompositeExtract %u32 %id 0
+%twox = OpIAdd %u32 %x %x
+%next = OpIAdd %u32 %twox %one
+%pa = OpAccessChain %ppbuffer %descriptor %zero
+%ps = OpAccessChain %ppbuffer %descriptor %two
+%po = OpAccessChain %ppbuffer %descriptor %three
+%a = OpLoad %pbuffer %pa
+%s = OpLoad %pbuffer %ps
+%o = OpLoad %pbuffer %po
+%left = OpAccessChain %pf32 %a %zero %twox
+%right = OpAccessChain %pf32 %a %zero %next
+%selector = OpAccessChain %pf32 %s %zero %x
+%sv = OpLoad %f32 %selector Aligned 4
+%negative = OpFOrdLessThan %bool %sv %fzero
+%chosen = OpSelect %pf32 %negative %left %right
+%value = OpLoad %f32 %chosen Aligned 4
+%out = OpAccessChain %pf32 %o %zero %x
+OpStore %out %value Aligned 4
+OpReturn
+OpFunctionEnd

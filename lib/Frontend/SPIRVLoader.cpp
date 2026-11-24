@@ -389,6 +389,7 @@ struct BoundBufferInfo {
   uint32_t MatrixStride = 16;
   bool MatrixRowMajor = false;
   uint32_t BaseByteOffset = 0;
+  bool IsAddressTable = false;
 };
 
 struct BoundCBufferInfo {
@@ -513,6 +514,10 @@ mlir::Type convertSpirvDataType(mlir::Type T, mlir::OpBuilder &B) {
 }
 
 uint32_t scalarTypeBytes(mlir::Type T) {
+  if (auto P = mlir::dyn_cast<mlir::spirv::PointerType>(T);
+      P &&
+      P.getStorageClass() == mlir::spirv::StorageClass::PhysicalStorageBuffer)
+    return 8;
   if (T.isF16() || T.isInteger(16))
     return 2;
   if (T.isF64() || T.isInteger(64))
@@ -1081,6 +1086,35 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     bool IsStorageBlock =
         SC == mlir::spirv::StorageClass::StorageBuffer ||
         StructTy.hasDecoration(mlir::spirv::Decoration::BufferBlock);
+    bool IsAddressTable =
+        IsStorageBlock &&
+        llvm::all_of(StructTy.getElementTypes(), [](mlir::Type T) {
+          auto P = mlir::dyn_cast<mlir::spirv::PointerType>(T);
+          return P && P.getStorageClass() ==
+                          mlir::spirv::StorageClass::PhysicalStorageBuffer;
+        });
+    if (IsAddressTable) {
+      ResourceBinding RB;
+      RB.Class = ResourceClass::UAV;
+      RB.Kind = ResourceKind::StructuredBuffer;
+      RB.ElementType = ComponentType::U64;
+      RB.RecordID = NextUAVId++;
+      RB.Name = GV.getSymName().str();
+      RB.Space = *DS;
+      RB.LowerBound = *Binding;
+      RB.RangeSize = RangeSize;
+      RB.ElementStride = 8;
+      BoundBufferInfo Info;
+      Info.ReflectIndex = Reflect.Resources.size();
+      Info.ElemType = StructTy;
+      Info.ElemStride = 8;
+      Info.IsArray = IsResourceArray;
+      Info.IsAddressTable = true;
+      BufferGlobals[GV.getSymName()] = Info;
+      Reflect.Resources.push_back(std::move(RB));
+      GlobalsToErase.push_back(GV);
+      continue;
+    }
     mlir::Type ArrayElemTy;
     uint32_t ArrayStride = 0;
     if (auto Arr = mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(
@@ -1507,9 +1541,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           return makeError("unsupported access pattern on buffer '{0}'", Sym);
 
         mlir::Value ArrIdx = Info.IsArray ? AllIndices[0] : mlir::Value();
-        mlir::Value ElemIdx = AllIndices.size() >= BaseIdx + 2
-                                  ? AllIndices[BaseIdx + 1]
-                                  : mlir::Value();
+        mlir::Value ElemIdx =
+            !Info.IsAddressTable && AllIndices.size() >= BaseIdx + 2
+                ? AllIndices[BaseIdx + 1]
+                : mlir::Value();
         auto getElemIdx = [&](mlir::OpBuilder &B, mlir::Location Loc) -> mlir::Value {
           if (ElemIdx)
             return castToSignless(B, Loc, ElemIdx);
@@ -1539,7 +1574,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                mlir::LLVM::AddOp::create(B, Loc, DynOff, Term))
                          : Term;
           };
-          for (size_t K = BaseIdx + 2; K < AllIndices.size(); ++K) {
+          for (size_t K = BaseIdx + (Info.IsAddressTable ? 0 : 2);
+               K < AllIndices.size(); ++K) {
             mlir::Value IdxV = AllIndices[K];
             auto CIdx = getConstSpirvInt(IdxV);
             if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(CurTy)) {
@@ -1669,6 +1705,14 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             auto VecTy = mlir::dyn_cast<mlir::VectorType>(OrigTy);
             mlir::Type ScalarTy = makeSignless(
                 VecTy ? VecTy.getElementType() : OrigTy, B);
+            if (Info.IsAddressTable) {
+              auto P = mlir::dyn_cast<mlir::spirv::PointerType>(OrigTy);
+              if (!P || P.getStorageClass() !=
+                            mlir::spirv::StorageClass::PhysicalStorageBuffer)
+                return makeError(
+                    "address-table loads require physical pointers");
+              ScalarTy = B.getI64Type();
+            }
             uint32_t ElemBytes = scalarTypeBytes(ScalarTy);
             unsigned NumComps =
                 VecTy ? static_cast<unsigned>(VecTy.getNumElements()) : 1u;
@@ -1702,6 +1746,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                   ir::BufferKindAttr::get(&Ctx, ir::BufferKind::Raw), IdxVal,
                   OffC, B.getI32IntegerAttr(static_cast<int32_t>(Mask)),
                   B.getI32IntegerAttr(static_cast<int32_t>(ElemBytes)));
+              if (Info.IsAddressTable)
+                LoadOp->setAttr("crucible.address_table", B.getUnitAttr());
               if (auto E = preserveBufferMemoryAccess(
                       LoadOp, Load.getMemoryAccessAttr(),
                       Load.getAlignmentAttr()))
@@ -1723,10 +1769,17 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                 ResultVal = Vec;
               }
             }
-            ResultVal = castFromSignless(B, Loc, ResultVal, OrigTy);
+            ResultVal = Info.IsAddressTable
+                            ? mlir::UnrealizedConversionCastOp::create(
+                                  B, Loc, OrigTy, ResultVal)
+                                  .getResult(0)
+                            : castFromSignless(B, Loc, ResultVal, OrigTy);
             Load.replaceAllUsesWith(ResultVal);
             Load.erase();
           } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(MU)) {
+            if (Info.IsAddressTable)
+              return makeError(
+                  "stores to physical address tables are unsupported");
             mlir::OpBuilder B(Store);
             mlir::Location Loc = Store.getLoc();
             mlir::Value Handle =
@@ -2805,6 +2858,134 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       continue;
     }
   }
+
+  // Physical pointers carry GPU addresses, not host or thread-local pointers.
+  auto IsPhysical = [](mlir::Type T) {
+    auto P = mlir::dyn_cast<mlir::spirv::PointerType>(T);
+    return P && P.getStorageClass() ==
+                    mlir::spirv::StorageClass::PhysicalStorageBuffer;
+  };
+  auto AddressOf = [&](mlir::Value V) -> Expected<mlir::Value> {
+    auto Cast = V.getDefiningOp<mlir::UnrealizedConversionCastOp>();
+    if (!Cast || Cast.getInputs().size() != 1 ||
+        !Cast.getInputs()[0].getType().isInteger(64))
+      return makeError("unsupported physical pointer producer");
+    return Cast.getInputs()[0];
+  };
+  SmallVector<mlir::Operation *> PhysicalOps;
+  EntryFn.walk([&](mlir::Operation *Op) {
+    if (llvm::any_of(Op->getOperandTypes(), IsPhysical) ||
+        llvm::any_of(Op->getResultTypes(), IsPhysical))
+      PhysicalOps.push_back(Op);
+  });
+  if (!PhysicalOps.empty())
+    (*TopMod)->setAttr("crucible.physical_addresses",
+                       mlir::UnitAttr::get(&Ctx));
+  for (auto *Op : PhysicalOps) {
+    if (mlir::isa<mlir::UnrealizedConversionCastOp>(Op))
+      continue;
+    mlir::OpBuilder B(Op);
+    auto Loc = Op->getLoc();
+    auto Wrap = [&](mlir::Value V, mlir::Type Ty) {
+      return mlir::UnrealizedConversionCastOp::create(B, Loc, Ty, V)
+          .getResult(0);
+    };
+    if (auto Chain = mlir::dyn_cast<mlir::spirv::AccessChainOp>(Op)) {
+      auto Base = AddressOf(Chain.getBasePtr());
+      if (!Base)
+        return Base.takeError();
+      mlir::Value Address = *Base;
+      mlir::Type Ty =
+          mlir::cast<mlir::spirv::PointerType>(Chain.getBasePtr().getType())
+              .getPointeeType();
+      for (mlir::Value Index : Chain.getIndices()) {
+        if (auto ST = mlir::dyn_cast<mlir::spirv::StructType>(Ty)) {
+          auto I = getConstSpirvInt(Index);
+          if (!I || *I >= ST.getNumElements())
+            return makeError("invalid physical struct index");
+          auto Off = mlir::LLVM::ConstantOp::create(B, Loc, B.getI64Type(),
+                                                    ST.getMemberOffset(*I));
+          Address = mlir::LLVM::AddOp::create(B, Loc, Address, Off);
+          Ty = ST.getElementType(*I);
+        } else {
+          uint32_t Stride = 0;
+          if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(Ty)) {
+            Stride = Arr.getArrayStride();
+            Ty = Arr.getElementType();
+          } else if (auto Arr =
+                         mlir::dyn_cast<mlir::spirv::RuntimeArrayType>(Ty)) {
+            Stride = Arr.getArrayStride();
+            Ty = Arr.getElementType();
+          } else {
+            return makeError("unsupported physical access-chain type");
+          }
+          if (!Stride)
+            return makeError("physical arrays require explicit ArrayStride");
+          auto Idx = castToSignless(B, Loc, Index);
+          if (!Idx.getType().isInteger(32) && !Idx.getType().isInteger(64))
+            return makeError("physical array indices require 32 or 64 bits");
+          if (Idx.getType().isInteger(32))
+            Idx = mlir::LLVM::SExtOp::create(B, Loc, B.getI64Type(), Idx);
+          auto Step =
+              mlir::LLVM::ConstantOp::create(B, Loc, B.getI64Type(), Stride);
+          auto Offset = mlir::LLVM::MulOp::create(B, Loc, Idx, Step);
+          Address = mlir::LLVM::AddOp::create(B, Loc, Address, Offset);
+        }
+      }
+      Chain.replaceAllUsesWith(Wrap(Address, Chain.getType()));
+    } else if (auto Select = mlir::dyn_cast<mlir::spirv::SelectOp>(Op)) {
+      auto T = AddressOf(Select.getTrueValue());
+      auto F = AddressOf(Select.getFalseValue());
+      if (!T)
+        return T.takeError();
+      if (!F)
+        return F.takeError();
+      auto Value =
+          mlir::LLVM::SelectOp::create(B, Loc, Select.getCondition(), *T, *F);
+      Select.replaceAllUsesWith(Wrap(Value, Select.getType()));
+    } else if (mlir::isa<mlir::spirv::LoadOp, mlir::spirv::StoreOp>(Op)) {
+      auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(Op);
+      auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(Op);
+      auto Ptr = Load ? Load.getPtr() : Store.getPtr();
+      auto Address = AddressOf(Ptr);
+      if (!Address)
+        return Address.takeError();
+      auto Ty = Load ? Load.getType() : Store.getValue().getType();
+      if (!mlir::isa<mlir::IntegerType, mlir::FloatType>(Ty))
+        return makeError(
+            "physical memory accesses currently require scalar values");
+      auto Access = Load ? Load.getMemoryAccess() : Store.getMemoryAccess();
+      auto Alignment =
+          Load ? Load.getAlignmentAttr() : Store.getAlignmentAttr();
+      if (!Access || *Access != mlir::spirv::MemoryAccess::Aligned ||
+          !Alignment || Alignment.getInt() < scalarTypeBytes(Ty))
+        return makeError(
+            "physical scalar accesses require natural explicit alignment");
+      auto Pointer = mlir::LLVM::IntToPtrOp::create(
+          B, Loc, mlir::LLVM::LLVMPointerType::get(&Ctx, 1), *Address);
+      Pointer->setAttr("crucible.physical_type",
+                       mlir::TypeAttr::get(makeSignless(Ty, B)));
+      if (Load) {
+        auto Value =
+            mlir::LLVM::LoadOp::create(B, Loc, makeSignless(Ty, B), Pointer);
+        Load.replaceAllUsesWith(castFromSignless(B, Loc, Value, Ty));
+      } else {
+        mlir::LLVM::StoreOp::create(
+            B, Loc, castToSignless(B, Loc, Store.getValue()), Pointer);
+      }
+    } else {
+      return makeError("unsupported physical pointer operation '{0}'",
+                       Op->getName().getStringRef());
+    }
+    Op->erase();
+  }
+  SmallVector<mlir::UnrealizedConversionCastOp> DeadAddressCasts;
+  EntryFn.walk([&](mlir::UnrealizedConversionCastOp Cast) {
+    if (Cast->use_empty() && llvm::any_of(Cast->getResultTypes(), IsPhysical))
+      DeadAddressCasts.push_back(Cast);
+  });
+  for (auto Cast : DeadAddressCasts)
+    Cast.erase();
 
   // 3d. Lower spirv.ControlBarrier & spirv.MemoryBarrier -> Layer 1 gpu.barrier.
   SmallVector<mlir::spirv::ControlBarrierOp, 4> Barriers;

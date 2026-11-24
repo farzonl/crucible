@@ -1,0 +1,14 @@
+# REQUIRES: gpu, spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.1 %S/../Inputs/spirv_physical_select.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.1 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal --metallib %t.metallib --require-msl-buffer-bindings --msl-buffer-binding=0,0,2
+# RUN: %crucible-run --lib %t.metallib --entry main0 --groups 2,1,1 --threads 1,1,1 --ir-ab 0,0,1,3 --buffer 0:f32:4:11,22,33,44 --buffer 1:f32:2:-1,1 --buffer 3:f32:2:zero | FileCheck %s
+# RUN: %crucible-run --lib %t.metallib --entry main0 --groups 2,1,1 --threads 1,1,1 --ir-ab 0,0,1,0 --buffer 0:f32:4:11,22,33,44 --buffer 1:f32:2:-1,1 | FileCheck %s --check-prefix=ALIAS
+# RUN: sed 's/OpDecorate %values ArrayStride 4/OpDecorate %values ArrayStride 8/' %S/../Inputs/spirv_physical_select.spvasm > %t.stride.spvasm
+# RUN: %spirv-as --target-env vulkan1.1 %t.stride.spvasm -o %t.stride.spv
+# RUN: %spirv-val --target-env vulkan1.1 %t.stride.spv
+# RUN: %cruciblec %t.stride.spv -o %t.stride.metal --metallib %t.stride.metallib --require-msl-buffer-bindings --msl-buffer-binding=0,0,2
+# RUN: %crucible-run --lib %t.stride.metallib --entry main0 --groups 2,1,1 --threads 1,1,1 --ir-ab 0,0,1,3 --buffer 0:f32:8:11,22,33,44,55,66,77,88 --buffer 1:f32:4:-1,99,1,99 --buffer 3:f32:4:zero | FileCheck %s --check-prefix=STRIDE
+# CHECK: buffer3: 11 44
+# ALIAS: buffer0: 11 44 33 44
+# STRIDE: buffer3: 11 0 77 0

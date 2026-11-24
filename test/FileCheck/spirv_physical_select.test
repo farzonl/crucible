@@ -1,0 +1,15 @@
+# REQUIRES: spirv-assembler, spirv-tools
+# RUN: %spirv-as --target-env vulkan1.1 %S/../Inputs/spirv_physical_select.spvasm -o %t.spv
+# RUN: %spirv-val --target-env vulkan1.1 %t.spv
+# RUN: %cruciblec %t.spv -o %t.metal --require-msl-buffer-bindings --msl-buffer-binding=0,0,2
+# RUN: FileCheck %s --input-file=%t.metal
+# RUN: sed 's/Aligned 4/Volatile|Aligned 4/g' %S/../Inputs/spirv_physical_select.spvasm > %t.volatile.spvasm
+# RUN: %spirv-as --target-env vulkan1.1 %t.volatile.spvasm -o %t.volatile.spv
+# RUN: %spirv-val --target-env vulkan1.1 %t.volatile.spv
+# RUN: not %cruciblec %t.volatile.spv -o %t.volatile.metal 2>&1 | FileCheck %s --check-prefix=REJECT
+# CHECK: device ulong* {{[^*]*}}{{\[\[}}buffer(2){{\]\]}}
+# CHECK-NOT: __restrict
+# CHECK: ulong {{.*}} =
+# CHECK: *((device float *)(
+# CHECK: ?
+# REJECT: physical scalar accesses require natural explicit alignment
