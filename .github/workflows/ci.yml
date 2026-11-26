@@ -193,3 +193,74 @@ jobs:
         with:
           name: lit-results
           path: lit-results.json
+
+  build-test-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout DirectX-Headers submodule
+        run: git submodule update --init --depth 1 third_party/DirectX-Headers
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Restore DXC SDK cache
+        id: cache-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1
+
+      - name: Install DXC (Windows x64)
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin
+          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip" -o /tmp/dxc.zip
+          unzip -q /tmp/dxc.zip -d /tmp/dxc
+          cp -a /tmp/dxc/bin/x64/* .sdk/bin/
+          rm -rf /tmp/dxc /tmp/dxc.zip
+
+      - name: Save DXC SDK cache
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade ninja lit
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
+
+      - name: Configure
+        run: |
+          WS="$(cygpath -m "${{ github.workspace }}")"
+          LIT_BIN="$(cygpath -m "$(which lit)")"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_DIR="${WS}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${WS}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${WS}/.sdk/bin/dxc.exe" \
+            -DLLVM_EXTERNAL_LIT="${LIT_BIN}"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Run lit test suite
+        env:
+          CRUCIBLE_D3D12_WARP: "1"
+        run: |
+          lit -sv --output lit-results.json build/test
+
+      - name: Upload lit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lit-results-windows
+          path: lit-results.json

@@ -106,13 +106,18 @@ if(LLVM_EXTERNAL_LIT)
       DEPENDS offloader api-query
       USES_TERMINAL
       COMMENT "Running llvm/offload-test-suite against Crucible (SPIR-V -> MSL -> Metal)")
-    if(CRUCIBLE_NACELLE_LIB AND CRUCIBLE_HAS_DIRECTX)
+    if((WIN32 OR CRUCIBLE_NACELLE_LIB) AND CRUCIBLE_HAS_DIRECTX)
+      set(_crucible_vk_to_dx_runtime "d3d12")
+      if(WIN32)
+        set(_crucible_vk_to_dx_runtime "warp")
+      endif()
       add_custom_target(check-crucible-offload-vk-to-dx
-        COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1 -Doffload_runtime=d3d12
+        COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1
+                -Doffload_runtime=${_crucible_vk_to_dx_runtime}
                 "${CMAKE_BINARY_DIR}/test-offload"
         DEPENDS offloader api-query
         USES_TERMINAL
-        COMMENT "Running llvm/offload-test-suite against Crucible (SPIR-V -> DXIL -> Nacelle D3D12)")
+        COMMENT "Running llvm/offload-test-suite against Crucible (SPIR-V -> DXIL -> D3D12)")
     endif()
     add_custom_target(check-crucible-offload-vk-kosmickrisp
       COMMAND ${CRUCIBLE_LIT_COMMAND} -sv -Dspirv_frontend=1

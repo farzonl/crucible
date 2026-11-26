@@ -2,6 +2,7 @@
 #   - dxil-to-metal  (macOS Metal via MetalDevice)
 #   - dxil-to-spirv  (Linux Vulkan Lavapipe via VulkanDevice)
 #   - spirv-to-metal (macOS Metal via SPIRVLoader -> MSLEmitter -> MetalDevice)
+#   - spirv-to-dxil  (Windows WARP via SPIRVLoader -> DXILEmitter -> D3D12Device)
 # and publishes the unified multi-track pass-rate dashboard (pages/index.html)
 # to GitHub Pages.
 
@@ -447,10 +448,101 @@ jobs:
           path: offload-results-dxil-to-spirv.json
           if-no-files-found: error
 
+  compliance-spirv-to-dxil:
+    if: inputs.cts_only != true
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout DirectX-Headers submodule
+        run: git submodule update --init --depth 1 third_party/DirectX-Headers
+
+      - name: Checkout llvm/offload-test-suite
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-test-suite
+          path: third_party/offload-test-suite
+
+      - name: Checkout llvm/offload-golden-images
+        uses: actions/checkout@v4
+        with:
+          repository: llvm/offload-golden-images
+          path: third_party/offload-golden-images
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade ninja lit psutil pyyaml
+
+      - name: Restore Windows DXC and libpng SDK cache
+        id: cache-win-sdk
+        uses: actions/cache/restore@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng
+
+      - name: Install DXC and libpng (Windows x64)
+        if: steps.cache-win-sdk.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .sdk/bin
+          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip" -o /tmp/dxc.zip
+          unzip -q /tmp/dxc.zip -d /tmp/dxc
+          cp -a /tmp/dxc/bin/x64/* .sdk/bin/
+          rm -rf /tmp/dxc /tmp/dxc.zip
+          "$(cygpath -u "$VCPKG_INSTALLATION_ROOT")/vcpkg.exe" install \
+            libpng:x64-windows-static-md \
+            --x-install-root="$(cygpath -w "${{ github.workspace }}/.sdk/vcpkg")"
+
+      - name: Save Windows DXC and libpng SDK cache
+        if: steps.cache-win-sdk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .sdk
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng
+
+      - name: Setup third_party LLVM/MLIR
+        uses: ./.github/actions/setup-llvm
+
+      - name: Configure and build
+        run: |
+          WS="$(cygpath -m "${{ github.workspace }}")"
+          LIT_BIN="$(cygpath -m "$(which lit)")"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${WS}/.sdk/vcpkg/x64-windows-static-md" \
+            -DLLVM_DIR="${WS}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${WS}/.toolchains/llvm/lib/cmake/mlir" \
+            -DDXC_EXECUTABLE="${WS}/.sdk/bin/dxc.exe" \
+            -DLLVM_EXTERNAL_LIT="${LIT_BIN}"
+          cmake --build build --parallel
+
+      - name: Run offload-test-suite (spirv-to-dxil on WARP)
+        env:
+          CRUCIBLE_OFFLOAD_RUNTIME: warp
+          CRUCIBLE_D3D12_WARP: "1"
+        run: |
+          build/tools/crucible-offload/api-query.exe
+          lit -v --timeout=60 -Dspirv_frontend=1 \
+            --output=offload-results-spirv-to-dxil.json \
+            build/test-offload || true
+          test -s offload-results-spirv-to-dxil.json
+
+      - name: Upload spirv-to-dxil results
+        uses: actions/upload-artifact@v4
+        with:
+          name: offload-results-spirv-to-dxil
+          path: offload-results-spirv-to-dxil.json
+          if-no-files-found: error
+
   publish:
     runs-on: ubuntu-latest
-    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv, compliance-spirv-to-metal, vulkan-cts-macos]
-    if: always() && github.ref == 'refs/heads/main' && inputs.cts_only != true && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success' || needs.vulkan-cts-macos.result == 'success')
+    needs: [compliance-dxil-to-metal, compliance-dxil-to-spirv, compliance-spirv-to-metal, compliance-spirv-to-dxil, vulkan-cts-macos]
+    if: always() && github.ref == 'refs/heads/main' && inputs.cts_only != true && (needs.compliance-dxil-to-metal.result == 'success' || needs.compliance-dxil-to-spirv.result == 'success' || needs.compliance-spirv-to-metal.result == 'success' || needs.compliance-spirv-to-dxil.result == 'success' || needs.vulkan-cts-macos.result == 'success')
     outputs:
       artifact_name: ${{ steps.set-artifact-name.outputs.artifact_name }}
     steps:
@@ -482,6 +574,7 @@ jobs:
             --track-lit "dxil-to-metal=DXIL -> Metal (macOS)=artifacts/offload-results-dxil-to-metal.json" \
             --track-lit "dxil-to-spirv=DXIL -> SPIR-V (Linux Vulkan)=artifacts/offload-results-dxil-to-spirv.json" \
             --track-lit "spirv-to-metal=SPIR-V -> Metal (macOS)=artifacts/offload-results-spirv-to-metal.json" \
+            --track-lit "spirv-to-dxil=SPIR-V -> DXIL (Windows WARP)=artifacts/offload-results-spirv-to-dxil.json" \
             --site-src pages \
             --out-dir _site \
             --sha "${{ github.sha }}" \

@@ -37,6 +37,11 @@ if getattr(config, "nacelle_compile", "") and os.path.exists(config.nacelle_comp
 if getattr(config, "crucible_has_nacelle", False) and config.crucible_run and os.path.exists(config.crucible_run):
     config.available_features.add("nacelle-d3d12")
 
+if platform.system() == "Windows" and config.crucible_run and os.path.exists(config.crucible_run):
+    config.available_features.add("windows-d3d12")
+    if os.environ.get("CRUCIBLE_D3D12_WARP"):
+        config.environment["CRUCIBLE_D3D12_WARP"] = os.environ["CRUCIBLE_D3D12_WARP"]
+
 if config.crucible_offload:
     config.substitutions.append(("%offloader", f'"{config.crucible_offload}" -api=dx'))
     config.substitutions.append(("%api_query", f'"{config.crucible_api_query}"'))
