@@ -33,6 +33,7 @@
 #endif
 #include <windows.h>
 #include <dxgi1_4.h>
+#include "../WindowsDXILSign.h"
 #else
 #include <dlfcn.h>
 #include <wsl/winadapter.h>
@@ -111,6 +112,7 @@ Error ensureD3D12Loaded() {
   if (!Mod)
     return createStringError(inconvertibleErrorCode(),
                              "failed to LoadLibrary '%s'", LibPath);
+  crucible_win_dxil::enableExperimentalShaderModels(Mod);
   L.Handle = Mod;
   L.RuntimePath = LibPath;
   L.CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
@@ -474,6 +476,15 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
   RSBlob->Release();
   if (FAILED(Hr))
     return hrErr(Hr, "CreateRootSignature");
+
+#ifdef _WIN32
+  std::string SignErr;
+  if (!crucible_win_dxil::signDXILInPlace(Compiled->Output.data(),
+                                          Compiled->Output.size(), SignErr))
+    return createStringError(inconvertibleErrorCode(),
+                             "DXIL validation/signing failed: %s",
+                             SignErr.c_str());
+#endif
 
   D3D12_COMPUTE_PIPELINE_STATE_DESC PSODesc{};
   PSODesc.pRootSignature = RootSig;

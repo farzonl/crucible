@@ -20,6 +20,7 @@
 #endif
 #include <windows.h>
 #include <dxgi1_4.h>
+#include "../WindowsDXILSign.h"
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -125,6 +126,7 @@ int runD3D12(const RunnerOptions &Opts) {
   HMODULE Lib = LoadLibraryA(LibPath);
   if (!Lib)
     fail(std::string("failed to LoadLibrary D3D12 runtime '") + LibPath + "'");
+  crucible_win_dxil::enableExperimentalShaderModels(Lib);
   CreateDeviceFn = reinterpret_cast<PFN_D3D12CreateDevice>(
       GetProcAddress(Lib, "D3D12CreateDevice"));
   SerializeRSFn = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
@@ -151,6 +153,12 @@ int runD3D12(const RunnerOptions &Opts) {
          "D3D12SerializeRootSignature");
 
   std::vector<uint8_t> Bytecode = readBinary(Opts.DxilPath);
+#ifdef _WIN32
+  std::string SignErr;
+  if (!crucible_win_dxil::signDXILInPlace(Bytecode.data(), Bytecode.size(),
+                                          SignErr))
+    fail("DXIL validation/signing failed: " + SignErr);
+#endif
 
   IUnknown *Adapter = nullptr;
 #ifdef _WIN32

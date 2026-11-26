@@ -41,6 +41,10 @@ if platform.system() == "Windows" and config.crucible_run and os.path.exists(con
     config.available_features.add("windows-d3d12")
     if os.environ.get("CRUCIBLE_D3D12_WARP"):
         config.environment["CRUCIBLE_D3D12_WARP"] = os.environ["CRUCIBLE_D3D12_WARP"]
+    if config.dxc:
+        dxil_dll = os.path.join(os.path.dirname(config.dxc), "dxil.dll")
+        if os.path.exists(dxil_dll):
+            config.environment["CRUCIBLE_DXIL_DLL"] = dxil_dll
 
 if config.crucible_offload:
     config.substitutions.append(("%offloader", f'"{config.crucible_offload}" -api=dx'))

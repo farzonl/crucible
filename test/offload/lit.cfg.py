@@ -43,6 +43,11 @@ warp_env = lit_config.params.get(
 if warp_env:
     config.environment["CRUCIBLE_D3D12_WARP"] = str(warp_env)
     api_query_env["CRUCIBLE_D3D12_WARP"] = str(warp_env)
+if os.name == "nt" and getattr(config, "dxc", ""):
+    dxil_dll = os.path.join(os.path.dirname(config.dxc), "dxil.dll")
+    if os.path.exists(dxil_dll):
+        config.environment["CRUCIBLE_DXIL_DLL"] = dxil_dll
+        api_query_env["CRUCIBLE_DXIL_DLL"] = dxil_dll
 
 try:
     report = yaml.safe_load(subprocess.check_output(
