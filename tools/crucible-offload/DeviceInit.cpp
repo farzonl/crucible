@@ -28,6 +28,8 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
     Runtime = "metal";
 #elif defined(CRUCIBLE_HAS_VULKAN_OFFLOAD)
     Runtime = "vulkan";
+#elif defined(CRUCIBLE_HAS_D3D12_OFFLOAD)
+    Runtime = "d3d12";
 #else
     return createStringError(
         std::errc::not_supported,
@@ -39,7 +41,8 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
   SmallVector<std::unique_ptr<offloadtest::Device>> NativeVulkanDevices;
   const bool IsD3D12Runtime = Runtime.equals_insensitive("d3d12") ||
                               Runtime.equals_insensitive("dxil") ||
-                              Runtime.equals_insensitive("nacelle");
+                              Runtime.equals_insensitive("nacelle") ||
+                              Runtime.equals_insensitive("warp");
 #ifdef CRUCIBLE_HAS_VULKAN_OFFLOAD
   if (!IsD3D12Runtime) {
     if (Error E = initializeVulkanDevices(Config, NativeVulkanDevices))
@@ -77,9 +80,7 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
         "CRUCIBLE_OFFLOAD_RUNTIME=vulkan requested, but Vulkan runtime is not "
         "built");
 #endif
-  } else if (Runtime.equals_insensitive("d3d12") ||
-             Runtime.equals_insensitive("dxil") ||
-             Runtime.equals_insensitive("nacelle")) {
+  } else if (IsD3D12Runtime) {
 #ifdef CRUCIBLE_HAS_D3D12_OFFLOAD
     auto D3D12Devices = crucible_offload::createD3D12Devices(Config);
     if (!D3D12Devices)
@@ -89,7 +90,7 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
 #else
     return createStringError(
         std::errc::not_supported,
-        "CRUCIBLE_OFFLOAD_RUNTIME=d3d12 requested, but Nacelle D3D12 runtime "
+        "CRUCIBLE_OFFLOAD_RUNTIME=d3d12 requested, but D3D12 runtime "
         "is not built");
 #endif
   }
@@ -98,7 +99,7 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
     return createStringError(
         std::errc::invalid_argument,
         "unknown CRUCIBLE_OFFLOAD_RUNTIME='%s' (expected 'metal', 'vulkan', "
-        "or 'd3d12')",
+        "'d3d12', or 'warp')",
         Runtime.str().c_str());
   }
 

@@ -13,7 +13,7 @@ if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   list(APPEND CRUCIBLE_RUN_SOURCES VulkanBackend.cpp)
 endif()
 
-if(CRUCIBLE_NACELLE_LIB)
+if(WIN32 OR CRUCIBLE_NACELLE_LIB)
   list(APPEND CRUCIBLE_RUN_SOURCES D3D12Backend.cpp)
 endif()
 
@@ -42,10 +42,12 @@ if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   endif()
 endif()
 
-if(CRUCIBLE_NACELLE_LIB)
-  target_compile_definitions(crucible-run PRIVATE
-    CRUCIBLE_RUN_HAS_D3D12=1
-    CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
+if(WIN32 OR CRUCIBLE_NACELLE_LIB)
+  target_compile_definitions(crucible-run PRIVATE CRUCIBLE_RUN_HAS_D3D12=1)
+  if(CRUCIBLE_NACELLE_LIB)
+    target_compile_definitions(crucible-run PRIVATE
+      CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
+  endif()
   target_include_directories(crucible-run PRIVATE
     "${CMAKE_SOURCE_DIR}/third_party/DirectX-Headers/include")
   if(NOT WIN32)

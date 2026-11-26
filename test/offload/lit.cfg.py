@@ -28,8 +28,8 @@ if lit_config.maxIndividualTestTime == 0:
 config.test_source_root = os.path.join(config.offload_suite_dir, "test")
 config.test_exec_root = config.crucible_offload_exec_root
 
-# Propagate explicit runtime selection (metal|vulkan) to both api-query and
-# offloader child processes.
+# Propagate explicit runtime selection (metal|vulkan|d3d12|warp) to both
+# api-query and offloader child processes.
 offload_runtime = lit_config.params.get(
     "offload_runtime", os.environ.get("CRUCIBLE_OFFLOAD_RUNTIME")
 )
@@ -37,6 +37,17 @@ api_query_env = os.environ.copy()
 if offload_runtime:
     config.environment["CRUCIBLE_OFFLOAD_RUNTIME"] = offload_runtime
     api_query_env["CRUCIBLE_OFFLOAD_RUNTIME"] = offload_runtime
+warp_env = lit_config.params.get(
+    "d3d12_warp", os.environ.get("CRUCIBLE_D3D12_WARP")
+)
+if warp_env:
+    config.environment["CRUCIBLE_D3D12_WARP"] = str(warp_env)
+    api_query_env["CRUCIBLE_D3D12_WARP"] = str(warp_env)
+if os.name == "nt" and getattr(config, "dxc", ""):
+    dxil_dll = os.path.join(os.path.dirname(config.dxc), "dxil.dll")
+    if os.path.exists(dxil_dll):
+        config.environment["CRUCIBLE_DXIL_DLL"] = dxil_dll
+        api_query_env["CRUCIBLE_DXIL_DLL"] = dxil_dll
 
 try:
     report = yaml.safe_load(subprocess.check_output(
@@ -144,15 +155,19 @@ else:
     config.substitutions.append(("%dxc_target_lib", config.dxc))
     config.substitutions.append(("%dxc_target", config.dxc))
 offload_api = "vk" if lit_config.params.get("spirv_frontend") else "dx"
-offloader = f"{shlex.quote(config.crucible_offload)} -api={offload_api}"
+def _quote_cmd(path):
+    return f'"{path}"' if os.name == "nt" else shlex.quote(path)
+
+offloader = f"{_quote_cmd(config.crucible_offload)} -api={offload_api}"
 if lit_config.params.get("vulkan_driver"):
-    driver = shlex.quote(lit_config.params["vulkan_driver"])
+    driver = _quote_cmd(lit_config.params["vulkan_driver"])
     offloader = f"env CRUCIBLE_OFFLOAD_DRIVER={driver} {offloader}"
 config.substitutions.append(("%offloader", offloader))
-config.substitutions.append(("%api_query", shlex.quote(config.crucible_api_query)))
+config.substitutions.append(("%api_query", _quote_cmd(config.crucible_api_query)))
+exe_suffix = ".exe" if os.name == "nt" else ""
 for tool in ["FileCheck", "split-file", "obj2yaml", "not"]:
     config.substitutions.append(
-        (rf"(?<!\S){tool}(?=\s|$)", os.path.join(config.llvm_tools_dir, tool)))
+        (rf"(?<!\S){tool}(?=\s|$)", os.path.join(config.llvm_tools_dir, tool + exe_suffix)))
 
 if getattr(config, "goldenimage_dir", "") and os.path.exists(config.goldenimage_dir) and getattr(config, "crucible_imgdiff", ""):
     config.substitutions.append(("%goldenimage_dir", config.goldenimage_dir))

@@ -9,6 +9,13 @@ if(APPLE)
 #define APPLE 1
 #endif
 ")
+elseif(WIN32)
+  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/suite-config/Config.h"
+"#ifndef OFFLOADTEST_CONFIG_H
+#define OFFLOADTEST_CONFIG_H
+#define _WIN32_WINNT 0x0A00
+#endif
+")
 else()
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/suite-config/Config.h"
 "#ifndef OFFLOADTEST_CONFIG_H
@@ -53,7 +60,7 @@ endif()
 if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   list(APPEND CRUCIBLE_OFFLOAD_SOURCES VulkanDevice.cpp)
 endif()
-if(CRUCIBLE_NACELLE_LIB AND CRUCIBLE_HAS_DIRECTX)
+if((WIN32 OR CRUCIBLE_NACELLE_LIB) AND CRUCIBLE_HAS_DIRECTX)
   list(APPEND CRUCIBLE_OFFLOAD_SOURCES D3D12Device.cpp)
 endif()
 
@@ -81,10 +88,13 @@ if(CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB)
   target_link_libraries(crucible-offload-device PUBLIC ${CRUCIBLE_VULKAN_LIB})
 endif()
 
-if(CRUCIBLE_NACELLE_LIB AND CRUCIBLE_HAS_DIRECTX)
+if((WIN32 OR CRUCIBLE_NACELLE_LIB) AND CRUCIBLE_HAS_DIRECTX)
   target_compile_definitions(crucible-offload-device PRIVATE
-    CRUCIBLE_HAS_D3D12_OFFLOAD=1
-    CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
+    CRUCIBLE_HAS_D3D12_OFFLOAD=1)
+  if(CRUCIBLE_NACELLE_LIB)
+    target_compile_definitions(crucible-offload-device PRIVATE
+      CRUCIBLE_NACELLE_LIB_PATH="${CRUCIBLE_NACELLE_LIB}")
+  endif()
   target_include_directories(crucible-offload-device PRIVATE
     "${CMAKE_SOURCE_DIR}/third_party/DirectX-Headers/include")
   if(NOT WIN32)

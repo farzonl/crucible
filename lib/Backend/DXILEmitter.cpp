@@ -2631,6 +2631,17 @@ Expected<std::string> emitDXIL(mlir::ModuleOp Mod, Reflection &Reflect,
     }
   }
 
+  // Set dx.valver = 1.8 to match LLVM DirectX's PSV0 version 3 (52-byte
+  // PSVRuntimeInfo3) so dxil.dll validation and Windows D3D12/WARP accept the
+  // emitted DXContainer.
+  if (!M.getNamedMetadata("dx.valver")) {
+    auto *I32Ty = Type::getInt32Ty(LLVMCtx);
+    auto *ValVerMD = MDNode::get(
+        LLVMCtx, {ConstantAsMetadata::get(ConstantInt::get(I32Ty, 1)),
+                  ConstantAsMetadata::get(ConstantInt::get(I32Ty, 8))});
+    M.getOrInsertNamedMetadata("dx.valver")->addOperand(ValVerMD);
+  }
+
   DXILLowerer Lowerer(M, Entry, Reflect, Opts);
   if (Error E = Lowerer.run(*StageOrErr))
     return std::move(E);

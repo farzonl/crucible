@@ -100,15 +100,25 @@ set(CRUCIBLE_MLIR_LIBS
   MLIRIR)
 
 # Match LLVM conventions: no RTTI / no exceptions unless LLVM has them.
-if(NOT LLVM_ENABLE_RTTI)
-  set(CRUCIBLE_NO_RTTI_FLAGS -fno-rtti)
-endif()
-set(CRUCIBLE_COMMON_FLAGS -fno-exceptions ${CRUCIBLE_NO_RTTI_FLAGS})
-if(UNIX AND NOT APPLE)
-  # Keep Crucible and LLVM/MLIR template instantiations hidden from the ELF
-  # dynamic symbol table so Vulkan ICDs (e.g., Mesa Lavapipe linked against a
-  # different system libLLVM.so) cannot interpose on them at runtime.
-  list(APPEND CRUCIBLE_COMMON_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden)
+if(MSVC)
+  # Strip CMake's default /GR and /EHsc to avoid cl.exe D9025 override warnings.
+  string(REGEX REPLACE "(^| ) */GR-? *( |$)" "\\1 \\2" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  string(REGEX REPLACE "(^| ) */EH[a-z-]+ *( |$)" "\\1 \\2" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set(CRUCIBLE_COMMON_FLAGS /EHs-c- /bigobj -DNOMINMAX -DWIN32_LEAN_AND_MEAN)
+  if(NOT LLVM_ENABLE_RTTI)
+    list(APPEND CRUCIBLE_COMMON_FLAGS /GR-)
+  endif()
+else()
+  if(NOT LLVM_ENABLE_RTTI)
+    set(CRUCIBLE_NO_RTTI_FLAGS -fno-rtti)
+  endif()
+  set(CRUCIBLE_COMMON_FLAGS -fno-exceptions ${CRUCIBLE_NO_RTTI_FLAGS})
+  if(UNIX AND NOT APPLE)
+    # Keep Crucible and LLVM/MLIR template instantiations hidden from the ELF
+    # dynamic symbol table so Vulkan ICDs (e.g., Mesa Lavapipe linked against a
+    # different system libLLVM.so) cannot interpose on them at runtime.
+    list(APPEND CRUCIBLE_COMMON_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden)
+  endif()
 endif()
 
 set(CRUCIBLE_SPIRV_HEADERS_INCLUDE_DIR
@@ -156,7 +166,7 @@ if(CRUCIBLE_NACELLE_DIR)
   endif()
 endif()
 
-if(APPLE OR (CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB) OR CRUCIBLE_NACELLE_LIB)
+if(APPLE OR WIN32 OR (CRUCIBLE_VULKAN_INCLUDE_DIR AND CRUCIBLE_VULKAN_LIB) OR CRUCIBLE_NACELLE_LIB)
   add_subdirectory(tools/crucible-run)
 endif()
 

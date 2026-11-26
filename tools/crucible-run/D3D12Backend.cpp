@@ -19,6 +19,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dxgi1_4.h>
+#include "../WindowsDXILSign.h"
 #else
 #include <dlfcn.h>
 #include <unistd.h>
@@ -112,27 +114,79 @@ int runD3D12(const RunnerOptions &Opts) {
   if (Opts.DxilPath.empty())
     fail("--dxil <file.dxil> is required for d3d12 backend");
 
-  const char *LibPath = std::getenv("CRUCIBLE_NACELLE_LIB");
+  const char *LibPath = std::getenv("CRUCIBLE_D3D12_LIB");
   if (!LibPath || !*LibPath)
-    LibPath = CRUCIBLE_NACELLE_LIB_PATH;
+    LibPath = std::getenv("CRUCIBLE_NACELLE_LIB");
 
+  PFN_D3D12CreateDevice CreateDeviceFn = nullptr;
+  PFN_D3D12SerializeRootSignature SerializeRSFn = nullptr;
+#ifdef _WIN32
+  if (!LibPath || !*LibPath)
+    LibPath = "d3d12.dll";
+  HMODULE Lib = LoadLibraryA(LibPath);
+  if (!Lib)
+    fail(std::string("failed to LoadLibrary D3D12 runtime '") + LibPath + "'");
+  crucible_win_dxil::enableExperimentalShaderModels(Lib);
+  CreateDeviceFn = reinterpret_cast<PFN_D3D12CreateDevice>(
+      GetProcAddress(Lib, "D3D12CreateDevice"));
+  SerializeRSFn = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
+      GetProcAddress(Lib, "D3D12SerializeRootSignature"));
+#else
+  if (!LibPath || !*LibPath) {
+#ifdef CRUCIBLE_NACELLE_LIB_PATH
+    LibPath = CRUCIBLE_NACELLE_LIB_PATH;
+#else
+    fail("CRUCIBLE_D3D12_LIB / CRUCIBLE_NACELLE_LIB not set");
+#endif
+  }
   void *Lib = dlopen(LibPath, RTLD_NOW | RTLD_LOCAL);
   if (!Lib)
     fail(std::string("failed to dlopen Nacelle D3D12 runtime '") + LibPath +
          "': " + (dlerror() ? dlerror() : "unknown error"));
-
-  auto CreateDeviceFn = reinterpret_cast<PFN_D3D12CreateDevice>(
+  CreateDeviceFn = reinterpret_cast<PFN_D3D12CreateDevice>(
       dlsym(Lib, "D3D12CreateDevice"));
-  auto SerializeRSFn = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
+  SerializeRSFn = reinterpret_cast<PFN_D3D12SerializeRootSignature>(
       dlsym(Lib, "D3D12SerializeRootSignature"));
+#endif
   if (!CreateDeviceFn || !SerializeRSFn)
-    fail("Nacelle D3D12 runtime missing D3D12CreateDevice or "
+    fail("D3D12 runtime missing D3D12CreateDevice or "
          "D3D12SerializeRootSignature");
 
   std::vector<uint8_t> Bytecode = readBinary(Opts.DxilPath);
+#ifdef _WIN32
+  std::string SignErr;
+  if (!crucible_win_dxil::signDXILInPlace(Bytecode.data(), Bytecode.size(),
+                                          SignErr))
+    fail("DXIL validation/signing failed: " + SignErr);
+#endif
+
+  IUnknown *Adapter = nullptr;
+#ifdef _WIN32
+  if (const char *WarpEnv = std::getenv("CRUCIBLE_D3D12_WARP");
+      WarpEnv && WarpEnv[0] && WarpEnv[0] != '0') {
+    HMODULE DXGI = LoadLibraryA("dxgi.dll");
+    if (!DXGI)
+      fail("failed to LoadLibrary dxgi.dll for WARP");
+    using PFN_CreateDXGIFactory1 = HRESULT(WINAPI *)(REFIID, void **);
+    auto CreateFactory = reinterpret_cast<PFN_CreateDXGIFactory1>(
+        GetProcAddress(DXGI, "CreateDXGIFactory1"));
+    IDXGIFactory4 *Factory = nullptr;
+    if (!CreateFactory)
+      fail("dxgi.dll missing CreateDXGIFactory1");
+    checkHr(CreateFactory(__uuidof(IDXGIFactory4),
+                          reinterpret_cast<void **>(&Factory)),
+            "CreateDXGIFactory1");
+    IDXGIAdapter1 *WarpAdapter = nullptr;
+    checkHr(Factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1),
+                                     reinterpret_cast<void **>(&WarpAdapter)),
+            "EnumWarpAdapter");
+    Factory->Release();
+    Adapter = WarpAdapter;
+  }
+#endif
 
   ID3D12Device *Dev = nullptr;
-  checkHr(CreateDeviceFn(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&Dev)),
+  checkHr(CreateDeviceFn(Adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&Dev)),
           "D3D12CreateDevice");
 
   D3D12_COMMAND_QUEUE_DESC QDesc{};

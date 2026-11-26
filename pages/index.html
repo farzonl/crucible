@@ -1105,6 +1105,9 @@
       if (trackId === "spirv-to-metal") {
         return externalRuns.filter(run => run.platform === "metal");
       }
+      if (trackId === "spirv-to-dxil") {
+        return externalRuns.filter(run => run.platform === "directx");
+      }
       return externalRuns.filter(run =>
         run.platform === "metal" || run.platform === "directx"
       );

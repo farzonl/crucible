@@ -33,6 +33,7 @@
 #endif
 #include <windows.h>
 #include <dxgi1_4.h>
+#include "../WindowsDXILSign.h"
 #else
 #include <dlfcn.h>
 #include <wsl/winadapter.h>
@@ -64,11 +65,19 @@ using namespace crucible_offload;
 
 namespace {
 
+#ifdef _WIN32
+using PFN_D3D12CreateDevice = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL,
+                                                REFIID, void **);
+using PFN_D3D12SerializeRootSignature =
+    HRESULT(WINAPI *)(const D3D12_ROOT_SIGNATURE_DESC *,
+                      D3D_ROOT_SIGNATURE_VERSION, ID3DBlob **, ID3DBlob **);
+#else
 using PFN_D3D12CreateDevice = HRESULT (*)(IUnknown *, D3D_FEATURE_LEVEL, REFIID,
                                           void **);
 using PFN_D3D12SerializeRootSignature =
     HRESULT (*)(const D3D12_ROOT_SIGNATURE_DESC *, D3D_ROOT_SIGNATURE_VERSION,
                 ID3DBlob **, ID3DBlob **);
+#endif
 
 struct D3D12Loader {
   void *Handle = nullptr;
@@ -103,6 +112,7 @@ Error ensureD3D12Loaded() {
   if (!Mod)
     return createStringError(inconvertibleErrorCode(),
                              "failed to LoadLibrary '%s'", LibPath);
+  crucible_win_dxil::enableExperimentalShaderModels(Mod);
   L.Handle = Mod;
   L.RuntimePath = LibPath;
   L.CreateDevice = reinterpret_cast<PFN_D3D12CreateDevice>(
@@ -466,6 +476,15 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
   RSBlob->Release();
   if (FAILED(Hr))
     return hrErr(Hr, "CreateRootSignature");
+
+#ifdef _WIN32
+  std::string SignErr;
+  if (!crucible_win_dxil::signDXILInPlace(Compiled->Output.data(),
+                                          Compiled->Output.size(), SignErr))
+    return createStringError(inconvertibleErrorCode(),
+                             "DXIL validation/signing failed: %s",
+                             SignErr.c_str());
+#endif
 
   D3D12_COMPUTE_PIPELINE_STATE_DESC PSODesc{};
   PSODesc.pRootSignature = RootSig;
@@ -918,9 +937,30 @@ createD3D12Devices(const DeviceConfig &) {
 
 #ifdef _WIN32
   // On Windows (when not overriding with a custom D3D12 DLL), enumerate real
-  // DXGI adapters (NVIDIA, AMD, Intel, WARP) and proxy each one.
+  // DXGI adapters (NVIDIA, AMD, Intel, WARP) or select WARP explicitly when
+  // CRUCIBLE_OFFLOAD_RUNTIME=warp or CRUCIBLE_D3D12_WARP=1.
   const char *OverrideLib = std::getenv("CRUCIBLE_D3D12_LIB");
   if (!OverrideLib || !*OverrideLib) {
+    bool WantWarp = false;
+    if (const char *Rt = std::getenv("CRUCIBLE_OFFLOAD_RUNTIME")) {
+      if (StringRef(Rt).equals_insensitive("warp"))
+        WantWarp = true;
+    }
+    if (const char *W = std::getenv("CRUCIBLE_D3D12_WARP")) {
+      if (W[0] && W[0] != '0')
+        WantWarp = true;
+    }
+
+    auto adapterNameFromDesc = [](const DXGI_ADAPTER_DESC1 &Desc) {
+      std::string Name;
+      for (wchar_t WC : Desc.Description) {
+        if (!WC)
+          break;
+        Name.push_back(WC < 128 ? static_cast<char>(WC) : '?');
+      }
+      return Name;
+    };
+
     if (HMODULE DXGI = LoadLibraryA("dxgi.dll")) {
       using PFN_CreateDXGIFactory1 = HRESULT(WINAPI *)(REFIID, void **);
       auto CreateFactory = reinterpret_cast<PFN_CreateDXGIFactory1>(
@@ -929,20 +969,34 @@ createD3D12Devices(const DeviceConfig &) {
       if (CreateFactory &&
           SUCCEEDED(CreateFactory(__uuidof(IDXGIFactory4),
                                   reinterpret_cast<void **>(&Factory)))) {
+        if (WantWarp) {
+          IDXGIAdapter1 *WarpAdapter = nullptr;
+          HRESULT Hr = Factory->EnumWarpAdapter(
+              __uuidof(IDXGIAdapter1),
+              reinterpret_cast<void **>(&WarpAdapter));
+          Factory->Release();
+          if (FAILED(Hr))
+            return hrErr(Hr, "EnumWarpAdapter");
+          DXGI_ADAPTER_DESC1 Desc{};
+          WarpAdapter->GetDesc1(&Desc);
+          auto DevOrErr = createProxiedDeviceForAdapter(
+              WarpAdapter, adapterNameFromDesc(Desc), Desc.VendorId,
+              Desc.DeviceId);
+          WarpAdapter->Release();
+          if (!DevOrErr)
+            return DevOrErr.takeError();
+          Devices.push_back(std::move(*DevOrErr));
+          return Devices;
+        }
         for (UINT Idx = 0;; ++Idx) {
           IDXGIAdapter1 *Adapter = nullptr;
           if (Factory->EnumAdapters1(Idx, &Adapter) == DXGI_ERROR_NOT_FOUND)
             break;
           DXGI_ADAPTER_DESC1 Desc{};
           Adapter->GetDesc1(&Desc);
-          std::string Name;
-          for (wchar_t WC : Desc.Description) {
-            if (!WC)
-              break;
-            Name.push_back(WC < 128 ? static_cast<char>(WC) : '?');
-          }
           if (auto DevOrErr = createProxiedDeviceForAdapter(
-                  Adapter, Name, Desc.VendorId, Desc.DeviceId))
+                  Adapter, adapterNameFromDesc(Desc), Desc.VendorId,
+                  Desc.DeviceId))
             Devices.push_back(std::move(*DevOrErr));
           else
             consumeError(DevOrErr.takeError());
@@ -951,6 +1005,10 @@ createD3D12Devices(const DeviceConfig &) {
         Factory->Release();
       }
     }
+    if (WantWarp)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "WARP adapter requested but dxgi.dll / IDXGIFactory4 unavailable");
   }
 #endif
 
