@@ -1120,7 +1120,8 @@ private:
   DenseMap<mlir::Operation *, std::string> GlobalTypes; // element MSL type
 
   // --- statements ---
-  Error emitBlock(mlir::Block &B, unsigned Ind);
+  Error emitBlock(mlir::Block &B, unsigned Ind,
+                  mlir::Operation *StopBefore = nullptr);
   Error emitSwitch(mlir::scf::IndexSwitchOp Switch, unsigned Ind);
   Error emitStatement(mlir::Operation *Op, unsigned Ind);
   Error emitIf(mlir::scf::IfOp If, unsigned Ind);
@@ -5632,11 +5633,257 @@ Error Emitter::emitWhile(mlir::scf::WhileOp While, unsigned Ind) {
     return Error::success();
   }
 
+  mlir::Block &After = While.getAfter().front();
+
+  // Check for the LiftControlFlowToSCF early-exit loop shape:
+  //   - `After` is a pass-through block (only `scf.yield` of its block args),
+  //   - `Before` ends with an `scf.if` (plus optional `arith.trunci` to `i1`)
+  //     that feeds `scf.condition`'s continuation flag and early-exit results.
+  // Lowering this directly to `if (exit) { res = ...; break; }` eliminates
+  // synthetic `uint` continue flags, dummy zero assignments, and nested `else`
+  // blocks so Metal's AGX compiler sees clean structured early-exit loops.
+  auto tryEmitEarlyExitWhile = [&]() -> Expected<bool> {
+    if (&After.front() != After.getTerminator())
+      return false;
+    auto AfterYield = mlir::cast<mlir::scf::YieldOp>(After.getTerminator());
+    if (AfterYield.getNumOperands() != CarriedNames.size())
+      return false;
+    SmallVector<unsigned, 4> YieldArgIdx;
+    for (mlir::Value V : AfterYield.getOperands()) {
+      auto BA = mlir::dyn_cast<mlir::BlockArgument>(V);
+      if (!BA || BA.getOwner() != &After)
+        return false;
+      YieldArgIdx.push_back(BA.getArgNumber());
+    }
+
+    mlir::Value CondVal = Condition.getCondition();
+    mlir::Operation *TruncOp = nullptr;
+    mlir::Value FlagVal = CondVal;
+    if (auto *Def = CondVal.getDefiningOp();
+        Def && Def->getBlock() == &Before &&
+        mlir::isa<mlir::arith::TruncIOp, mlir::LLVM::TruncOp>(Def) &&
+        Def->getNextNode() == Condition.getOperation()) {
+      TruncOp = Def;
+      FlagVal = Def->getOperand(0);
+    }
+    auto ExitIf = FlagVal.getDefiningOp<mlir::scf::IfOp>();
+    if (!ExitIf || ExitIf->getBlock() != &Before ||
+        ExitIf.getElseRegion().empty())
+      return false;
+    mlir::Operation *ExpectedNext =
+        TruncOp ? TruncOp : Condition.getOperation();
+    if (ExitIf->getNextNode() != ExpectedNext)
+      return false;
+
+    // Every result of ExitIf must be consumed only by TruncOp or Condition.
+    for (mlir::Value Res : ExitIf.getResults()) {
+      for (mlir::Operation *U : Res.getUsers())
+        if (U != TruncOp && U != Condition.getOperation())
+          return false;
+    }
+    unsigned RootFlagIdx =
+        mlir::cast<mlir::OpResult>(FlagVal).getResultNumber();
+
+    // Only declare result variables that are actually used after the loop.
+    SmallVector<std::string, 4> LiveResultNames(While.getNumResults());
+    for (unsigned I = 0, E = While.getNumResults(); I < E; ++I) {
+      mlir::Value Res = While.getResult(I);
+      if (Res.use_empty())
+        continue;
+      auto Ty = mslType(Res.getType());
+      if (!Ty)
+        return Ty.takeError();
+      std::string Name = freshName();
+      line(Ind, *Ty + " " + Name + ";");
+      ValueNames[Res] = Name;
+      LiveResultNames[I] = Name;
+    }
+
+    auto EmitExitAssigns = [&](ArrayRef<mlir::Value> SubArgs,
+                               unsigned BInd) -> Error {
+      for (unsigned I = 0, E = LiveResultNames.size(); I < E; ++I) {
+        if (LiveResultNames[I].empty())
+          continue;
+        auto ValE = exprFor(SubArgs[I], PrecUnknown);
+        if (!ValE)
+          return ValE.takeError();
+        line(BInd, LiveResultNames[I] + " = " + ValE->Text + ";");
+      }
+      return Error::success();
+    };
+
+    auto EmitExitTree = [&](auto &Self, mlir::scf::IfOp IfOp, unsigned FlagIdx,
+                            SmallVector<mlir::Value, 8> CurArgs,
+                            unsigned CurInd) -> Error {
+      auto EmitBranch = [&](mlir::Block &BB, SmallVector<mlir::Value, 8> SubArgs,
+                            mlir::Value BranchFlag, unsigned BInd) -> Error {
+        // Case 1: Unconditional break branch (flag == 0).
+        if (auto C = constInt(BranchFlag); C && *C == 0) {
+          if (Error E = emitBlock(BB, BInd))
+            return E;
+          if (Error E = EmitExitAssigns(SubArgs, BInd))
+            return E;
+          line(BInd, "break;");
+          return Error::success();
+        }
+
+        // Case 2: Nested early-exit scf.if at the end of BB.
+        auto Term = mlir::cast<mlir::scf::YieldOp>(BB.getTerminator());
+        if (auto NestedIf = BranchFlag.getDefiningOp<mlir::scf::IfOp>();
+            NestedIf && NestedIf->getBlock() == &BB &&
+            !NestedIf.getElseRegion().empty() &&
+            NestedIf->getNextNode() == Term.getOperation()) {
+          bool OnlyUsedByYield = true;
+          for (mlir::Value Res : NestedIf.getResults()) {
+            for (mlir::Operation *U : Res.getUsers())
+              if (U != Term.getOperation()) {
+                OnlyUsedByYield = false;
+                break;
+              }
+            if (!OnlyUsedByYield)
+              break;
+          }
+          if (OnlyUsedByYield) {
+            if (Error E = emitBlock(BB, BInd, NestedIf.getOperation()))
+              return E;
+            unsigned NestedFlagIdx =
+                mlir::cast<mlir::OpResult>(BranchFlag).getResultNumber();
+            return Self(Self, NestedIf, NestedFlagIdx, std::move(SubArgs),
+                        BInd);
+          }
+        }
+
+        // Case 3: Continuation leaf -- evaluate continuation condition, break
+        // if false, otherwise update loop-carried variables.
+        if (Error E = emitBlock(BB, BInd))
+          return E;
+
+        // Unwrap zext/extui from i1 so we emit `if (!(cond))` directly.
+        mlir::Value BoolFlag = BranchFlag;
+        if (auto *Def = BranchFlag.getDefiningOp();
+            Def && mlir::isa<mlir::arith::ExtUIOp, mlir::LLVM::ZExtOp>(Def) &&
+            Def->getOperand(0).getType().isInteger(1)) {
+          BoolFlag = Def->getOperand(0);
+        }
+        std::string ContText;
+        if (BoolFlag.getType().isInteger(1)) {
+          auto CE = exprFor(BoolFlag, PrecUnary);
+          if (!CE)
+            return CE.takeError();
+          ContText = CE->Text;
+        } else {
+          auto CE = exprFor(BoolFlag, PrecUnknown);
+          if (!CE)
+            return CE.takeError();
+          ContText = "bool((" + CE->Text + ") & 1u)";
+        }
+
+        bool HasLiveResults = llvm::any_of(
+            LiveResultNames, [](const std::string &S) { return !S.empty(); });
+        if (HasLiveResults) {
+          line(BInd, "if (!" + ContText + ") {");
+          if (Error E = EmitExitAssigns(SubArgs, BInd + 1))
+            return E;
+          line(BInd + 1, "break;");
+          line(BInd, "}");
+        } else {
+          line(BInd, "if (!" + ContText + ") break;");
+        }
+
+        SmallVector<std::string, 4> NewVals;
+        for (unsigned Idx : YieldArgIdx) {
+          auto Name = ensureNamed(SubArgs[Idx], BInd, /*CopyBlockArgs=*/true);
+          if (!Name)
+            return Name.takeError();
+          NewVals.push_back(*Name);
+        }
+        for (auto [Name, NewVal] : zip(CarriedNames, NewVals))
+          if (Name != NewVal)
+            line(BInd, Name + " = " + NewVal + ";");
+        return Error::success();
+      };
+
+      auto Substitute = [&](mlir::scf::YieldOp Y) {
+        SmallVector<mlir::Value, 8> Out = CurArgs;
+        for (mlir::Value &V : Out) {
+          if (auto OpRes = mlir::dyn_cast<mlir::OpResult>(V);
+              OpRes && OpRes.getOwner() == IfOp.getOperation()) {
+            V = Y.getOperand(OpRes.getResultNumber());
+          }
+        }
+        return Out;
+      };
+
+      mlir::Block &ThenB = IfOp.getThenRegion().front();
+      mlir::Block &ElseB = IfOp.getElseRegion().front();
+      auto ThenY = mlir::cast<mlir::scf::YieldOp>(ThenB.getTerminator());
+      auto ElseY = mlir::cast<mlir::scf::YieldOp>(ElseB.getTerminator());
+      auto ThenArgs = Substitute(ThenY);
+      auto ElseArgs = Substitute(ElseY);
+      mlir::Value ThenFlag = ThenY.getOperand(FlagIdx);
+      mlir::Value ElseFlag = ElseY.getOperand(FlagIdx);
+      bool ThenBreaks = constInt(ThenFlag).value_or(1) == 0;
+      bool ElseBreaks = constInt(ElseFlag).value_or(1) == 0;
+
+      if (ThenBreaks && !ElseBreaks) {
+        auto CondE = exprFor(IfOp.getCondition(), PrecUnknown);
+        if (!CondE)
+          return CondE.takeError();
+        line(CurInd, "if (" + CondE->Text + ") {");
+        if (Error E = EmitBranch(ThenB, std::move(ThenArgs), ThenFlag,
+                                 CurInd + 1))
+          return E;
+        line(CurInd, "}");
+        return EmitBranch(ElseB, std::move(ElseArgs), ElseFlag, CurInd);
+      }
+      if (ElseBreaks && !ThenBreaks) {
+        auto CondE = exprFor(IfOp.getCondition(), PrecUnary);
+        if (!CondE)
+          return CondE.takeError();
+        line(CurInd, "if (!" + CondE->Text + ") {");
+        if (Error E = EmitBranch(ElseB, std::move(ElseArgs), ElseFlag,
+                                 CurInd + 1))
+          return E;
+        line(CurInd, "}");
+        return EmitBranch(ThenB, std::move(ThenArgs), ThenFlag, CurInd);
+      }
+      auto CondE = exprFor(IfOp.getCondition(), PrecUnknown);
+      if (!CondE)
+        return CondE.takeError();
+      line(CurInd, "if (" + CondE->Text + ") {");
+      if (Error E = EmitBranch(ThenB, std::move(ThenArgs), ThenFlag,
+                               CurInd + 1))
+        return E;
+      line(CurInd, "} else {");
+      if (Error E = EmitBranch(ElseB, std::move(ElseArgs), ElseFlag,
+                               CurInd + 1))
+        return E;
+      line(CurInd, "}");
+      return Error::success();
+    };
+
+    line(Ind, "while (true) {");
+    if (Error E = emitBlock(Before, Ind + 1, ExitIf.getOperation()))
+      return E;
+    SmallVector<mlir::Value, 8> RootArgs(Condition.getArgs().begin(),
+                                         Condition.getArgs().end());
+    if (Error E = EmitExitTree(EmitExitTree, ExitIf, RootFlagIdx,
+                               std::move(RootArgs), Ind + 1))
+      return E;
+    line(Ind, "}");
+    return true;
+  };
+
+  auto EarlyExit = tryEmitEarlyExitWhile();
+  if (!EarlyExit)
+    return EarlyExit.takeError();
+  if (*EarlyExit)
+    return Error::success();
+
   // General form:
   //   while (true) { <before>; r = condArgs; if (!cond) break; <after>;
   //                  carried = yields; }
   SmallVector<std::string, 4> ResultNames;
-  mlir::Block &After = While.getAfter().front();
   for (auto [Res, Arg] : zip(While.getResults(), After.getArguments())) {
     auto Ty = mslType(Res.getType());
     if (!Ty)
@@ -6554,13 +6801,16 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
   return emitTemp(Op, Ind);
 }
 
-Error Emitter::emitBlock(mlir::Block &B, unsigned Ind) {
+Error Emitter::emitBlock(mlir::Block &B, unsigned Ind,
+                         mlir::Operation *StopBefore) {
   // Pair same-block sin(x) and cos(x) on the same operand into Metal's
   // sincos(x, c) builtin (skipped under strict FP mode).
   if (!R.RequiresStrictFP && !Opts.EmulateF64) {
     DenseMap<mlir::Value, mlir::Operation *> PendingSin;
     DenseMap<mlir::Value, mlir::Operation *> PendingCos;
     for (mlir::Operation &Op : B) {
+      if (&Op == StopBefore)
+        break;
       if (Op.getNumResults() != 1 || Op.getResult(0).use_empty())
         continue;
       mlir::Type Ty = Op.getResult(0).getType();
@@ -6592,6 +6842,8 @@ Error Emitter::emitBlock(mlir::Block &B, unsigned Ind) {
   }
 
   for (mlir::Operation &Op : B) {
+    if (&Op == StopBefore)
+      break;
     if (auto It = SinCosPartner.find(&Op); It != SinCosPartner.end()) {
       if (ValueNames.count(Op.getResult(0)))
         continue; // already emitted by partner
