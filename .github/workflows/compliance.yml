@@ -479,33 +479,36 @@ jobs:
         run: |
           python -m pip install --upgrade ninja lit psutil pyyaml
 
-      - name: Restore Windows DXC and libpng SDK cache
+      - name: Restore Windows DXC, WARP, and libpng SDK cache
         id: cache-win-sdk
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng-v2
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.9.2609-warp-1.0.22-libpng-v2
 
-      - name: Install DXC and libpng (Windows x64)
+      - name: Install DXC, WARP, and libpng (Windows x64)
         if: steps.cache-win-sdk.outputs.cache-hit != 'true'
         run: |
-          mkdir -p .sdk/bin .sdk/vcpkg
-          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip" -o /tmp/dxc.zip
+          mkdir -p .sdk/bin .sdk/warp .sdk/vcpkg
+          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -o /tmp/dxc.zip
           unzip -q /tmp/dxc.zip -d /tmp/dxc
           cp -a /tmp/dxc/bin/x64/* .sdk/bin/
           rm -rf /tmp/dxc /tmp/dxc.zip
+          curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.22/microsoft.direct3d.warp.1.0.22.nupkg" -o /tmp/warp.nupkg
+          unzip -q -j /tmp/warp.nupkg "build/native/bin/x64/d3d10warp.dll" -d .sdk/warp
+          rm -f /tmp/warp.nupkg
           VCPKG_ROOT="$(cygpath -u "$VCPKG_INSTALLATION_ROOT")"
           "${VCPKG_ROOT}/vcpkg.exe" install libpng:x64-windows-static-md
           cp -a "${VCPKG_ROOT}/installed/x64-windows-static-md/." .sdk/vcpkg/
           test -f .sdk/vcpkg/include/png.h
           ls -la .sdk/vcpkg/lib
 
-      - name: Save Windows DXC and libpng SDK cache
+      - name: Save Windows DXC, WARP, and libpng SDK cache
         if: steps.cache-win-sdk.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng-v2
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.9.2609-warp-1.0.22-libpng-v2
 
       - name: Setup third_party LLVM/MLIR
         uses: ./.github/actions/setup-llvm
@@ -532,6 +535,7 @@ jobs:
           CRUCIBLE_OFFLOAD_RUNTIME: warp
           CRUCIBLE_D3D12_WARP: "1"
         run: |
+          cp -f .sdk/warp/d3d10warp.dll build/tools/crucible-offload/
           build/tools/crucible-offload/api-query.exe
           lit -v --timeout=60 -Dspirv_frontend=1 \
             --output=offload-results-spirv-to-dxil.json \

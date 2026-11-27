@@ -208,28 +208,31 @@ jobs:
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Restore DXC SDK cache
+      - name: Restore DXC and WARP SDK cache
         id: cache-sdk
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.9.2609-warp-1.0.22
 
-      - name: Install DXC (Windows x64)
+      - name: Install DXC and WARP (Windows x64)
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         run: |
-          mkdir -p .sdk/bin
-          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip" -o /tmp/dxc.zip
+          mkdir -p .sdk/bin .sdk/warp
+          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -o /tmp/dxc.zip
           unzip -q /tmp/dxc.zip -d /tmp/dxc
           cp -a /tmp/dxc/bin/x64/* .sdk/bin/
           rm -rf /tmp/dxc /tmp/dxc.zip
+          curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.22/microsoft.direct3d.warp.1.0.22.nupkg" -o /tmp/warp.nupkg
+          unzip -q -j /tmp/warp.nupkg "build/native/bin/x64/d3d10warp.dll" -d .sdk/warp
+          rm -f /tmp/warp.nupkg
 
-      - name: Save DXC SDK cache
+      - name: Save DXC and WARP SDK cache
         if: steps.cache-sdk.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.9.2609-warp-1.0.22
 
       - name: Install build dependencies
         run: |
@@ -256,6 +259,7 @@ jobs:
         env:
           CRUCIBLE_D3D12_WARP: "1"
         run: |
+          cp -f .sdk/warp/d3d10warp.dll build/tools/crucible-run/
           lit -sv --output lit-results.json build/test
 
       - name: Upload lit results
