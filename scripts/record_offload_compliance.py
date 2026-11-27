@@ -5,6 +5,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shutil
 import urllib.error
 import urllib.parse
@@ -28,7 +29,7 @@ def category_for_test(test_name: str) -> str:
 
 def normalize_test_name(name: str) -> str:
     name = name.split("::", 1)[-1].strip().replace("\\", "/")
-    name = name.rsplit("/", 1)[-1]
+    name = name.lstrip("./")
     if name.endswith(".test"):
         name = name[:-5]
     return name
@@ -176,8 +177,16 @@ def parse_track_spec(spec: str) -> tuple[str, str, Path]:
     return parts[0].strip(), parts[1].strip(), Path(parts[2].strip())
 
 
+def resolve_external_github_token() -> str | None:
+    for env_var in ("OFFLOAD_READ_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"):
+        val = os.environ.get(env_var)
+        if val:
+            return val
+    return None
+
+
 def github_api_json(url: str) -> dict | None:
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    token = resolve_external_github_token()
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -216,7 +225,14 @@ def parse_xunit_tests(xml_text: str) -> list:
     root = ET.fromstring(xml_text)
     tests = []
     for testcase in root.iter("testcase"):
-        name = normalize_test_name(testcase.get("name", ""))
+        raw_name = testcase.get("name", "")
+        classname = testcase.get("classname", "")
+        if "/" not in raw_name and "\\" not in raw_name and classname:
+            # llvm-lit xUnit sets classname like "OffloadTest-d3d12.Feature/HLSLLib" or "OffloadTest-d3d12.WaveOps"
+            rel_dir = classname.split(".", 1)[-1] if "." in classname else ""
+            if rel_dir:
+                raw_name = f"{rel_dir}/{raw_name}"
+        name = normalize_test_name(raw_name)
         if not name:
             continue
         if testcase.find("failure") is not None:
@@ -229,13 +245,61 @@ def parse_xunit_tests(xml_text: str) -> list:
     return sorted(tests, key=lambda test: test["name"])
 
 
+LIT_LOG_LINE_RE = re.compile(
+    r"(?:^|\s)(PASS|FLAKYPASS|FAIL|XFAIL|XPASS|UNSUPPORTED|UNRESOLVED|TIMEOUT):"
+    r"\s+\S+\s+::\s+(.+?)\s+\(\d+\s+of\s+\d+\)"
+)
+
+
+def parse_lit_log_tests(raw_zip: bytes) -> list:
+    """Extract per-test statuses (including XFAIL) from a GitHub Actions run logs zip."""
+    by_name: dict[str, str] = {}
+    with zipfile.ZipFile(io.BytesIO(raw_zip)) as zf:
+        for member in zf.namelist():
+            if not member.endswith(".txt"):
+                continue
+            text = zf.read(member).decode("utf-8", errors="replace")
+            for code, raw_name in LIT_LOG_LINE_RE.findall(text):
+                name = normalize_test_name(raw_name)
+                if not name:
+                    continue
+                if code in ("PASS", "FLAKYPASS"):
+                    status = "pass"
+                elif code == "XFAIL":
+                    status = "xfail"
+                elif code == "UNSUPPORTED":
+                    status = "unsupported"
+                else:
+                    status = "fail"
+                by_name[name] = status
+    return [{"name": name, "status": status} for name, status in sorted(by_name.items())]
+
+
+def summarize_external_tests(tests: list) -> dict:
+    total = len(tests)
+    passed = sum(1 for t in tests if t.get("status") == "pass")
+    failed = sum(1 for t in tests if t.get("status") == "fail")
+    xfail = sum(1 for t in tests if t.get("status") == "xfail")
+    unsupported = sum(1 for t in tests if t.get("status") == "unsupported")
+    pass_rate = round((100.0 * passed / total), 2) if total > 0 else 0.0
+    return {
+        "total": total,
+        "executed": passed + failed + xfail,
+        "passed": passed,
+        "failed": failed,
+        "xfail": xfail,
+        "unsupported": unsupported,
+        "passRate": pass_rate,
+    }
+
+
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
 def download_github_zip(url: str) -> bytes | None:
-    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    token = resolve_external_github_token()
     headers = {
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
@@ -250,6 +314,13 @@ def download_github_zip(url: str) -> bytes | None:
             return resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code not in (301, 302, 303, 307, 308):
+            if exc.code in (401, 403):
+                print(
+                    f"Warning: HTTP {exc.code} downloading {url} "
+                    "(cross-repo artifact/log downloads require a read-only PAT in OFFLOAD_READ_TOKEN)"
+                )
+            else:
+                print(f"Warning: HTTP {exc.code} downloading {url}")
             return None
         location = exc.headers.get("Location")
         if not location:
@@ -261,18 +332,37 @@ def download_github_zip(url: str) -> bytes | None:
         try:
             with urllib.request.urlopen(dl_req, timeout=60) as resp:
                 return resp.read()
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as dl_exc:
+            print(f"Warning: failed downloading redirected zip from {url}: {dl_exc}")
             return None
-    except (urllib.error.URLError, TimeoutError):
+    except (urllib.error.URLError, TimeoutError) as exc:
+        print(f"Warning: network error downloading {url}: {exc}")
         return None
 
 
-def fetch_external_comparisons() -> dict:
+def fetch_external_comparisons(previous_comparisons: dict | None = None) -> dict:
     comparisons = {
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "repository": "llvm/offload-test-suite",
         "runs": [],
     }
+
+    previous_by_id: dict[str, dict] = {}
+    if isinstance(previous_comparisons, dict):
+        for prev in previous_comparisons.get("runs", []):
+            if isinstance(prev, dict) and prev.get("id"):
+                previous_by_id[prev["id"]] = prev
+
+    badges_summary_url = (
+        "https://raw.githubusercontent.com/farzonl/"
+        "offload-test-suite-badges/badges/summary.json"
+    )
+    badges_summary = fetch_json(badges_summary_url)
+    badge_workflows = (
+        badges_summary.get("workflows", {})
+        if isinstance(badges_summary, dict)
+        else {}
+    )
 
     official_workflows = (
         ("windows-intel-dxc-vk", "windows-intel-dxc-vk.yaml", "vulkan", "DXC"),
@@ -289,6 +379,9 @@ def fetch_external_comparisons() -> dict:
         ("windows-amd-clang-d3d12", "windows-amd-clang-d3d12.yaml", "directx", "Clang"),
     )
     for key, workflow_file, platform, compiler in official_workflows:
+        badge_entry = badge_workflows.get(key)
+        badge_entry = badge_entry if isinstance(badge_entry, dict) else {}
+
         workflow_runs_url = (
             "https://api.github.com/repos/llvm/offload-test-suite/actions/"
             f"workflows/{urllib.parse.quote(workflow_file)}/runs"
@@ -305,21 +398,25 @@ def fetch_external_comparisons() -> dict:
             ),
             None,
         )
-        if not run:
+
+        run_id = run.get("id") if run else badge_entry.get("runId")
+        run_url = (run.get("html_url") if run else None) or badge_entry.get("runUrl", "")
+        updated_at = (run.get("updated_at") if run else None) or badge_entry.get("updatedAt", "")
+        if not run_id and not badge_entry:
             continue
-        run_id = run.get("id")
-        tests = []
+
+        tests: list = []
+        tests_from_exact_source = False
         if run_id:
+            # 1. Try test-results-* artifacts (prefer testresults.json over xUnit XML,
+            #    since llvm-lit xUnit omits XFAIL status).
             artifacts_url = (
                 f"https://api.github.com/repos/llvm/offload-test-suite/"
                 f"actions/runs/{run_id}/artifacts?per_page=100"
             )
             artifact_data = github_api_json(artifacts_url)
+            xunit_tests: list = []
             if artifact_data:
-                token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
-                headers = {"User-Agent": "Crucible-Compliance-CI"}
-                if token:
-                    headers["Authorization"] = f"Bearer {token}"
                 for artifact in artifact_data.get("artifacts", []):
                     name = artifact.get("name", "")
                     if artifact.get("expired") or not name.startswith("test-results-"):
@@ -338,18 +435,66 @@ def fetch_external_comparisons() -> dict:
                                         zf.read(member).decode("utf-8")
                                     )
                                     candidate = normalize_external_tests(lit_data)
+                                    if len(candidate) > len(tests):
+                                        tests = candidate
+                                        tests_from_exact_source = True
                                 elif member.endswith(".xml"):
                                     candidate = parse_xunit_tests(
                                         zf.read(member).decode("utf-8")
                                     )
-                                else:
-                                    continue
-                                if len(candidate) > len(tests):
-                                    tests = candidate
+                                    if len(candidate) > len(xunit_tests):
+                                        xunit_tests = candidate
                     except (urllib.error.HTTPError, urllib.error.URLError,
                             TimeoutError, zipfile.BadZipFile, json.JSONDecodeError,
                             UnicodeDecodeError, ET.ParseError):
                         continue
+
+            # 2. If no testresults.json was found, try run logs which include exact
+            #    PASS / FAIL / XFAIL / UNSUPPORTED lines from llvm-lit.
+            if not tests:
+                logs_url = (
+                    f"https://api.github.com/repos/llvm/offload-test-suite/"
+                    f"actions/runs/{run_id}/logs"
+                )
+                raw_logs = download_github_zip(logs_url)
+                if raw_logs:
+                    try:
+                        log_tests = parse_lit_log_tests(raw_logs)
+                        if log_tests:
+                            tests = log_tests
+                            tests_from_exact_source = True
+                    except (zipfile.BadZipFile, UnicodeDecodeError):
+                        pass
+
+            # 3. Fall back to xUnit XML if logs did not contain per-test lit lines.
+            if not tests and xunit_tests:
+                tests = xunit_tests
+
+        # Preserve previously cached per-test data if this runId matches and we could
+        # not download artifacts/logs in this CI run.
+        prev_run = previous_by_id.get(key)
+        if not tests and prev_run and prev_run.get("runId") == run_id and prev_run.get("tests"):
+            tests = prev_run["tests"]
+
+        # Choose the most accurate summary results:
+        # - Exact per-test data (testresults.json or lit logs) -> summarize directly.
+        # - Otherwise prefer offload-test-suite-badges summary.json (which parses
+        #   actual lit summary counts including XFAIL), falling back to xUnit summary.
+        badge_results = (
+            badge_entry.get("results")
+            if isinstance(badge_entry.get("results"), dict)
+            else {}
+        )
+        if tests and tests_from_exact_source:
+            results = summarize_external_tests(tests)
+        elif badge_results:
+            results = badge_results
+        elif tests:
+            results = summarize_external_tests(tests)
+        elif prev_run and isinstance(prev_run.get("results"), dict):
+            results = prev_run["results"]
+        else:
+            results = {}
 
         label = f"{compiler} · {key.replace('-', ' ').title()}"
         comparisons["runs"].append({
@@ -359,11 +504,14 @@ def fetch_external_comparisons() -> dict:
             "platform": platform,
             "compiler": compiler,
             "runId": run_id,
-            "runUrl": run.get("html_url", ""),
-            "updatedAt": run.get("updated_at", ""),
-            "results": {},
+            "runUrl": run_url,
+            "updatedAt": updated_at,
+            "results": results,
             "tests": tests,
         })
+
+    if not comparisons["runs"] and isinstance(previous_comparisons, dict) and previous_comparisons.get("runs"):
+        return previous_comparisons
     return comparisons
 
 
@@ -465,8 +613,6 @@ def main() -> None:
                 "passRate": summary["passRate"],
                 "elapsed": summary["elapsed"],
                 "categories": summary["categories"],
-                "failures": summary["failures"],
-                "tests": summary["tests"],
             }
             history = [h for h in history if h.get("sha") != args.sha]
             history.append(entry)
@@ -554,7 +700,15 @@ def main() -> None:
     with open(data_dir / "tracks.json", "w", encoding="utf-8") as f:
         json.dump(tracks_manifest, f, indent=2)
 
-    comparisons = fetch_external_comparisons()
+    previous_comparisons = None
+    if args.pages_url:
+        loaded_comparisons = fetch_json(
+            f"{args.pages_url.rstrip('/')}/data/comparisons.json"
+        )
+        if isinstance(loaded_comparisons, dict):
+            previous_comparisons = loaded_comparisons
+
+    comparisons = fetch_external_comparisons(previous_comparisons)
     with open(data_dir / "comparisons.json", "w", encoding="utf-8") as f:
         json.dump(comparisons, f, indent=2)
 
