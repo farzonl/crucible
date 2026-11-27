@@ -1394,6 +1394,247 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     }
   }
 
+  // Rewrite SPIR-V derivative opcodes (OpDPdx..OpFwidthCoarse, 207..215) and
+  // OpDemoteToHelperInvocation (5380) — which MLIR's SPIR-V deserializer does
+  // not yet recognize — into OpFunctionCall calls to dummy helper functions
+  // named "__crucible_spv_*". These calls are lowered directly to
+  // crucible.deriv / crucible.discard right after deserialization.
+  {
+    constexpr uint32_t kOpDemoteToHelperInvocation = 5380u;
+    constexpr uint32_t kCapDemoteToHelperInvocation = 5379u;
+    auto isDerivOp = [](uint32_t Op) { return Op >= 207u && Op <= 215u; };
+    auto isExtName = [](ArrayRef<uint32_t> W, StringRef Name) {
+      std::string S;
+      S.reserve(W.size() * 4);
+      for (uint32_t Word : W) {
+        for (int B = 0; B < 4; ++B) {
+          char C = static_cast<char>((Word >> (B * 8)) & 0xff);
+          if (!C)
+            return S == Name;
+          S.push_back(C);
+        }
+      }
+      return S == Name;
+    };
+
+    uint32_t VoidTyId = 0;
+    bool HasDemote = false;
+    bool HasDemoteExtOrCap = false;
+    // Key: (Op << 32) | ResultTypeId -> HelperFnInfo
+    struct HelperFnInfo {
+      uint32_t Op = 0;
+      uint32_t TypeId = 0;
+      uint32_t FnTyId = 0;
+      uint32_t FnId = 0;
+      uint32_t ParamId = 0;
+      uint32_t LabelId = 0;
+      std::string Name;
+    };
+    DenseMap<uint64_t, HelperFnInfo> Helpers;
+    SmallVector<uint64_t, 8> HelperOrder;
+
+    for (size_t I = 5; I < Words.size();) {
+      uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+      if (Count == 0 || I + Count > Words.size())
+        break;
+      if (Op == spv::OpTypeVoid && Count == 2) {
+        VoidTyId = Words[I + 1];
+      } else if (Op == spv::OpExtension && Count >= 2 &&
+                 isExtName(ArrayRef(Words).slice(I + 1, Count - 1),
+                           "SPV_EXT_demote_to_helper_invocation")) {
+        HasDemoteExtOrCap = true;
+      } else if (Op == spv::OpCapability && Count == 2 &&
+                 Words[I + 1] == kCapDemoteToHelperInvocation) {
+        HasDemoteExtOrCap = true;
+      } else if (isDerivOp(Op) && Count == 4) {
+        uint32_t ResTy = Words[I + 1];
+        uint64_t Key = (static_cast<uint64_t>(Op) << 32) | ResTy;
+        if (!Helpers.contains(Key)) {
+          HelperFnInfo Info;
+          Info.Op = Op;
+          Info.TypeId = ResTy;
+          Helpers[Key] = Info;
+          HelperOrder.push_back(Key);
+        }
+      } else if (Op == kOpDemoteToHelperInvocation && Count == 1) {
+        HasDemote = true;
+      }
+      I += Count;
+    }
+
+    if (!Helpers.empty() || HasDemote || HasDemoteExtOrCap) {
+      uint32_t NextId = Words[3];
+      bool NeedVoidTy = HasDemote && (VoidTyId == 0);
+      if (NeedVoidTy)
+        VoidTyId = NextId++;
+
+      auto derivPrefix = [](uint32_t Op) -> const char * {
+        switch (Op) {
+        case 207: return "__crucible_spv_dpdx_";
+        case 208: return "__crucible_spv_dpdy_";
+        case 209: return "__crucible_spv_fwidth_";
+        case 210: return "__crucible_spv_dpdx_fine_";
+        case 211: return "__crucible_spv_dpdy_fine_";
+        case 212: return "__crucible_spv_fwidth_fine_";
+        case 213: return "__crucible_spv_dpdx_coarse_";
+        case 214: return "__crucible_spv_dpdy_coarse_";
+        case 215: return "__crucible_spv_fwidth_coarse_";
+        default: return "__crucible_spv_deriv_";
+        }
+      };
+
+      for (uint64_t Key : HelperOrder) {
+        HelperFnInfo &Info = Helpers[Key];
+        Info.FnTyId = NextId++;
+        Info.FnId = NextId++;
+        Info.ParamId = NextId++;
+        Info.LabelId = NextId++;
+        Info.Name = std::string(derivPrefix(Info.Op)) + std::to_string(Info.TypeId);
+      }
+
+      HelperFnInfo DemoteInfo;
+      if (HasDemote) {
+        DemoteInfo.Op = kOpDemoteToHelperInvocation;
+        DemoteInfo.TypeId = VoidTyId;
+        DemoteInfo.FnTyId = NextId++;
+        DemoteInfo.FnId = NextId++;
+        DemoteInfo.LabelId = NextId++;
+        DemoteInfo.Name = "__crucible_spv_demote";
+      }
+
+      auto emitOpName = [](SmallVectorImpl<uint32_t> &Out, uint32_t TargetId,
+                           StringRef Name) {
+        size_t StrWords = (Name.size() + 4) / 4;
+        uint32_t Count = static_cast<uint32_t>(2 + StrWords);
+        Out.push_back((Count << 16) | spv::OpName);
+        Out.push_back(TargetId);
+        for (size_t W = 0; W < StrWords; ++W) {
+          uint32_t Word = 0;
+          for (size_t B = 0; B < 4; ++B) {
+            size_t Idx = W * 4 + B;
+            if (Idx < Name.size())
+              Word |= static_cast<uint32_t>(static_cast<uint8_t>(Name[Idx]))
+                      << (B * 8);
+          }
+          Out.push_back(Word);
+        }
+      };
+
+      auto isBeforeNames = [](uint32_t Op) {
+        return Op == spv::OpCapability || Op == spv::OpExtension ||
+               Op == spv::OpExtInstImport || Op == spv::OpMemoryModel ||
+               Op == spv::OpEntryPoint || Op == spv::OpExecutionMode ||
+               Op == spv::OpExecutionModeId || Op == spv::OpString ||
+               Op == spv::OpSourceExtension || Op == spv::OpSource ||
+               Op == spv::OpSourceContinued;
+      };
+
+      SmallVector<uint32_t> Out(Words.begin(), Words.begin() + 5);
+      bool EmittedNames = false;
+      bool EmittedHelpers = false;
+      for (size_t I = 5; I < Words.size();) {
+        uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+        if (Count == 0 || I + Count > Words.size())
+          break;
+        // Strip demote extension/capability
+        if ((Op == spv::OpExtension && Count >= 2 &&
+             isExtName(ArrayRef(Words).slice(I + 1, Count - 1),
+                       "SPV_EXT_demote_to_helper_invocation")) ||
+            (Op == spv::OpCapability && Count == 2 &&
+             Words[I + 1] == kCapDemoteToHelperInvocation)) {
+          I += Count;
+          continue;
+        }
+        // Emit OpName declarations right after header/source section
+        if (!EmittedNames && !isBeforeNames(Op)) {
+          EmittedNames = true;
+          for (uint64_t Key : HelperOrder)
+            emitOpName(Out, Helpers[Key].FnId, Helpers[Key].Name);
+          if (HasDemote)
+            emitOpName(Out, DemoteInfo.FnId, DemoteInfo.Name);
+        }
+        // Emit helper OpTypeFunction + dummy helper function definitions
+        // right before the first OpFunction.
+        if (!EmittedHelpers && Op == spv::OpFunction) {
+          EmittedHelpers = true;
+          if (NeedVoidTy) {
+            Out.push_back((2u << 16) | spv::OpTypeVoid);
+            Out.push_back(VoidTyId);
+          }
+          for (uint64_t Key : HelperOrder) {
+            const HelperFnInfo &Info = Helpers[Key];
+            // OpTypeFunction FnTyId RetTy ParamTy
+            Out.push_back((4u << 16) | spv::OpTypeFunction);
+            Out.push_back(Info.FnTyId);
+            Out.push_back(Info.TypeId);
+            Out.push_back(Info.TypeId);
+          }
+          if (HasDemote) {
+            Out.push_back((3u << 16) | spv::OpTypeFunction);
+            Out.push_back(DemoteInfo.FnTyId);
+            Out.push_back(VoidTyId);
+          }
+          for (uint64_t Key : HelperOrder) {
+            const HelperFnInfo &Info = Helpers[Key];
+            Out.push_back((5u << 16) | spv::OpFunction);
+            Out.push_back(Info.TypeId);
+            Out.push_back(Info.FnId);
+            Out.push_back(0u);
+            Out.push_back(Info.FnTyId);
+            Out.push_back((3u << 16) | spv::OpFunctionParameter);
+            Out.push_back(Info.TypeId);
+            Out.push_back(Info.ParamId);
+            Out.push_back((2u << 16) | spv::OpLabel);
+            Out.push_back(Info.LabelId);
+            Out.push_back((2u << 16) | spv::OpReturnValue);
+            Out.push_back(Info.ParamId);
+            Out.push_back((1u << 16) | spv::OpFunctionEnd);
+          }
+          if (HasDemote) {
+            Out.push_back((5u << 16) | spv::OpFunction);
+            Out.push_back(VoidTyId);
+            Out.push_back(DemoteInfo.FnId);
+            Out.push_back(0u);
+            Out.push_back(DemoteInfo.FnTyId);
+            Out.push_back((2u << 16) | spv::OpLabel);
+            Out.push_back(DemoteInfo.LabelId);
+            Out.push_back((1u << 16) | spv::OpReturn);
+            Out.push_back((1u << 16) | spv::OpFunctionEnd);
+          }
+        }
+        // Rewrite derivative instructions -> OpFunctionCall
+        if (isDerivOp(Op) && Count == 4) {
+          uint32_t ResTy = Words[I + 1];
+          uint32_t ResId = Words[I + 2];
+          uint32_t ValId = Words[I + 3];
+          uint64_t Key = (static_cast<uint64_t>(Op) << 32) | ResTy;
+          const HelperFnInfo &Info = Helpers[Key];
+          Out.push_back((5u << 16) | spv::OpFunctionCall);
+          Out.push_back(ResTy);
+          Out.push_back(ResId);
+          Out.push_back(Info.FnId);
+          Out.push_back(ValId);
+          I += Count;
+          continue;
+        }
+        // Rewrite OpDemoteToHelperInvocation -> OpFunctionCall __crucible_spv_demote
+        if (Op == kOpDemoteToHelperInvocation && Count == 1) {
+          uint32_t CallResId = NextId++;
+          Out.push_back((4u << 16) | spv::OpFunctionCall);
+          Out.push_back(VoidTyId);
+          Out.push_back(CallResId);
+          Out.push_back(DemoteInfo.FnId);
+          I += Count;
+          continue;
+        }
+        Out.append(Words.begin() + I, Words.begin() + I + Count);
+        I += Count;
+      }
+      Out[3] = NextId;
+      Words.assign(Out.begin(), Out.end());
+    }
+  }
+
   // Keep CFG as plain spirv.Branch / spirv.BranchConditional so
   // ConvertSPIRVToLLVM + LiftControlFlowToSCF handle all control flow.
   mlir::spirv::DeserializationOptions DeserOpts;
@@ -1407,6 +1648,67 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       mlir::ModuleOp::create(SpvMod->getLoc());
   TopMod->getBody()->push_back(SpvMod.release());
   auto SpvModule = *TopMod->getOps<mlir::spirv::ModuleOp>().begin();
+
+  // Lower synthetic __crucible_spv_* calls (from pre-deserialization SPIR-V
+  // derivative/demote rewrites) BEFORE helper inlining so their dummy bodies
+  // are never inlined into callers.
+  {
+    auto I1TyLocal = mlir::IntegerType::get(&Ctx, 1);
+    SmallVector<mlir::spirv::FunctionCallOp, 8> SynthCalls;
+    SpvModule.walk([&](mlir::spirv::FunctionCallOp FC) {
+      if (FC.getCallee().starts_with("__crucible_spv_"))
+        SynthCalls.push_back(FC);
+    });
+    for (auto FC : SynthCalls) {
+      mlir::OpBuilder B(FC);
+      mlir::Location Loc = FC.getLoc();
+      StringRef Callee = FC.getCallee();
+      if (Callee == "__crucible_spv_demote") {
+        auto TrueC = mlir::LLVM::ConstantOp::create(B, Loc, I1TyLocal, true);
+        ir::DiscardOp::create(B, Loc, TrueC);
+        FC.erase();
+        continue;
+      }
+      if (FC.getNumOperands() == 1 && FC.getNumResults() == 1) {
+        mlir::Value Arg = FC.getOperand(0);
+        mlir::Type ResTy = FC.getResult(0).getType();
+        ir::DerivQuality Qual =
+            Callee.contains("_fine_") ? ir::DerivQuality::Fine
+                                      : ir::DerivQuality::Coarse;
+        mlir::Value Res;
+        if (Callee.starts_with("__crucible_spv_fwidth")) {
+          auto Dx = ir::DerivOp::create(
+              B, Loc, ResTy, Arg,
+              ir::DerivAxisAttr::get(&Ctx, ir::DerivAxis::X),
+              ir::DerivQualityAttr::get(&Ctx, Qual));
+          auto Dy = ir::DerivOp::create(
+              B, Loc, ResTy, Arg,
+              ir::DerivAxisAttr::get(&Ctx, ir::DerivAxis::Y),
+              ir::DerivQualityAttr::get(&Ctx, Qual));
+          auto AbsDx = mlir::LLVM::FAbsOp::create(B, Loc, ResTy, Dx.getResult());
+          auto AbsDy = mlir::LLVM::FAbsOp::create(B, Loc, ResTy, Dy.getResult());
+          Res = mlir::LLVM::FAddOp::create(B, Loc, ResTy, AbsDx, AbsDy);
+        } else {
+          ir::DerivAxis Axis = Callee.starts_with("__crucible_spv_dpdy")
+                                   ? ir::DerivAxis::Y
+                                   : ir::DerivAxis::X;
+          Res = ir::DerivOp::create(B, Loc, ResTy, Arg,
+                                    ir::DerivAxisAttr::get(&Ctx, Axis),
+                                    ir::DerivQualityAttr::get(&Ctx, Qual))
+                    .getResult();
+        }
+        FC.getResult(0).replaceAllUsesWith(Res);
+        FC.erase();
+      }
+    }
+    SmallVector<mlir::spirv::FuncOp, 8> SynthFuncs;
+    SpvModule.walk([&](mlir::spirv::FuncOp F) {
+      if (F.getSymName().starts_with("__crucible_spv_"))
+        SynthFuncs.push_back(F);
+    });
+    for (auto F : SynthFuncs)
+      F.erase();
+  }
 
   // Shader ABI rewriting below operates on entry bodies, including helpers.
   llvm::StringSet<> EntryNames;
@@ -3055,6 +3357,51 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             }
           }
           Store.erase();
+        } else if (auto AC = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
+          auto Indices = AC.getIndices();
+          int64_t ColIdx = -1;
+          if (Indices.size() == 1) {
+            if (auto SC = Indices[0].getDefiningOp<mlir::spirv::ConstantOp>()) {
+              if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(SC.getValue()))
+                ColIdx = IA.getInt();
+            } else if (auto LC =
+                           Indices[0].getDefiningOp<mlir::LLVM::ConstantOp>()) {
+              if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(LC.getValue()))
+                ColIdx = IA.getInt();
+            }
+          }
+          if (ColIdx < 0 || ColIdx >= 4)
+            return makeError(
+                "unsupported AccessChain index on stage I/O global '{0}'", Sym);
+          SmallVector<mlir::Operation *, 4> ACUsers(AC->getUsers().begin(),
+                                                    AC->getUsers().end());
+          for (mlir::Operation *AU : ACUsers) {
+            if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(AU)) {
+              mlir::OpBuilder B(Load);
+              mlir::Location Loc = Load.getLoc();
+              mlir::Type ElemTy = makeSignless(Load.getType(), B);
+              auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              auto LI = ir::LoadInputOp::create(
+                  B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                  static_cast<int8_t>(ColIdx), /*vertex_id=*/mlir::Value());
+              Load.replaceAllUsesWith(
+                  castFromSignless(B, Loc, LI.getResult(), Load.getType()));
+              Load.erase();
+            } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(AU)) {
+              mlir::OpBuilder B(Store);
+              mlir::Location Loc = Store.getLoc();
+              mlir::Value Val = castToSignless(B, Loc, Store.getValue());
+              auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
+                                        RowC, static_cast<int8_t>(ColIdx), Val);
+              Store.erase();
+            } else {
+              return makeError(
+                  "unsupported user '{0}' of stage I/O AccessChain '{1}'",
+                  AU->getName().getStringRef(), Sym);
+            }
+          }
+          AC.erase();
         } else {
           return makeError("unsupported user '{0}' of stage I/O global '{1}'",
                            U->getName().getStringRef(), Sym);
@@ -4059,7 +4406,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
 
   // 3g. Lower spirv.Kill -> crucible.discard(true).
   SmallVector<mlir::spirv::KillOp, 4> KillOps;
-  EntryFn.walk([&](mlir::spirv::KillOp K) { KillOps.push_back(K); });
+  SpvModule.walk([&](mlir::spirv::KillOp K) { KillOps.push_back(K); });
   for (auto K : KillOps) {
     mlir::OpBuilder B(K);
     mlir::Location Loc = K.getLoc();

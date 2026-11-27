@@ -1,0 +1,16 @@
+# Regression test for SPIR-V -> DXIL derivatives, discard (OpDemoteToHelperInvocation),
+# and SampleBias MinLod clamp (#184):
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E mainDerivDiscard -Fo %t.dd.spv %S/../Inputs/spirv_dxil_deriv_discard_clamp.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.dd.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.dd.spv -o %t.dd.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E mainSampleClamp -Fo %t.sc.spv %S/../Inputs/spirv_dxil_deriv_discard_clamp.hlsl
+# RUN: %cruciblec --target=dxil %t.sc.spv -o %t.sc.dxil
+
+# CHECK: define void @mainDerivDiscard()
+# CHECK-DAG: call void @dx.op.discard(i32 82, i1 true)
+# CHECK-DAG: call float @dx.op.unary.f32(i32 85, float {{%.*}})
+# CHECK-DAG: call float @dx.op.unary.f32(i32 84, float {{%.*}})
+# CHECK-DAG: call float @dx.op.unary.f32(i32 83, float {{%.*}})

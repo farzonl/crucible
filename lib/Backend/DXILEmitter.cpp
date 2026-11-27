@@ -929,6 +929,8 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
         cast<ConstantInt>(CI->getArgOperand(OffIdx))->getZExtValue();
     OffIdx += 1 + 2 * NumGrads;
   }
+  bool HasClamp = false;
+  Value *ClampVal = nullptr;
   if (OffIdx < CI->arg_size()) {
     uint32_t NumOffsets =
         cast<ConstantInt>(CI->getArgOperand(OffIdx))->getZExtValue();
@@ -943,25 +945,49 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
         ZeroOffset = OV;
       }
     }
+    unsigned ClampIdx = OffIdx + 1 + NumOffsets;
+    if (ClampIdx + 1 < CI->arg_size()) {
+      HasClamp = cast<ConstantInt>(CI->getArgOperand(ClampIdx))->getZExtValue() != 0;
+      if (HasClamp)
+        ClampVal = CI->getArgOperand(ClampIdx + 1);
+    }
   }
 
   Value *Res = nullptr;
   switch (Mode) {
   case ir::SampleMode::Implicit: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::dx_resource_sample,
-        {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
-         CoordVal->getType(), ZeroOffset->getType()});
-    Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, ZeroOffset});
+    if (HasClamp) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_sample_clamp,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), ZeroOffset->getType()});
+      Res = B.CreateCall(
+          Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, ZeroOffset, ClampVal});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_sample,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), ZeroOffset->getType()});
+      Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, ZeroOffset});
+    }
     break;
   }
   case ir::SampleMode::Bias: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::dx_resource_samplebias,
-        {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
-         CoordVal->getType(), ZeroOffset->getType()});
-    Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, LodOrBias,
-                            ZeroOffset});
+    if (HasClamp) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_samplebias_clamp,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), ZeroOffset->getType()});
+      Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, LodOrBias,
+                              ZeroOffset, ClampVal});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_samplebias,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), ZeroOffset->getType()});
+      Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, LodOrBias,
+                              ZeroOffset});
+    }
     break;
   }
   case ir::SampleMode::Level: {
@@ -992,22 +1018,41 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
     };
     Value *DDX = buildGradVec(GradIdx + 1);
     Value *DDY = buildGradVec(GradIdx + 1 + NumGrads);
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::dx_resource_samplegrad,
-        {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
-         CoordVal->getType(), DDX->getType(), DDY->getType(),
-         ZeroOffset->getType()});
-    Res = B.CreateCall(
-        Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, DDX, DDY, ZeroOffset});
+    if (HasClamp) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_samplegrad_clamp,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), DDX->getType(), DDY->getType(),
+           ZeroOffset->getType()});
+      Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, DDX,
+                              DDY, ZeroOffset, ClampVal});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_samplegrad,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), DDX->getType(), DDY->getType(),
+           ZeroOffset->getType()});
+      Res = B.CreateCall(
+          Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, DDX, DDY, ZeroOffset});
+    }
     break;
   }
   case ir::SampleMode::Cmp: {
-    Function *Fn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::dx_resource_samplecmp,
-        {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
-         CoordVal->getType(), ZeroOffset->getType()});
-    Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, CmpVal,
-                            ZeroOffset});
+    if (HasClamp) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_samplecmp_clamp,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), ZeroOffset->getType()});
+      Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, CmpVal,
+                              ZeroOffset, ClampVal});
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, Intrinsic::dx_resource_samplecmp,
+          {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+           CoordVal->getType(), ZeroOffset->getType()});
+      Res = B.CreateCall(Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, CmpVal,
+                              ZeroOffset});
+    }
     break;
   }
   case ir::SampleMode::CmpLevelZero: {
@@ -1561,8 +1606,20 @@ Error DXILLowerer::lowerPixelOp(CallInst *CI, DxOp Op) {
     else
       ID = (Quality == ir::DerivQuality::Fine) ? Intrinsic::dx_ddy_fine
                                                : Intrinsic::dx_ddy_coarse;
-    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
-    Value *Res = B.CreateCall(Fn, {Val});
+    Value *Res = nullptr;
+    if (auto *VTy = dyn_cast<FixedVectorType>(Val->getType())) {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(
+          &M, ID, {VTy->getElementType()});
+      Res = PoisonValue::get(VTy);
+      for (unsigned I = 0; I < VTy->getNumElements(); ++I) {
+        Value *Lane = B.CreateExtractElement(Val, B.getInt32(I));
+        Value *DLane = B.CreateCall(Fn, {Lane});
+        Res = B.CreateInsertElement(Res, DLane, B.getInt32(I));
+      }
+    } else {
+      Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
+      Res = B.CreateCall(Fn, {Val});
+    }
     CI->replaceAllUsesWith(Res);
     CI->eraseFromParent();
     return Error::success();
@@ -2610,6 +2667,8 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       Args.push_back(
           i32C(B, Loc, static_cast<int32_t>(COp.getOffsets().size())));
       Args.append(COp.getOffsets().begin(), COp.getOffsets().end());
+      Args.push_back(i32C(B, Loc, COp.getClamp() ? 1 : 0));
+      Args.push_back(COp.getClamp() ? COp.getClamp() : undefV(B, Loc, F32Ty));
       mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::TexSample,
                                        COp.getResult().getType(), Args);
       COp.getResult().replaceAllUsesWith(Rep);
