@@ -1243,6 +1243,62 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   if (Error E = expandModfStruct(Words))
     return std::move(E);
 
+  // Strip SPV_KHR_compute_shader_derivatives metadata (extension/capability/
+  // execution-mode) that newer DXC emits for compute quad ops, which MLIR's
+  // SPIR-V deserializer does not yet recognize even though it handles
+  // GroupNonUniformQuadSwap natively.
+  {
+    bool HasDerivExt = false;
+    auto IsExtName = [](ArrayRef<uint32_t> W, StringRef Name) {
+      std::string S;
+      S.reserve(W.size() * 4);
+      for (uint32_t Word : W) {
+        for (int B = 0; B < 4; ++B) {
+          char C = static_cast<char>((Word >> (B * 8)) & 0xff);
+          if (!C)
+            return S == Name;
+          S.push_back(C);
+        }
+      }
+      return S == Name;
+    };
+    for (size_t I = 5; I < Words.size();) {
+      uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+      if (Count == 0 || I + Count > Words.size())
+        break;
+      if (Op == spv::OpExtension && Count >= 2 &&
+          IsExtName(ArrayRef(Words).slice(I + 1, Count - 1),
+                    "SPV_KHR_compute_shader_derivatives")) {
+        HasDerivExt = true;
+        break;
+      }
+      I += Count;
+    }
+    if (HasDerivExt) {
+      SmallVector<uint32_t> Out(Words.begin(), Words.begin() + 5);
+      for (size_t I = 5; I < Words.size();) {
+        uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+        if (Count == 0 || I + Count > Words.size())
+          break;
+        bool Skip = false;
+        if (Op == spv::OpExtension && Count >= 2 &&
+            IsExtName(ArrayRef(Words).slice(I + 1, Count - 1),
+                      "SPV_KHR_compute_shader_derivatives"))
+          Skip = true;
+        else if (Op == spv::OpCapability && Count == 2 &&
+                 (Words[I + 1] == 5288u || Words[I + 1] == 5350u))
+          Skip = true;
+        else if (Op == spv::OpExecutionMode && Count >= 3 &&
+                 (Words[I + 2] == 5289u || Words[I + 2] == 5290u))
+          Skip = true;
+        if (!Skip)
+          Out.append(Words.begin() + I, Words.begin() + I + Count);
+        I += Count;
+      }
+      Words.assign(Out.begin(), Out.end());
+    }
+  }
+
   // Keep CFG as plain spirv.Branch / spirv.BranchConditional so
   // ConvertSPIRVToLLVM + LiftControlFlowToSCF handle all control flow.
   mlir::spirv::DeserializationOptions DeserOpts;
@@ -1478,6 +1534,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       RB.LowerBound = 0;
       RB.RangeSize = 1;
       RB.ElementStride = PaddedBytes;
+      RB.IsPushConstant = true;
 
       BoundCBufferInfo Info;
       Info.ReflectIndex = Reflect.Resources.size();
@@ -3753,6 +3810,36 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           B, Loc, I1Ty, Val,
           ir::WaveVoteKindAttr::get(B.getContext(), ir::WaveVoteKind::AllEqual));
       G.replaceAllUsesWith(W.getResult());
+      G.erase();
+    } else if (auto G = mlir::dyn_cast<mlir::spirv::GroupNonUniformQuadSwapOp>(
+                   Op)) {
+      mlir::Type OrigTy = G.getType();
+      mlir::Value Val = castToSignless(B, Loc, G.getValue());
+      uint32_t Dir = static_cast<uint32_t>(G.getDirection());
+      ir::QuadOpKind Kind = ir::QuadOpKind::ReadAcrossX;
+      if (Dir == 1)
+        Kind = ir::QuadOpKind::ReadAcrossY;
+      else if (Dir == 2)
+        Kind = ir::QuadOpKind::ReadAcrossDiagonal;
+      auto KindAttr = ir::QuadOpKindAttr::get(B.getContext(), Kind);
+      mlir::Value Res;
+      if (auto VT = mlir::dyn_cast<mlir::VectorType>(Val.getType())) {
+        mlir::Value Acc = mlir::LLVM::PoisonOp::create(B, Loc, VT);
+        for (int64_t I = 0; I < VT.getNumElements(); ++I) {
+          mlir::Value Idx = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, I);
+          mlir::Value Lane =
+              mlir::LLVM::ExtractElementOp::create(B, Loc, Val, Idx);
+          auto Q = ir::QuadOp::create(B, Loc, VT.getElementType(), Lane,
+                                      KindAttr);
+          Acc = mlir::LLVM::InsertElementOp::create(B, Loc, Acc, Q.getResult(),
+                                                    Idx);
+        }
+        Res = Acc;
+      } else {
+        auto Q = ir::QuadOp::create(B, Loc, Val.getType(), Val, KindAttr);
+        Res = Q.getResult();
+      }
+      G.replaceAllUsesWith(castFromSignless(B, Loc, Res, OrigTy));
       G.erase();
     } else if (auto G =
                    mlir::dyn_cast<mlir::spirv::GroupNonUniformElectOp>(Op)) {
