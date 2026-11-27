@@ -1,0 +1,21 @@
+# Verify capability-driven middle-end legalization:
+#   - DXIL target decomposes math.atan2, math.ctlz/cttz, and f32 math.fma
+#     into DXIL-supported ops (dx.op.unary.f32 atan, dx.op.unaryBits.i32).
+#   - Metal target keeps native atan2().
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/middle_end_dxil_math.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s --check-prefix=DXIL
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --check-prefix=MSL --input-file=%t.metal
+
+# DXIL: define void @main()
+# DXIL-NOT: llvm.ctlz
+# DXIL-NOT: llvm.cttz
+# DXIL-DAG: @dx.op.unary.f32
+# DXIL-DAG: @dx.op.unaryBits.i32
+# DXIL: @dx.op.rawBufferStore
+
+# MSL: kernel void
+# MSL: atan2(
