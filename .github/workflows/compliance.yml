@@ -484,26 +484,28 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng-v2
 
       - name: Install DXC and libpng (Windows x64)
         if: steps.cache-win-sdk.outputs.cache-hit != 'true'
         run: |
-          mkdir -p .sdk/bin
+          mkdir -p .sdk/bin .sdk/vcpkg
           curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.8.2505.1/dxc_2025_07_14.zip" -o /tmp/dxc.zip
           unzip -q /tmp/dxc.zip -d /tmp/dxc
           cp -a /tmp/dxc/bin/x64/* .sdk/bin/
           rm -rf /tmp/dxc /tmp/dxc.zip
-          "$(cygpath -u "$VCPKG_INSTALLATION_ROOT")/vcpkg.exe" install \
-            libpng:x64-windows-static-md \
-            --x-install-root="$(cygpath -w "${{ github.workspace }}/.sdk/vcpkg")"
+          VCPKG_ROOT="$(cygpath -u "$VCPKG_INSTALLATION_ROOT")"
+          "${VCPKG_ROOT}/vcpkg.exe" install libpng:x64-windows-static-md
+          cp -a "${VCPKG_ROOT}/installed/x64-windows-static-md/." .sdk/vcpkg/
+          test -f .sdk/vcpkg/include/png.h
+          ls -la .sdk/vcpkg/lib
 
       - name: Save Windows DXC and libpng SDK cache
         if: steps.cache-win-sdk.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .sdk
-          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng
+          key: crucible-sdk-${{ runner.os }}-${{ runner.arch }}-dxc-v1.8.2505.1-libpng-v2
 
       - name: Setup third_party LLVM/MLIR
         uses: ./.github/actions/setup-llvm
@@ -514,7 +516,7 @@ jobs:
           LIT_BIN="$(cygpath -m "$(which lit)")"
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="${WS}/.sdk/vcpkg/x64-windows-static-md" \
+            -DCMAKE_PREFIX_PATH="${WS}/.sdk/vcpkg" \
             -DLLVM_DIR="${WS}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${WS}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${WS}/.sdk/bin/dxc.exe" \
