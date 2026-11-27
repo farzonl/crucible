@@ -354,6 +354,21 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
 }
 
 llvm::Error assignDXILBindings(Reflection &R, const Options &Opts) {
+  // Remap Vulkan PushConstant sentinel space (0xFFFFFFFEu, which is reserved
+  // in D3D12 root signatures) to a valid unused register space.
+  uint32_t MaxNormalSpace = 0;
+  for (const ResourceBinding &RB : R.Resources) {
+    if (!RB.IsPushConstant && RB.Space < 0xFFFFFFF0u)
+      MaxNormalSpace = std::max(MaxNormalSpace, RB.Space + 1u);
+  }
+  for (ResourceBinding &RB : R.Resources) {
+    if (RB.IsPushConstant || RB.Space == 0xFFFFFFFEu) {
+      RB.IsPushConstant = true;
+      RB.Space = MaxNormalSpace;
+      RB.LowerBound = 0;
+    }
+  }
+
   // Preserve explicit (Class, Space, LowerBound) register assignments when
   // they do not collide (e.g. SPIR-V DescriptorSet -> space, Binding ->
   // register within each class). Resolve unbounded array overrides if given.

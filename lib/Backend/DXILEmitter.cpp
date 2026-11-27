@@ -2064,26 +2064,56 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       continue;
     }
     if (auto G = mlir::dyn_cast<mlir::gpu::SubgroupReduceOp>(Op)) {
-      int32_t Kind = 0;
-      switch (G.getOp()) {
-      case mlir::gpu::AllReduceOperation::ADD: Kind = 0; break;
-      case mlir::gpu::AllReduceOperation::MUL: Kind = 1; break;
-      case mlir::gpu::AllReduceOperation::MINSI:
-      case mlir::gpu::AllReduceOperation::MINIMUMF:
-      case mlir::gpu::AllReduceOperation::MINNUMF:
-      case mlir::gpu::AllReduceOperation::MINIMUMNUMF: Kind = 2; break;
-      case mlir::gpu::AllReduceOperation::MINUI: Kind = 3; break;
-      case mlir::gpu::AllReduceOperation::MAXSI:
-      case mlir::gpu::AllReduceOperation::MAXIMUMF:
-      case mlir::gpu::AllReduceOperation::MAXNUMF:
-      case mlir::gpu::AllReduceOperation::MAXIMUMNUMF: Kind = 4; break;
-      case mlir::gpu::AllReduceOperation::MAXUI: Kind = 5; break;
-      case mlir::gpu::AllReduceOperation::AND: Kind = 6; break;
-      case mlir::gpu::AllReduceOperation::OR: Kind = 7; break;
-      case mlir::gpu::AllReduceOperation::XOR: Kind = 8; break;
+      StringRef ScanKind;
+      if (auto Attr = G->getAttrOfType<mlir::StringAttr>("crucible.scan_kind"))
+        ScanKind = Attr.getValue();
+      int32_t Kind = -1;
+      if (ScanKind == "exclusive" || ScanKind == "inclusive") {
+        if (G.getOp() == mlir::gpu::AllReduceOperation::ADD)
+          Kind = 9;
+        else if (G.getOp() == mlir::gpu::AllReduceOperation::MUL)
+          Kind = 10;
+      }
+      if (Kind < 0) {
+        switch (G.getOp()) {
+        case mlir::gpu::AllReduceOperation::ADD: Kind = 0; break;
+        case mlir::gpu::AllReduceOperation::MUL: Kind = 1; break;
+        case mlir::gpu::AllReduceOperation::MINSI:
+        case mlir::gpu::AllReduceOperation::MINIMUMF:
+        case mlir::gpu::AllReduceOperation::MINNUMF:
+        case mlir::gpu::AllReduceOperation::MINIMUMNUMF: Kind = 2; break;
+        case mlir::gpu::AllReduceOperation::MINUI: Kind = 3; break;
+        case mlir::gpu::AllReduceOperation::MAXSI:
+        case mlir::gpu::AllReduceOperation::MAXIMUMF:
+        case mlir::gpu::AllReduceOperation::MAXNUMF:
+        case mlir::gpu::AllReduceOperation::MAXIMUMNUMF: Kind = 4; break;
+        case mlir::gpu::AllReduceOperation::MAXUI: Kind = 5; break;
+        case mlir::gpu::AllReduceOperation::AND: Kind = 6; break;
+        case mlir::gpu::AllReduceOperation::OR: Kind = 7; break;
+        case mlir::gpu::AllReduceOperation::XOR: Kind = 8; break;
+        }
       }
       mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::WaveReduce, G.getType(),
                                        {G.getValue(), i32C(B, Loc, Kind)});
+      if (ScanKind == "inclusive" && (Kind == 9 || Kind == 10)) {
+        mlir::Type Ty = G.getType();
+        mlir::Type ElemTy = Ty;
+        if (auto VT = mlir::dyn_cast<mlir::VectorType>(Ty))
+          ElemTy = VT.getElementType();
+        bool IsFloat = mlir::isa<mlir::FloatType>(ElemTy);
+        if (Kind == 9)
+          Rep = IsFloat
+                    ? mlir::LLVM::FAddOp::create(B, Loc, Rep, G.getValue())
+                          .getResult()
+                    : mlir::LLVM::AddOp::create(B, Loc, Rep, G.getValue())
+                          .getResult();
+        else
+          Rep = IsFloat
+                    ? mlir::LLVM::FMulOp::create(B, Loc, Rep, G.getValue())
+                          .getResult()
+                    : mlir::LLVM::MulOp::create(B, Loc, Rep, G.getValue())
+                          .getResult();
+      }
       G.getResult().replaceAllUsesWith(Rep);
       G.erase();
       continue;

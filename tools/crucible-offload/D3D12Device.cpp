@@ -312,6 +312,7 @@ struct BoundResource {
   ID3D12Resource *CounterReadbackBuf = nullptr;
   uint64_t SizeBytes = 0;
   uint64_t AllocBytes = 0;
+  std::vector<uint8_t> InlineData;
 };
 
 Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
@@ -399,6 +400,33 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
                             ? ((BR.SizeBytes + 255ull) & ~255ull)
                             : std::max<uint64_t>(BR.SizeBytes, 4ull);
         Bound.push_back(BR);
+      }
+    }
+  }
+
+  // Bind Vulkan PushConstants (remapped to a valid CBV space by
+  // assignDXILBindings) if referenced by the compiled shader.
+  if (!P.PushConstants.empty()) {
+    for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+      if (RB.Class == crucible::ResourceClass::CBV && RB.IsPushConstant) {
+        llvm::SmallVector<uint8_t, 64> PCBytes;
+        for (const auto &Block : P.PushConstants) {
+          if (Block.Stage == Stages::Compute || P.PushConstants.size() == 1) {
+            Block.getContent(PCBytes);
+            break;
+          }
+        }
+        uint64_t RawSize = std::max<uint64_t>(
+            {static_cast<uint64_t>(PCBytes.size()), RB.ElementStride, 16ull});
+        BoundResource BR;
+        BR.Res = nullptr;
+        BR.Class = crucible::ResourceClass::CBV;
+        BR.Space = RB.Space;
+        BR.Register = RB.LowerBound;
+        BR.InlineData.assign(PCBytes.begin(), PCBytes.end());
+        BR.SizeBytes = BR.InlineData.size();
+        BR.AllocBytes = (RawSize + 255ull) & ~255ull;
+        Bound.push_back(std::move(BR));
       }
     }
   }
@@ -517,7 +545,6 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
 
   for (uint32_t I = 0; I < Bound.size(); ++I) {
     BoundResource &BR = Bound[I];
-    const CPUBuffer &CPU = *BR.Res->BufferPtr;
     D3D12_CPU_DESCRIPTOR_HANDLE Slot{CpuStart.ptr +
                                      static_cast<SIZE_T>(I) * IncSize};
 
@@ -533,8 +560,13 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       if (FAILED(Hr))
         return hrErr(Hr, "Map CBV");
       std::memset(Mapped, 0, BR.AllocBytes);
-      if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx])
-        std::memcpy(Mapped, CPU.Data[BR.ArrIdx].get(), BR.SizeBytes);
+      if (!BR.InlineData.empty()) {
+        std::memcpy(Mapped, BR.InlineData.data(), BR.InlineData.size());
+      } else if (BR.Res && BR.Res->BufferPtr) {
+        const CPUBuffer &CPU = *BR.Res->BufferPtr;
+        if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx])
+          std::memcpy(Mapped, CPU.Data[BR.ArrIdx].get(), BR.SizeBytes);
+      }
       BR.UploadBuf->Unmap(0, nullptr);
 
       D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc{};
@@ -542,6 +574,7 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       CBVDesc.SizeInBytes = static_cast<UINT>(BR.AllocBytes);
       Dev->CreateConstantBufferView(&CBVDesc, Slot);
     } else {
+      const CPUBuffer &CPU = *BR.Res->BufferPtr;
       bool IsUAV = (BR.Class == crucible::ResourceClass::UAV);
       D3D12_RESOURCE_FLAGS Flags = IsUAV
                                        ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS

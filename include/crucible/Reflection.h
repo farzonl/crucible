@@ -88,6 +88,7 @@ struct ResourceBinding {
   uint32_t TypedComponents = 0; ///< Number of DXIL storage components per element.
   bool GloballyCoherent = false;
   bool HasCounter = false;
+  bool IsPushConstant = false;
   bool RequiresTextureAtomics = false; ///< Requires MTLTextureUsageShaderAtomic.
 
   /// Assigned Metal slot ([[buffer(n)]] / [[texture(n)]] / [[sampler(n)]]).
