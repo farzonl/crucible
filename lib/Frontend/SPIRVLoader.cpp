@@ -931,6 +931,7 @@ struct StageIOInfo {
   bool IsInput = true;
   mlir::Type ValueType;
   uint32_t Columns = 1;
+  bool IsMultiRow = false;
 };
 
 // Split a DXC SPIR-V stage variable name like "in.var.COLOR2" or
@@ -1971,18 +1972,29 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         if (auto Vec = mlir::dyn_cast<mlir::VectorType>(ValTy)) {
           ElemTy = Vec.getElementType();
           Cols = static_cast<uint32_t>(Vec.getNumElements());
+        } else if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(ValTy)) {
+          ElemTy = Arr.getElementType();
+          Cols = static_cast<uint32_t>(Arr.getNumElements());
         }
         StageParameter SP{};
         SP.ID = IsInput ? NextInputID++ : NextOutputID++;
         SP.Type = toComponentType(ElemTy);
         SP.Rows = 1;
-        SP.Columns = Cols;
+        SP.Columns = std::min(Cols, 4u);
         SP.Interpolation = 2; // Linear
         switch (*BI) {
         case mlir::spirv::BuiltIn::Position:
         case mlir::spirv::BuiltIn::FragCoord:
           SP.Semantic = "SV_Position";
           SP.Kind = 3; // Position
+          break;
+        case mlir::spirv::BuiltIn::ClipDistance:
+          SP.Semantic = "SV_ClipDistance";
+          SP.Kind = 6; // ClipDistance
+          break;
+        case mlir::spirv::BuiltIn::CullDistance:
+          SP.Semantic = "SV_CullDistance";
+          SP.Kind = 7; // CullDistance
           break;
         case mlir::spirv::BuiltIn::VertexIndex:
           SP.Semantic = "SV_VertexID";
@@ -2033,9 +2045,18 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       if (auto LA = GV->getAttrOfType<mlir::IntegerAttr>("location"))
         LocAttr = static_cast<uint32_t>(LA.getInt());
       mlir::Type ValTy = PtrTy.getPointeeType();
-      mlir::Type ElemTy = ValTy;
+      mlir::Type RowTy = ValTy;
+      uint32_t Rows = 1;
+      if (auto Arr = mlir::dyn_cast<mlir::spirv::ArrayType>(ValTy)) {
+        Rows = static_cast<uint32_t>(Arr.getNumElements());
+        RowTy = Arr.getElementType();
+      } else if (auto Mat = mlir::dyn_cast<mlir::spirv::MatrixType>(ValTy)) {
+        Rows = static_cast<uint32_t>(Mat.getNumColumns());
+        RowTy = Mat.getColumnType();
+      }
+      mlir::Type ElemTy = RowTy;
       uint32_t Cols = 1;
-      if (auto Vec = mlir::dyn_cast<mlir::VectorType>(ValTy)) {
+      if (auto Vec = mlir::dyn_cast<mlir::VectorType>(RowTy)) {
         ElemTy = Vec.getElementType();
         Cols = static_cast<uint32_t>(Vec.getNumElements());
       }
@@ -2045,10 +2066,11 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       SP.Semantic = Sem;
       SP.SemanticIndex = SemIdx;
       SP.Type = toComponentType(ElemTy);
-      SP.Rows = 1;
+      SP.Rows = Rows;
       SP.Columns = Cols;
       SP.Interpolation = 2; // Linear
-      SP.RowSemanticIndices = {SemIdx};
+      for (uint32_t R = 0; R < Rows; ++R)
+        SP.RowSemanticIndices.push_back(SemIdx + R);
       if (!IsInput && Reflect.Stage == ShaderStage::Pixel) {
         SP.Semantic = "SV_Target";
         SP.SemanticIndex = LocAttr;
@@ -2056,7 +2078,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       } else {
         SP.Kind = 0; // Arbitrary
       }
-      StageIOInfo IO{SP.ID, IsInput, ValTy, Cols};
+      StageIOInfo IO{SP.ID, IsInput, ValTy, Cols, Rows > 1};
       StageIOGlobals[GV.getSymName()] = IO;
       if (IsInput)
         Reflect.Inputs.push_back(std::move(SP));
@@ -3115,8 +3137,6 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         for (mlir::Value Idx : Chain.getIndices())
           AllIndices.push_back(Idx);
         size_t StartIdx = Info.IsArray ? 1 : 0;
-        if (AllIndices.size() <= StartIdx)
-          return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
 
         mlir::Value ArrIdx = Info.IsArray ? AllIndices[0] : mlir::Value();
         SmallVector<mlir::Operation *, 8> MemUsers(Chain->getUsers().begin(),
@@ -3127,6 +3147,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
               return Err;
             continue;
           }
+          if (AllIndices.size() <= StartIdx)
+            return makeError("unsupported access pattern on cbuffer '{0}'", Sym);
           auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(MU);
           if (!Load)
             return makeError("unsupported non-load user of cbuffer '{0}'", Sym);
@@ -3476,90 +3498,175 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           mlir::OpBuilder B(Load);
           mlir::Location Loc = Load.getLoc();
           mlir::Type ValTy = Load.getType();
-          auto VecTy = mlir::dyn_cast<mlir::VectorType>(ValTy);
-          mlir::Type ElemTy =
-              makeSignless(VecTy ? VecTy.getElementType() : ValTy, B);
-          auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
 
-          if (!VecTy) {
+          auto loadRow = [&](mlir::Type RowTy, int32_t RowIdx) -> mlir::Value {
+            auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, RowIdx);
+            if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(RowTy)) {
+              mlir::Type ElemTy = makeSignless(VecTy.getElementType(), B);
+              SmallVector<mlir::Value, 4> Comps;
+              for (unsigned C = 0; C < VecTy.getNumElements(); ++C) {
+                auto LI = ir::LoadInputOp::create(
+                    B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                    static_cast<int8_t>(C), /*vertex_id=*/mlir::Value());
+                Comps.push_back(
+                    castFromSignless(B, Loc, LI.getResult(), VecTy.getElementType()));
+              }
+              return mlir::spirv::CompositeConstructOp::create(
+                  B, Loc, RowTy, Comps).getResult();
+            }
+            mlir::Type ElemTy = makeSignless(RowTy, B);
             auto LI = ir::LoadInputOp::create(
                 B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
                 static_cast<int8_t>(0), /*vertex_id=*/mlir::Value());
-            Load.replaceAllUsesWith(LI.getResult());
+            return castFromSignless(B, Loc, LI.getResult(), RowTy);
+          };
+
+          if (auto ArrTy = mlir::dyn_cast<mlir::spirv::ArrayType>(ValTy)) {
+            SmallVector<mlir::Value, 4> Elems;
+            for (unsigned R = 0; R < ArrTy.getNumElements(); ++R)
+              Elems.push_back(loadRow(ArrTy.getElementType(), static_cast<int32_t>(R)));
+            auto Agg = mlir::spirv::CompositeConstructOp::create(B, Loc, ValTy, Elems);
+            Load.replaceAllUsesWith(Agg.getResult());
+          } else if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(ValTy)) {
+            SmallVector<mlir::Value, 4> Cols;
+            for (unsigned R = 0; R < MatTy.getNumColumns(); ++R)
+              Cols.push_back(loadRow(MatTy.getColumnType(), static_cast<int32_t>(R)));
+            auto Agg = mlir::spirv::CompositeConstructOp::create(B, Loc, ValTy, Cols);
+            Load.replaceAllUsesWith(Agg.getResult());
           } else {
-            SmallVector<mlir::Value, 4> Comps;
-            for (unsigned C = 0; C < Info.Columns; ++C) {
-              auto LI = ir::LoadInputOp::create(
-                  B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
-                  static_cast<int8_t>(C), /*vertex_id=*/mlir::Value());
-              Comps.push_back(LI.getResult());
-            }
-            auto Vec = mlir::spirv::CompositeConstructOp::create(
-                B, Loc, ValTy, Comps);
-            Load.replaceAllUsesWith(Vec.getResult());
+            Load.replaceAllUsesWith(loadRow(ValTy, 0));
           }
           Load.erase();
         } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(U)) {
           mlir::OpBuilder B(Store);
           mlir::Location Loc = Store.getLoc();
-          mlir::Value Val = castToSignless(B, Loc, Store.getValue());
-          auto VecTy = mlir::dyn_cast<mlir::VectorType>(Val.getType());
-          mlir::Type ElemTy =
-              VecTy ? VecTy.getElementType() : Val.getType();
-          auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+          mlir::Value OrigVal = Store.getValue();
+          mlir::Type ValTy = OrigVal.getType();
 
-          if (!VecTy) {
-            ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
-                                      RowC, static_cast<int8_t>(0), Val);
-          } else {
-            for (unsigned C = 0; C < Info.Columns; ++C) {
-              auto IdxC = mlir::LLVM::ConstantOp::create(
-                  B, Loc, I32Ty, static_cast<int32_t>(C));
-              auto Lane = mlir::LLVM::ExtractElementOp::create(
-                  B, Loc, Val, IdxC);
+          auto storeRow = [&](mlir::Value RowVal, int32_t RowIdx) {
+            mlir::Value SVal = castToSignless(B, Loc, RowVal);
+            auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, RowIdx);
+            if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(SVal.getType())) {
+              for (unsigned C = 0; C < VecTy.getNumElements(); ++C) {
+                auto IdxC = mlir::LLVM::ConstantOp::create(
+                    B, Loc, I32Ty, static_cast<int32_t>(C));
+                auto Lane = mlir::LLVM::ExtractElementOp::create(
+                    B, Loc, SVal, IdxC);
+                ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
+                                          RowC, static_cast<int8_t>(C),
+                                          Lane.getResult());
+              }
+            } else {
               ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
-                                        RowC, static_cast<int8_t>(C),
-                                        Lane.getResult());
+                                        RowC, static_cast<int8_t>(0), SVal);
             }
+          };
+
+          if (auto ArrTy = mlir::dyn_cast<mlir::spirv::ArrayType>(ValTy)) {
+            for (unsigned R = 0; R < ArrTy.getNumElements(); ++R) {
+              auto Elem = mlir::spirv::CompositeExtractOp::create(
+                  B, Loc, OrigVal, ArrayRef<int32_t>{static_cast<int32_t>(R)});
+              storeRow(Elem.getResult(), static_cast<int32_t>(R));
+            }
+          } else if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(ValTy)) {
+            for (unsigned R = 0; R < MatTy.getNumColumns(); ++R) {
+              auto Col = mlir::spirv::CompositeExtractOp::create(
+                  B, Loc, OrigVal, ArrayRef<int32_t>{static_cast<int32_t>(R)});
+              storeRow(Col.getResult(), static_cast<int32_t>(R));
+            }
+          } else {
+            storeRow(OrigVal, 0);
           }
           Store.erase();
         } else if (auto AC = mlir::dyn_cast<mlir::spirv::AccessChainOp>(U)) {
           auto Indices = AC.getIndices();
-          int64_t ColIdx = -1;
-          if (Indices.size() == 1) {
-            if (auto SC = Indices[0].getDefiningOp<mlir::spirv::ConstantOp>()) {
+          auto readConstIdx = [](mlir::Value V) -> int64_t {
+            if (auto SC = V.getDefiningOp<mlir::spirv::ConstantOp>()) {
               if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(SC.getValue()))
-                ColIdx = IA.getInt();
-            } else if (auto LC =
-                           Indices[0].getDefiningOp<mlir::LLVM::ConstantOp>()) {
+                return IA.getInt();
+            } else if (auto LC = V.getDefiningOp<mlir::LLVM::ConstantOp>()) {
               if (auto IA = mlir::dyn_cast<mlir::IntegerAttr>(LC.getValue()))
-                ColIdx = IA.getInt();
+                return IA.getInt();
             }
+            return -1;
+          };
+          int64_t RowIdx = 0;
+          int64_t ColIdx = 0;
+          if (Info.IsMultiRow) {
+            if (Indices.empty() || Indices.size() > 2)
+              return makeError(
+                  "unsupported AccessChain index on stage I/O global '{0}'", Sym);
+            RowIdx = readConstIdx(Indices[0]);
+            if (RowIdx < 0)
+              return makeError(
+                  "unsupported AccessChain row index on stage I/O global '{0}'",
+                  Sym);
+            if (Indices.size() == 2) {
+              ColIdx = readConstIdx(Indices[1]);
+              if (ColIdx < 0 || ColIdx >= 4)
+                return makeError(
+                    "unsupported AccessChain col index on stage I/O global '{0}'",
+                    Sym);
+            }
+          } else {
+            if (Indices.size() != 1)
+              return makeError(
+                  "unsupported AccessChain index on stage I/O global '{0}'", Sym);
+            ColIdx = readConstIdx(Indices[0]);
+            if (ColIdx < 0 || ColIdx >= 4)
+              return makeError(
+                  "unsupported AccessChain index on stage I/O global '{0}'", Sym);
           }
-          if (ColIdx < 0 || ColIdx >= 4)
-            return makeError(
-                "unsupported AccessChain index on stage I/O global '{0}'", Sym);
           SmallVector<mlir::Operation *, 4> ACUsers(AC->getUsers().begin(),
                                                     AC->getUsers().end());
           for (mlir::Operation *AU : ACUsers) {
             if (auto Load = mlir::dyn_cast<mlir::spirv::LoadOp>(AU)) {
               mlir::OpBuilder B(Load);
               mlir::Location Loc = Load.getLoc();
-              mlir::Type ElemTy = makeSignless(Load.getType(), B);
-              auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
-              auto LI = ir::LoadInputOp::create(
-                  B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
-                  static_cast<int8_t>(ColIdx), /*vertex_id=*/mlir::Value());
-              Load.replaceAllUsesWith(
-                  castFromSignless(B, Loc, LI.getResult(), Load.getType()));
+              auto RowC = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(RowIdx));
+              if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(Load.getType())) {
+                mlir::Type ElemTy = makeSignless(VecTy.getElementType(), B);
+                SmallVector<mlir::Value, 4> Comps;
+                for (unsigned C = 0; C < VecTy.getNumElements(); ++C) {
+                  auto LI = ir::LoadInputOp::create(
+                      B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                      static_cast<int8_t>(C), /*vertex_id=*/mlir::Value());
+                  Comps.push_back(castFromSignless(B, Loc, LI.getResult(),
+                                                   VecTy.getElementType()));
+                }
+                auto Vec = mlir::spirv::CompositeConstructOp::create(
+                    B, Loc, Load.getType(), Comps);
+                Load.replaceAllUsesWith(Vec.getResult());
+              } else {
+                mlir::Type ElemTy = makeSignless(Load.getType(), B);
+                auto LI = ir::LoadInputOp::create(
+                    B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                    static_cast<int8_t>(ColIdx), /*vertex_id=*/mlir::Value());
+                Load.replaceAllUsesWith(
+                    castFromSignless(B, Loc, LI.getResult(), Load.getType()));
+              }
               Load.erase();
             } else if (auto Store = mlir::dyn_cast<mlir::spirv::StoreOp>(AU)) {
               mlir::OpBuilder B(Store);
               mlir::Location Loc = Store.getLoc();
               mlir::Value Val = castToSignless(B, Loc, Store.getValue());
-              auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
-              ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
-                                        RowC, static_cast<int8_t>(ColIdx), Val);
+              auto RowC = mlir::LLVM::ConstantOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(RowIdx));
+              if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(Val.getType())) {
+                for (unsigned C = 0; C < VecTy.getNumElements(); ++C) {
+                  auto IdxC = mlir::LLVM::ConstantOp::create(
+                      B, Loc, I32Ty, static_cast<int32_t>(C));
+                  auto Lane = mlir::LLVM::ExtractElementOp::create(
+                      B, Loc, Val, IdxC);
+                  ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
+                                            RowC, static_cast<int8_t>(C),
+                                            Lane.getResult());
+                }
+              } else {
+                ir::StoreOutputOp::create(B, Loc, static_cast<int32_t>(Info.ID),
+                                          RowC, static_cast<int8_t>(ColIdx), Val);
+              }
               Store.erase();
             } else {
               return makeError(
@@ -5605,13 +5712,26 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   }
 
   // Upstream handles aggregate insert/extract and memory operations, but not
-  // construction. Use its type converter so local aggregate layouts agree.
+  // construction. Use its type converter so local aggregate layouts agree,
+  // augmented with signless integer/vector conversions for signed/unsigned
+  // SPIR-V struct fields (e.g. si32 / vector<3xsi32>).
   mlir::LLVMTypeConverter AggregateTypes(&Ctx);
+  AggregateTypes.addConversion([](mlir::IntegerType T) -> mlir::Type {
+    if (T.isSignless())
+      return T;
+    return mlir::IntegerType::get(T.getContext(), T.getWidth());
+  });
+  AggregateTypes.addConversion([&](mlir::VectorType VT) -> mlir::Type {
+    mlir::Type E = AggregateTypes.convertType(VT.getElementType());
+    if (!E)
+      return nullptr;
+    return mlir::VectorType::get(VT.getShape(), E);
+  });
   mlir::populateSPIRVToLLVMTypeConversion(AggregateTypes);
   SmallVector<mlir::spirv::CompositeConstructOp, 8> AggregateConstructs;
   EntryFn.walk([&](mlir::spirv::CompositeConstructOp CC) {
-    if (mlir::isa<mlir::spirv::StructType, mlir::spirv::ArrayType>(
-            CC.getType()))
+    if (mlir::isa<mlir::spirv::StructType, mlir::spirv::ArrayType,
+                  mlir::spirv::MatrixType>(CC.getType()))
       AggregateConstructs.push_back(CC);
   });
   for (auto CC : AggregateConstructs) {
