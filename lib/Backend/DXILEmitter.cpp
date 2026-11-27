@@ -811,20 +811,44 @@ Error DXILLowerer::lowerTexLoad(CallInst *CI) {
       CoordVal = B.CreateInsertElement(CoordVal, CI->getArgOperand(4 + I),
                                        B.getInt32(I));
   }
-  Value *OffsetVal = Constant::getNullValue(CoordVal->getType());
+  auto spatialDims = [](const ResourceBinding *RB, uint32_t Fallback) -> uint32_t {
+    if (!RB)
+      return Fallback;
+    switch (RB->Kind) {
+    case ResourceKind::Texture1D:
+    case ResourceKind::Texture1DArray:
+      return 1;
+    case ResourceKind::Texture2D:
+    case ResourceKind::Texture2DArray:
+    case ResourceKind::Texture2DMS:
+    case ResourceKind::Texture2DMSArray:
+      return 2;
+    case ResourceKind::Texture3D:
+      return 3;
+    case ResourceKind::TextureCube:
+    case ResourceKind::TextureCubeArray:
+      return 0;
+    default:
+      return Fallback;
+    }
+  };
+  uint32_t SpatialDims = spatialDims(RH.RB, NumCoords);
+  Value *OffsetVal = UndefValue::get(CoordVal->getType());
   unsigned OffStart = 4 + NumCoords;
-  if (OffStart < CI->arg_size()) {
-    uint32_t NumOffsets =
-        cast<ConstantInt>(CI->getArgOperand(OffStart))->getZExtValue();
-    if (NumOffsets > 0) {
-      if (NumCoords == 1) {
-        OffsetVal = CI->getArgOperand(OffStart + 1);
-      } else {
-        Type *OffTy = CoordVal->getType();
-        OffsetVal = Constant::getNullValue(OffTy);
-        for (unsigned I = 0; I < std::min(NumOffsets, NumCoords); ++I)
-          OffsetVal = B.CreateInsertElement(
-              OffsetVal, CI->getArgOperand(OffStart + 1 + I), B.getInt32(I));
+  uint32_t NumOffsets = 0;
+  if (OffStart < CI->arg_size())
+    NumOffsets = cast<ConstantInt>(CI->getArgOperand(OffStart))->getZExtValue();
+  if (SpatialDims > 0) {
+    if (NumCoords == 1) {
+      OffsetVal = (NumOffsets > 0) ? CI->getArgOperand(OffStart + 1)
+                                   : static_cast<Value *>(B.getInt32(0));
+    } else {
+      Type *OffTy = CoordVal->getType();
+      OffsetVal = UndefValue::get(OffTy);
+      for (unsigned I = 0; I < std::min(SpatialDims, NumCoords); ++I) {
+        Value *OV = (I < NumOffsets) ? CI->getArgOperand(OffStart + 1 + I)
+                                     : static_cast<Value *>(B.getInt32(0));
+        OffsetVal = B.CreateInsertElement(OffsetVal, OV, B.getInt32(I));
       }
     }
   }
@@ -918,11 +942,33 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
       CoordVal = B.CreateInsertElement(CoordVal, CI->getArgOperand(7 + I),
                                        B.getInt32(I));
   }
+  auto spatialDims = [](const ResourceBinding *RB, uint32_t Fallback) -> uint32_t {
+    if (!RB)
+      return Fallback;
+    switch (RB->Kind) {
+    case ResourceKind::Texture1D:
+    case ResourceKind::Texture1DArray:
+      return 1;
+    case ResourceKind::Texture2D:
+    case ResourceKind::Texture2DArray:
+    case ResourceKind::Texture2DMS:
+    case ResourceKind::Texture2DMSArray:
+      return 2;
+    case ResourceKind::Texture3D:
+      return 3;
+    case ResourceKind::TextureCube:
+    case ResourceKind::TextureCubeArray:
+      return 0;
+    default:
+      return Fallback;
+    }
+  };
+  uint32_t SpatialDims = spatialDims(TexRH.RB, NumCoords);
   Type *OffsetTy = (NumCoords == 1)
                        ? static_cast<Type *>(B.getInt32Ty())
                        : static_cast<Type *>(
                              FixedVectorType::get(B.getInt32Ty(), NumCoords));
-  Value *ZeroOffset = Constant::getNullValue(OffsetTy);
+  Value *ZeroOffset = UndefValue::get(OffsetTy);
   unsigned OffIdx = 7 + NumCoords;
   if (Mode == ir::SampleMode::Grad && OffIdx < CI->arg_size()) {
     uint32_t NumGrads =
@@ -931,25 +977,28 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
   }
   bool HasClamp = false;
   Value *ClampVal = nullptr;
+  uint32_t NumOffsets = 0;
   if (OffIdx < CI->arg_size()) {
-    uint32_t NumOffsets =
-        cast<ConstantInt>(CI->getArgOperand(OffIdx))->getZExtValue();
-    if (NumOffsets > 0) {
-      if (NumCoords == 1) {
-        ZeroOffset = CI->getArgOperand(OffIdx + 1);
-      } else {
-        Value *OV = Constant::getNullValue(OffsetTy);
-        for (unsigned I = 0; I < std::min(NumOffsets, NumCoords); ++I)
-          OV = B.CreateInsertElement(OV, CI->getArgOperand(OffIdx + 1 + I),
-                                     B.getInt32(I));
-        ZeroOffset = OV;
-      }
-    }
+    NumOffsets = cast<ConstantInt>(CI->getArgOperand(OffIdx))->getZExtValue();
     unsigned ClampIdx = OffIdx + 1 + NumOffsets;
     if (ClampIdx + 1 < CI->arg_size()) {
       HasClamp = cast<ConstantInt>(CI->getArgOperand(ClampIdx))->getZExtValue() != 0;
       if (HasClamp)
         ClampVal = CI->getArgOperand(ClampIdx + 1);
+    }
+  }
+  if (SpatialDims > 0) {
+    if (NumCoords == 1) {
+      ZeroOffset = (NumOffsets > 0) ? CI->getArgOperand(OffIdx + 1)
+                                    : static_cast<Value *>(B.getInt32(0));
+    } else {
+      Value *OV = UndefValue::get(OffsetTy);
+      for (unsigned I = 0; I < std::min(SpatialDims, NumCoords); ++I) {
+        Value *Lane = (I < NumOffsets) ? CI->getArgOperand(OffIdx + 1 + I)
+                                       : static_cast<Value *>(B.getInt32(0));
+        OV = B.CreateInsertElement(OV, Lane, B.getInt32(I));
+      }
+      ZeroOffset = OV;
     }
   }
 
@@ -1799,7 +1848,24 @@ void DXILLowerer::emitSemanticSignatures() {
     if (Params.empty())
       return nullptr;
     SmallVector<Metadata *, 8> Nodes;
+    // For VS outputs and PS inputs, assign deterministic stage-independent
+    // StartRows so VS OSG1 and PS ISG1 always match on D3D12:
+    //   - SV_Position (Kind == 3) -> Row 0
+    //   - User varyings with SPIR-V Location L -> Row 1 + L
+    //   - Other allocated SGVs (ClipDistance, CullDistance, IsFrontFace, ...)
+    //     -> allocated sequentially after the highest user varying row.
+    bool IsInterStage = (!IsInput && Reflect.Stage == ShaderStage::Vertex) ||
+                        (IsInput && Reflect.Stage == ShaderStage::Pixel);
     uint32_t NextRow = 0;
+    if (IsInterStage) {
+      NextRow = 1; // Reserve Row 0 for SV_Position
+      for (const StageParameter &SP : Params) {
+        if (SP.Location != UINT32_MAX) {
+          uint32_t Rows = std::max(1u, SP.Rows);
+          NextRow = std::max(NextRow, 1u + SP.Location + Rows);
+        }
+      }
+    }
     for (const StageParameter &SP : Params) {
       uint32_t Kind = SP.Kind;
       // Normalize SemanticKind for known system values if Kind == 0.
@@ -1827,6 +1893,10 @@ void DXILLowerer::emitSemanticSignatures() {
       if (!IsNotAllocated) {
         if (Kind == 16 && !IsInput && Reflect.Stage == ShaderStage::Pixel) {
           StartRow = SP.SemanticIndex;
+        } else if (IsInterStage && Kind == 3) {
+          StartRow = 0;
+        } else if (IsInterStage && SP.Location != UINT32_MAX) {
+          StartRow = 1u + SP.Location;
         } else {
           StartRow = NextRow;
           NextRow += Rows;

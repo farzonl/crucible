@@ -1999,6 +1999,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         case mlir::spirv::BuiltIn::FrontFacing:
           SP.Semantic = "SV_IsFrontFace";
           SP.Kind = 13;
+          SP.Type = ComponentType::U32;
           break;
         case mlir::spirv::BuiltIn::FragDepth:
           SP.Semantic = "SV_Depth";
@@ -2047,6 +2048,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       SP.Type = toComponentType(ElemTy);
       SP.Rows = 1;
       SP.Columns = Cols;
+      SP.Location = LocAttr;
       SP.Interpolation = 2; // Linear
       SP.RowSemanticIndices = {SemIdx};
       if (!IsInput && Reflect.Stage == ShaderStage::Pixel) {
@@ -3482,10 +3484,20 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
 
           if (!VecTy) {
-            auto LI = ir::LoadInputOp::create(
-                B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
-                static_cast<int8_t>(0), /*vertex_id=*/mlir::Value());
-            Load.replaceAllUsesWith(LI.getResult());
+            if (ValTy.isInteger(1)) {
+              auto LI = ir::LoadInputOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(Info.ID), RowC,
+                  static_cast<int8_t>(0), /*vertex_id=*/mlir::Value());
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              auto Cmp = mlir::LLVM::ICmpOp::create(
+                  B, Loc, mlir::LLVM::ICmpPredicate::ne, LI.getResult(), ZeroC);
+              Load.replaceAllUsesWith(Cmp.getResult());
+            } else {
+              auto LI = ir::LoadInputOp::create(
+                  B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
+                  static_cast<int8_t>(0), /*vertex_id=*/mlir::Value());
+              Load.replaceAllUsesWith(LI.getResult());
+            }
           } else {
             SmallVector<mlir::Value, 4> Comps;
             for (unsigned C = 0; C < Info.Columns; ++C) {

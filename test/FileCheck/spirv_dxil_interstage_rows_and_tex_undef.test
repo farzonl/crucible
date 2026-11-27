@@ -1,0 +1,29 @@
+# Regression test for Batch 12 DXIL semantics & validation fixes (#184):
+# - Stage-independent VS/PS StartRow alignment (SV_Position=row 0, loc L=row 1+L)
+# - SV_IsFrontFace loaded as scalar i32 (ComponentType::U32) then compared != 0
+# - Non-spatial offset lanes on Texture2DArray are undef (not 0)
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T cs_6_0 -E mainLoad -Fo %t.load.spv %S/../Inputs/spirv_dxil_interstage_rows_and_tex_undef.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.load.spv | FileCheck %s --check-prefix=LOAD
+# RUN: %cruciblec --target=dxil %t.load.spv -o %t.load.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T vs_6_0 -E mainVS -Fo %t.vs.spv %S/../Inputs/spirv_dxil_interstage_rows_and_tex_undef.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.vs.spv | FileCheck %s --check-prefix=VS
+# RUN: %cruciblec --target=dxil %t.vs.spv -o %t.vs.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E mainPS -Fo %t.ps.spv %S/../Inputs/spirv_dxil_interstage_rows_and_tex_undef.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.ps.spv | FileCheck %s --check-prefix=PS
+# RUN: %cruciblec --target=dxil %t.ps.spv -o %t.ps.dxil
+
+# LOAD: define void @mainLoad()
+# LOAD-DAG: call %dx.types.ResRet.f32 @dx.op.textureLoad.f32(i32 66, %dx.types.Handle {{%.*}}, i32 0, i32 0, i32 0, i32 0, i32 1, i32 -1, i32 undef)
+
+# VS: define void @mainVS()
+# VS-DAG: !"SV_Position", i8 9, i8 3, {{![0-9]+}}, i8 4, i32 1, i8 4, i32 0, i8 0
+# VS-DAG: !"USER_SEMANTIC", i8 9, i8 0, {{![0-9]+}}, i8 2, i32 1, i8 4, i32 1, i8 0
+
+# PS: define void @mainPS()
+# PS-DAG: call i32 @dx.op.loadInput.i32(i32 4, i32 {{[0-9]+}}, i32 0, i8 0, i32 poison)
+# PS-DAG: !"USER_SEMANTIC", i8 9, i8 0, {{![0-9]+}}, i8 2, i32 1, i8 4, i32 1, i8 0
+# PS-DAG: !"SV_IsFrontFace", i8 5, i8 13
