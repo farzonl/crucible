@@ -5,7 +5,7 @@
 # RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
 # RUN: %nacelle-compile --cs %t.dxil --emit-scf > /dev/null
 # RUN: %crucible-run --backend d3d12 --dxil %t.dxil --groups 1,1,1 \
-# RUN:   --buffer 0:f32:8:iota | FileCheck %s
+# RUN:   --buffer 0:f32:64:iota | FileCheck %s
 
 # Out[i] = i * 2 + 1
 # CHECK: buffer0: 1 3 5 7 9 11 13 15
