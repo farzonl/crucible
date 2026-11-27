@@ -298,6 +298,73 @@ Expected<ID3D12Resource *> createCommittedBuffer(ID3D12Device *Dev,
   return Res;
 }
 
+D3D12_TEXTURE_ADDRESS_MODE d3d12AddressMode(AddressMode A) {
+  switch (A) {
+  case AddressMode::Clamp:
+    return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  case AddressMode::Repeat:
+    return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  case AddressMode::Mirror:
+    return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+  case AddressMode::Border:
+    return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+  case AddressMode::MirrorOnce:
+    return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+  }
+  return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+}
+
+D3D12_COMPARISON_FUNC d3d12CompareFunc(CompareFunction C) {
+  switch (C) {
+  case CompareFunction::Never:
+    return D3D12_COMPARISON_FUNC_NEVER;
+  case CompareFunction::Less:
+    return D3D12_COMPARISON_FUNC_LESS;
+  case CompareFunction::Equal:
+    return D3D12_COMPARISON_FUNC_EQUAL;
+  case CompareFunction::LessEqual:
+    return D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  case CompareFunction::Greater:
+    return D3D12_COMPARISON_FUNC_GREATER;
+  case CompareFunction::NotEqual:
+    return D3D12_COMPARISON_FUNC_NOT_EQUAL;
+  case CompareFunction::GreaterEqual:
+    return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+  case CompareFunction::Always:
+    return D3D12_COMPARISON_FUNC_ALWAYS;
+  }
+  return D3D12_COMPARISON_FUNC_NEVER;
+}
+
+D3D12_FILTER d3d12Filter(const YAMLSampler &S) {
+  bool MinLin = (S.MinFilter != FilterMode::Nearest);
+  bool MagLin = (S.MagFilter != FilterMode::Nearest);
+  bool MipLin = MinLin;
+  bool Cmp = (S.Kind == SamplerKind::SamplerComparison);
+  auto Type = Cmp ? D3D12_FILTER_REDUCTION_TYPE_COMPARISON
+                  : D3D12_FILTER_REDUCTION_TYPE_STANDARD;
+  return D3D12_ENCODE_BASIC_FILTER(
+      MinLin ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+      MagLin ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT,
+      MipLin ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT, Type);
+}
+
+struct BoundSampler {
+  const offloadtest::Resource *Res = nullptr;
+  uint32_t Space = 0;
+  uint32_t Register = 0;
+};
+
+struct TexSubresourceLayout {
+  uint32_t Subresource = 0;
+  uint32_t Width = 1;
+  uint32_t Height = 1;
+  uint32_t Depth = 1;
+  uint32_t RowPitch = 256;
+  uint64_t SrcOffset = 0;
+  uint64_t DstOffset = 0;
+};
+
 struct BoundResource {
   const offloadtest::Resource *Res = nullptr;
   uint32_t ArrIdx = 0;
@@ -314,6 +381,11 @@ struct BoundResource {
   uint64_t AllocBytes = 0;
   std::vector<uint8_t> InlineData;
   bool IsStandaloneCounter = false;
+  bool IsTexture = false;
+  uint32_t TexW = 1, TexH = 1, TexD = 1, TexMips = 1, TexSlices = 1;
+  uint32_t TexBytesPerPixel = 4;
+  DXGI_FORMAT TexFmt = DXGI_FORMAT_R32G32B32A32_FLOAT;
+  std::vector<TexSubresourceLayout> TexLayouts;
 };
 
 Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
@@ -350,14 +422,57 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
 
   // Map pipeline resources to their DXIL (Class, Space, Register) bindings.
   std::vector<BoundResource> Bound;
+  std::vector<BoundSampler> BoundSamplers;
   for (size_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx) {
     for (const offloadtest::Resource &Res : P.Sets[SetIdx].Resources) {
-      if (Res.isSampler() || Res.isTexture() || Res.isAccelerationStructure())
+      if (Res.isAccelerationStructure())
         return createStringError(
             std::errc::not_supported,
             "D3D12 offload proxy does not yet support texture/sampler/AS "
             "resource '%s'",
             Res.Name.c_str());
+
+      if (Res.isSampler()) {
+        if (!Res.SamplerPtr)
+          return createStringError(std::errc::invalid_argument,
+                                   "sampler '%s' has no descriptor",
+                                   Res.Name.c_str());
+        uint32_t Space = static_cast<uint32_t>(SetIdx);
+        uint32_t BaseReg = 0;
+        if (Res.VKBinding) {
+          BaseReg = Res.VKBinding->Binding;
+        } else if (Res.DXBinding) {
+          Space = Res.DXBinding->Space;
+          BaseReg = Res.DXBinding->Register;
+        }
+        bool MatchedByName = false;
+        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+          if (RB.Class == crucible::ResourceClass::Sampler &&
+              !RB.Name.empty() && RB.Name == Res.Name) {
+            Space = RB.Space;
+            BaseReg = RB.LowerBound;
+            MatchedByName = true;
+            break;
+          }
+        }
+        if (!MatchedByName) {
+          for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+            if (RB.Class == crucible::ResourceClass::Sampler &&
+                RB.Space == Space && RB.LowerBound == BaseReg) {
+              Space = RB.Space;
+              BaseReg = RB.LowerBound;
+              break;
+            }
+          }
+        }
+        BoundSampler BS;
+        BS.Res = &Res;
+        BS.Space = Space;
+        BS.Register = BaseReg;
+        BoundSamplers.push_back(BS);
+        continue;
+      }
+
       if (!Res.BufferPtr)
         return createStringError(std::errc::invalid_argument,
                                  "resource '%s' has no backing buffer",
@@ -408,10 +523,52 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
         BR.Space = Space;
         BR.Register = BaseReg + A;
         BR.SizeBytes = Res.BufferPtr->Size;
-        BR.AllocBytes = (Class == crucible::ResourceClass::CBV)
-                            ? ((BR.SizeBytes + 255ull) & ~255ull)
-                            : std::max<uint64_t>(BR.SizeBytes, 4ull);
-        Bound.push_back(BR);
+        if (Res.isTexture()) {
+          BR.IsTexture = true;
+          const CPUBuffer &CPU = *Res.BufferPtr;
+          BR.TexW = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Width));
+          BR.TexH = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Height));
+          BR.TexD = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Depth));
+          BR.TexMips =
+              static_cast<uint32_t>(std::max(1, CPU.OutputProps.MipLevels));
+          BR.TexSlices =
+              static_cast<uint32_t>(std::max(1, CPU.OutputProps.ArraySlices));
+          BR.TexFmt = dxgiFormatForBuffer(CPU);
+          unsigned Ch = CPU.Channels ? static_cast<unsigned>(CPU.Channels) : 1u;
+          BR.TexBytesPerPixel =
+              static_cast<uint32_t>(CPU.getSingleElementSize() * Ch);
+          uint64_t SrcOff = 0, DstOff = 0;
+          for (uint32_t S = 0; S < BR.TexSlices; ++S) {
+            for (uint32_t M = 0; M < BR.TexMips; ++M) {
+              uint32_t MW = std::max(1u, BR.TexW >> M);
+              uint32_t MH = std::max(1u, BR.TexH >> M);
+              uint32_t MD = std::max(1u, BR.TexD >> M);
+              uint32_t RawPitch = MW * BR.TexBytesPerPixel;
+              uint32_t AlignedPitch =
+                  (RawPitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+                  ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+              DstOff = (DstOff + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull) &
+                       ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull);
+              TexSubresourceLayout L{};
+              L.Subresource = S * BR.TexMips + M;
+              L.Width = MW;
+              L.Height = MH;
+              L.Depth = MD;
+              L.RowPitch = AlignedPitch;
+              L.SrcOffset = SrcOff;
+              L.DstOffset = DstOff;
+              BR.TexLayouts.push_back(L);
+              SrcOff += static_cast<uint64_t>(RawPitch) * MH * MD;
+              DstOff += static_cast<uint64_t>(AlignedPitch) * MH * MD;
+            }
+          }
+          BR.AllocBytes = std::max<uint64_t>(DstOff, 256ull);
+        } else {
+          BR.AllocBytes = (Class == crucible::ResourceClass::CBV)
+                              ? ((BR.SizeBytes + 255ull) & ~255ull)
+                              : std::max<uint64_t>(BR.SizeBytes, 4ull);
+        }
+        Bound.push_back(std::move(BR));
       }
 
       // Vulkan SPIR-V represents RWStructuredBuffer counters as a separate UAV
@@ -507,17 +664,55 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
     Ranges.push_back(R);
   }
 
-  D3D12_ROOT_PARAMETER RootParam{};
-  RootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  RootParam.DescriptorTable.NumDescriptorRanges =
-      static_cast<UINT>(Ranges.size());
-  RootParam.DescriptorTable.pDescriptorRanges =
-      Ranges.empty() ? nullptr : Ranges.data();
-  RootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  ID3D12DescriptorHeap *SamplerHeap = nullptr;
+  std::vector<D3D12_DESCRIPTOR_RANGE> SamplerRanges;
+  if (!BoundSamplers.empty()) {
+    D3D12_DESCRIPTOR_HEAP_DESC SHeapDesc{};
+    SHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    SHeapDesc.NumDescriptors = static_cast<UINT>(BoundSamplers.size());
+    SHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    Hr = Dev->CreateDescriptorHeap(&SHeapDesc, __uuidof(ID3D12DescriptorHeap),
+                                   reinterpret_cast<void **>(&SamplerHeap));
+    if (FAILED(Hr))
+      return hrErr(Hr, "CreateDescriptorHeap(Sampler)");
+    SamplerRanges.reserve(BoundSamplers.size());
+    for (uint32_t I = 0; I < BoundSamplers.size(); ++I) {
+      D3D12_DESCRIPTOR_RANGE R{};
+      R.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+      R.NumDescriptors = 1;
+      R.BaseShaderRegister = BoundSamplers[I].Register;
+      R.RegisterSpace = BoundSamplers[I].Space;
+      R.OffsetInDescriptorsFromTableStart = I;
+      SamplerRanges.push_back(R);
+    }
+  }
+
+  std::vector<D3D12_ROOT_PARAMETER> RootParams;
+  int CbvSrvUavParamIdx = -1;
+  int SamplerParamIdx = -1;
+  if (!Ranges.empty()) {
+    CbvSrvUavParamIdx = static_cast<int>(RootParams.size());
+    D3D12_ROOT_PARAMETER P0{};
+    P0.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    P0.DescriptorTable.NumDescriptorRanges = static_cast<UINT>(Ranges.size());
+    P0.DescriptorTable.pDescriptorRanges = Ranges.data();
+    P0.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    RootParams.push_back(P0);
+  }
+  if (!SamplerRanges.empty()) {
+    SamplerParamIdx = static_cast<int>(RootParams.size());
+    D3D12_ROOT_PARAMETER P1{};
+    P1.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    P1.DescriptorTable.NumDescriptorRanges =
+        static_cast<UINT>(SamplerRanges.size());
+    P1.DescriptorTable.pDescriptorRanges = SamplerRanges.data();
+    P1.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    RootParams.push_back(P1);
+  }
 
   D3D12_ROOT_SIGNATURE_DESC RSDesc{};
-  RSDesc.NumParameters = Ranges.empty() ? 0 : 1;
-  RSDesc.pParameters = Ranges.empty() ? nullptr : &RootParam;
+  RSDesc.NumParameters = static_cast<UINT>(RootParams.size());
+  RSDesc.pParameters = RootParams.empty() ? nullptr : RootParams.data();
   RSDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
   ID3DBlob *RSBlob = nullptr;
@@ -612,6 +807,169 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       CBVDesc.BufferLocation = BR.UploadBuf->GetGPUVirtualAddress();
       CBVDesc.SizeInBytes = static_cast<UINT>(BR.AllocBytes);
       Dev->CreateConstantBufferView(&CBVDesc, Slot);
+    } else if (BR.IsTexture) {
+      const CPUBuffer &CPU = *BR.Res->BufferPtr;
+      bool IsUAV = (BR.Class == crucible::ResourceClass::UAV);
+      D3D12_RESOURCE_FLAGS Flags =
+          IsUAV ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                : D3D12_RESOURCE_FLAG_NONE;
+      bool Is1D = (BR.Res->Kind == ResourceKind::Texture1D ||
+                   BR.Res->Kind == ResourceKind::Texture1DArray ||
+                   BR.Res->Kind == ResourceKind::RWTexture1D ||
+                   BR.Res->Kind == ResourceKind::RWTexture1DArray);
+      bool Is3D = (BR.Res->Kind == ResourceKind::Texture3D ||
+                   BR.Res->Kind == ResourceKind::RWTexture3D);
+      bool IsArray = (BR.Res->Kind == ResourceKind::Texture1DArray ||
+                      BR.Res->Kind == ResourceKind::Texture2DArray ||
+                      BR.Res->Kind == ResourceKind::RWTexture1DArray ||
+                      BR.Res->Kind == ResourceKind::RWTexture2DArray ||
+                      BR.TexSlices > 1);
+
+      D3D12_HEAP_PROPERTIES Heap{};
+      Heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      Heap.CreationNodeMask = 1;
+      Heap.VisibleNodeMask = 1;
+      D3D12_RESOURCE_DESC TDesc{};
+      TDesc.Dimension = Is1D   ? D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                        : Is3D ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                               : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      TDesc.Width = BR.TexW;
+      TDesc.Height = Is1D ? 1 : BR.TexH;
+      TDesc.DepthOrArraySize =
+          static_cast<UINT16>(Is3D ? BR.TexD : BR.TexSlices);
+      TDesc.MipLevels = static_cast<UINT16>(BR.TexMips);
+      TDesc.Format = BR.TexFmt;
+      TDesc.SampleDesc = {1, 0};
+      TDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      TDesc.Flags = Flags;
+      Hr = Dev->CreateCommittedResource(
+          &Heap, D3D12_HEAP_FLAG_NONE, &TDesc, D3D12_RESOURCE_STATE_COPY_DEST,
+          nullptr, __uuidof(ID3D12Resource),
+          reinterpret_cast<void **>(&BR.DefaultBuf));
+      if (FAILED(Hr))
+        return hrErr(Hr, "CreateCommittedResource(Texture)");
+
+      auto UpOrErr = createCommittedBuffer(
+          Dev, D3D12_HEAP_TYPE_UPLOAD, BR.AllocBytes, D3D12_RESOURCE_FLAG_NONE,
+          D3D12_RESOURCE_STATE_GENERIC_READ);
+      if (!UpOrErr)
+        return UpOrErr.takeError();
+      BR.UploadBuf = *UpOrErr;
+
+      void *Mapped = nullptr;
+      Hr = BR.UploadBuf->Map(0, nullptr, &Mapped);
+      if (FAILED(Hr))
+        return hrErr(Hr, "Map texture upload");
+      std::memset(Mapped, 0, BR.AllocBytes);
+      const char *SrcBase =
+          (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx])
+              ? CPU.Data[BR.ArrIdx].get()
+              : nullptr;
+      for (const TexSubresourceLayout &L : BR.TexLayouts) {
+        uint32_t RawPitch = L.Width * BR.TexBytesPerPixel;
+        if (SrcBase) {
+          for (uint32_t Z = 0; Z < L.Depth; ++Z) {
+            for (uint32_t Y = 0; Y < L.Height; ++Y) {
+              uint64_t SOff =
+                  L.SrcOffset + (static_cast<uint64_t>(Z) * L.Height + Y) * RawPitch;
+              uint64_t DOff =
+                  L.DstOffset + (static_cast<uint64_t>(Z) * L.Height + Y) * L.RowPitch;
+              if (SOff + RawPitch <= BR.SizeBytes)
+                std::memcpy(static_cast<char *>(Mapped) + DOff, SrcBase + SOff,
+                            RawPitch);
+            }
+          }
+        }
+        D3D12_TEXTURE_COPY_LOCATION DstLoc{};
+        DstLoc.pResource = BR.DefaultBuf;
+        DstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        DstLoc.SubresourceIndex = L.Subresource;
+
+        D3D12_TEXTURE_COPY_LOCATION SrcLoc{};
+        SrcLoc.pResource = BR.UploadBuf;
+        SrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        SrcLoc.PlacedFootprint.Offset = L.DstOffset;
+        SrcLoc.PlacedFootprint.Footprint.Format = BR.TexFmt;
+        SrcLoc.PlacedFootprint.Footprint.Width = L.Width;
+        SrcLoc.PlacedFootprint.Footprint.Height = L.Height;
+        SrcLoc.PlacedFootprint.Footprint.Depth = L.Depth;
+        SrcLoc.PlacedFootprint.Footprint.RowPitch = L.RowPitch;
+        Cmd->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+      }
+      BR.UploadBuf->Unmap(0, nullptr);
+
+      D3D12_RESOURCE_BARRIER Barrier{};
+      Barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      Barrier.Transition.pResource = BR.DefaultBuf;
+      Barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      Barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      Barrier.Transition.StateAfter =
+          IsUAV ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      Cmd->ResourceBarrier(1, &Barrier);
+
+      if (IsUAV) {
+        auto RbOrErr = createCommittedBuffer(
+            Dev, D3D12_HEAP_TYPE_READBACK, BR.AllocBytes,
+            D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!RbOrErr)
+          return RbOrErr.takeError();
+        BR.ReadbackBuf = *RbOrErr;
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc{};
+        UAVDesc.Format = BR.TexFmt;
+        if (Is1D) {
+          UAVDesc.ViewDimension = IsArray ? D3D12_UAV_DIMENSION_TEXTURE1DARRAY
+                                          : D3D12_UAV_DIMENSION_TEXTURE1D;
+          if (IsArray) {
+            UAVDesc.Texture1DArray.MipSlice = 0;
+            UAVDesc.Texture1DArray.FirstArraySlice = 0;
+            UAVDesc.Texture1DArray.ArraySize = BR.TexSlices;
+          } else {
+            UAVDesc.Texture1D.MipSlice = 0;
+          }
+        } else if (Is3D) {
+          UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+          UAVDesc.Texture3D.MipSlice = 0;
+          UAVDesc.Texture3D.FirstWSlice = 0;
+          UAVDesc.Texture3D.WSize = BR.TexD;
+        } else if (IsArray) {
+          UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+          UAVDesc.Texture2DArray.MipSlice = 0;
+          UAVDesc.Texture2DArray.FirstArraySlice = 0;
+          UAVDesc.Texture2DArray.ArraySize = BR.TexSlices;
+        } else {
+          UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+          UAVDesc.Texture2D.MipSlice = 0;
+        }
+        Dev->CreateUnorderedAccessView(BR.DefaultBuf, nullptr, &UAVDesc, Slot);
+      } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc{};
+        SRVDesc.Format = BR.TexFmt;
+        SRVDesc.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (Is1D) {
+          SRVDesc.ViewDimension = IsArray ? D3D12_SRV_DIMENSION_TEXTURE1DARRAY
+                                          : D3D12_SRV_DIMENSION_TEXTURE1D;
+          if (IsArray) {
+            SRVDesc.Texture1DArray.MipLevels = BR.TexMips;
+            SRVDesc.Texture1DArray.ArraySize = BR.TexSlices;
+          } else {
+            SRVDesc.Texture1D.MipLevels = BR.TexMips;
+          }
+        } else if (Is3D) {
+          SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+          SRVDesc.Texture3D.MipLevels = BR.TexMips;
+        } else if (IsArray) {
+          SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+          SRVDesc.Texture2DArray.MipLevels = BR.TexMips;
+          SRVDesc.Texture2DArray.ArraySize = BR.TexSlices;
+        } else {
+          SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+          SRVDesc.Texture2D.MipLevels = BR.TexMips;
+        }
+        Dev->CreateShaderResourceView(BR.DefaultBuf, &SRVDesc, Slot);
+      }
     } else {
       const CPUBuffer &CPU = *BR.Res->BufferPtr;
       bool IsUAV = (BR.Class == crucible::ResourceClass::UAV);
@@ -761,13 +1119,43 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
     }
   }
 
-  ID3D12DescriptorHeap *Heaps[] = {DescHeap};
-  Cmd->SetDescriptorHeaps(1, Heaps);
+  if (SamplerHeap) {
+    UINT SInc =
+        Dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    D3D12_CPU_DESCRIPTOR_HANDLE SStart =
+        SamplerHeap->GetCPUDescriptorHandleForHeapStart();
+    for (uint32_t I = 0; I < BoundSamplers.size(); ++I) {
+      const YAMLSampler &S = *BoundSamplers[I].Res->SamplerPtr;
+      D3D12_SAMPLER_DESC SDesc{};
+      SDesc.Filter = d3d12Filter(S);
+      D3D12_TEXTURE_ADDRESS_MODE Addr = d3d12AddressMode(S.Address);
+      SDesc.AddressU = Addr;
+      SDesc.AddressV = Addr;
+      SDesc.AddressW = Addr;
+      SDesc.MaxAnisotropy = 1;
+      SDesc.ComparisonFunc = (S.Kind == SamplerKind::SamplerComparison)
+                                 ? d3d12CompareFunc(S.ComparisonOp)
+                                 : D3D12_COMPARISON_FUNC_NEVER;
+      SDesc.MinLOD = S.MinLOD;
+      SDesc.MaxLOD = S.MaxLOD;
+      D3D12_CPU_DESCRIPTOR_HANDLE Slot{SStart.ptr +
+                                       static_cast<SIZE_T>(I) * SInc};
+      Dev->CreateSampler(&SDesc, Slot);
+    }
+  }
+
+  ID3D12DescriptorHeap *Heaps[2] = {DescHeap, SamplerHeap};
+  Cmd->SetDescriptorHeaps(SamplerHeap ? 2 : 1, Heaps);
   Cmd->SetComputeRootSignature(RootSig);
   Cmd->SetPipelineState(PSO);
-  if (!Ranges.empty())
+  if (CbvSrvUavParamIdx >= 0)
     Cmd->SetComputeRootDescriptorTable(
-        0, DescHeap->GetGPUDescriptorHandleForHeapStart());
+        static_cast<UINT>(CbvSrvUavParamIdx),
+        DescHeap->GetGPUDescriptorHandleForHeapStart());
+  if (SamplerParamIdx >= 0 && SamplerHeap)
+    Cmd->SetComputeRootDescriptorTable(
+        static_cast<UINT>(SamplerParamIdx),
+        SamplerHeap->GetGPUDescriptorHandleForHeapStart());
 
   const auto &Grid = P.DispatchParameters.DispatchGroupCount;
   Cmd->Dispatch(Grid[0], Grid[1], Grid[2]);
@@ -782,7 +1170,27 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
     Barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     Barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     Cmd->ResourceBarrier(1, &Barrier);
-    Cmd->CopyBufferRegion(BR.ReadbackBuf, 0, BR.DefaultBuf, 0, BR.AllocBytes);
+    if (BR.IsTexture) {
+      for (const TexSubresourceLayout &L : BR.TexLayouts) {
+        D3D12_TEXTURE_COPY_LOCATION SrcLoc{};
+        SrcLoc.pResource = BR.DefaultBuf;
+        SrcLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        SrcLoc.SubresourceIndex = L.Subresource;
+
+        D3D12_TEXTURE_COPY_LOCATION DstLoc{};
+        DstLoc.pResource = BR.ReadbackBuf;
+        DstLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        DstLoc.PlacedFootprint.Offset = L.DstOffset;
+        DstLoc.PlacedFootprint.Footprint.Format = BR.TexFmt;
+        DstLoc.PlacedFootprint.Footprint.Width = L.Width;
+        DstLoc.PlacedFootprint.Footprint.Height = L.Height;
+        DstLoc.PlacedFootprint.Footprint.Depth = L.Depth;
+        DstLoc.PlacedFootprint.Footprint.RowPitch = L.RowPitch;
+        Cmd->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+      }
+    } else {
+      Cmd->CopyBufferRegion(BR.ReadbackBuf, 0, BR.DefaultBuf, 0, BR.AllocBytes);
+    }
 
     if (BR.CounterDefaultBuf && BR.CounterReadbackBuf) {
       D3D12_RESOURCE_BARRIER CB{};
@@ -832,7 +1240,8 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       continue;
     CPUBuffer &CPU = *BR.Res->BufferPtr;
     void *Mapped = nullptr;
-    D3D12_RANGE ReadRange{0, static_cast<SIZE_T>(BR.SizeBytes)};
+    D3D12_RANGE ReadRange{
+        0, static_cast<SIZE_T>(BR.IsTexture ? BR.AllocBytes : BR.SizeBytes)};
     Hr = BR.ReadbackBuf->Map(0, &ReadRange, &Mapped);
     if (FAILED(Hr))
       return hrErr(Hr, "Map readback");
@@ -840,6 +1249,24 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       if (CPU.Counters.size() <= BR.ArrIdx)
         CPU.Counters.resize(BR.ArrIdx + 1, 0);
       std::memcpy(&CPU.Counters[BR.ArrIdx], Mapped, 4);
+    } else if (BR.IsTexture) {
+      if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx]) {
+        char *DstBase = CPU.Data[BR.ArrIdx].get();
+        for (const TexSubresourceLayout &L : BR.TexLayouts) {
+          uint32_t RawPitch = L.Width * BR.TexBytesPerPixel;
+          for (uint32_t Z = 0; Z < L.Depth; ++Z) {
+            for (uint32_t Y = 0; Y < L.Height; ++Y) {
+              uint64_t SOff =
+                  L.DstOffset + (static_cast<uint64_t>(Z) * L.Height + Y) * L.RowPitch;
+              uint64_t DOff =
+                  L.SrcOffset + (static_cast<uint64_t>(Z) * L.Height + Y) * RawPitch;
+              if (DOff + RawPitch <= BR.SizeBytes)
+                std::memcpy(DstBase + DOff, static_cast<const char *>(Mapped) + SOff,
+                            RawPitch);
+            }
+          }
+        }
+      }
     } else if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx]) {
       std::memcpy(CPU.Data[BR.ArrIdx].get(), Mapped, BR.SizeBytes);
     }

@@ -268,23 +268,46 @@ void decomposeCtlzCttz(mlir::ModuleOp Mod) {
 
   for (auto [Op, Kind] : Work) {
     mlir::Value In = Op->getOperand(0);
-    auto IntTy = dyn_cast<mlir::IntegerType>(In.getType());
-    if (!IntTy || IntTy.getWidth() != 32)
-      continue;
-    mlir::OpBuilder B(Op);
-    mlir::Location Loc = Op->getLoc();
-    mlir::Value Zero =
-        mlir::LLVM::ConstantOp::create(B, Loc, IntTy, B.getI32IntegerAttr(0));
-    mlir::Value Width =
-        mlir::LLVM::ConstantOp::create(B, Loc, IntTy, B.getI32IntegerAttr(32));
-    mlir::Value First = ir::FirstBitOp::create(
-        B, Loc, IntTy, In, ir::FirstBitKindAttr::get(B.getContext(), Kind));
-    mlir::Value IsZero = mlir::LLVM::ICmpOp::create(
-        B, Loc, mlir::LLVM::ICmpPredicate::eq, In, Zero);
-    mlir::Value Res =
-        mlir::LLVM::SelectOp::create(B, Loc, IsZero, Width, First);
-    Op->getResult(0).replaceAllUsesWith(Res);
-    Op->erase();
+    mlir::Type Ty = In.getType();
+    auto emitScalar = [&](mlir::OpBuilder &B, mlir::Location Loc,
+                          mlir::Value Val,
+                          mlir::IntegerType IntTy) -> mlir::Value {
+      mlir::Value Zero =
+          mlir::LLVM::ConstantOp::create(B, Loc, IntTy, B.getI32IntegerAttr(0));
+      mlir::Value Width = mlir::LLVM::ConstantOp::create(
+          B, Loc, IntTy, B.getI32IntegerAttr(32));
+      mlir::Value First = ir::FirstBitOp::create(
+          B, Loc, IntTy, Val, ir::FirstBitKindAttr::get(B.getContext(), Kind));
+      mlir::Value IsZero = mlir::LLVM::ICmpOp::create(
+          B, Loc, mlir::LLVM::ICmpPredicate::eq, Val, Zero);
+      return mlir::LLVM::SelectOp::create(B, Loc, IsZero, Width, First);
+    };
+
+    if (auto IntTy = dyn_cast<mlir::IntegerType>(Ty)) {
+      if (IntTy.getWidth() != 32)
+        continue;
+      mlir::OpBuilder B(Op);
+      mlir::Value Res = emitScalar(B, Op->getLoc(), In, IntTy);
+      Op->getResult(0).replaceAllUsesWith(Res);
+      Op->erase();
+    } else if (auto VecTy = dyn_cast<mlir::VectorType>(Ty)) {
+      auto ElemTy = dyn_cast<mlir::IntegerType>(VecTy.getElementType());
+      if (!ElemTy || ElemTy.getWidth() != 32 || VecTy.getRank() != 1)
+        continue;
+      mlir::OpBuilder B(Op);
+      mlir::Location Loc = Op->getLoc();
+      mlir::Value Acc = mlir::LLVM::PoisonOp::create(B, Loc, VecTy);
+      for (int64_t I = 0; I < VecTy.getNumElements(); ++I) {
+        mlir::Value Idx = mlir::LLVM::ConstantOp::create(
+            B, Loc, ElemTy, B.getI32IntegerAttr(static_cast<int32_t>(I)));
+        mlir::Value Lane =
+            mlir::LLVM::ExtractElementOp::create(B, Loc, In, Idx);
+        mlir::Value OutLane = emitScalar(B, Loc, Lane, ElemTy);
+        Acc = mlir::LLVM::InsertElementOp::create(B, Loc, Acc, OutLane, Idx);
+      }
+      Op->getResult(0).replaceAllUsesWith(Acc);
+      Op->erase();
+    }
   }
 }
 

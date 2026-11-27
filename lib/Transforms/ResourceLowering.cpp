@@ -373,6 +373,7 @@ llvm::Error assignDXILBindings(Reflection &R, const Options &Opts) {
   // they do not collide (e.g. SPIR-V DescriptorSet -> space, Binding ->
   // register within each class). Resolve unbounded array overrides if given.
   std::map<std::pair<ResourceClass, uint32_t>, std::set<uint32_t>> UsedRegs;
+  std::map<std::pair<ResourceClass, uint32_t>, uint32_t> UnboundedStart;
   for (ResourceBinding &RB : R.Resources) {
     if (RB.RangeSize == 0xFFFFFFFFu) {
       for (const ArraySizeOverride &O : Opts.ArraySizeOverrides) {
@@ -386,11 +387,49 @@ llvm::Error assignDXILBindings(Reflection &R, const Options &Opts) {
     if (RB.RangeSize == 0)
       return makeError("resource '{0}': zero-sized descriptor array is invalid",
                        RB.Name);
-    auto &Used = UsedRegs[{RB.Class, RB.Space}];
-    uint32_t Count = (RB.RangeSize == 0xFFFFFFFFu) ? 1u : RB.RangeSize;
+    auto Key = std::make_pair(RB.Class, RB.Space);
+    bool IsUnbounded = (RB.RangeSize == 0xFFFFFFFFu);
+
+    // Unbounded ranges [LowerBound, inf) cannot share a (Class, Space) with
+    // another unbounded range or any register >= LowerBound; move colliding
+    // unbounded resources to a fresh register space.
+    auto hasUnboundedOverlap = [&](const std::pair<ResourceClass, uint32_t> &K,
+                                   uint32_t Start, bool Unb) {
+      auto It = UnboundedStart.find(K);
+      if (It != UnboundedStart.end()) {
+        if (Unb || Start >= It->second)
+          return true;
+      }
+      if (Unb) {
+        auto UIt = UsedRegs.find(K);
+        if (UIt != UsedRegs.end() && !UIt->second.empty() &&
+            *UIt->second.rbegin() >= Start)
+          return true;
+      }
+      return false;
+    };
+
+    if (hasUnboundedOverlap(Key, RB.LowerBound, IsUnbounded)) {
+      uint32_t NewSpace = RB.Space + 1u;
+      while (UsedRegs.count({RB.Class, NewSpace}) ||
+             UnboundedStart.count({RB.Class, NewSpace}))
+        ++NewSpace;
+      RB.Space = NewSpace;
+      RB.LowerBound = 0;
+      Key = std::make_pair(RB.Class, RB.Space);
+    }
+
+    auto &Used = UsedRegs[Key];
+    if (IsUnbounded) {
+      UnboundedStart[Key] = RB.LowerBound;
+      Used.insert(RB.LowerBound);
+      continue;
+    }
+    uint32_t Count = RB.RangeSize;
     bool Collides = false;
     for (uint32_t I = 0; I < Count; ++I) {
-      if (Used.count(RB.LowerBound + I)) {
+      if (Used.count(RB.LowerBound + I) ||
+          (UnboundedStart.count(Key) && RB.LowerBound + I >= UnboundedStart[Key])) {
         Collides = true;
         break;
       }
