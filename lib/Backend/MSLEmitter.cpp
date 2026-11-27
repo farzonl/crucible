@@ -79,6 +79,22 @@ std::string signedView(mlir::Type T, StringRef Value) {
     return ("as_type<" + Base + std::to_string(VT.getNumElements()) + ">(" + Value + ")").str();
   }
   StringRef Ty = T.isInteger(8) ? "char" : T.isInteger(16) ? "short" : T.isInteger(64) ? "long" : "int";
+  if (T.isInteger(32) && Value.ends_with("u")) {
+    uint64_t U = 0;
+    if (!Value.drop_back(1).getAsInteger(10, U) && U <= UINT32_MAX) {
+      int32_t S = static_cast<int32_t>(static_cast<uint32_t>(U));
+      if (S >= 0)
+        return std::to_string(S);
+      if (S == INT32_MIN)
+        return "(-2147483647 - 1)";
+      return "(" + std::to_string(S) + ")";
+    }
+  }
+  if (T.isInteger(64) && Value.ends_with("ul")) {
+    uint64_t U = 0;
+    if (!Value.drop_back(2).getAsInteger(10, U) && U <= uint64_t(INT64_MAX))
+      return std::to_string(U) + "l";
+  }
   return ("as_type<" + Ty + ">(" + Value + ")").str();
 }
 
@@ -1086,6 +1102,9 @@ private:
     return 4;
   }
   bool shouldInline(mlir::Operation *Op);
+  bool canVectorizeBufferAccess(ResState &RS, mlir::Value Coord0,
+                                mlir::Value Coord1, unsigned Width);
+  DenseMap<mlir::Operation *, mlir::Operation *> SinCosPartner;
 
   // --- pointers (groupshared / local arrays) ---
   Error collectGroupshared();
@@ -2397,6 +2416,8 @@ static bool mayWriteMemory(mlir::Operation *Op) {
 }
 
 bool Emitter::shouldInline(mlir::Operation *Op) {
+  if (SinCosPartner.count(Op))
+    return false;
   if (Op->hasAttr("crucible.volatile") || Op->hasAttr("crucible.address_table"))
     return false;
   if (auto Load = mlir::dyn_cast<mlir::LLVM::LoadOp>(Op);
@@ -3230,6 +3251,13 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
             return makeError("volatile load used before materialization");
           return Expr{It->second + "." + std::string(1, "xyzw"[*Pos & 3]),
                       PrecPrimary};
+        }
+        if (mlir::isa<ir::BufferLoadOp>(Prod)) {
+          if (auto It = ValueNames.find(EE.getVector());
+              It != ValueNames.end()) {
+            return Expr{It->second + "." + std::string(1, "xyzw"[*Pos & 3]),
+                        PrecPrimary};
+          }
         }
         if (mlir::isa<ir::BufferLoadOp, ir::CBufferLoadOp,
                       ir::TexGetDimensionsOp>(Prod))
@@ -4587,6 +4615,36 @@ Error Emitter::emitTemp(mlir::Operation *Op, unsigned Ind) {
   return Error::success();
 }
 
+bool Emitter::canVectorizeBufferAccess(ResState &RS, mlir::Value Coord0,
+                                       mlir::Value Coord1, unsigned Width) {
+  if (Width != 2 && Width != 4)
+    return false;
+  if (RS.ElemType != "float" && RS.ElemType != "uint")
+    return false;
+  if (Opts.BoundsCheckBuffers && R.BufferSizesMetalIndex != UINT32_MAX)
+    return false;
+  uint64_t AlignBytes = static_cast<uint64_t>(Width) * 4u;
+  switch (RS.RB->Kind) {
+  case ResourceKind::StructuredBuffer: {
+    uint32_t Stride = RS.RB->ElementStride;
+    if (Stride == 0 || (Stride % AlignBytes) != 0)
+      return false;
+    if (isUndefLike(Coord1))
+      return true;
+    auto COff = constInt(Coord1);
+    return COff && (*COff % AlignBytes) == 0;
+  }
+  case ResourceKind::TypedBuffer:
+    return RS.RB->TypedComponents == Width;
+  case ResourceKind::RawBuffer: {
+    auto CByte = constInt(Coord0);
+    return CByte && (*CByte % AlignBytes) == 0;
+  }
+  default:
+    return false;
+  }
+}
+
 Error Emitter::emitBufferStore(ir::BufferStoreOp Store, unsigned Ind) {
   ResState *RS = stateFor(Store.getHandle());
   if (!RS)
@@ -4598,6 +4656,43 @@ Error Emitter::emitBufferStore(ir::BufferStoreOp Store, unsigned Ind) {
     *RName = "((volatile device " + RS->ElemType + " *)" + *RName + ")";
   uint32_t Mask = static_cast<uint32_t>(Store.getMask());
   auto Vals = Store.getValues();
+
+  // Emit a single 128-bit (float4/uint4) or 64-bit (float2/uint2) vector store
+  // when all components are contiguous from 0 and base alignment is guaranteed.
+  uint32_t EffectiveMask = Mask;
+  if (RS->RB->Kind == ResourceKind::TypedBuffer &&
+      RS->RB->TypedComponents > 0 && RS->RB->TypedComponents < 4)
+    EffectiveMask &= (1u << RS->RB->TypedComponents) - 1u;
+  unsigned VecWidth = (EffectiveMask == 0xFu && Vals.size() >= 4)   ? 4
+                      : (EffectiveMask == 0x3u && Vals.size() >= 2) ? 2
+                                                                    : 0;
+  if (VecWidth > 0 && !Store->hasAttr("crucible.volatile") &&
+      canVectorizeBufferAccess(*RS, Store.getIndex(), Store.getElementOffset(),
+                               VecWidth)) {
+    auto BaseIndex =
+        bufferIndexExpr(*RS, Store.getIndex(), Store.getElementOffset(), 0);
+    if (!BaseIndex)
+      return BaseIndex.takeError();
+    std::string VecTy = RS->ElemType + std::to_string(VecWidth);
+    std::string Args;
+    for (unsigned Comp = 0; Comp < VecWidth; ++Comp) {
+      auto V = exprFor(Vals[Comp], PrecUnknown);
+      if (!V)
+        return V.takeError();
+      std::string Value = V->Text;
+      auto StoreTy = mslType(Vals[Comp].getType());
+      if (!StoreTy)
+        return StoreTy.takeError();
+      if (*StoreTy != RS->ElemType)
+        Value = "as_type<" + RS->ElemType + ">(" + Value + ")";
+      if (Comp > 0)
+        Args += ", ";
+      Args += Value;
+    }
+    line(Ind, "*(device " + VecTy + " *)(&" + *RName + "[" + *BaseIndex +
+                  "]) = " + VecTy + "(" + Args + ");");
+    return Error::success();
+  }
   for (unsigned Comp = 0; Comp < 4 && Comp < Vals.size(); ++Comp) {
     if (RS->RB->Kind == ResourceKind::TypedBuffer &&
         RS->RB->TypedComponents != 0 && Comp >= RS->RB->TypedComponents)
@@ -5792,6 +5887,57 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
     return Error::success();
   }
 
+  if (auto BL = mlir::dyn_cast<ir::BufferLoadOp>(Op);
+      BL && !BL->hasAttr("crucible.volatile") && !BL.getStatus() &&
+      !BL.getResult().use_empty()) {
+    ResState *RS = stateFor(BL.getHandle());
+    auto VecTy = mlir::dyn_cast<mlir::VectorType>(BL.getResult().getType());
+    if (RS && VecTy) {
+      uint32_t UsedMask = 0;
+      bool AllConstExtract = true;
+      for (mlir::Operation *U : BL.getResult().getUsers()) {
+        auto EE = mlir::dyn_cast<mlir::LLVM::ExtractElementOp>(U);
+        if (!EE) {
+          AllConstExtract = false;
+          break;
+        }
+        auto Pos = constInt(EE.getPosition());
+        if (!Pos || *Pos >= 4) {
+          AllConstExtract = false;
+          break;
+        }
+        UsedMask |= (1u << static_cast<unsigned>(*Pos));
+      }
+      unsigned UsedCount = llvm::popcount(UsedMask);
+      unsigned VecWidth = (UsedMask & 0xCu) ? 4 : 2;
+      if (AllConstExtract && UsedCount >= 2 &&
+          canVectorizeBufferAccess(*RS, BL.getIndex(), BL.getElementOffset(),
+                                   VecWidth)) {
+        auto RName = resourceExpr(BL.getHandle());
+        if (!RName)
+          return RName.takeError();
+        auto BaseIndex =
+            bufferIndexExpr(*RS, BL.getIndex(), BL.getElementOffset(), 0);
+        if (!BaseIndex)
+          return BaseIndex.takeError();
+        auto LoadElemTy = mslType(VecTy.getElementType());
+        if (!LoadElemTy)
+          return LoadElemTy.takeError();
+        if (elemByteSize(*LoadElemTy) == 4) {
+          std::string LoadVecTy = *LoadElemTy + std::to_string(VecWidth);
+          std::string Qual = RS->RB->Class == ResourceClass::UAV
+                                 ? "device "
+                                 : "device const ";
+          std::string Name = freshName();
+          line(Ind, LoadVecTy + " " + Name + " = *(" + Qual + LoadVecTy +
+                        " *)(&" + *RName + "[" + *BaseIndex + "]);");
+          ValueNames[BL.getResult()] = Name;
+          return Error::success();
+        }
+      }
+    }
+  }
+
   if (mlir::isa<ir::BindResourceOp, ir::HeapResourceOp, ir::BufferLoadOp,
                 ir::CBufferLoadOp, ir::TexGetDimensionsOp,
                 ir::GetMeshPayloadOp>(Op))
@@ -6409,9 +6555,68 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
 }
 
 Error Emitter::emitBlock(mlir::Block &B, unsigned Ind) {
-  for (mlir::Operation &Op : B)
+  // Pair same-block sin(x) and cos(x) on the same operand into Metal's
+  // sincos(x, c) builtin (skipped under strict FP mode).
+  if (!R.RequiresStrictFP && !Opts.EmulateF64) {
+    DenseMap<mlir::Value, mlir::Operation *> PendingSin;
+    DenseMap<mlir::Value, mlir::Operation *> PendingCos;
+    for (mlir::Operation &Op : B) {
+      if (Op.getNumResults() != 1 || Op.getResult(0).use_empty())
+        continue;
+      mlir::Type Ty = Op.getResult(0).getType();
+      mlir::Type ElemTy = Ty;
+      if (auto VT = mlir::dyn_cast<mlir::VectorType>(Ty))
+        ElemTy = VT.getElementType();
+      if (!ElemTy.isF32() && !ElemTy.isF16())
+        continue;
+      if (mlir::isa<mlir::LLVM::SinOp, mlir::math::SinOp>(&Op)) {
+        mlir::Value X = Op.getOperand(0);
+        if (auto It = PendingCos.find(X); It != PendingCos.end()) {
+          SinCosPartner[&Op] = It->second;
+          SinCosPartner[It->second] = &Op;
+          PendingCos.erase(It);
+        } else {
+          PendingSin.try_emplace(X, &Op);
+        }
+      } else if (mlir::isa<mlir::LLVM::CosOp, mlir::math::CosOp>(&Op)) {
+        mlir::Value X = Op.getOperand(0);
+        if (auto It = PendingSin.find(X); It != PendingSin.end()) {
+          SinCosPartner[&Op] = It->second;
+          SinCosPartner[It->second] = &Op;
+          PendingSin.erase(It);
+        } else {
+          PendingCos.try_emplace(X, &Op);
+        }
+      }
+    }
+  }
+
+  for (mlir::Operation &Op : B) {
+    if (auto It = SinCosPartner.find(&Op); It != SinCosPartner.end()) {
+      if (ValueNames.count(Op.getResult(0)))
+        continue; // already emitted by partner
+      mlir::Operation *Partner = It->second;
+      bool ThisIsSin = mlir::isa<mlir::LLVM::SinOp, mlir::math::SinOp>(&Op);
+      mlir::Operation *SinOp = ThisIsSin ? &Op : Partner;
+      mlir::Operation *CosOp = ThisIsSin ? Partner : &Op;
+      auto Ty = mslType(SinOp->getResult(0).getType());
+      if (!Ty)
+        return Ty.takeError();
+      auto Arg = exprFor(SinOp->getOperand(0), PrecUnknown);
+      if (!Arg)
+        return Arg.takeError();
+      std::string CosName = freshName();
+      std::string SinName = freshName();
+      line(Ind, *Ty + " " + CosName + ";");
+      line(Ind, *Ty + " " + SinName + " = sincos(" + Arg->Text + ", " +
+                    CosName + ");");
+      ValueNames[SinOp->getResult(0)] = SinName;
+      ValueNames[CosOp->getResult(0)] = CosName;
+      continue;
+    }
     if (Error E = emitStatement(&Op, Ind))
       return E;
+  }
   return Error::success();
 }
 

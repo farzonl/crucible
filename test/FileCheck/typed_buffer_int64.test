@@ -2,7 +2,7 @@
 # RUN: %cruciblec %t.dxil -o %t.metal
 # RUN: FileCheck %s < %t.metal
 
-# CHECK-DAG: srv0[{{[^]]+}} * 2u + 1u]
-# CHECK-DAG: srv1[{{[^]]+}} * 4u + 3u]
-# CHECK-DAG: uav0[{{[^]]+}} * 2u + 1u] =
-# CHECK-DAG: uav1[{{[^]]+}} * 4u + 3u] =
+# CHECK-DAG: *(device const uint2 *)(&srv0[{{[^]]+}} * 2u])
+# CHECK-DAG: *(device const uint4 *)(&srv1[{{[^]]+}} * 4u])
+# CHECK-DAG: *(device uint2 *)(&uav0[{{[^]]+}} * 2u]) = uint2(
+# CHECK-DAG: *(device uint4 *)(&uav1[{{[^]]+}} * 4u]) = uint4(
