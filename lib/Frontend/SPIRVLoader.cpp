@@ -1394,14 +1394,20 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     }
   }
 
-  // Rewrite SPIR-V derivative opcodes (OpDPdx..OpFwidthCoarse, 207..215) and
-  // OpDemoteToHelperInvocation (5380) — which MLIR's SPIR-V deserializer does
-  // not yet recognize — into OpFunctionCall calls to dummy helper functions
-  // named "__crucible_spv_*". These calls are lowered directly to
-  // crucible.deriv / crucible.discard right after deserialization.
+  // Rewrite SPIR-V derivative opcodes (OpDPdx..OpFwidthCoarse, 207..215),
+  // OpDemoteToHelperInvocation (5380), GLSL.std.450 FaceForward (70) and
+  // Refract (72), and strip NonUniform decoration (5300) — all of which MLIR's
+  // SPIR-V deserializer does not yet recognize — into OpFunctionCall calls to
+  // dummy helper functions named "__crucible_spv_*".
   {
     constexpr uint32_t kOpDemoteToHelperInvocation = 5380u;
     constexpr uint32_t kCapDemoteToHelperInvocation = 5379u;
+    constexpr uint32_t kDecNonUniform = 5300u;
+    constexpr uint32_t kGlslFaceForward = 70u;
+    constexpr uint32_t kGlslRefract = 72u;
+    // Synthetic op tags in HelperFnInfo::Op for GLSL.std.450 rewrites.
+    constexpr uint32_t kTagFaceForward = 0x10070u;
+    constexpr uint32_t kTagRefract = 0x10072u;
     auto isDerivOp = [](uint32_t Op) { return Op >= 207u && Op <= 215u; };
     auto isExtName = [](ArrayRef<uint32_t> W, StringRef Name) {
       std::string S;
@@ -1418,15 +1424,20 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     };
 
     uint32_t VoidTyId = 0;
+    uint32_t GlslExtId = 0;
     bool HasDemote = false;
     bool HasDemoteExtOrCap = false;
+    bool HasNonUniformDec = false;
+    DenseMap<uint32_t, uint32_t> VecElemType;
     // Key: (Op << 32) | ResultTypeId -> HelperFnInfo
     struct HelperFnInfo {
       uint32_t Op = 0;
       uint32_t TypeId = 0;
+      uint32_t ScalarTypeId = 0; // For Refract's eta parameter
       uint32_t FnTyId = 0;
       uint32_t FnId = 0;
-      uint32_t ParamId = 0;
+      uint32_t ParamIds[3] = {0, 0, 0};
+      uint32_t NumParams = 1;
       uint32_t LabelId = 0;
       std::string Name;
     };
@@ -1437,8 +1448,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
       if (Count == 0 || I + Count > Words.size())
         break;
-      if (Op == spv::OpTypeVoid && Count == 2) {
+      if (Op == spv::OpExtInstImport && Count >= 3 &&
+          isExtName(ArrayRef(Words).slice(I + 2, Count - 2), "GLSL.std.450")) {
+        GlslExtId = Words[I + 1];
+      } else if (Op == spv::OpTypeVoid && Count == 2) {
         VoidTyId = Words[I + 1];
+      } else if (Op == spv::OpTypeVector && Count == 4) {
+        VecElemType[Words[I + 1]] = Words[I + 2];
       } else if (Op == spv::OpExtension && Count >= 2 &&
                  isExtName(ArrayRef(Words).slice(I + 1, Count - 1),
                            "SPV_EXT_demote_to_helper_invocation")) {
@@ -1446,6 +1462,11 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       } else if (Op == spv::OpCapability && Count == 2 &&
                  Words[I + 1] == kCapDemoteToHelperInvocation) {
         HasDemoteExtOrCap = true;
+      } else if ((Op == spv::OpDecorate && Count >= 3 &&
+                  Words[I + 2] == kDecNonUniform) ||
+                 (Op == spv::OpMemberDecorate && Count >= 4 &&
+                  Words[I + 3] == kDecNonUniform)) {
+        HasNonUniformDec = true;
       } else if (isDerivOp(Op) && Count == 4) {
         uint32_t ResTy = Words[I + 1];
         uint64_t Key = (static_cast<uint64_t>(Op) << 32) | ResTy;
@@ -1453,6 +1474,25 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           HelperFnInfo Info;
           Info.Op = Op;
           Info.TypeId = ResTy;
+          Info.NumParams = 1;
+          Helpers[Key] = Info;
+          HelperOrder.push_back(Key);
+        }
+      } else if (Op == spv::OpExtInst && Count == 8 && GlslExtId != 0 &&
+                 Words[I + 3] == GlslExtId &&
+                 (Words[I + 4] == kGlslFaceForward ||
+                  Words[I + 4] == kGlslRefract)) {
+        uint32_t ResTy = Words[I + 1];
+        uint32_t Tag = (Words[I + 4] == kGlslFaceForward) ? kTagFaceForward
+                                                          : kTagRefract;
+        uint64_t Key = (static_cast<uint64_t>(Tag) << 32) | ResTy;
+        if (!Helpers.contains(Key)) {
+          HelperFnInfo Info;
+          Info.Op = Tag;
+          Info.TypeId = ResTy;
+          auto ElemIt = VecElemType.find(ResTy);
+          Info.ScalarTypeId = (ElemIt != VecElemType.end()) ? ElemIt->second : ResTy;
+          Info.NumParams = 3;
           Helpers[Key] = Info;
           HelperOrder.push_back(Key);
         }
@@ -1462,13 +1502,13 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       I += Count;
     }
 
-    if (!Helpers.empty() || HasDemote || HasDemoteExtOrCap) {
+    if (!Helpers.empty() || HasDemote || HasDemoteExtOrCap || HasNonUniformDec) {
       uint32_t NextId = Words[3];
       bool NeedVoidTy = HasDemote && (VoidTyId == 0);
       if (NeedVoidTy)
         VoidTyId = NextId++;
 
-      auto derivPrefix = [](uint32_t Op) -> const char * {
+      auto helperPrefix = [](uint32_t Op) -> const char * {
         switch (Op) {
         case 207: return "__crucible_spv_dpdx_";
         case 208: return "__crucible_spv_dpdy_";
@@ -1479,6 +1519,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         case 213: return "__crucible_spv_dpdx_coarse_";
         case 214: return "__crucible_spv_dpdy_coarse_";
         case 215: return "__crucible_spv_fwidth_coarse_";
+        case kTagFaceForward: return "__crucible_spv_faceforward_";
+        case kTagRefract: return "__crucible_spv_refract_";
         default: return "__crucible_spv_deriv_";
         }
       };
@@ -1487,9 +1529,10 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         HelperFnInfo &Info = Helpers[Key];
         Info.FnTyId = NextId++;
         Info.FnId = NextId++;
-        Info.ParamId = NextId++;
+        for (uint32_t P = 0; P < Info.NumParams; ++P)
+          Info.ParamIds[P] = NextId++;
         Info.LabelId = NextId++;
-        Info.Name = std::string(derivPrefix(Info.Op)) + std::to_string(Info.TypeId);
+        Info.Name = std::string(helperPrefix(Info.Op)) + std::to_string(Info.TypeId);
       }
 
       HelperFnInfo DemoteInfo;
@@ -1536,12 +1579,16 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
         if (Count == 0 || I + Count > Words.size())
           break;
-        // Strip demote extension/capability
+        // Strip demote extension/capability and NonUniform decorations
         if ((Op == spv::OpExtension && Count >= 2 &&
              isExtName(ArrayRef(Words).slice(I + 1, Count - 1),
                        "SPV_EXT_demote_to_helper_invocation")) ||
             (Op == spv::OpCapability && Count == 2 &&
-             Words[I + 1] == kCapDemoteToHelperInvocation)) {
+             Words[I + 1] == kCapDemoteToHelperInvocation) ||
+            (Op == spv::OpDecorate && Count >= 3 &&
+             Words[I + 2] == kDecNonUniform) ||
+            (Op == spv::OpMemberDecorate && Count >= 4 &&
+             Words[I + 3] == kDecNonUniform)) {
           I += Count;
           continue;
         }
@@ -1563,11 +1610,16 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           }
           for (uint64_t Key : HelperOrder) {
             const HelperFnInfo &Info = Helpers[Key];
-            // OpTypeFunction FnTyId RetTy ParamTy
-            Out.push_back((4u << 16) | spv::OpTypeFunction);
+            uint32_t FTWords = 3u + Info.NumParams;
+            Out.push_back((FTWords << 16) | spv::OpTypeFunction);
             Out.push_back(Info.FnTyId);
             Out.push_back(Info.TypeId);
-            Out.push_back(Info.TypeId);
+            for (uint32_t P = 0; P < Info.NumParams; ++P) {
+              uint32_t PTy = (Info.Op == kTagRefract && P == 2)
+                                 ? Info.ScalarTypeId
+                                 : Info.TypeId;
+              Out.push_back(PTy);
+            }
           }
           if (HasDemote) {
             Out.push_back((3u << 16) | spv::OpTypeFunction);
@@ -1581,13 +1633,18 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
             Out.push_back(Info.FnId);
             Out.push_back(0u);
             Out.push_back(Info.FnTyId);
-            Out.push_back((3u << 16) | spv::OpFunctionParameter);
-            Out.push_back(Info.TypeId);
-            Out.push_back(Info.ParamId);
+            for (uint32_t P = 0; P < Info.NumParams; ++P) {
+              uint32_t PTy = (Info.Op == kTagRefract && P == 2)
+                                 ? Info.ScalarTypeId
+                                 : Info.TypeId;
+              Out.push_back((3u << 16) | spv::OpFunctionParameter);
+              Out.push_back(PTy);
+              Out.push_back(Info.ParamIds[P]);
+            }
             Out.push_back((2u << 16) | spv::OpLabel);
             Out.push_back(Info.LabelId);
             Out.push_back((2u << 16) | spv::OpReturnValue);
-            Out.push_back(Info.ParamId);
+            Out.push_back(Info.ParamIds[0]);
             Out.push_back((1u << 16) | spv::OpFunctionEnd);
           }
           if (HasDemote) {
@@ -1614,6 +1671,27 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           Out.push_back(ResId);
           Out.push_back(Info.FnId);
           Out.push_back(ValId);
+          I += Count;
+          continue;
+        }
+        // Rewrite GLSL.std.450 FaceForward / Refract -> OpFunctionCall
+        if (Op == spv::OpExtInst && Count == 8 && GlslExtId != 0 &&
+            Words[I + 3] == GlslExtId &&
+            (Words[I + 4] == kGlslFaceForward ||
+             Words[I + 4] == kGlslRefract)) {
+          uint32_t ResTy = Words[I + 1];
+          uint32_t ResId = Words[I + 2];
+          uint32_t Tag = (Words[I + 4] == kGlslFaceForward) ? kTagFaceForward
+                                                            : kTagRefract;
+          uint64_t Key = (static_cast<uint64_t>(Tag) << 32) | ResTy;
+          const HelperFnInfo &Info = Helpers[Key];
+          Out.push_back((7u << 16) | spv::OpFunctionCall);
+          Out.push_back(ResTy);
+          Out.push_back(ResId);
+          Out.push_back(Info.FnId);
+          Out.push_back(Words[I + 5]);
+          Out.push_back(Words[I + 6]);
+          Out.push_back(Words[I + 7]);
           I += Count;
           continue;
         }
@@ -1696,6 +1774,94 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                                     ir::DerivAxisAttr::get(&Ctx, Axis),
                                     ir::DerivQualityAttr::get(&Ctx, Qual))
                     .getResult();
+        }
+        FC.getResult(0).replaceAllUsesWith(Res);
+        FC.erase();
+        continue;
+      }
+      if (FC.getNumOperands() == 3 && FC.getNumResults() == 1 &&
+          (Callee.starts_with("__crucible_spv_faceforward_") ||
+           Callee.starts_with("__crucible_spv_refract_"))) {
+        mlir::Type ResTy = FC.getResult(0).getType();
+        auto VecTy = mlir::dyn_cast<mlir::VectorType>(ResTy);
+        auto ElemTy = mlir::cast<mlir::FloatType>(
+            VecTy ? VecTy.getElementType() : ResTy);
+        auto I32TyLocal = mlir::IntegerType::get(&Ctx, 32);
+
+        auto buildDot = [&](mlir::Value A, mlir::Value C) -> mlir::Value {
+          if (!VecTy)
+            return mlir::LLVM::FMulOp::create(B, Loc, ElemTy, A, C);
+          unsigned N = static_cast<unsigned>(VecTy.getNumElements());
+          mlir::Value Acc;
+          for (unsigned K = 0; K < N; ++K) {
+            auto IdxC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32TyLocal, static_cast<int32_t>(K));
+            mlir::Value AK = mlir::LLVM::ExtractElementOp::create(B, Loc, A, IdxC);
+            mlir::Value CK = mlir::LLVM::ExtractElementOp::create(B, Loc, C, IdxC);
+            mlir::Value Prod = mlir::LLVM::FMulOp::create(B, Loc, ElemTy, AK, CK);
+            Acc = Acc ? mlir::Value(mlir::LLVM::FAddOp::create(B, Loc, ElemTy, Acc, Prod))
+                      : Prod;
+          }
+          return Acc;
+        };
+        auto splatScalar = [&](mlir::Value S) -> mlir::Value {
+          if (!VecTy)
+            return S;
+          unsigned N = static_cast<unsigned>(VecTy.getNumElements());
+          mlir::Value V = mlir::LLVM::PoisonOp::create(B, Loc, VecTy);
+          for (unsigned K = 0; K < N; ++K) {
+            auto IdxC = mlir::LLVM::ConstantOp::create(
+                B, Loc, I32TyLocal, static_cast<int32_t>(K));
+            V = mlir::LLVM::InsertElementOp::create(B, Loc, V, S, IdxC);
+          }
+          return V;
+        };
+        auto fConst = [&](double Val) -> mlir::Value {
+          return mlir::LLVM::ConstantOp::create(
+              B, Loc, ElemTy, B.getFloatAttr(ElemTy, Val));
+        };
+
+        mlir::Value ZeroS = fConst(0.0);
+        mlir::Value Res;
+        if (Callee.starts_with("__crucible_spv_faceforward_")) {
+          // faceforward(N, I, Nref) = dot(Nref, I) < 0 ? N : -N
+          mlir::Value N = FC.getOperand(0);
+          mlir::Value I = FC.getOperand(1);
+          mlir::Value Nref = FC.getOperand(2);
+          mlir::Value D = buildDot(Nref, I);
+          mlir::Value Lt0 = mlir::LLVM::FCmpOp::create(
+              B, Loc, mlir::LLVM::FCmpPredicate::olt, D, ZeroS);
+          mlir::Value NegN = mlir::LLVM::FNegOp::create(B, Loc, ResTy, N);
+          Res = mlir::LLVM::SelectOp::create(B, Loc, ResTy, Lt0, N, NegN);
+        } else {
+          // refract(I, N, eta):
+          //   d = dot(N, I)
+          //   k = 1.0 - eta * eta * (1.0 - d * d)
+          //   res = (k < 0.0) ? 0.0 : eta * I - (eta * d + sqrt(max(k, 0.0))) * N
+          mlir::Value I = FC.getOperand(0);
+          mlir::Value N = FC.getOperand(1);
+          mlir::Value Eta = FC.getOperand(2);
+          mlir::Value OneS = fConst(1.0);
+          mlir::Value D = buildDot(N, I);
+          mlir::Value DD = mlir::LLVM::FMulOp::create(B, Loc, ElemTy, D, D);
+          mlir::Value OneMinusDD = mlir::LLVM::FSubOp::create(B, Loc, ElemTy, OneS, DD);
+          mlir::Value Eta2 = mlir::LLVM::FMulOp::create(B, Loc, ElemTy, Eta, Eta);
+          mlir::Value Term = mlir::LLVM::FMulOp::create(B, Loc, ElemTy, Eta2, OneMinusDD);
+          mlir::Value K = mlir::LLVM::FSubOp::create(B, Loc, ElemTy, OneS, Term);
+          mlir::Value Klt0 = mlir::LLVM::FCmpOp::create(
+              B, Loc, mlir::LLVM::FCmpPredicate::olt, K, ZeroS);
+          mlir::Value SafeK = mlir::LLVM::SelectOp::create(
+              B, Loc, ElemTy, Klt0, ZeroS, K);
+          mlir::Value SqrtK = mlir::LLVM::SqrtOp::create(B, Loc, ElemTy, SafeK);
+          mlir::Value EtaD = mlir::LLVM::FMulOp::create(B, Loc, ElemTy, Eta, D);
+          mlir::Value ScaleN = mlir::LLVM::FAddOp::create(B, Loc, ElemTy, EtaD, SqrtK);
+          mlir::Value EtaI = mlir::LLVM::FMulOp::create(
+              B, Loc, ResTy, splatScalar(Eta), I);
+          mlir::Value ScaledN = mlir::LLVM::FMulOp::create(
+              B, Loc, ResTy, splatScalar(ScaleN), N);
+          mlir::Value Diff = mlir::LLVM::FSubOp::create(B, Loc, ResTy, EtaI, ScaledN);
+          Res = mlir::LLVM::SelectOp::create(
+              B, Loc, ResTy, Klt0, splatScalar(ZeroS), Diff);
         }
         FC.getResult(0).replaceAllUsesWith(Res);
         FC.erase();

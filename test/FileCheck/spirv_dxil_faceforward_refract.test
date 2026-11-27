@@ -1,0 +1,10 @@
+# Regression test for Batch 9 SPIR-V GLSL.std.450 FaceForward (70) & Refract (72) rewrites:
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/spirv_dxil_faceforward_refract.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+
+# CHECK: define void @main()
+# CHECK-DAG: @dx.op.unary.f32(i32 24, float {{%.*}})
+# CHECK-DAG: fcmp olt float
