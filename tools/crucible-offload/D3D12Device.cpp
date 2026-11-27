@@ -263,6 +263,12 @@ DXGI_FORMAT dxgiFormatFor(DataFormat Format, int Channels) {
     if (Ch == 1) return DXGI_FORMAT_R8_UINT;
     if (Ch == 2) return DXGI_FORMAT_R8G8_UINT;
     return DXGI_FORMAT_R8G8B8A8_UINT;
+  case DataFormat::Int64:
+  case DataFormat::UInt64:
+  case DataFormat::Hex64:
+  case DataFormat::Float64:
+    if (Ch == 1) return DXGI_FORMAT_R32G32_UINT;
+    return DXGI_FORMAT_R32G32B32A32_UINT;
   default:
     return DXGI_FORMAT_R32_UINT;
   }
@@ -384,6 +390,7 @@ struct BoundResource {
   ID3D12Resource *CounterReadbackBuf = nullptr;
   uint64_t SizeBytes = 0;
   uint64_t AllocBytes = 0;
+  uint32_t ReflectedStride = 0;
   std::vector<uint8_t> InlineData;
   bool IsStandaloneCounter = false;
   bool IsUnbounded = false;
@@ -527,6 +534,7 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
           BR.Space = Space;
           BR.Register = BaseReg + A;
           BR.IsUnbounded = IsUnbounded;
+          BR.ReflectedStride = Matched->ElementStride;
           BR.SizeBytes = Res.BufferPtr->Size;
           if (Res.isTexture()) {
             BR.IsTexture = true;
@@ -573,9 +581,21 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
             }
             BR.AllocBytes = std::max<uint64_t>(DstOff, 256ull);
           } else {
-            BR.AllocBytes = (Class == crucible::ResourceClass::CBV)
-                                ? ((BR.SizeBytes + 255ull) & ~255ull)
-                                : std::max<uint64_t>(BR.SizeBytes, 4ull);
+            if (Class == crucible::ResourceClass::CBV) {
+              BR.AllocBytes = (BR.SizeBytes + 255ull) & ~255ull;
+            } else if (Res.Kind == ResourceKind::ByteAddressBuffer ||
+                       Res.Kind == ResourceKind::RWByteAddressBuffer) {
+              BR.AllocBytes = std::max<uint64_t>(4ull, (BR.SizeBytes + 3ull) & ~3ull);
+            } else if (Res.Kind == ResourceKind::StructuredBuffer ||
+                       Res.Kind == ResourceKind::RWStructuredBuffer) {
+              uint32_t S = BR.ReflectedStride
+                               ? BR.ReflectedStride
+                               : std::max<uint32_t>(2u, Res.BufferPtr->getElementSize());
+              BR.AllocBytes =
+                  std::max<uint64_t>(S, ((BR.SizeBytes + S - 1ull) / S) * S);
+            } else {
+              BR.AllocBytes = std::max<uint64_t>(BR.SizeBytes, 4ull);
+            }
           }
           Bound.push_back(std::move(BR));
         }
@@ -1121,7 +1141,9 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
               static_cast<UINT>(std::max<uint64_t>(1, BR.AllocBytes / 4));
           UAVDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         } else if (BR.Res->Kind == ResourceKind::RWStructuredBuffer) {
-          uint32_t Stride = std::max<uint32_t>(4u, CPU.getElementSize());
+          uint32_t Stride = BR.ReflectedStride
+                                ? BR.ReflectedStride
+                                : std::max<uint32_t>(2u, CPU.getElementSize());
           UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
           UAVDesc.Buffer.StructureByteStride = Stride;
           UAVDesc.Buffer.NumElements =
@@ -1145,7 +1167,9 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
               static_cast<UINT>(std::max<uint64_t>(1, BR.AllocBytes / 4));
           SRVDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
         } else if (BR.Res->Kind == ResourceKind::StructuredBuffer) {
-          uint32_t Stride = std::max<uint32_t>(4u, CPU.getElementSize());
+          uint32_t Stride = BR.ReflectedStride
+                                ? BR.ReflectedStride
+                                : std::max<uint32_t>(2u, CPU.getElementSize());
           SRVDesc.Format = DXGI_FORMAT_UNKNOWN;
           SRVDesc.Buffer.StructureByteStride = Stride;
           SRVDesc.Buffer.NumElements =
