@@ -423,6 +423,12 @@
       --label-6: "Unsupported";
     }
 
+    .comparison-table {
+      --label-2: "Crucible";
+      --label-3: "External run";
+      --label-4: "Difference";
+    }
+
     @container (width < 600px) {
       table, thead, tbody, tr, th, td {
         display: block;
@@ -611,7 +617,7 @@
       </div>
       <div id="comparison-counts" class="diff-counts"></div>
       <div tabindex="0" role="region" aria-label="Test behavior comparison" class="table-wrapper">
-        <table class="category-table">
+        <table class="comparison-table">
           <thead>
             <tr>
               <th scope="col">Test</th>
@@ -1108,9 +1114,21 @@
       if (trackId === "spirv-to-dxil") {
         return externalRuns.filter(run => run.platform === "directx");
       }
-      return externalRuns.filter(run =>
-        run.platform === "metal" || run.platform === "directx"
-      );
+      if (trackId === "dxil-to-metal") {
+        return externalRuns.filter(run =>
+          run.platform === "metal" || run.platform === "directx"
+        );
+      }
+      return externalRuns;
+    }
+
+    function externalRunPassRate(run) {
+      if (typeof run.results?.passRate === "number") return run.results.passRate;
+      if (Array.isArray(run.tests) && run.tests.length) {
+        const passed = run.tests.filter(t => t.status === "pass").length;
+        return (100 * passed) / run.tests.length;
+      }
+      return 0;
     }
 
     function renderComparison() {
@@ -1124,7 +1142,7 @@
 
       if (select.dataset.track !== currentTrackId) {
         select.innerHTML = candidates.map(run =>
-          `<option value="${escapeHtml(run.id)}">${escapeHtml(run.label)} — ${Number(run.results?.passRate || 0).toFixed(1)}%</option>`
+          `<option value="${escapeHtml(run.id)}">${escapeHtml(run.label)} — ${externalRunPassRate(run).toFixed(1)}%</option>`
         ).join("");
         select.dataset.track = currentTrackId;
       } else {
@@ -1141,10 +1159,19 @@
       }
 
       if (!run.tests?.length) {
-        document.getElementById("comparison-counts").textContent =
-          "Test-level artifact data is unavailable for this run.";
+        const r = run.results || {};
+        if (typeof r.total === "number" && r.total > 0) {
+          document.getElementById("comparison-counts").innerHTML =
+            `<span><strong>${externalRunPassRate(run).toFixed(1)}%</strong> external pass rate</span>` +
+            `<span><strong>${r.passed ?? 0}</strong> / ${r.total} passed</span>` +
+            `<span><strong>${r.xfail ?? 0}</strong> xfail</span>` +
+            `<span><strong>${r.unsupported ?? 0}</strong> unsupported</span>`;
+        } else {
+          document.getElementById("comparison-counts").textContent =
+            "Test-level artifact data is unavailable for this run.";
+        }
         document.getElementById("comparison-tbody").innerHTML =
-          '<tr><td colspan="4">No downloadable testresults.json was found.</td></tr>';
+          '<tr><td colspan="4">Per-test diff data is unavailable for this run (cross-repo artifact/log download requires OFFLOAD_READ_TOKEN).</td></tr>';
         return;
       }
 

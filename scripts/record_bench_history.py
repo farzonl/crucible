@@ -155,7 +155,7 @@ def main() -> None:
                 if isinstance(arr, list):
                     with open(data_dir / fname, "w", encoding="utf-8") as f:
                         json.dump(arr, f, indent=2)
-        for fname in ("latest.json", "badge.json"):
+        for fname in ("latest.json", "badge.json", "comparisons.json"):
             if not (data_dir / fname).exists():
                 obj = fetch_json_url(base_url + f"/data/{fname}")
                 if isinstance(obj, dict):
