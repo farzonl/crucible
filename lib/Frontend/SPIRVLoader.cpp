@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Frontend.h"
+#include "../Transforms/MiddleEnd.h"
 #include "crucible/Diagnostic.h"
 #include "crucible/Dialect/CrucibleDialect.h"
 
@@ -4998,6 +4999,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   // 4. Lower remaining SPIR-V ops (arithmetic, constants, casts, branches) to
   // LLVM dialect via MLIR's upstream ConvertSPIRVToLLVM pass.
   mlir::PassManager PM(&Ctx);
+  PM.enableVerifier(false);
   PM.addPass(mlir::createConvertSPIRVToLLVMPass());
   if (mlir::failed(PM.run(*TopMod)))
     return makeError("MLIR ConvertSPIRVToLLVM pass failed");
@@ -5016,6 +5018,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       Op->moveBefore(SM);
     SM.erase();
   }
+
+  normalizeSignlessLLVMConstants(*TopMod);
 
   if (mlir::failed(mlir::verify(*TopMod)))
     return makeError("MLIR verification failed after SPIR-V lowering");

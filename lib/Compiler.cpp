@@ -11,6 +11,7 @@
 #include "Backend/MSLEmitter.h"
 #include "Backend/SPIRVEmitter.h"
 #include "Frontend/Frontend.h"
+#include "Transforms/MiddleEnd.h"
 #include "Transforms/Transforms.h"
 
 #include "llvm/IR/LLVMContext.h"
@@ -30,6 +31,10 @@ Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
                       : loadMLIR(Input, MCtx, Opts.EntryPoint);
     if (!Loaded)
       return Loaded.takeError();
+
+    if (Error E = runMiddleEnd(*Loaded->Module, Loaded->Reflect,
+                               TargetCaps::metal()))
+      return std::move(E);
 
     if (Error E = assignMetalBindings(Loaded->Reflect, Opts))
       return std::move(E);
@@ -59,11 +64,18 @@ Expected<CompileResult> compileToMSL(MemoryBufferRef Input,
   if (!Shader)
     return Shader.takeError();
 
+  mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
+  auto Mod = importDXILToMLIR(*Shader, MCtx);
+  if (!Mod)
+    return Mod.takeError();
+
+  if (Error E = runMiddleEnd(**Mod, Shader->Reflect, TargetCaps::metal()))
+    return std::move(E);
+
   if (Error E = assignMetalBindings(Shader->Reflect, Opts))
     return std::move(E);
 
-  mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
-  auto Structured = structurizeCFG(*Shader, MCtx);
+  auto Structured = structurizeMLIRModule(std::move(*Mod), Shader->Reflect);
   if (!Structured)
     return Structured.takeError();
 
@@ -89,13 +101,16 @@ Expected<SPIRVCompileResult> compileDXILToSPIRV(MemoryBufferRef DXIL,
   if (!Shader)
     return Shader.takeError();
 
-  if (Error E = assignSPIRVBindings(Shader->Reflect, Opts))
-    return std::move(E);
-
   mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
   auto Mod = importDXILToMLIR(*Shader, MCtx);
   if (!Mod)
     return Mod.takeError();
+
+  if (Error E = runMiddleEnd(**Mod, Shader->Reflect, TargetCaps::spirv()))
+    return std::move(E);
+
+  if (Error E = assignSPIRVBindings(Shader->Reflect, Opts))
+    return std::move(E);
 
   if (Opts.DumpMLIR) {
     (*Mod)->print(llvm::errs());
@@ -133,6 +148,10 @@ Expected<DXILCompileResult> compileToDXIL(MemoryBufferRef Input,
     // (gpu.* + math.* + llvm.* + crucible.*).
     lowerDXILToLayer1(*Loaded->Module);
 
+    if (Error E = runMiddleEnd(*Loaded->Module, Loaded->Reflect,
+                               TargetCaps::dxil()))
+      return std::move(E);
+
     if (Error E = assignDXILBindings(Loaded->Reflect, Opts))
       return std::move(E);
 
@@ -157,13 +176,16 @@ Expected<DXILCompileResult> compileToDXIL(MemoryBufferRef Input,
   if (!Shader)
     return Shader.takeError();
 
-  if (Error E = assignDXILBindings(Shader->Reflect, Opts))
-    return std::move(E);
-
   mlir::MLIRContext MCtx(mlir::MLIRContext::Threading::DISABLED);
   auto Mod = importDXILToMLIR(*Shader, MCtx);
   if (!Mod)
     return Mod.takeError();
+
+  if (Error E = runMiddleEnd(**Mod, Shader->Reflect, TargetCaps::dxil()))
+    return std::move(E);
+
+  if (Error E = assignDXILBindings(Shader->Reflect, Opts))
+    return std::move(E);
 
   if (Opts.DumpMLIR) {
     (*Mod)->print(llvm::errs());

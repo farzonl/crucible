@@ -10,6 +10,7 @@ add_library(crucible STATIC
   Transforms/ResourceLowering.cpp
   Transforms/CFGStructurizer.cpp
   Transforms/DXILToLayer1.cpp
+  Transforms/MiddleEnd.cpp
   Backend/DXILEmitter.cpp
   Backend/MSLEmitter.cpp
   Backend/SPIRVEmitter.cpp
