@@ -490,13 +490,13 @@ jobs:
         if: steps.cache-win-sdk.outputs.cache-hit != 'true'
         run: |
           mkdir -p .sdk/bin .sdk/warp .sdk/vcpkg
-          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -o /tmp/dxc.zip
-          unzip -q /tmp/dxc.zip -d /tmp/dxc
-          cp -a /tmp/dxc/bin/x64/* .sdk/bin/
-          rm -rf /tmp/dxc /tmp/dxc.zip
-          curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.22/microsoft.direct3d.warp.1.0.22.nupkg" -o /tmp/warp.nupkg
-          unzip -q -j /tmp/warp.nupkg "build/native/bin/x64/d3d10warp.dll" -d .sdk/warp
-          rm -f /tmp/warp.nupkg
+          curl -fsSL "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip" -o dxc.zip
+          python -c "import zipfile; zipfile.ZipFile('dxc.zip').extractall('dxc_extract')"
+          cp -a dxc_extract/bin/x64/* .sdk/bin/
+          rm -rf dxc_extract dxc.zip
+          curl -fsSL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.22/microsoft.direct3d.warp.1.0.22.nupkg" -o warp.nupkg
+          python -c "import zipfile; z=zipfile.ZipFile('warp.nupkg'); open('.sdk/warp/d3d10warp.dll','wb').write(z.read('build/native/bin/x64/d3d10warp.dll'))"
+          rm -f warp.nupkg
           VCPKG_ROOT="$(cygpath -u "$VCPKG_INSTALLATION_ROOT")"
           "${VCPKG_ROOT}/vcpkg.exe" install libpng:x64-windows-static-md
           cp -a "${VCPKG_ROOT}/installed/x64-windows-static-md/." .sdk/vcpkg/
