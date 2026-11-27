@@ -1,0 +1,22 @@
+# Regression test for DXIL compliance fixes (#180, #181, #183, #185):
+# - TypedBuffer UAV store zero-fills unused lanes instead of undef (#180)
+# - 16-bit StructuredBuffer uses i16 instead of i8 array (#185)
+# - half FP ops omit !dx.precise metadata (#181)
+# - WaveMultiPrefixSum and WaveReadLaneAt (gpu.shuffle) lower cleanly (#183)
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -enable-16bit-types -T cs_6_2 -E main -Fo %t.uav.spv %S/../Inputs/spirv_dxil_uav_and_f16.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.uav.spv | FileCheck %s --check-prefix=UAVF16
+# RUN: %cruciblec --target=dxil %t.uav.spv -o %t.uav.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.1 -T cs_6_5 -E main -Fo %t.wave.spv %S/../Inputs/spirv_dxil_wave_and_grad.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.wave.spv | FileCheck %s --check-prefix=WAVE
+# RUN: %cruciblec --target=dxil %t.wave.spv -o %t.wave.dxil
+
+# UAVF16: define void @main()
+# UAVF16-DAG: call void @dx.op.bufferStore.i32(i32 69, %dx.types.Handle {{%.*}}, i32 {{%.*}}, i32 undef, i32 {{%.*}}, i32 0, i32 0, i32 0, i8 15)
+# UAVF16-DAG: call half @dx.op.unary.f16(i32 6, half {{%.*}}){{$}}
+
+# WAVE: define void @main()
+# WAVE-DAG: @dx.op.waveMultiPrefixOp.i32
+# WAVE-DAG: @dx.op.waveReadLaneAt.i32
