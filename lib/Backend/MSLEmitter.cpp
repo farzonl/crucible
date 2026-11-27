@@ -7005,13 +7005,18 @@ Error Emitter::emitBlock(mlir::Block &B, unsigned Ind,
     }
   }
 
-  for (mlir::Operation &Op : B) {
+  // Track packed vector widths so chained lane-parallel binary ops can reuse
+  // whole vectors (`v13 + v17`) instead of rebuilding `float4(v13.x, ...)`.
+  llvm::StringMap<unsigned> PackedVecWidths;
+
+  for (auto It = B.begin(), End = B.end(); It != End; ++It) {
+    mlir::Operation &Op = *It;
     if (&Op == StopBefore)
       break;
-    if (auto It = SinCosPartner.find(&Op); It != SinCosPartner.end()) {
+    if (auto SIt = SinCosPartner.find(&Op); SIt != SinCosPartner.end()) {
       if (ValueNames.count(Op.getResult(0)))
         continue; // already emitted by partner
-      mlir::Operation *Partner = It->second;
+      mlir::Operation *Partner = SIt->second;
       bool ThisIsSin = mlir::isa<mlir::LLVM::SinOp, mlir::math::SinOp>(&Op);
       mlir::Operation *SinOp = ThisIsSin ? &Op : Partner;
       mlir::Operation *CosOp = ThisIsSin ? Partner : &Op;
@@ -7030,6 +7035,204 @@ Error Emitter::emitBlock(mlir::Block &B, unsigned Ind,
       ValueNames[CosOp->getResult(0)] = CosName;
       continue;
     }
+
+    // Pack contiguous scalar StoreOutputOp writes to the same vector output
+    // field into a single `stageOut.sigN = float4(...)` assignment.
+    if (auto SO = mlir::dyn_cast<ir::StoreOutputOp>(&Op);
+        SO && !R.Hull &&
+        (R.Stage == ShaderStage::Vertex || R.Stage == ShaderStage::Pixel)) {
+      uint32_t ID = static_cast<uint32_t>(SO.getOutputId());
+      auto Row = constInt(SO.getRow());
+      auto P = llvm::find_if(R.Outputs, [&](const StageParameter &S) {
+        return S.ID == ID;
+      });
+      if (P != R.Outputs.end() && Row && *Row < P->Rows && P->Columns >= 2 &&
+          P->Columns <= 4 && P->Kind != ClipDistance &&
+          P->Kind != CullDistance) {
+        SmallVector<mlir::Value, 4> ColVals(P->Columns);
+        uint32_t SeenMask = 0;
+        auto Scan = It;
+        unsigned Matched = 0;
+        while (Scan != End && &*Scan != StopBefore && Matched < P->Columns) {
+          auto NextSO = mlir::dyn_cast<ir::StoreOutputOp>(&*Scan);
+          if (!NextSO || static_cast<uint32_t>(NextSO.getOutputId()) != ID)
+            break;
+          auto NextRow = constInt(NextSO.getRow());
+          uint32_t Col =
+              static_cast<uint32_t>(static_cast<uint8_t>(NextSO.getCol()));
+          if (!NextRow || *NextRow != *Row || Col >= P->Columns ||
+              (SeenMask & (1u << Col)))
+            break;
+          SeenMask |= (1u << Col);
+          ColVals[Col] = NextSO.getValue();
+          ++Matched;
+          ++Scan;
+        }
+        uint32_t FullMask = (1u << P->Columns) - 1u;
+        if (SeenMask == FullMask) {
+          const char *ElemTy = P->Type == ComponentType::F32   ? "float"
+                               : P->Type == ComponentType::F16 ? "half"
+                               : P->Type == ComponentType::I32 ? "int"
+                               : P->Type == ComponentType::U32 ? "uint"
+                                                               : nullptr;
+          if (!ElemTy)
+            return makeError("unsupported stage output component type");
+          std::string VecTy = std::string(ElemTy) + std::to_string(P->Columns);
+          std::string Args;
+          for (unsigned C = 0; C < P->Columns; ++C) {
+            auto E = exprFor(ColVals[C], PrecUnknown);
+            if (!E)
+              return E.takeError();
+            if (C > 0)
+              Args += ", ";
+            Args += E->Text;
+          }
+          line(Ind, "stageOut." + signatureField(*P, *Row) + " = " + VecTy +
+                        "(" + Args + ");");
+          It = std::prev(Scan);
+          continue;
+        }
+      }
+    }
+
+    // Pack 2..4 consecutive lane-parallel scalar float binary ops into a
+    // single Metal vector op (`float4 vN = lhs + rhs;`) to shrink MSL AST size
+    // and speed up Apple's runtime Clang/MSL frontend.
+    auto FloatBinOpKind = [](mlir::Operation *O) -> int {
+      if (mlir::isa<mlir::LLVM::FAddOp>(O))
+        return 1;
+      if (mlir::isa<mlir::LLVM::FSubOp>(O))
+        return 2;
+      if (mlir::isa<mlir::LLVM::FMulOp>(O))
+        return 3;
+      if (mlir::isa<mlir::LLVM::FDivOp>(O))
+        return 4;
+      return 0;
+    };
+    int Kind = (!R.RequiresStrictFP && !Opts.EmulateF64) ? FloatBinOpKind(&Op)
+                                                         : 0;
+    if (Kind != 0 && !shouldInline(&Op) && !Op.getResult(0).use_empty() &&
+        !ValueNames.count(Op.getResult(0))) {
+      mlir::Type ScalarTy = Op.getResult(0).getType();
+      if (ScalarTy.isF32() || ScalarTy.isF16()) {
+        SmallVector<mlir::Operation *, 4> Group = {&Op};
+        auto Scan = std::next(It);
+        while (Scan != End && &*Scan != StopBefore && Group.size() < 4) {
+          mlir::Operation *Cur = &*Scan;
+          if (FloatBinOpKind(Cur) != Kind ||
+              Cur->getResult(0).getType() != ScalarTy || shouldInline(Cur) ||
+              Cur->getResult(0).use_empty() ||
+              ValueNames.count(Cur->getResult(0)))
+            break;
+          // Reject cross-lane dependencies within the same packed group.
+          bool CrossDep = false;
+          for (mlir::Operation *Prev : Group) {
+            mlir::Value PR = Prev->getResult(0);
+            if (Cur->getOperand(0) == PR || Cur->getOperand(1) == PR) {
+              CrossDep = true;
+              break;
+            }
+          }
+          if (CrossDep)
+            break;
+          Group.push_back(Cur);
+          ++Scan;
+        }
+        unsigned W = Group.size();
+        if (W >= 2) {
+          auto ScalarTyName = mslType(ScalarTy);
+          if (!ScalarTyName)
+            return ScalarTyName.takeError();
+          std::string VecTy = *ScalarTyName + std::to_string(W);
+          int OpPrec = (Kind == 1 || Kind == 2) ? PrecAdd : PrecMul;
+          const char *OpSym = Kind == 1   ? " + "
+                              : Kind == 2 ? " - "
+                              : Kind == 3 ? " * "
+                                          : " / ";
+
+          auto BuildVecOperand = [&](unsigned OpIdx,
+                                     bool &IsScalarBroadcast) -> Expected<std::string> {
+            SmallVector<std::string, 4> Parts;
+            bool AllSame = true;
+            for (unsigned K = 0; K < W; ++K) {
+              auto E = exprFor(Group[K]->getOperand(OpIdx), PrecUnknown);
+              if (!E)
+                return E.takeError();
+              if (K > 0 && E->Text != Parts[0])
+                AllSame = false;
+              Parts.push_back(std::move(E->Text));
+            }
+            if (AllSame) {
+              IsScalarBroadcast = true;
+              auto E = exprFor(Group[0]->getOperand(OpIdx), OpPrec);
+              if (!E)
+                return E.takeError();
+              return E->Text;
+            }
+            // Fold `base.x, base.y[, base.z[, base.w]]` directly to `base`
+            // when `base` is known to be a W-component vector.
+            static constexpr char Swiz[4] = {'x', 'y', 'z', 'w'};
+            if (Parts[0].size() > 2 && Parts[0][Parts[0].size() - 2] == '.' &&
+                Parts[0].back() == 'x') {
+              StringRef Base = StringRef(Parts[0]).drop_back(2);
+              bool MatchesSwiz = true;
+              for (unsigned K = 1; K < W; ++K) {
+                if (Parts[K].size() != Base.size() + 2 ||
+                    !StringRef(Parts[K]).starts_with(Base) ||
+                    Parts[K][Base.size()] != '.' ||
+                    Parts[K].back() != Swiz[K]) {
+                  MatchesSwiz = false;
+                  break;
+                }
+              }
+              if (MatchesSwiz) {
+                bool BaseWidthMatches = (PackedVecWidths.lookup(Base) == W);
+                if (!BaseWidthMatches) {
+                  if (auto EE = Group[0]->getOperand(OpIdx).getDefiningOp<
+                                mlir::LLVM::ExtractElementOp>()) {
+                    if (auto VT = mlir::dyn_cast<mlir::VectorType>(
+                            EE.getVector().getType());
+                        VT && VT.getNumElements() == W)
+                      BaseWidthMatches = true;
+                  }
+                }
+                if (BaseWidthMatches)
+                  return Base.str();
+              }
+            }
+            std::string Joined = VecTy + "(";
+            for (unsigned K = 0; K < W; ++K) {
+              if (K > 0)
+                Joined += ", ";
+              Joined += Parts[K];
+            }
+            Joined += ")";
+            return Joined;
+          };
+
+          bool LhsScalar = false, RhsScalar = false;
+          auto Lhs = BuildVecOperand(0, LhsScalar);
+          if (!Lhs)
+            return Lhs.takeError();
+          auto Rhs = BuildVecOperand(1, RhsScalar);
+          if (!Rhs)
+            return Rhs.takeError();
+          // Ensure at least one operand is vector-typed so the result is VecTy.
+          if (LhsScalar && RhsScalar)
+            *Lhs = VecTy + "(" + *Lhs + ")";
+          std::string Name = freshName();
+          line(Ind, VecTy + " " + Name + " = " + *Lhs + OpSym + *Rhs + ";");
+          PackedVecWidths[Name] = W;
+          static constexpr char Swiz[4] = {'x', 'y', 'z', 'w'};
+          for (unsigned K = 0; K < W; ++K)
+            ValueNames[Group[K]->getResult(0)] =
+                Name + "." + std::string(1, Swiz[K]);
+          It = std::prev(Scan);
+          continue;
+        }
+      }
+    }
+
     if (Error E = emitStatement(&Op, Ind))
       return E;
   }
