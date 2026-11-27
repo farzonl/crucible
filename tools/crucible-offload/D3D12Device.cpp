@@ -357,6 +357,7 @@ struct BoundSampler {
   const offloadtest::Resource *Res = nullptr;
   uint32_t Space = 0;
   uint32_t Register = 0;
+  bool IsUnbounded = false;
 };
 
 struct TexSubresourceLayout {
@@ -385,6 +386,7 @@ struct BoundResource {
   uint64_t AllocBytes = 0;
   std::vector<uint8_t> InlineData;
   bool IsStandaloneCounter = false;
+  bool IsUnbounded = false;
   bool IsTexture = false;
   uint32_t TexW = 1, TexH = 1, TexD = 1, TexMips = 1, TexSlices = 1;
   uint32_t TexBytesPerPixel = 4;
@@ -436,6 +438,32 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
             "resource '%s'",
             Res.Name.c_str());
 
+      auto findReflected =
+          [&](crucible::ResourceClass C, uint32_t SrcSet, uint32_t SrcBinding,
+              const std::string &Name,
+              bool HasVK) -> const crucible::ResourceBinding * {
+        if (HasVK) {
+          for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+            if (RB.Class == C && !RB.IsPushConstant &&
+                RB.SPIRVSet == SrcSet && RB.SPIRVBinding == SrcBinding)
+              return &RB;
+          }
+        }
+        if (!Name.empty()) {
+          for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+            if (RB.Class == C && !RB.IsPushConstant && !RB.Name.empty() &&
+                RB.Name == Name)
+              return &RB;
+          }
+        }
+        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+          if (RB.Class == C && !RB.IsPushConstant && RB.Space == SrcSet &&
+              RB.LowerBound == SrcBinding)
+            return &RB;
+        }
+        return nullptr;
+      };
+
       if (Res.isSampler()) {
         if (!Res.SamplerPtr)
           return createStringError(std::errc::invalid_argument,
@@ -449,30 +477,16 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
           Space = Res.DXBinding->Space;
           BaseReg = Res.DXBinding->Register;
         }
-        bool MatchedByName = false;
-        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
-          if (RB.Class == crucible::ResourceClass::Sampler &&
-              !RB.Name.empty() && RB.Name == Res.Name) {
-            Space = RB.Space;
-            BaseReg = RB.LowerBound;
-            MatchedByName = true;
-            break;
-          }
-        }
-        if (!MatchedByName) {
-          for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
-            if (RB.Class == crucible::ResourceClass::Sampler &&
-                RB.Space == Space && RB.LowerBound == BaseReg) {
-              Space = RB.Space;
-              BaseReg = RB.LowerBound;
-              break;
-            }
-          }
-        }
+        const crucible::ResourceBinding *Matched =
+            findReflected(crucible::ResourceClass::Sampler, Space, BaseReg,
+                          Res.Name, static_cast<bool>(Res.VKBinding));
+        if (!Matched)
+          continue;
         BoundSampler BS;
         BS.Res = &Res;
-        BS.Space = Space;
-        BS.Register = BaseReg;
+        BS.Space = Matched->Space;
+        BS.Register = Matched->LowerBound;
+        BS.IsUnbounded = (Matched->RangeSize == 0xFFFFFFFFu);
         BoundSamplers.push_back(BS);
         continue;
       }
@@ -498,85 +512,73 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       }
 
       crucible::ResourceClass Class = *ClassOpt;
-      bool MatchedByName = false;
-      for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
-        if (RB.Class == Class && !RB.Name.empty() && RB.Name == Res.Name) {
-          Space = RB.Space;
-          BaseReg = RB.LowerBound;
-          MatchedByName = true;
-          break;
-        }
-      }
-      if (!MatchedByName) {
-        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
-          if (RB.Space == Space && RB.LowerBound == BaseReg &&
-              RB.Class == Class) {
-            Space = RB.Space;
-            BaseReg = RB.LowerBound;
-            break;
-          }
-        }
-      }
-
+      const crucible::ResourceBinding *Matched = findReflected(
+          Class, Space, BaseReg, Res.Name, static_cast<bool>(Res.VKBinding));
       uint32_t ArrCount = std::max<uint32_t>(1u, Res.BufferPtr->ArraySize);
-      for (uint32_t A = 0; A < ArrCount; ++A) {
-        BoundResource BR;
-        BR.Res = &Res;
-        BR.ArrIdx = A;
-        BR.Class = Class;
-        BR.Space = Space;
-        BR.Register = BaseReg + A;
-        BR.SizeBytes = Res.BufferPtr->Size;
-        if (Res.isTexture()) {
-          BR.IsTexture = true;
-          const CPUBuffer &CPU = *Res.BufferPtr;
-          BR.TexW = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Width));
-          BR.TexH = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Height));
-          BR.TexD = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Depth));
-          BR.TexMips =
-              static_cast<uint32_t>(std::max(1, CPU.OutputProps.MipLevels));
-          BR.TexSlices =
-              static_cast<uint32_t>(std::max(1, CPU.OutputProps.ArraySlices));
-          if (Res.Kind == ResourceKind::TextureCube)
-            BR.TexSlices = 6;
-          else if (Res.Kind == ResourceKind::TextureCubeArray)
-            BR.TexSlices = std::max(6u, BR.TexSlices);
-          BR.TexFmt = dxgiFormatForBuffer(CPU);
-          unsigned Ch = CPU.Channels ? static_cast<unsigned>(CPU.Channels) : 1u;
-          BR.TexBytesPerPixel =
-              static_cast<uint32_t>(CPU.getSingleElementSize() * Ch);
-          uint64_t SrcOff = 0, DstOff = 0;
-          for (uint32_t S = 0; S < BR.TexSlices; ++S) {
-            for (uint32_t M = 0; M < BR.TexMips; ++M) {
-              uint32_t MW = std::max(1u, BR.TexW >> M);
-              uint32_t MH = std::max(1u, BR.TexH >> M);
-              uint32_t MD = std::max(1u, BR.TexD >> M);
-              uint32_t RawPitch = MW * BR.TexBytesPerPixel;
-              uint32_t AlignedPitch =
-                  (RawPitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
-                  ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
-              DstOff = (DstOff + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull) &
-                       ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull);
-              TexSubresourceLayout L{};
-              L.Subresource = S * BR.TexMips + M;
-              L.Width = MW;
-              L.Height = MH;
-              L.Depth = MD;
-              L.RowPitch = AlignedPitch;
-              L.SrcOffset = SrcOff;
-              L.DstOffset = DstOff;
-              BR.TexLayouts.push_back(L);
-              SrcOff += static_cast<uint64_t>(RawPitch) * MH * MD;
-              DstOff += static_cast<uint64_t>(AlignedPitch) * MH * MD;
+      if (Matched) {
+        Space = Matched->Space;
+        BaseReg = Matched->LowerBound;
+        bool IsUnbounded = (Matched->RangeSize == 0xFFFFFFFFu);
+        for (uint32_t A = 0; A < ArrCount; ++A) {
+          BoundResource BR;
+          BR.Res = &Res;
+          BR.ArrIdx = A;
+          BR.Class = Class;
+          BR.Space = Space;
+          BR.Register = BaseReg + A;
+          BR.IsUnbounded = IsUnbounded;
+          BR.SizeBytes = Res.BufferPtr->Size;
+          if (Res.isTexture()) {
+            BR.IsTexture = true;
+            const CPUBuffer &CPU = *Res.BufferPtr;
+            BR.TexW = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Width));
+            BR.TexH = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Height));
+            BR.TexD = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Depth));
+            BR.TexMips =
+                static_cast<uint32_t>(std::max(1, CPU.OutputProps.MipLevels));
+            BR.TexSlices =
+                static_cast<uint32_t>(std::max(1, CPU.OutputProps.ArraySlices));
+            if (Res.Kind == ResourceKind::TextureCube)
+              BR.TexSlices = 6;
+            else if (Res.Kind == ResourceKind::TextureCubeArray)
+              BR.TexSlices = std::max(6u, BR.TexSlices);
+            BR.TexFmt = dxgiFormatForBuffer(CPU);
+            unsigned Ch = CPU.Channels ? static_cast<unsigned>(CPU.Channels) : 1u;
+            BR.TexBytesPerPixel =
+                static_cast<uint32_t>(CPU.getSingleElementSize() * Ch);
+            uint64_t SrcOff = 0, DstOff = 0;
+            for (uint32_t S = 0; S < BR.TexSlices; ++S) {
+              for (uint32_t M = 0; M < BR.TexMips; ++M) {
+                uint32_t MW = std::max(1u, BR.TexW >> M);
+                uint32_t MH = std::max(1u, BR.TexH >> M);
+                uint32_t MD = std::max(1u, BR.TexD >> M);
+                uint32_t RawPitch = MW * BR.TexBytesPerPixel;
+                uint32_t AlignedPitch =
+                    (RawPitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+                    ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+                DstOff = (DstOff + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull) &
+                         ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull);
+                TexSubresourceLayout L{};
+                L.Subresource = S * BR.TexMips + M;
+                L.Width = MW;
+                L.Height = MH;
+                L.Depth = MD;
+                L.RowPitch = AlignedPitch;
+                L.SrcOffset = SrcOff;
+                L.DstOffset = DstOff;
+                BR.TexLayouts.push_back(L);
+                SrcOff += static_cast<uint64_t>(RawPitch) * MH * MD;
+                DstOff += static_cast<uint64_t>(AlignedPitch) * MH * MD;
+              }
             }
+            BR.AllocBytes = std::max<uint64_t>(DstOff, 256ull);
+          } else {
+            BR.AllocBytes = (Class == crucible::ResourceClass::CBV)
+                                ? ((BR.SizeBytes + 255ull) & ~255ull)
+                                : std::max<uint64_t>(BR.SizeBytes, 4ull);
           }
-          BR.AllocBytes = std::max<uint64_t>(DstOff, 256ull);
-        } else {
-          BR.AllocBytes = (Class == crucible::ResourceClass::CBV)
-                              ? ((BR.SizeBytes + 255ull) & ~255ull)
-                              : std::max<uint64_t>(BR.SizeBytes, 4ull);
+          Bound.push_back(std::move(BR));
         }
-        Bound.push_back(std::move(BR));
       }
 
       // Vulkan SPIR-V represents RWStructuredBuffer counters as a separate UAV
@@ -585,24 +587,25 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
         uint32_t CSpace = static_cast<uint32_t>(SetIdx);
         uint32_t CBaseReg = *Res.VKBinding->CounterBinding;
         std::string CName = "counter.var." + Res.Name;
-        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
-          if (RB.Class == crucible::ResourceClass::UAV && RB.Name == CName) {
-            CSpace = RB.Space;
-            CBaseReg = RB.LowerBound;
-            break;
+        const crucible::ResourceBinding *CMatched = findReflected(
+            crucible::ResourceClass::UAV, CSpace, CBaseReg, CName, true);
+        if (CMatched) {
+          CSpace = CMatched->Space;
+          CBaseReg = CMatched->LowerBound;
+          bool CUnbounded = (CMatched->RangeSize == 0xFFFFFFFFu);
+          for (uint32_t A = 0; A < ArrCount; ++A) {
+            BoundResource CBR;
+            CBR.Res = &Res;
+            CBR.ArrIdx = A;
+            CBR.Class = crucible::ResourceClass::UAV;
+            CBR.Space = CSpace;
+            CBR.Register = CBaseReg + A;
+            CBR.IsUnbounded = CUnbounded;
+            CBR.SizeBytes = 4;
+            CBR.AllocBytes = 4;
+            CBR.IsStandaloneCounter = true;
+            Bound.push_back(CBR);
           }
-        }
-        for (uint32_t A = 0; A < ArrCount; ++A) {
-          BoundResource CBR;
-          CBR.Res = &Res;
-          CBR.ArrIdx = A;
-          CBR.Class = crucible::ResourceClass::UAV;
-          CBR.Space = CSpace;
-          CBR.Register = CBaseReg + A;
-          CBR.SizeBytes = 4;
-          CBR.AllocBytes = 4;
-          CBR.IsStandaloneCounter = true;
-          Bound.push_back(CBR);
         }
       }
     }
@@ -649,9 +652,19 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
 
   std::vector<D3D12_DESCRIPTOR_RANGE> Ranges;
   Ranges.reserve(Bound.size());
-  for (uint32_t I = 0; I < Bound.size(); ++I) {
+  for (uint32_t I = 0; I < Bound.size();) {
+    uint32_t Start = I;
+    bool AnyUnbounded = Bound[I].IsUnbounded;
+    uint32_t RunLen = 1;
+    while (I + RunLen < Bound.size() &&
+           Bound[I + RunLen].Class == Bound[Start].Class &&
+           Bound[I + RunLen].Space == Bound[Start].Space &&
+           Bound[I + RunLen].Register == Bound[Start].Register + RunLen) {
+      AnyUnbounded |= Bound[I + RunLen].IsUnbounded;
+      ++RunLen;
+    }
     D3D12_DESCRIPTOR_RANGE R{};
-    switch (Bound[I].Class) {
+    switch (Bound[Start].Class) {
     case crucible::ResourceClass::CBV:
       R.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
       break;
@@ -665,11 +678,12 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       R.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
       break;
     }
-    R.NumDescriptors = 1;
-    R.BaseShaderRegister = Bound[I].Register;
-    R.RegisterSpace = Bound[I].Space;
-    R.OffsetInDescriptorsFromTableStart = I;
+    R.NumDescriptors = AnyUnbounded ? UINT_MAX : RunLen;
+    R.BaseShaderRegister = Bound[Start].Register;
+    R.RegisterSpace = Bound[Start].Space;
+    R.OffsetInDescriptorsFromTableStart = Start;
     Ranges.push_back(R);
+    I += RunLen;
   }
 
   ID3D12DescriptorHeap *SamplerHeap = nullptr;
@@ -684,14 +698,25 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
     if (FAILED(Hr))
       return hrErr(Hr, "CreateDescriptorHeap(Sampler)");
     SamplerRanges.reserve(BoundSamplers.size());
-    for (uint32_t I = 0; I < BoundSamplers.size(); ++I) {
+    for (uint32_t I = 0; I < BoundSamplers.size();) {
+      uint32_t Start = I;
+      bool AnyUnbounded = BoundSamplers[I].IsUnbounded;
+      uint32_t RunLen = 1;
+      while (I + RunLen < BoundSamplers.size() &&
+             BoundSamplers[I + RunLen].Space == BoundSamplers[Start].Space &&
+             BoundSamplers[I + RunLen].Register ==
+                 BoundSamplers[Start].Register + RunLen) {
+        AnyUnbounded |= BoundSamplers[I + RunLen].IsUnbounded;
+        ++RunLen;
+      }
       D3D12_DESCRIPTOR_RANGE R{};
       R.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-      R.NumDescriptors = 1;
-      R.BaseShaderRegister = BoundSamplers[I].Register;
-      R.RegisterSpace = BoundSamplers[I].Space;
-      R.OffsetInDescriptorsFromTableStart = I;
+      R.NumDescriptors = AnyUnbounded ? UINT_MAX : RunLen;
+      R.BaseShaderRegister = BoundSamplers[Start].Register;
+      R.RegisterSpace = BoundSamplers[Start].Space;
+      R.OffsetInDescriptorsFromTableStart = Start;
       SamplerRanges.push_back(R);
+      I += RunLen;
     }
   }
 

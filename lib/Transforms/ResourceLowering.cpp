@@ -354,6 +354,15 @@ llvm::Error assignSPIRVBindings(Reflection &R, const Options &Opts) {
 }
 
 llvm::Error assignDXILBindings(Reflection &R, const Options &Opts) {
+  // Snapshot original source (SPIR-V DescriptorSet, Binding) before any DXIL
+  // register-space remapping so callers (such as the D3D12 offload proxy) can
+  // match Vulkan pipeline bindings deterministically even when YAML names
+  // differ from shader variable names.
+  for (ResourceBinding &RB : R.Resources) {
+    RB.SPIRVSet = RB.Space;
+    RB.SPIRVBinding = RB.LowerBound;
+  }
+
   // Remap Vulkan PushConstant sentinel space (0xFFFFFFFEu, which is reserved
   // in D3D12 root signatures) to a valid unused register space.
   uint32_t MaxNormalSpace = 0;
