@@ -1008,6 +1008,7 @@ private:
     std::string ElemType; // scalar MSL type for buffers; row type for CBVs
     bool IsSampled = false;
     bool IsDepthSampled = false;
+    bool ConstantAddressSpace = false;
   };
 
   struct HandleRef {
@@ -2002,6 +2003,8 @@ Error Emitter::inferElementTypes() {
   }
 
   std::string FirstError;
+  DenseMap<const ResState *, bool> SRVHasConstLoad;
+  DenseMap<const ResState *, bool> SRVDisqualifyConst;
   auto Record = [&](mlir::Value Handle, mlir::Type Elem) {
     ResState *RS = stateFor(Handle);
     if (!RS) {
@@ -2029,6 +2032,35 @@ Error Emitter::inferElementTypes() {
     if (auto BL = mlir::dyn_cast<ir::BufferLoadOp>(Op)) {
       auto VecTy = mlir::cast<mlir::VectorType>(BL.getResult().getType());
       Record(BL.getHandle(), VecTy.getElementType());
+      if (ResState *RS = stateFor(BL.getHandle());
+          RS && RS->RB && RS->RB->Class == ResourceClass::SRV) {
+        mlir::Value ElemOff = BL.getElementOffset();
+        auto C0 = BL.getIndex() ? constInt(BL.getIndex()) : std::nullopt;
+        bool OffConst = !ElemOff || isUndefLike(ElemOff) ||
+                        constInt(ElemOff).has_value();
+        if (!C0 || !OffConst || BL->hasAttr("crucible.volatile")) {
+          SRVDisqualifyConst[RS] = true;
+        } else {
+          uint64_t ByteEnd = 0;
+          if (RS->RB->Kind == ResourceKind::StructuredBuffer) {
+            uint64_t Off = (!ElemOff || isUndefLike(ElemOff))
+                               ? 0
+                               : *constInt(ElemOff);
+            ByteEnd = (*C0) * RS->RB->ElementStride + Off + 16;
+          } else if (RS->RB->Kind == ResourceKind::RawBuffer) {
+            ByteEnd = (*C0) + 16;
+          } else if (RS->RB->Kind == ResourceKind::TypedBuffer) {
+            unsigned W = std::max(1u, RS->RB->TypedComponents);
+            ByteEnd = ((*C0) * W + 4) * elemByteSize(RS->ElemType);
+          } else {
+            SRVDisqualifyConst[RS] = true;
+          }
+          if (ByteEnd > 65536)
+            SRVDisqualifyConst[RS] = true;
+          else
+            SRVHasConstLoad[RS] = true;
+        }
+      }
       return;
     }
     if (auto BS = mlir::dyn_cast<ir::BufferStoreOp>(Op)) {
@@ -2146,6 +2178,23 @@ Error Emitter::inferElementTypes() {
     DefaultElemType(RS);
   for (ResState &RS : HeapStates)
     DefaultElemType(RS);
+
+  // Promote small, compile-time constant-indexed read-only SRV buffers to
+  // Metal's `constant` address space (<= 64 KB) so Apple Silicon loads them
+  // through the uniform constant cache instead of device L1.
+  if (R.RTShaders.empty()) {
+    for (ResState &RS : ResStates) {
+      if (!RS.RB || RS.RB->Class != ResourceClass::SRV ||
+          RS.RB->RangeSize != 1 || RS.RB->GloballyCoherent)
+        continue;
+      if (RS.RB->Kind != ResourceKind::StructuredBuffer &&
+          RS.RB->Kind != ResourceKind::TypedBuffer &&
+          RS.RB->Kind != ResourceKind::RawBuffer)
+        continue;
+      if (SRVHasConstLoad.lookup(&RS) && !SRVDisqualifyConst.lookup(&RS))
+        RS.ConstantAddressSpace = true;
+    }
+  }
   return Error::success();
 }
 
@@ -6172,9 +6221,9 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
           return LoadElemTy.takeError();
         if (elemByteSize(*LoadElemTy) == 4) {
           std::string LoadVecTy = *LoadElemTy + std::to_string(VecWidth);
-          std::string Qual = RS->RB->Class == ResourceClass::UAV
-                                 ? "device "
-                                 : "device const ";
+          std::string Qual = RS->RB->Class == ResourceClass::UAV ? "device "
+                             : RS->ConstantAddressSpace          ? "constant "
+                                                                 : "device const ";
           std::string Name = freshName();
           line(Ind, LoadVecTy + " " + Name + " = *(" + Qual + LoadVecTy +
                         " *)(&" + *RName + "[" + *BaseIndex + "]);");
@@ -7134,10 +7183,12 @@ Expected<std::string> Emitter::kernelSignature() {
       }
       continue;
     }
-    const char *PtrPrefix = RB.Class == ResourceClass::SRV   ? "device const "
-                            : RB.Class == ResourceClass::UAV ? "device "
-                                                             : "constant ";
+    const char *PtrPrefix =
+        (RB.Class == ResourceClass::CBV || RS->ConstantAddressSpace)
+            ? "constant "
+            : (RB.Class == ResourceClass::SRV ? "device const " : "device ");
     const char *RestrictQual = (RB.Class != ResourceClass::CBV &&
+                                !RS->ConstantAddressSpace &&
                                 !RB.GloballyCoherent && !HasPhysicalPointers)
                                    ? "__restrict "
                                    : "";
