@@ -2097,8 +2097,13 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
       return createStringError(inconvertibleErrorCode(),
                                "kernel '%s' not found after compilation",
                                R.MSLEntryName.c_str());
-    MTL::ComputePipelineState *PSO =
-        Device->newComputePipelineState(Fn, &NErr);
+    auto CPDesc = NS::TransferPtr(MTL::ComputePipelineDescriptor::alloc()->init());
+    CPDesc->setComputeFunction(Fn);
+    uint32_t TGThreads = R.NumThreads[0] * R.NumThreads[1] * R.NumThreads[2];
+    if (TGThreads > 0 && (TGThreads % 32u) == 0u)
+      CPDesc->setThreadGroupSizeIsMultipleOfThreadExecutionWidth(true);
+    MTL::ComputePipelineState *PSO = Device->newComputePipelineState(
+        CPDesc.get(), MTL::PipelineOptionNone, nullptr, &NErr);
     if (!PSO)
       return mtlError("pipeline state creation failed", NErr);
 

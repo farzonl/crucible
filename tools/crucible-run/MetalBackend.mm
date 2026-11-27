@@ -41,8 +41,17 @@ int runMetal(const RunnerOptions &Opts) {
       fail("kernel '" + Opts.Entry + "' not found in library");
 
     auto PipelineStart = std::chrono::steady_clock::now();
+    MTLComputePipelineDescriptor *CPDesc =
+        [[MTLComputePipelineDescriptor alloc] init];
+    CPDesc.computeFunction = Fn;
+    uint32_t TGThreads = Opts.Threads[0] * Opts.Threads[1] * Opts.Threads[2];
+    if (TGThreads > 0 && (TGThreads % 32u) == 0u)
+      CPDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
     id<MTLComputePipelineState> PSO =
-        [Device newComputePipelineStateWithFunction:Fn error:&Err];
+        [Device newComputePipelineStateWithDescriptor:CPDesc
+                                              options:MTLPipelineOptionNone
+                                           reflection:nil
+                                                error:&Err];
     auto PipelineEnd = std::chrono::steady_clock::now();
     if (!PSO)
       fail(std::string("pipeline creation failed: ") +
