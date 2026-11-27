@@ -3130,6 +3130,48 @@ Expected<std::string> emitDXIL(mlir::ModuleOp Mod, Reflection &Reflect,
     }
   }
 
+  // DXIL forbids extractvalue on LLVM array types ([N x T]). Rewrite
+  // `load [N x T]` whose users are all `extractvalue` into per-element GEPs
+  // and scalar loads (fixes ByteAddressBuffers.test).
+  {
+    SmallVector<LoadInst *, 8> ArrLoads;
+    for (Function &F : M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *LI = dyn_cast<LoadInst>(&I))
+            if (isa<ArrayType>(LI->getType()) && !LI->isVolatile() &&
+                !LI->isAtomic())
+              ArrLoads.push_back(LI);
+
+    for (LoadInst *LI : ArrLoads) {
+      bool AllEV = true;
+      for (User *U : LI->users()) {
+        if (!isa<ExtractValueInst>(U)) {
+          AllEV = false;
+          break;
+        }
+      }
+      if (!AllEV || LI->use_empty())
+        continue;
+      auto *ArrTy = cast<ArrayType>(LI->getType());
+      Value *Ptr = LI->getPointerOperand();
+      SmallVector<ExtractValueInst *, 8> EVs;
+      for (User *U : LI->users())
+        EVs.push_back(cast<ExtractValueInst>(U));
+      for (ExtractValueInst *EV : EVs) {
+        IRBuilder<> B(LI);
+        SmallVector<Value *, 4> Idxs = {B.getInt32(0)};
+        for (unsigned Idx : EV->indices())
+          Idxs.push_back(B.getInt32(Idx));
+        Value *ElemPtr = B.CreateInBoundsGEP(ArrTy, Ptr, Idxs);
+        Value *ElemLoad = B.CreateLoad(EV->getType(), ElemPtr);
+        EV->replaceAllUsesWith(ElemLoad);
+        EV->eraseFromParent();
+      }
+      LI->eraseFromParent();
+    }
+  }
+
   // DXIL validation forbids !dx.precise metadata on minprecision (half/f16)
   // instructions. Mark half FP ops fast when strict FP is not requested so
   // LLVM's DirectX backend does not attach !dx.precise to them.
