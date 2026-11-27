@@ -114,6 +114,7 @@ struct StageParameter {
   uint32_t Interpolation; ///< DXIL interpolation mode.
   uint32_t Rows;
   uint32_t Columns;
+  uint32_t Location = UINT32_MAX; ///< Source SPIR-V Location decoration, if any.
   std::vector<uint32_t> RowSemanticIndices;
 };
 

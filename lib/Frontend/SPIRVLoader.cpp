@@ -2011,6 +2011,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         case mlir::spirv::BuiltIn::FrontFacing:
           SP.Semantic = "SV_IsFrontFace";
           SP.Kind = 13;
+          SP.Type = ComponentType::U32;
           break;
         case mlir::spirv::BuiltIn::FragDepth:
           SP.Semantic = "SV_Depth";
@@ -2068,6 +2069,7 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       SP.Type = toComponentType(ElemTy);
       SP.Rows = Rows;
       SP.Columns = Cols;
+      SP.Location = LocAttr;
       SP.Interpolation = 2; // Linear
       for (uint32_t R = 0; R < Rows; ++R)
         SP.RowSemanticIndices.push_back(SemIdx + R);
@@ -3501,6 +3503,16 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
 
           auto loadRow = [&](mlir::Type RowTy, int32_t RowIdx) -> mlir::Value {
             auto RowC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, RowIdx);
+            if (RowTy.isInteger(1)) {
+              auto LI = ir::LoadInputOp::create(
+                  B, Loc, I32Ty, static_cast<int32_t>(Info.ID), RowC,
+                  static_cast<int8_t>(0), /*vertex_id=*/mlir::Value());
+              auto ZeroC = mlir::LLVM::ConstantOp::create(B, Loc, I32Ty, 0);
+              return mlir::LLVM::ICmpOp::create(B, Loc,
+                                                mlir::LLVM::ICmpPredicate::ne,
+                                                LI.getResult(), ZeroC)
+                  .getResult();
+            }
             if (auto VecTy = mlir::dyn_cast<mlir::VectorType>(RowTy)) {
               mlir::Type ElemTy = makeSignless(VecTy.getElementType(), B);
               SmallVector<mlir::Value, 4> Comps;
@@ -3508,11 +3520,12 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
                 auto LI = ir::LoadInputOp::create(
                     B, Loc, ElemTy, static_cast<int32_t>(Info.ID), RowC,
                     static_cast<int8_t>(C), /*vertex_id=*/mlir::Value());
-                Comps.push_back(
-                    castFromSignless(B, Loc, LI.getResult(), VecTy.getElementType()));
+                Comps.push_back(castFromSignless(B, Loc, LI.getResult(),
+                                                 VecTy.getElementType()));
               }
-              return mlir::spirv::CompositeConstructOp::create(
-                  B, Loc, RowTy, Comps).getResult();
+              return mlir::spirv::CompositeConstructOp::create(B, Loc, RowTy,
+                                                               Comps)
+                  .getResult();
             }
             mlir::Type ElemTy = makeSignless(RowTy, B);
             auto LI = ir::LoadInputOp::create(
@@ -3524,14 +3537,19 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
           if (auto ArrTy = mlir::dyn_cast<mlir::spirv::ArrayType>(ValTy)) {
             SmallVector<mlir::Value, 4> Elems;
             for (unsigned R = 0; R < ArrTy.getNumElements(); ++R)
-              Elems.push_back(loadRow(ArrTy.getElementType(), static_cast<int32_t>(R)));
-            auto Agg = mlir::spirv::CompositeConstructOp::create(B, Loc, ValTy, Elems);
+              Elems.push_back(
+                  loadRow(ArrTy.getElementType(), static_cast<int32_t>(R)));
+            auto Agg =
+                mlir::spirv::CompositeConstructOp::create(B, Loc, ValTy, Elems);
             Load.replaceAllUsesWith(Agg.getResult());
-          } else if (auto MatTy = mlir::dyn_cast<mlir::spirv::MatrixType>(ValTy)) {
+          } else if (auto MatTy =
+                         mlir::dyn_cast<mlir::spirv::MatrixType>(ValTy)) {
             SmallVector<mlir::Value, 4> Cols;
             for (unsigned R = 0; R < MatTy.getNumColumns(); ++R)
-              Cols.push_back(loadRow(MatTy.getColumnType(), static_cast<int32_t>(R)));
-            auto Agg = mlir::spirv::CompositeConstructOp::create(B, Loc, ValTy, Cols);
+              Cols.push_back(
+                  loadRow(MatTy.getColumnType(), static_cast<int32_t>(R)));
+            auto Agg =
+                mlir::spirv::CompositeConstructOp::create(B, Loc, ValTy, Cols);
             Load.replaceAllUsesWith(Agg.getResult());
           } else {
             Load.replaceAllUsesWith(loadRow(ValTy, 0));
