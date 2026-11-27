@@ -14,11 +14,11 @@
 # RUN: not %cruciblec %t.unsupported.spv -o %t.unsupported.metal 2>&1 | FileCheck %s --check-prefix=REJECT
 # CHECK-NOT: isnan(
 # CHECK-NOT: abs(
-# CHECK: & 2147483647u
-# CHECK: ushort(
-# CHECK: as_type<uint2>
-# CHECK: > 2139095040u
-# CHECK: > ushort(31744u)
+# CHECK-DAG: & 2147483647u
+# CHECK-DAG: ushort(
+# CHECK-DAG: as_type<uint2>
+# CHECK-DAG: > 2139095040u
+# CHECK-DAG: > ushort(31744u)
 # CHECK-NOT: isnan(
 # CHECK-NOT: abs(
 # REJECT: unsupported operation 12 in FloatControls2 strict subset

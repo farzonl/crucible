@@ -26,7 +26,7 @@ inline double measureCmdMs(id<MTLCommandBuffer> cmdBuf,
 template <typename Fn>
 inline void runWarmup(uint32_t minIters, Fn &&fn) {
   double elapsedMs = 0.0;
-  for (uint32_t i = 0; i < minIters || (elapsedMs < 8.0 && i < 64); ++i)
+  for (uint32_t i = 0; i < minIters || (elapsedMs < 40.0 && i < 128); ++i)
     elapsedMs += fn();
 }
 

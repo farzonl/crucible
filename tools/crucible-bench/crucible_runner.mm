@@ -134,8 +134,19 @@ MetalBenchResult runCrucibleComputeBench(const std::string &benchId,
     }
 
     NSError *mtlErr = nil;
+    MTLComputePipelineDescriptor *cpDesc =
+        [[MTLComputePipelineDescriptor alloc] init];
+    cpDesc.computeFunction = csStage.fn;
+    uint32_t tgThreads = csStage.reflect.NumThreads[0] *
+                         csStage.reflect.NumThreads[1] *
+                         csStage.reflect.NumThreads[2];
+    if (tgThreads > 0 && (tgThreads % 32u) == 0u)
+      cpDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
     id<MTLComputePipelineState> pso =
-        [device newComputePipelineStateWithFunction:csStage.fn error:&mtlErr];
+        [device newComputePipelineStateWithDescriptor:cpDesc
+                                              options:MTLPipelineOptionNone
+                                           reflection:nil
+                                                error:&mtlErr];
 
     auto t1 = std::chrono::steady_clock::now();
     res.compileMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
