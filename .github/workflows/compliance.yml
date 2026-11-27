@@ -517,6 +517,10 @@ jobs:
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="${WS}/.sdk/vcpkg" \
+            -DZLIB_INCLUDE_DIR="${WS}/.sdk/vcpkg/include" \
+            -DZLIB_LIBRARY="${WS}/.sdk/vcpkg/lib/libzs.lib" \
+            -DPNG_PNG_INCLUDE_DIR="${WS}/.sdk/vcpkg/include" \
+            -DPNG_LIBRARY="${WS}/.sdk/vcpkg/lib/libpng16.lib" \
             -DLLVM_DIR="${WS}/.toolchains/llvm/lib/cmake/llvm" \
             -DMLIR_DIR="${WS}/.toolchains/llvm/lib/cmake/mlir" \
             -DDXC_EXECUTABLE="${WS}/.sdk/bin/dxc.exe" \
