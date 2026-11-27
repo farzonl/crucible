@@ -1,0 +1,21 @@
+# Regression test for Batch 11 shared SPIRVLoader fixes:
+# - SV_ClipDistance / SV_CullDistance built-in stage I/O (SemanticKind 6 / 7)
+# - Multi-row Array and Matrix stage I/O semantics (load/store & AccessChain)
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T vs_6_0 -E mainVS -Fo %t.vs.spv %S/../Inputs/spirv_dxil_array_matrix_clip_semantics.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.vs.spv | FileCheck %s --check-prefix=VS
+# RUN: %cruciblec --target=dxil %t.vs.spv -o %t.vs.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E mainPS -Fo %t.ps.spv %S/../Inputs/spirv_dxil_array_matrix_clip_semantics.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.ps.spv | FileCheck %s --check-prefix=PS
+# RUN: %cruciblec --target=dxil %t.ps.spv -o %t.ps.dxil
+
+# VS: define void @mainVS()
+# VS-DAG: !"SV_ClipDistance", i8 9, i8 6
+# VS-DAG: !"MY_ARR"
+# VS-DAG: !"MY_MAT"
+
+# PS: define void @mainPS()
+# PS-DAG: call float @dx.op.loadInput.f32(i32 4, i32 {{[0-9]+}}, i32 0, i8 0, i32 poison)
+# PS-DAG: call float @dx.op.loadInput.f32(i32 4, i32 {{[0-9]+}}, i32 1, i8 0, i32 poison)
