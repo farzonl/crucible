@@ -4039,8 +4039,12 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return Expr{"((ulong(" + Hi->Text + ") << 32ul) | ulong(" + Lo->Text + "))",
                 PrecPrimary};
   }
+  // Use simd_prefix_exclusive_sum(1u) == 0u rather than simd_is_first():
+  // HLSL WaveIsFirstLane() must elect the lowest *active* lane under
+  // divergent control flow, whereas Metal's simd_is_first() only returns true
+  // for lane 0 on some Metal drivers (e.g. Apple Paravirtual device).
   if (mlir::isa<ir::WaveIsFirstLaneOp>(Op))
-    return Expr{"simd_is_first()", PrecPrimary};
+    return Expr{"simd_prefix_exclusive_sum(1u) == 0u", PrecEq};
   if (auto WV = mlir::dyn_cast<ir::WaveVoteOp>(Op)) {
     auto A = exprFor(WV.getValue(), PrecUnknown);
     if (!A)
