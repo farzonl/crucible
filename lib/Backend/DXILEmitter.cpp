@@ -872,20 +872,20 @@ Error DXILLowerer::lowerTexStore(CallInst *CI) {
   unsigned ValStart = 3 + NumCoords;
   unsigned NumVals = CI->arg_size() - ValStart;
   Type *ElemTy = CI->getArgOperand(ValStart)->getType();
-  Value *StoreVal = nullptr;
-  if (NumVals == 1) {
-    StoreVal = CI->getArgOperand(ValStart);
-  } else {
-    Type *VecTy = FixedVectorType::get(ElemTy, NumVals);
-    StoreVal = PoisonValue::get(VecTy);
-    for (unsigned I = 0; I < NumVals; ++I)
-      StoreVal = B.CreateInsertElement(StoreVal, CI->getArgOperand(ValStart + I),
-                                       B.getInt32(I));
+  // Always pad texture UAV stores to 4 channels with zeroes so dx.op.textureStore
+  // never receives undef lanes (which fails DXIL validation).
+  Type *Vec4Ty = FixedVectorType::get(ElemTy, 4);
+  Value *StoreVal = PoisonValue::get(Vec4Ty);
+  for (unsigned I = 0; I < 4; ++I) {
+    Value *V = (I < NumVals && !isa<UndefValue>(CI->getArgOperand(ValStart + I)))
+                   ? CI->getArgOperand(ValStart + I)
+                   : Constant::getNullValue(ElemTy);
+    StoreVal = B.CreateInsertElement(StoreVal, V, B.getInt32(I));
   }
 
   Function *Fn = Intrinsic::getOrInsertDeclaration(
       &M, Intrinsic::dx_resource_store_texture,
-      {RH.DxHandleTy, CoordVal->getType(), StoreVal->getType()});
+      {RH.DxHandleTy, CoordVal->getType(), Vec4Ty});
   B.CreateCall(Fn, {RH.DxHandle, CoordVal, StoreVal});
   CI->eraseFromParent();
   return Error::success();
@@ -3028,9 +3028,107 @@ Expected<std::string> emitDXIL(mlir::ModuleOp Mod, Reflection &Reflect,
     M.getOrInsertNamedMetadata("dx.valver")->addOperand(ValVerMD);
   }
 
+  // Enable native 16-bit types (UseNativeLowPrecision) on SM 6.2+ so f16/i16
+  // CBuffer loads, 16-bit StructuredBuffer strides (2/6 bytes), half<->i16
+  // bitcasts, and precise half ops validate cleanly under dxil.dll.
+  if (Reflect.ShaderModelMajor > 6 ||
+      (Reflect.ShaderModelMajor == 6 && Reflect.ShaderModelMinor >= 2)) {
+    M.addModuleFlag(Module::ModFlagBehavior::Override, "dx.nativelowprec", 1u);
+  }
+
   DXILLowerer Lowerer(M, Entry, Reflect, Opts);
   if (Error E = Lowerer.run(*StageOrErr))
     return std::move(E);
+
+  // Scalarize scalar<->vector bitcasts (e.g. i32 <-> <2 x half>, double <->
+  // <2 x i32>) which LLVM's DXIL scalarizer does not lower and dxil.dll rejects
+  // with "Instructions must be of an allowed type".
+  {
+    SmallVector<BitCastInst *, 16> VecBitCasts;
+    for (Function &F : M)
+      for (BasicBlock &BB : F)
+        for (Instruction &I : BB)
+          if (auto *BC = dyn_cast<BitCastInst>(&I))
+            if (isa<FixedVectorType>(BC->getSrcTy()) !=
+                isa<FixedVectorType>(BC->getDestTy()))
+              VecBitCasts.push_back(BC);
+
+    for (BitCastInst *BC : VecBitCasts) {
+      IRBuilder<> B(BC);
+      Value *Src = BC->getOperand(0);
+      Type *SrcTy = BC->getSrcTy();
+      Type *DstTy = BC->getDestTy();
+      Value *Rep = nullptr;
+
+      if (auto *DstVT = dyn_cast<FixedVectorType>(DstTy)) {
+        // Scalar -> Vector
+        unsigned N = DstVT->getNumElements();
+        Type *ElemTy = DstVT->getElementType();
+        unsigned ElemBits = ElemTy->getPrimitiveSizeInBits();
+        unsigned SrcBits = SrcTy->getPrimitiveSizeInBits();
+        if (SrcTy->isDoubleTy() && N == 2 && ElemTy->isIntegerTy(32)) {
+          Function *SplitFn = Intrinsic::getOrInsertDeclaration(
+              &M, Intrinsic::dx_splitdouble, {B.getInt32Ty()});
+          Value *Pair = B.CreateCall(SplitFn, {Src});
+          Value *Vec = PoisonValue::get(DstVT);
+          Vec = B.CreateInsertElement(Vec, B.CreateExtractValue(Pair, {0}),
+                                      B.getInt32(0));
+          Vec = B.CreateInsertElement(Vec, B.CreateExtractValue(Pair, {1}),
+                                      B.getInt32(1));
+          Rep = Vec;
+        } else if (ElemBits > 0 && N * ElemBits == SrcBits) {
+          Type *WideIntTy = Type::getIntNTy(LLVMCtx, SrcBits);
+          Type *ElemIntTy = Type::getIntNTy(LLVMCtx, ElemBits);
+          Value *IntSrc =
+              SrcTy->isIntegerTy() ? Src : B.CreateBitCast(Src, WideIntTy);
+          Value *Vec = PoisonValue::get(DstVT);
+          for (unsigned I = 0; I < N; ++I) {
+            Value *Shifted =
+                (I == 0) ? IntSrc
+                         : B.CreateLShr(IntSrc,
+                                        ConstantInt::get(WideIntTy, I * ElemBits));
+            Value *Part = B.CreateTrunc(Shifted, ElemIntTy);
+            if (ElemTy != ElemIntTy)
+              Part = B.CreateBitCast(Part, ElemTy);
+            Vec = B.CreateInsertElement(Vec, Part, B.getInt32(I));
+          }
+          Rep = Vec;
+        }
+      } else if (auto *SrcVT = dyn_cast<FixedVectorType>(SrcTy)) {
+        // Vector -> Scalar
+        unsigned N = SrcVT->getNumElements();
+        Type *ElemTy = SrcVT->getElementType();
+        unsigned ElemBits = ElemTy->getPrimitiveSizeInBits();
+        unsigned DstBits = DstTy->getPrimitiveSizeInBits();
+        if (DstTy->isDoubleTy() && N == 2 && ElemTy->isIntegerTy(32)) {
+          Function *MakeFn = Intrinsic::getOrInsertDeclaration(
+              &M, Intrinsic::dx_asdouble, {B.getInt32Ty()});
+          Value *Lo = B.CreateExtractElement(Src, B.getInt32(0));
+          Value *Hi = B.CreateExtractElement(Src, B.getInt32(1));
+          Rep = B.CreateCall(MakeFn, {Lo, Hi});
+        } else if (ElemBits > 0 && N * ElemBits == DstBits) {
+          Type *WideIntTy = Type::getIntNTy(LLVMCtx, DstBits);
+          Type *ElemIntTy = Type::getIntNTy(LLVMCtx, ElemBits);
+          Value *Acc = ConstantInt::get(WideIntTy, 0);
+          for (unsigned I = 0; I < N; ++I) {
+            Value *Part = B.CreateExtractElement(Src, B.getInt32(I));
+            if (ElemTy != ElemIntTy)
+              Part = B.CreateBitCast(Part, ElemIntTy);
+            Value *Ext = B.CreateZExt(Part, WideIntTy);
+            if (I > 0)
+              Ext = B.CreateShl(Ext, ConstantInt::get(WideIntTy, I * ElemBits));
+            Acc = B.CreateOr(Acc, Ext);
+          }
+          Rep = DstTy->isIntegerTy() ? Acc : B.CreateBitCast(Acc, DstTy);
+        }
+      }
+
+      if (Rep) {
+        BC->replaceAllUsesWith(Rep);
+        BC->eraseFromParent();
+      }
+    }
+  }
 
   // DXIL validation forbids !dx.precise metadata on minprecision (half/f16)
   // instructions. Mark half FP ops fast when strict FP is not requested so

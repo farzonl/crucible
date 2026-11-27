@@ -1,0 +1,15 @@
+# Regression test for Batch 8 DXIL validation fixes (#182):
+# - Native 16-bit flag (dx.nativelowprec -> UseNativeLowPrecision)
+# - Texture UAV store zero-fills unused lanes instead of undef
+# - Scalar<->vector bitcasts (i32 <-> <2 x half>, double <-> <2 x i32>) scalarized
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -enable-16bit-types -fspv-target-env=vulkan1.3 -T cs_6_2 -E main -Fo %t.spv %S/../Inputs/spirv_dxil_native16_and_bitcast.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+
+# CHECK: define void @main()
+# CHECK-NOT: bitcast i32 {{.*}} to <2 x half>
+# CHECK-NOT: bitcast double {{.*}} to <2 x i32>
+# CHECK-DAG: @dx.op.splitDouble.f64
+# CHECK-DAG: call void @dx.op.textureStore.f32(i32 67, %dx.types.Handle {{%.*}}, i32 0, i32 0, i32 undef, float {{%.*}}, float 0.000000e+00, float 0.000000e+00, float 0.000000e+00, i8 15)
