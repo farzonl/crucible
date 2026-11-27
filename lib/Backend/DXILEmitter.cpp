@@ -323,8 +323,12 @@ Type *DXILLowerer::getDXILResourceType(const ResourceBinding &RB) {
       ElemTy = Type::getInt32Ty(Ctx);
     else if ((Stride % 4u) == 0)
       ElemTy = ArrayType::get(Type::getInt32Ty(Ctx), Stride / 4u);
+    else if (Stride == 2u)
+      ElemTy = Type::getInt16Ty(Ctx);
+    else if ((Stride % 2u) == 0)
+      ElemTy = ArrayType::get(Type::getInt16Ty(Ctx), Stride / 2u);
     else
-      ElemTy = ArrayType::get(Type::getInt8Ty(Ctx), Stride);
+      ElemTy = ArrayType::get(Type::getInt32Ty(Ctx), (Stride + 3u) / 4u);
     return TargetExtType::get(Ctx, "dx.RawBuffer", {ElemTy},
                               {IsWriteable, IsROV});
   }
@@ -613,7 +617,10 @@ Error DXILLowerer::lowerBufferStore(CallInst *CI) {
     Type *Vec4Ty = FixedVectorType::get(ScalarTy, 4);
     Value *Vec = PoisonValue::get(Vec4Ty);
     for (unsigned I = 0; I < 4; ++I) {
-      Value *V = (I < Vals.size()) ? Vals[I] : UndefValue::get(ScalarTy);
+      Value *V =
+          (I < Vals.size() && (Mask & (1u << I)) && !isa<UndefValue>(Vals[I]))
+              ? Vals[I]
+              : Constant::getNullValue(ScalarTy);
       Vec = B.CreateInsertElement(Vec, V, B.getInt32(I));
     }
     Function *StoreFn = Intrinsic::getOrInsertDeclaration(
@@ -934,6 +941,34 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
                             ZeroOffset});
     break;
   }
+  case ir::SampleMode::Grad: {
+    unsigned GradIdx = 7 + NumCoords;
+    uint32_t NumGrads =
+        GradIdx < CI->arg_size()
+            ? cast<ConstantInt>(CI->getArgOperand(GradIdx))->getZExtValue()
+            : 0u;
+    auto buildGradVec = [&](unsigned Start) -> Value * {
+      if (NumGrads <= 1)
+        return Start < CI->arg_size() ? CI->getArgOperand(Start)
+                                      : ConstantFP::get(B.getFloatTy(), 0.0);
+      Type *GTy = FixedVectorType::get(B.getFloatTy(), NumGrads);
+      Value *GV = PoisonValue::get(GTy);
+      for (unsigned I = 0; I < NumGrads; ++I)
+        GV = B.CreateInsertElement(GV, CI->getArgOperand(Start + I),
+                                   B.getInt32(I));
+      return GV;
+    };
+    Value *DDX = buildGradVec(GradIdx + 1);
+    Value *DDY = buildGradVec(GradIdx + 1 + NumGrads);
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::dx_resource_samplegrad,
+        {CI->getType(), TexRH.DxHandleTy, SmpRH.DxHandleTy,
+         CoordVal->getType(), DDX->getType(), DDY->getType(),
+         ZeroOffset->getType()});
+    Res = B.CreateCall(
+        Fn, {TexRH.DxHandle, SmpRH.DxHandle, CoordVal, DDX, DDY, ZeroOffset});
+    break;
+  }
   case ir::SampleMode::Cmp: {
     Function *Fn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::dx_resource_samplecmp,
@@ -1159,6 +1194,42 @@ Error DXILLowerer::lowerWaveOp(CallInst *CI, DxOp Op) {
       Value *M3 = CI->arg_size() > 6 ? CI->getArgOperand(6) : B.getInt32(0);
       Res = B.CreateCall(Fn, {Cond, M0, M1, M2, M3});
     }
+    break;
+  }
+  case DxOp::WaveMultiPrefix: {
+    Value *Val = CI->getArgOperand(1);
+    auto OpKind = static_cast<ir::WaveMultiPrefixOpKind>(
+        cast<ConstantInt>(CI->getArgOperand(2))->getZExtValue());
+    bool IsUnsigned =
+        cast<ConstantInt>(CI->getArgOperand(3))->getZExtValue() != 0;
+    Value *M0 = CI->arg_size() > 4 ? CI->getArgOperand(4) : B.getInt32(0);
+    Value *M1 = CI->arg_size() > 5 ? CI->getArgOperand(5) : B.getInt32(0);
+    Value *M2 = CI->arg_size() > 6 ? CI->getArgOperand(6) : B.getInt32(0);
+    Value *M3 = CI->arg_size() > 7 ? CI->getArgOperand(7) : B.getInt32(0);
+    Intrinsic::ID ID = Intrinsic::dx_wave_multi_prefix_sum;
+    switch (OpKind) {
+    case ir::WaveMultiPrefixOpKind::Sum:
+      ID = (IsUnsigned && Val->getType()->isIntOrIntVectorTy())
+               ? Intrinsic::dx_wave_multi_prefix_usum
+               : Intrinsic::dx_wave_multi_prefix_sum;
+      break;
+    case ir::WaveMultiPrefixOpKind::Product:
+      ID = (IsUnsigned && Val->getType()->isIntOrIntVectorTy())
+               ? Intrinsic::dx_wave_multi_prefix_uproduct
+               : Intrinsic::dx_wave_multi_prefix_product;
+      break;
+    case ir::WaveMultiPrefixOpKind::And:
+      ID = Intrinsic::dx_wave_multi_prefix_bit_and;
+      break;
+    case ir::WaveMultiPrefixOpKind::Or:
+      ID = Intrinsic::dx_wave_multi_prefix_bit_or;
+      break;
+    case ir::WaveMultiPrefixOpKind::Xor:
+      ID = Intrinsic::dx_wave_multi_prefix_bit_xor;
+      break;
+    }
+    Function *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {Val->getType()});
+    Res = B.CreateCall(Fn, {Val, M0, M1, M2, M3});
     break;
   }
   case DxOp::WaveReadLaneFirst: {
@@ -1957,6 +2028,28 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       G.erase();
       continue;
     }
+    if (auto G = mlir::dyn_cast<mlir::gpu::ShuffleOp>(Op)) {
+      mlir::Value Offset = G.getOffset();
+      mlir::Value TargetLane = Offset;
+      if (G.getMode() != mlir::gpu::ShuffleMode::IDX) {
+        mlir::Value Lane = makeBridgeCall(B, Loc, DxOp::LaneId, I32Ty, {});
+        if (G.getMode() == mlir::gpu::ShuffleMode::XOR)
+          TargetLane = mlir::LLVM::XOrOp::create(B, Loc, Lane, Offset);
+        else if (G.getMode() == mlir::gpu::ShuffleMode::UP)
+          TargetLane = mlir::LLVM::SubOp::create(B, Loc, Lane, Offset);
+        else
+          TargetLane = mlir::LLVM::AddOp::create(B, Loc, Lane, Offset);
+      }
+      mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::WaveReadLaneAt,
+                                       G.getShuffleResult().getType(),
+                                       {G.getValue(), TargetLane});
+      mlir::Value Valid =
+          mlir::LLVM::ConstantOp::create(B, Loc, I1Ty, B.getBoolAttr(true));
+      G.getShuffleResult().replaceAllUsesWith(Rep);
+      G.getValid().replaceAllUsesWith(Valid);
+      G.erase();
+      continue;
+    }
     if (auto G = mlir::dyn_cast<mlir::gpu::SubgroupBroadcastOp>(Op)) {
       mlir::Value Rep;
       if (G.getBroadcastType() == mlir::gpu::BroadcastType::first_active_lane) {
@@ -2308,11 +2401,16 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
           COp.getLodOrBias() ? COp.getLodOrBias() : undefV(B, Loc, F32Ty);
       mlir::Value Cmp =
           COp.getCmpVal() ? COp.getCmpVal() : undefV(B, Loc, F32Ty);
-      SmallVector<mlir::Value, 10> Args = {
+      SmallVector<mlir::Value, 14> Args = {
           COp.getTex(), COp.getSampler(),
           i32C(B, Loc, static_cast<int32_t>(COp.getMode())),
           i32C(B, Loc, static_cast<int32_t>(COp.getCoords().size())), Lod, Cmp};
       Args.append(COp.getCoords().begin(), COp.getCoords().end());
+      if (COp.getMode() == ir::SampleMode::Grad) {
+        Args.push_back(i32C(B, Loc, static_cast<int32_t>(COp.getDdx().size())));
+        Args.append(COp.getDdx().begin(), COp.getDdx().end());
+        Args.append(COp.getDdy().begin(), COp.getDdy().end());
+      }
       mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::TexSample,
                                        COp.getResult().getType(), Args);
       COp.getResult().replaceAllUsesWith(Rep);
@@ -2417,6 +2515,17 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
           COp.getCond(), i32C(B, Loc, static_cast<int32_t>(COp.getKind()))};
       Args.append(COp.getMask().begin(), COp.getMask().end());
       mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::WaveBitCount, I32Ty, Args);
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::WaveMultiPrefixOp>(Op)) {
+      SmallVector<mlir::Value, 8> Args = {
+          COp.getValue(), i32C(B, Loc, static_cast<int32_t>(COp.getOp())),
+          i32C(B, Loc, COp.getIsUnsigned() ? 1 : 0)};
+      Args.append(COp.getMask().begin(), COp.getMask().end());
+      mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::WaveMultiPrefix,
+                                       COp.getResult().getType(), Args);
       COp.getResult().replaceAllUsesWith(Rep);
       COp.erase();
       continue;
@@ -2645,6 +2754,21 @@ Expected<std::string> emitDXIL(mlir::ModuleOp Mod, Reflection &Reflect,
   DXILLowerer Lowerer(M, Entry, Reflect, Opts);
   if (Error E = Lowerer.run(*StageOrErr))
     return std::move(E);
+
+  // DXIL validation forbids !dx.precise metadata on minprecision (half/f16)
+  // instructions. Mark half FP ops fast when strict FP is not requested so
+  // LLVM's DirectX backend does not attach !dx.precise to them.
+  if (!Reflect.RequiresStrictFP) {
+    for (Function &F : M) {
+      for (BasicBlock &BB : F) {
+        for (Instruction &I : BB) {
+          if (isa<FPMathOperator>(I) &&
+              I.getType()->getScalarType()->isHalfTy())
+            I.setFast(true);
+        }
+      }
+    }
+  }
 
   std::string VerifyErr;
   raw_string_ostream VerifyOS(VerifyErr);
