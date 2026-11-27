@@ -12,6 +12,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -47,11 +48,43 @@ int runMetal(const RunnerOptions &Opts) {
     uint32_t TGThreads = Opts.Threads[0] * Opts.Threads[1] * Opts.Threads[2];
     if (TGThreads > 0 && (TGThreads % 32u) == 0u)
       CPDesc.threadGroupSizeIsMultipleOfThreadExecutionWidth = YES;
+
+    // Optional on-disk MTLBinaryArchive PSO cache via CRUCIBLE_METAL_CACHE.
+    id<MTLBinaryArchive> Archive = nil;
+    NSURL *ArchiveURL = nil;
+    if (const char *CacheEnv = std::getenv("CRUCIBLE_METAL_CACHE");
+        CacheEnv && CacheEnv[0] != '\0') {
+      if (@available(macOS 11.0, *)) {
+        ArchiveURL = [NSURL fileURLWithPath:@(CacheEnv)];
+        MTLBinaryArchiveDescriptor *BADesc =
+            [[MTLBinaryArchiveDescriptor alloc] init];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:@(CacheEnv)])
+          BADesc.url = ArchiveURL;
+        NSError *ArchErr = nil;
+        Archive = [Device newBinaryArchiveWithDescriptor:BADesc error:&ArchErr];
+        if (!Archive && BADesc.url) {
+          BADesc.url = nil;
+          Archive = [Device newBinaryArchiveWithDescriptor:BADesc error:&ArchErr];
+        }
+        if (Archive)
+          CPDesc.binaryArchives = @[ Archive ];
+      }
+    }
+
     id<MTLComputePipelineState> PSO =
         [Device newComputePipelineStateWithDescriptor:CPDesc
                                               options:MTLPipelineOptionNone
                                            reflection:nil
                                                 error:&Err];
+    if (PSO && Archive && ArchiveURL) {
+      if (@available(macOS 11.0, *)) {
+        NSError *ArchErr = nil;
+        if ([Archive addComputePipelineFunctionsWithDescriptor:CPDesc
+                                                         error:&ArchErr]) {
+          [Archive serializeToURL:ArchiveURL error:&ArchErr];
+        }
+      }
+    }
     auto PipelineEnd = std::chrono::steady_clock::now();
     if (!PSO)
       fail(std::string("pipeline creation failed: ") +

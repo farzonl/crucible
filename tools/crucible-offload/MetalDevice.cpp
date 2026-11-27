@@ -27,6 +27,7 @@
 #include "llvm/Object/DXContainer.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
@@ -2102,8 +2103,40 @@ Error executeCompute(Pipeline &P, MTL::Device *Device, bool UseVulkanBinding) {
     uint32_t TGThreads = R.NumThreads[0] * R.NumThreads[1] * R.NumThreads[2];
     if (TGThreads > 0 && (TGThreads % 32u) == 0u)
       CPDesc->setThreadGroupSizeIsMultipleOfThreadExecutionWidth(true);
+
+    // Optional on-disk MTLBinaryArchive PSO cache via CRUCIBLE_METAL_CACHE.
+    NS::SharedPtr<MTL::BinaryArchive> Archive;
+    NS::SharedPtr<NS::URL> ArchiveURL;
+    if (const char *CacheEnv = std::getenv("CRUCIBLE_METAL_CACHE");
+        CacheEnv && CacheEnv[0] != '\0') {
+      ArchiveURL = NS::TransferPtr(NS::URL::fileURLWithPath(
+          NS::String::string(CacheEnv, NS::UTF8StringEncoding)));
+      auto BADesc =
+          NS::TransferPtr(MTL::BinaryArchiveDescriptor::alloc()->init());
+      if (llvm::sys::fs::exists(CacheEnv))
+        BADesc->setUrl(ArchiveURL.get());
+      NS::Error *ArchErr = nullptr;
+      Archive = NS::TransferPtr(
+          Device->newBinaryArchive(BADesc.get(), &ArchErr));
+      if (!Archive && BADesc->url()) {
+        BADesc->setUrl(nullptr);
+        Archive = NS::TransferPtr(
+            Device->newBinaryArchive(BADesc.get(), &ArchErr));
+      }
+      if (Archive) {
+        const NS::Object *Objs[1] = {Archive.get()};
+        auto Arr = NS::TransferPtr(NS::Array::array(Objs, 1));
+        CPDesc->setBinaryArchives(Arr.get());
+      }
+    }
+
     MTL::ComputePipelineState *PSO = Device->newComputePipelineState(
         CPDesc.get(), MTL::PipelineOptionNone, nullptr, &NErr);
+    if (PSO && Archive && ArchiveURL) {
+      NS::Error *ArchErr = nullptr;
+      if (Archive->addComputePipelineFunctions(CPDesc.get(), &ArchErr))
+        Archive->serializeToURL(ArchiveURL.get(), &ArchErr);
+    }
     if (!PSO)
       return mtlError("pipeline state creation failed", NErr);
 
