@@ -225,6 +225,7 @@ private:
   Error lowerPixelOp(CallInst *CI, DxOp Op);
 
   void configureEntryAndLinkage(StringRef StageName);
+  void emitSemanticSignatures();
   void normalizeGroupsharedAtomics();
   void cleanupBridgeArtifacts();
 };
@@ -1516,6 +1517,31 @@ Error DXILLowerer::lowerMathOrBitOp(CallInst *CI, DxOp Op) {
 
 Error DXILLowerer::lowerPixelOp(CallInst *CI, DxOp Op) {
   IRBuilder<> B(CI);
+  if (Op == DxOp::LoadInput) {
+    Value *InputId = CI->getArgOperand(1);
+    Value *Row = CI->getArgOperand(2);
+    Value *Col = B.CreateTrunc(CI->getArgOperand(3), B.getInt8Ty());
+    Value *VertId = CI->getArgOperand(4);
+    if (isa<UndefValue>(VertId))
+      VertId = PoisonValue::get(B.getInt32Ty());
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::dx_load_input, {CI->getType()});
+    Value *Res = B.CreateCall(Fn, {InputId, Row, Col, VertId});
+    CI->replaceAllUsesWith(Res);
+    CI->eraseFromParent();
+    return Error::success();
+  }
+  if (Op == DxOp::StoreOutput) {
+    Value *OutputId = CI->getArgOperand(1);
+    Value *Row = CI->getArgOperand(2);
+    Value *Col = B.CreateTrunc(CI->getArgOperand(3), B.getInt8Ty());
+    Value *Val = CI->getArgOperand(4);
+    Function *Fn = Intrinsic::getOrInsertDeclaration(
+        &M, Intrinsic::dx_store_output, {Val->getType()});
+    B.CreateCall(Fn, {OutputId, Row, Col, Val});
+    CI->eraseFromParent();
+    return Error::success();
+  }
   if (Op == DxOp::Discard) {
     Function *Fn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::dx_discard);
     B.CreateCall(Fn, {CI->getArgOperand(1)});
@@ -1658,6 +1684,8 @@ Error DXILLowerer::lowerBridgeCall(CallInst *CI) {
   case DxOp::SplitDouble:
   case DxOp::UAddc:
     return lowerMathOrBitOp(CI, Op);
+  case DxOp::LoadInput:
+  case DxOp::StoreOutput:
   case DxOp::Discard:
   case DxOp::Deriv:
     return lowerPixelOp(CI, Op);
@@ -1687,6 +1715,109 @@ void DXILLowerer::configureEntryAndLinkage(StringRef StageName) {
       F.addFnAttr(Attribute::AlwaysInline);
     }
   }
+}
+
+void DXILLowerer::emitSemanticSignatures() {
+  if (Reflect.Stage != ShaderStage::Vertex &&
+      Reflect.Stage != ShaderStage::Pixel)
+    return;
+  if (Reflect.Inputs.empty() && Reflect.Outputs.empty())
+    return;
+
+  auto I32 = [&](uint32_t V) {
+    return ConstantAsMetadata::get(ConstantInt::get(Type::getInt32Ty(Ctx), V));
+  };
+  auto I8 = [&](uint8_t V) {
+    return ConstantAsMetadata::get(ConstantInt::get(Type::getInt8Ty(Ctx), V));
+  };
+
+  auto isIntComp = [](ComponentType T) {
+    return T == ComponentType::I1 || T == ComponentType::I16 ||
+           T == ComponentType::U16 || T == ComponentType::I32 ||
+           T == ComponentType::U32;
+  };
+
+  auto buildSigList = [&](const std::vector<StageParameter> &Params,
+                          bool IsInput) -> MDNode * {
+    if (Params.empty())
+      return nullptr;
+    SmallVector<Metadata *, 8> Nodes;
+    uint32_t NextRow = 0;
+    for (const StageParameter &SP : Params) {
+      uint32_t Kind = SP.Kind;
+      // Normalize SemanticKind for known system values if Kind == 0.
+      if (Kind == 0) {
+        if (StringRef(SP.Semantic).equals_insensitive("SV_Position"))
+          Kind = 3; // Position
+        else if (StringRef(SP.Semantic).equals_insensitive("SV_VertexID"))
+          Kind = 1; // VertexID
+        else if (StringRef(SP.Semantic).equals_insensitive("SV_InstanceID"))
+          Kind = 2; // InstanceID
+        else if (StringRef(SP.Semantic).equals_insensitive("SV_Target"))
+          Kind = 16; // Target
+        else if (StringRef(SP.Semantic).equals_insensitive("SV_IsFrontFace"))
+          Kind = 13; // IsFrontFace
+      }
+      // Only NotPacked depth/stencil outputs omit register allocation;
+      // SGV inputs like SV_VertexID (1), SV_InstanceID (2), SV_IsFrontFace (13)
+      // require an allocated signature row/column in DXIL.
+      bool IsNotAllocated =
+          (Kind == 17 || Kind == 26 || Kind == 27 || Kind == 28);
+      uint32_t Rows = std::max(1u, SP.Rows);
+      uint8_t Cols = static_cast<uint8_t>(std::clamp(SP.Columns, 1u, 4u));
+      uint32_t StartRow = ~0u;
+      uint8_t StartCol = 0xFFu;
+      if (!IsNotAllocated) {
+        if (Kind == 16 && !IsInput && Reflect.Stage == ShaderStage::Pixel) {
+          StartRow = SP.SemanticIndex;
+        } else {
+          StartRow = NextRow;
+          NextRow += Rows;
+        }
+        StartCol = 0;
+      }
+
+      uint32_t Interp = 0; // Undefined
+      bool NeedsInterp = (!IsInput && Reflect.Stage == ShaderStage::Vertex) ||
+                         (IsInput && Reflect.Stage == ShaderStage::Pixel);
+      if (NeedsInterp && !IsNotAllocated) {
+        if (Kind == 3)
+          Interp = 4; // LinearNoperspective for SV_Position
+        else if (isIntComp(SP.Type))
+          Interp = 1; // Constant
+        else
+          Interp = SP.Interpolation ? SP.Interpolation : 2u; // Linear
+      }
+
+      SmallVector<Metadata *, 4> Indices;
+      if (!SP.RowSemanticIndices.empty()) {
+        for (uint32_t Idx : SP.RowSemanticIndices)
+          Indices.push_back(I32(Idx));
+      } else {
+        for (uint32_t R = 0; R < Rows; ++R)
+          Indices.push_back(I32(SP.SemanticIndex + R));
+      }
+
+      uint32_t CompTy = static_cast<uint32_t>(SP.Type);
+      if (CompTy == 0)
+        CompTy = static_cast<uint32_t>(ComponentType::F32);
+
+      // 13-operand SemanticSignatureElement metadata node (see
+      // DXILSignatureAnalysis.cpp:checkElementNode).
+      Nodes.push_back(MDNode::get(
+          Ctx, {I32(SP.ID), MDString::get(Ctx, SP.Semantic), I32(CompTy),
+                I32(Kind), MDNode::get(Ctx, Indices), I32(Interp), I32(Rows),
+                I8(Cols), I32(StartRow), I8(StartCol), I8(0), I8(0), I32(0)}));
+    }
+    return MDNode::get(Ctx, Nodes);
+  };
+
+  MDNode *InMD = buildSigList(Reflect.Inputs, /*IsInput=*/true);
+  MDNode *OutMD = buildSigList(Reflect.Outputs, /*IsInput=*/false);
+  if (!InMD && !OutMD)
+    return;
+  NamedMDNode *SigMD = M.getOrInsertNamedMetadata("dx.semantic.signatures");
+  SigMD->addOperand(MDNode::get(Ctx, {ValueAsMetadata::get(Entry), InMD, OutMD}));
 }
 
 void DXILLowerer::normalizeGroupsharedAtomics() {
@@ -1799,6 +1930,7 @@ Error DXILLowerer::run(StringRef StageName) {
   cleanupBridgeArtifacts();
   normalizeGroupsharedAtomics();
   configureEntryAndLinkage(StageName);
+  emitSemanticSignatures();
   return Error::success();
 }
 
@@ -2539,6 +2671,25 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
       }
       return makeError("DirectX backend: unsupported sysval kind {0}",
                        static_cast<unsigned>(COp.getKind()));
+    }
+    if (auto COp = mlir::dyn_cast<ir::LoadInputOp>(Op)) {
+      mlir::Value VertId =
+          COp.getVertexId() ? COp.getVertexId() : undefV(B, Loc, I32Ty);
+      mlir::Value Rep = makeBridgeCall(
+          B, Loc, DxOp::LoadInput, COp.getResult().getType(),
+          {i32C(B, Loc, COp.getInputId()), COp.getRow(),
+           i32C(B, Loc, static_cast<int32_t>(COp.getCol())), VertId});
+      COp.getResult().replaceAllUsesWith(Rep);
+      COp.erase();
+      continue;
+    }
+    if (auto COp = mlir::dyn_cast<ir::StoreOutputOp>(Op)) {
+      makeBridgeCall(B, Loc, DxOp::StoreOutput, mlir::Type(),
+                     {i32C(B, Loc, COp.getOutputId()), COp.getRow(),
+                      i32C(B, Loc, static_cast<int32_t>(COp.getCol())),
+                      COp.getValue()});
+      COp.erase();
+      continue;
     }
     if (auto COp = mlir::dyn_cast<ir::DiscardOp>(Op)) {
       makeBridgeCall(B, Loc, DxOp::Discard, mlir::Type(), {COp.getCond()});

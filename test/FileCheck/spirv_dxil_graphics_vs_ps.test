@@ -1,0 +1,35 @@
+# Regression test for SPIR-V -> DXIL graphics (Vertex + Pixel) lowering (#184):
+# - Emits dx.op.loadInput / dx.op.storeOutput and !dx.semantic.signatures
+# - Preserves SemanticIndex=0 for unnumbered HLSL semantics (e.g., COLOR)
+# - Allocates signature row for SV_VertexID system value input
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T vs_6_0 -E mainVS -Fo %t.vs.spv %S/../Inputs/spirv_dxil_graphics_vs_ps.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.vs.spv | FileCheck %s --check-prefix=VS
+# RUN: %cruciblec --target=dxil %t.vs.spv -o %t.vs.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T vs_6_0 -E mainVSId -Fo %t.vsid.spv %S/../Inputs/spirv_dxil_graphics_vs_ps.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.vsid.spv | FileCheck %s --check-prefix=VSID
+# RUN: %cruciblec --target=dxil %t.vsid.spv -o %t.vsid.dxil
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T ps_6_0 -E mainPS -Fo %t.ps.spv %S/../Inputs/spirv_dxil_graphics_vs_ps.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.ps.spv | FileCheck %s --check-prefix=PS
+# RUN: %cruciblec --target=dxil %t.ps.spv -o %t.ps.dxil
+
+# VS: define void @mainVS()
+# VS-DAG: call float @dx.op.loadInput.f32(i32 4, i32 0, i32 0, i8 0, i32 poison)
+# VS-DAG: call float @dx.op.loadInput.f32(i32 4, i32 1, i32 0, i8 0, i32 poison)
+# VS-DAG: call void @dx.op.storeOutput.f32(i32 5, i32 0, i32 0, i8 0, float {{%.*}})
+# VS-DAG: call void @dx.op.storeOutput.f32(i32 5, i32 1, i32 0, i8 0, float {{%.*}})
+# VS-DAG: !"POSITION", i8 9, i8 0, ![[ZERO:[0-9]+]]
+# VS-DAG: !"COLOR", i8 9, i8 0, ![[ZERO]]
+# VS-DAG: ![[ZERO]] = !{i32 0}
+
+# VSID: define void @mainVSId()
+# VSID-DAG: call i32 @dx.op.loadInput.i32(i32 4, i32 0, i32 0, i8 0, i32 poison)
+# VSID-DAG: !"SV_VertexID"
+
+# PS: define void @mainPS()
+# PS-DAG: call float @dx.op.loadInput.f32(i32 4, i32 0, i32 0, i8 0, i32 poison)
+# PS-DAG: call void @dx.op.storeOutput.f32(i32 5, i32 0, i32 0, i8 0, float {{%.*}})
+# PS-DAG: !"SV_Target"

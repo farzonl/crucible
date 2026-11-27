@@ -938,10 +938,14 @@ struct StageIOInfo {
 std::pair<std::string, uint32_t> parseStageVarSemantic(StringRef SymName,
                                                        uint32_t DefaultIdx) {
   StringRef S = SymName;
-  if (S.starts_with("in.var."))
+  bool HasStagePrefix = false;
+  if (S.starts_with("in.var.")) {
     S = S.drop_front(7);
-  else if (S.starts_with("out.var."))
+    HasStagePrefix = true;
+  } else if (S.starts_with("out.var.")) {
     S = S.drop_front(8);
+    HasStagePrefix = true;
+  }
   size_t End = S.size();
   while (End > 0 && std::isdigit(static_cast<unsigned char>(S[End - 1])))
     --End;
@@ -950,7 +954,7 @@ std::pair<std::string, uint32_t> parseStageVarSemantic(StringRef SymName,
     if (!S.substr(End).getAsInteger(10, Idx))
       return {S.substr(0, End).str(), Idx};
   }
-  return {S.str(), DefaultIdx};
+  return {S.str(), HasStagePrefix ? 0u : DefaultIdx};
 }
 
 ResourceKind mapImageKind(mlir::spirv::ImageType ImgTy) {
