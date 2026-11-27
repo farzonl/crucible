@@ -422,12 +422,15 @@ Error DXILLowerer::lowerBindResource(CallInst *CI) {
   // crucible.bind_resource carries the absolute register index (LowerBound +
   // arrayOffset), whereas llvm.dx.resource.handlefrombinding expects the
   // 0-based offset within [LowerBound, LowerBound + RangeSize).
+  // ArrIdx was biased by the original pre-remapping lower bound (RB->SPIRVBinding),
+  // which assignDXILBindings snapshots before resolving register collisions.
   Value *Idx = nullptr;
   if (RB->RangeSize == 1) {
     Idx = B.getInt32(0);
   } else {
-    Idx = (RB->LowerBound == 0) ? ArrIdx
-                                : B.CreateSub(ArrIdx, B.getInt32(RB->LowerBound));
+    uint32_t SrcLowerBound = RB->SPIRVBinding;
+    Idx = (SrcLowerBound == 0) ? ArrIdx
+                               : B.CreateSub(ArrIdx, B.getInt32(SrcLowerBound));
   }
   if (NonUniform) {
     Function *NuriFn = Intrinsic::getOrInsertDeclaration(
@@ -615,9 +618,13 @@ Error DXILLowerer::lowerBufferStore(CallInst *CI) {
     ActiveComps = 1;
 
   if (IsTyped) {
-    Type *Vec4Ty = FixedVectorType::get(ScalarTy, 4);
-    Value *Vec = PoisonValue::get(Vec4Ty);
-    for (unsigned I = 0; I < 4; ++I) {
+    // A DXIL typed buffer store writes at most 128 bits (4 x 32-bit = 2 x 64-bit).
+    // Passing <4 x i64> causes LLVM's DXILOpLowering to split into two overlapping
+    // dx.op.bufferStore.i32 calls at the same index, overwriting with zeros.
+    unsigned StoreVecLen = (ScalarTy->getPrimitiveSizeInBits() == 64) ? 2u : 4u;
+    Type *VecTy = FixedVectorType::get(ScalarTy, StoreVecLen);
+    Value *Vec = PoisonValue::get(VecTy);
+    for (unsigned I = 0; I < StoreVecLen; ++I) {
       Value *V =
           (I < Vals.size() && (Mask & (1u << I)) && !isa<UndefValue>(Vals[I]))
               ? Vals[I]
@@ -625,7 +632,7 @@ Error DXILLowerer::lowerBufferStore(CallInst *CI) {
       Vec = B.CreateInsertElement(Vec, V, B.getInt32(I));
     }
     Function *StoreFn = Intrinsic::getOrInsertDeclaration(
-        &M, Intrinsic::dx_resource_store_typedbuffer, {RH.DxHandleTy, Vec4Ty});
+        &M, Intrinsic::dx_resource_store_typedbuffer, {RH.DxHandleTy, VecTy});
     B.CreateCall(StoreFn, {RH.DxHandle, Index, Vec});
   } else {
     Value *OffArg = IsRaw ? static_cast<Value *>(PoisonValue::get(B.getInt32Ty()))

@@ -436,6 +436,8 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
   // Map pipeline resources to their DXIL (Class, Space, Register) bindings.
   std::vector<BoundResource> Bound;
   std::vector<BoundSampler> BoundSamplers;
+  std::vector<const offloadtest::Resource *> HeapResources;
+  std::vector<const offloadtest::Resource *> HeapSamplers;
   for (size_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx) {
     for (const offloadtest::Resource &Res : P.Sets[SetIdx].Resources) {
       if (Res.isAccelerationStructure())
@@ -444,6 +446,14 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
             "D3D12 offload proxy does not yet support texture/sampler/AS "
             "resource '%s'",
             Res.Name.c_str());
+
+      if (Res.HeapIndex && !Res.VKBinding && !Res.DXBinding) {
+        if (Res.isSampler())
+          HeapSamplers.push_back(&Res);
+        else
+          HeapResources.push_back(&Res);
+        continue;
+      }
 
       auto findReflected =
           [&](crucible::ResourceClass C, uint32_t SrcSet, uint32_t SrcBinding,
@@ -627,6 +637,171 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
             Bound.push_back(CBR);
           }
         }
+      }
+    }
+  }
+
+  // Populate dynamic-resource descriptor heaps (ResourceDescriptorHeap,
+  // counter.var.ResourceDescriptorHeap, SamplerDescriptorHeap) from HeapIndex
+  // entries in pipeline.yaml.
+  auto populateBoundResource = [&](BoundResource &BR,
+                                   const offloadtest::Resource &Res,
+                                   uint32_t ArrIdx,
+                                   crucible::ResourceClass Class,
+                                   uint32_t ReflectedStride) {
+    BR.Res = &Res;
+    BR.ArrIdx = ArrIdx;
+    BR.Class = Class;
+    BR.ReflectedStride = ReflectedStride;
+    BR.SizeBytes = Res.BufferPtr->Size;
+    if (Res.isTexture()) {
+      BR.IsTexture = true;
+      const CPUBuffer &CPU = *Res.BufferPtr;
+      BR.TexW = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Width));
+      BR.TexH = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Height));
+      BR.TexD = static_cast<uint32_t>(std::max(1, CPU.OutputProps.Depth));
+      BR.TexMips =
+          static_cast<uint32_t>(std::max(1, CPU.OutputProps.MipLevels));
+      BR.TexSlices =
+          static_cast<uint32_t>(std::max(1, CPU.OutputProps.ArraySlices));
+      if (Res.Kind == ResourceKind::TextureCube)
+        BR.TexSlices = 6;
+      else if (Res.Kind == ResourceKind::TextureCubeArray)
+        BR.TexSlices = std::max(6u, BR.TexSlices);
+      BR.TexFmt = dxgiFormatForBuffer(CPU);
+      unsigned Ch = CPU.Channels ? static_cast<unsigned>(CPU.Channels) : 1u;
+      BR.TexBytesPerPixel =
+          static_cast<uint32_t>(CPU.getSingleElementSize() * Ch);
+      uint64_t SrcOff = 0, DstOff = 0;
+      for (uint32_t S = 0; S < BR.TexSlices; ++S) {
+        for (uint32_t M = 0; M < BR.TexMips; ++M) {
+          uint32_t MW = std::max(1u, BR.TexW >> M);
+          uint32_t MH = std::max(1u, BR.TexH >> M);
+          uint32_t MD = std::max(1u, BR.TexD >> M);
+          uint32_t RawPitch = MW * BR.TexBytesPerPixel;
+          uint32_t AlignedPitch =
+              (RawPitch + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+              ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+          DstOff = (DstOff + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull) &
+                   ~(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull);
+          TexSubresourceLayout L{};
+          L.Subresource = S * BR.TexMips + M;
+          L.Width = MW;
+          L.Height = MH;
+          L.Depth = MD;
+          L.RowPitch = AlignedPitch;
+          L.SrcOffset = SrcOff;
+          L.DstOffset = DstOff;
+          BR.TexLayouts.push_back(L);
+          SrcOff += static_cast<uint64_t>(RawPitch) * MH * MD;
+          DstOff += static_cast<uint64_t>(AlignedPitch) * MH * MD;
+        }
+      }
+      BR.AllocBytes = std::max<uint64_t>(DstOff, 256ull);
+    } else if (Class == crucible::ResourceClass::CBV) {
+      BR.AllocBytes = (BR.SizeBytes + 255ull) & ~255ull;
+    } else if (Res.Kind == ResourceKind::ByteAddressBuffer ||
+               Res.Kind == ResourceKind::RWByteAddressBuffer) {
+      BR.AllocBytes = std::max<uint64_t>(4ull, (BR.SizeBytes + 3ull) & ~3ull);
+    } else if (Res.Kind == ResourceKind::StructuredBuffer ||
+               Res.Kind == ResourceKind::RWStructuredBuffer) {
+      uint32_t S = BR.ReflectedStride
+                       ? BR.ReflectedStride
+                       : std::max<uint32_t>(2u, Res.BufferPtr->getElementSize());
+      BR.AllocBytes =
+          std::max<uint64_t>(S, ((BR.SizeBytes + S - 1ull) / S) * S);
+    } else {
+      BR.AllocBytes = std::max<uint64_t>(BR.SizeBytes, 4ull);
+    }
+  };
+
+  if (!HeapResources.empty()) {
+    for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+      if (RB.RangeSize != 0xFFFFFFFFu)
+        continue;
+      if (RB.Name == "ResourceDescriptorHeap") {
+        uint32_t MaxIdx = 0;
+        bool AnyMatch = false;
+        for (const offloadtest::Resource *R : HeapResources) {
+          auto C = classifyResource(R->Kind);
+          if (C && *C == RB.Class && R->BufferPtr) {
+            MaxIdx = std::max(MaxIdx, *R->HeapIndex);
+            AnyMatch = true;
+          }
+        }
+        if (!AnyMatch)
+          continue;
+        uint32_t BaseSlot = static_cast<uint32_t>(Bound.size());
+        for (uint32_t SlotIdx = 0; SlotIdx <= MaxIdx; ++SlotIdx) {
+          BoundResource Pad;
+          Pad.Class = RB.Class;
+          Pad.Space = RB.Space;
+          Pad.Register = RB.LowerBound + SlotIdx;
+          Pad.IsUnbounded = true;
+          Bound.push_back(std::move(Pad));
+        }
+        for (const offloadtest::Resource *R : HeapResources) {
+          auto C = classifyResource(R->Kind);
+          if (C && *C == RB.Class && R->BufferPtr) {
+            BoundResource &BR = Bound[BaseSlot + *R->HeapIndex];
+            populateBoundResource(BR, *R, 0, RB.Class, RB.ElementStride);
+          }
+        }
+      } else if (RB.Name == "counter.var.ResourceDescriptorHeap" &&
+                 RB.Class == crucible::ResourceClass::UAV) {
+        uint32_t MaxIdx = 0;
+        bool AnyMatch = false;
+        for (const offloadtest::Resource *R : HeapResources) {
+          if (R->HasCounter && R->BufferPtr) {
+            MaxIdx = std::max(MaxIdx, *R->HeapIndex);
+            AnyMatch = true;
+          }
+        }
+        if (!AnyMatch)
+          continue;
+        uint32_t BaseSlot = static_cast<uint32_t>(Bound.size());
+        for (uint32_t SlotIdx = 0; SlotIdx <= MaxIdx; ++SlotIdx) {
+          BoundResource Pad;
+          Pad.Class = crucible::ResourceClass::UAV;
+          Pad.Space = RB.Space;
+          Pad.Register = RB.LowerBound + SlotIdx;
+          Pad.IsUnbounded = true;
+          Bound.push_back(std::move(Pad));
+        }
+        for (const offloadtest::Resource *R : HeapResources) {
+          if (R->HasCounter && R->BufferPtr) {
+            BoundResource &CBR = Bound[BaseSlot + *R->HeapIndex];
+            CBR.Res = R;
+            CBR.ArrIdx = 0;
+            CBR.SizeBytes = 4;
+            CBR.AllocBytes = 4;
+            CBR.IsStandaloneCounter = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (!HeapSamplers.empty()) {
+    uint32_t MaxIdx = 0;
+    for (const offloadtest::Resource *R : HeapSamplers)
+      if (R->SamplerPtr)
+        MaxIdx = std::max(MaxIdx, *R->HeapIndex);
+    for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+      if (RB.Class != crucible::ResourceClass::Sampler ||
+          RB.RangeSize != 0xFFFFFFFFu || RB.Name != "SamplerDescriptorHeap")
+        continue;
+      uint32_t BaseSlot = static_cast<uint32_t>(BoundSamplers.size());
+      for (uint32_t SlotIdx = 0; SlotIdx <= MaxIdx; ++SlotIdx) {
+        BoundSampler Pad;
+        Pad.Space = RB.Space;
+        Pad.Register = RB.LowerBound + SlotIdx;
+        Pad.IsUnbounded = true;
+        BoundSamplers.push_back(Pad);
+      }
+      for (const offloadtest::Resource *R : HeapSamplers) {
+        if (R->SamplerPtr)
+          BoundSamplers[BaseSlot + *R->HeapIndex].Res = R;
       }
     }
   }
@@ -832,6 +1007,8 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
 
   for (uint32_t I = 0; I < Bound.size(); ++I) {
     BoundResource &BR = Bound[I];
+    if (!BR.Res && BR.InlineData.empty() && !BR.IsStandaloneCounter)
+      continue;
     D3D12_CPU_DESCRIPTOR_HANDLE Slot{CpuStart.ptr +
                                      static_cast<SIZE_T>(I) * IncSize};
 
@@ -1098,7 +1275,7 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
           continue;
         }
 
-        if (BR.Res->HasCounter &&
+        if (BR.Res->HasCounter && !BR.Res->HeapIndex &&
             !(BR.Res->VKBinding && BR.Res->VKBinding->CounterBinding)) {
           auto CDef = createCommittedBuffer(
               Dev, D3D12_HEAP_TYPE_DEFAULT, 4,
@@ -1191,19 +1368,28 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
     D3D12_CPU_DESCRIPTOR_HANDLE SStart =
         SamplerHeap->GetCPUDescriptorHandleForHeapStart();
     for (uint32_t I = 0; I < BoundSamplers.size(); ++I) {
-      const YAMLSampler &S = *BoundSamplers[I].Res->SamplerPtr;
       D3D12_SAMPLER_DESC SDesc{};
-      SDesc.Filter = d3d12Filter(S);
-      D3D12_TEXTURE_ADDRESS_MODE Addr = d3d12AddressMode(S.Address);
-      SDesc.AddressU = Addr;
-      SDesc.AddressV = Addr;
-      SDesc.AddressW = Addr;
-      SDesc.MaxAnisotropy = 1;
-      SDesc.ComparisonFunc = (S.Kind == SamplerKind::SamplerComparison)
-                                 ? d3d12CompareFunc(S.ComparisonOp)
-                                 : D3D12_COMPARISON_FUNC_NEVER;
-      SDesc.MinLOD = S.MinLOD;
-      SDesc.MaxLOD = S.MaxLOD;
+      if (BoundSamplers[I].Res && BoundSamplers[I].Res->SamplerPtr) {
+        const YAMLSampler &S = *BoundSamplers[I].Res->SamplerPtr;
+        SDesc.Filter = d3d12Filter(S);
+        D3D12_TEXTURE_ADDRESS_MODE Addr = d3d12AddressMode(S.Address);
+        SDesc.AddressU = Addr;
+        SDesc.AddressV = Addr;
+        SDesc.AddressW = Addr;
+        SDesc.MaxAnisotropy = 1;
+        SDesc.ComparisonFunc = (S.Kind == SamplerKind::SamplerComparison)
+                                   ? d3d12CompareFunc(S.ComparisonOp)
+                                   : D3D12_COMPARISON_FUNC_NEVER;
+        SDesc.MinLOD = S.MinLOD;
+        SDesc.MaxLOD = S.MaxLOD;
+      } else {
+        SDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+        SDesc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        SDesc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        SDesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        SDesc.MaxAnisotropy = 1;
+        SDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+      }
       D3D12_CPU_DESCRIPTOR_HANDLE Slot{SStart.ptr +
                                        static_cast<SIZE_T>(I) * SInc};
       Dev->CreateSampler(&SDesc, Slot);
@@ -1685,8 +1871,25 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
   PSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
   PSODesc.RasterizerState.FrontCounterClockwise = FALSE;
   PSODesc.RasterizerState.DepthClipEnable = TRUE;
-  PSODesc.DepthStencilState.DepthEnable = FALSE;
-  PSODesc.DepthStencilState.StencilEnable = FALSE;
+  bool HasStencil = P.Stencil && P.Stencil->Enabled;
+  DXGI_FORMAT DSVFmt =
+      HasStencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT;
+  PSODesc.DepthStencilState.DepthEnable = TRUE;
+  PSODesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+  PSODesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  PSODesc.DepthStencilState.StencilEnable = HasStencil ? TRUE : FALSE;
+  if (HasStencil) {
+    PSODesc.DepthStencilState.StencilReadMask = 0xFF;
+    PSODesc.DepthStencilState.StencilWriteMask = 0xFF;
+    D3D12_DEPTH_STENCILOP_DESC Op{};
+    Op.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+    Op.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    Op.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+    Op.StencilFunc = d3d12CompareFunc(P.Stencil->ComparisonOp);
+    PSODesc.DepthStencilState.FrontFace = Op;
+    PSODesc.DepthStencilState.BackFace = Op;
+  }
+  PSODesc.DSVFormat = DSVFmt;
   PSODesc.InputLayout = {InputElems.empty() ? nullptr : InputElems.data(),
                          static_cast<UINT>(InputElems.size())};
   uint32_t SampleCount = std::max<uint32_t>(1u, B.SampleCount);
@@ -1749,6 +1952,42 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
       RTVHeap->GetCPUDescriptorHandleForHeapStart();
   Dev->CreateRenderTargetView(RTTex, nullptr, RTVHandle);
 
+  // Depth/stencil texture + DSV heap
+  D3D12_RESOURCE_DESC DSDesc{};
+  DSDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  DSDesc.Width = RTW;
+  DSDesc.Height = RTH;
+  DSDesc.DepthOrArraySize = 1;
+  DSDesc.MipLevels = 1;
+  DSDesc.Format = DSVFmt;
+  DSDesc.SampleDesc = {SampleCount, 0};
+  DSDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  DSDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_CLEAR_VALUE DSClear{};
+  DSClear.Format = DSVFmt;
+  DSClear.DepthStencil.Depth = 1.0f;
+  DSClear.DepthStencil.Stencil =
+      HasStencil ? static_cast<UINT8>(P.Stencil->ClearValue) : 0;
+  ID3D12Resource *DSTex = nullptr;
+  Hr = Dev->CreateCommittedResource(&DefHeap, D3D12_HEAP_FLAG_NONE, &DSDesc,
+                                    D3D12_RESOURCE_STATE_DEPTH_WRITE, &DSClear,
+                                    __uuidof(ID3D12Resource),
+                                    reinterpret_cast<void **>(&DSTex));
+  if (FAILED(Hr))
+    return hrErr(Hr, "CreateCommittedResource(DepthStencil)");
+
+  D3D12_DESCRIPTOR_HEAP_DESC DSVHeapDesc{};
+  DSVHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+  DSVHeapDesc.NumDescriptors = 1;
+  ID3D12DescriptorHeap *DSVHeap = nullptr;
+  Hr = Dev->CreateDescriptorHeap(&DSVHeapDesc, __uuidof(ID3D12DescriptorHeap),
+                                 reinterpret_cast<void **>(&DSVHeap));
+  if (FAILED(Hr))
+    return hrErr(Hr, "CreateDescriptorHeap(DSV)");
+  D3D12_CPU_DESCRIPTOR_HANDLE DSVHandle =
+      DSVHeap->GetCPUDescriptorHandleForHeapStart();
+  Dev->CreateDepthStencilView(DSTex, nullptr, DSVHandle);
+
   auto RTRbOrErr = createCommittedBuffer(
       Dev, D3D12_HEAP_TYPE_READBACK, RTReadbackBytes, D3D12_RESOURCE_FLAG_NONE,
       D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1802,6 +2041,8 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
       DescHeap->GetCPUDescriptorHandleForHeapStart();
   for (uint32_t I = 0; I < Bound.size(); ++I) {
     BoundResource &BR = Bound[I];
+    if (!BR.Res && BR.InlineData.empty() && !BR.IsStandaloneCounter)
+      continue;
     D3D12_CPU_DESCRIPTOR_HANDLE Slot{CpuStart.ptr +
                                      static_cast<SIZE_T>(I) * IncSize};
     if (BR.Class == crucible::ResourceClass::CBV) {
@@ -2038,8 +2279,16 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
   }
 
   const float ClearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  Cmd->OMSetRenderTargets(1, &RTVHandle, FALSE, &DSVHandle);
   Cmd->ClearRenderTargetView(RTVHandle, ClearColor, 0, nullptr);
-  Cmd->OMSetRenderTargets(1, &RTVHandle, FALSE, nullptr);
+  Cmd->ClearDepthStencilView(
+      DSVHandle,
+      HasStencil ? (D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL)
+                 : D3D12_CLEAR_FLAG_DEPTH,
+      1.0f, HasStencil ? static_cast<UINT8>(P.Stencil->ClearValue) : 0, 0,
+      nullptr);
+  if (HasStencil)
+    Cmd->OMSetStencilRef(0);
 
   D3D12_VIEWPORT VP{};
   if (B.getViewportCount() > 0) {
