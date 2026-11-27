@@ -1299,6 +1299,97 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
     }
   }
 
+  // MLIR's SPIR-V deserializer drops the value attribute on OpConstantComposite
+  // of OpTypeMatrix, producing an invalid null-value spirv.Constant. Rewrite
+  // constant matrices into OpCompositeConstruct at the start of each function
+  // that references them.
+  {
+    DenseSet<uint32_t> MatrixTypes;
+    struct ConstMatrixDef {
+      uint32_t TypeId;
+      uint32_t ResultId;
+      SmallVector<uint32_t, 4> ColIds;
+    };
+    DenseMap<uint32_t, ConstMatrixDef> ConstMatrices;
+    for (size_t I = 5; I < Words.size();) {
+      uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+      if (Count == 0 || I + Count > Words.size())
+        break;
+      if (Op == spv::OpTypeMatrix && Count >= 4)
+        MatrixTypes.insert(Words[I + 1]);
+      else if (Op == spv::OpConstantComposite && Count >= 4 &&
+               MatrixTypes.contains(Words[I + 1])) {
+        ConstMatrixDef Def;
+        Def.TypeId = Words[I + 1];
+        Def.ResultId = Words[I + 2];
+        for (uint32_t K = 3; K < Count; ++K)
+          Def.ColIds.push_back(Words[I + K]);
+        ConstMatrices[Def.ResultId] = std::move(Def);
+      }
+      I += Count;
+    }
+    if (!ConstMatrices.empty()) {
+      SmallVector<uint32_t> Out(Words.begin(), Words.begin() + 5);
+      uint32_t NextId = Words[3];
+      bool InFunction = false;
+      bool InsertedInFn = false;
+      DenseMap<uint32_t, uint32_t> FnIdMap;
+      for (size_t I = 5; I < Words.size();) {
+        uint32_t Count = Words[I] >> 16, Op = Words[I] & 0xffff;
+        if (Count == 0 || I + Count > Words.size())
+          break;
+        if (Op == spv::OpConstantComposite && Count >= 4 &&
+            ConstMatrices.contains(Words[I + 2])) {
+          I += Count;
+          continue;
+        }
+        if (Op == spv::OpFunction) {
+          InFunction = true;
+          InsertedInFn = false;
+          FnIdMap.clear();
+        } else if (Op == spv::OpFunctionEnd) {
+          InFunction = false;
+          FnIdMap.clear();
+        }
+        if (InFunction && Op == spv::OpLabel && !InsertedInFn) {
+          Out.append(Words.begin() + I, Words.begin() + I + Count);
+          InsertedInFn = true;
+          for (const auto &KV : ConstMatrices) {
+            uint32_t NewId = NextId++;
+            FnIdMap[KV.first] = NewId;
+            const ConstMatrixDef &Def = KV.second;
+            uint32_t CCWords = 3u + static_cast<uint32_t>(Def.ColIds.size());
+            Out.push_back((CCWords << 16) | spv::OpCompositeConstruct);
+            Out.push_back(Def.TypeId);
+            Out.push_back(NewId);
+            for (uint32_t ColId : Def.ColIds)
+              Out.push_back(ColId);
+          }
+          I += Count;
+          continue;
+        }
+        if (InFunction && !FnIdMap.empty()) {
+          size_t Start = Out.size();
+          Out.append(Words.begin() + I, Words.begin() + I + Count);
+          // Remap operand IDs (skip opcode word and any result type/id words
+          // only where not a reference; since ConstMatrices IDs were global
+          // constant IDs, they only ever appear as operand references inside
+          // function bodies).
+          for (size_t K = 1; K < Count; ++K) {
+            auto It = FnIdMap.find(Out[Start + K]);
+            if (It != FnIdMap.end())
+              Out[Start + K] = It->second;
+          }
+        } else {
+          Out.append(Words.begin() + I, Words.begin() + I + Count);
+        }
+        I += Count;
+      }
+      Out[3] = NextId;
+      Words.assign(Out.begin(), Out.end());
+    }
+  }
+
   // Keep CFG as plain spirv.Branch / spirv.BranchConditional so
   // ConvertSPIRVToLLVM + LiftControlFlowToSCF handle all control flow.
   mlir::spirv::DeserializationOptions DeserOpts;
@@ -4743,6 +4834,8 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
         MatConsts.push_back(C);
     });
     for (auto C : MatConsts) {
+      if (!C.getValue())
+        continue;
       auto MatTy = mlir::cast<mlir::spirv::MatrixType>(C.getType());
       auto ColTy = mlir::cast<mlir::VectorType>(MatTy.getColumnType());
       auto AA = mlir::dyn_cast<mlir::ArrayAttr>(C.getValue());

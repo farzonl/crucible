@@ -1,0 +1,17 @@
+# Regression test for OpConstantComposite of OpTypeMatrix (#185):
+# verifies SPIRVLoader expands constant matrices instead of crashing on
+# MLIR's null-value spirv.Constant, for both DXIL and Metal targets.
+# REQUIRES: directx-backend
+
+# RUN: %dxc -spirv -fspv-target-env=vulkan1.3 -T cs_6_0 -E main -Fo %t.spv %S/../Inputs/spirv_const_matrix.hlsl
+# RUN: %cruciblec --target=dxil --dxil-asm %t.spv | FileCheck %s --check-prefix=DXIL
+# RUN: %cruciblec --target=dxil %t.spv -o %t.dxil
+# RUN: %cruciblec %t.spv -o %t.metal
+# RUN: FileCheck %s --check-prefix=MSL --input-file=%t.metal
+
+# DXIL: define void @main()
+# DXIL: fmul float
+# DXIL: @dx.op.rawBufferStore
+
+# MSL: kernel void
+# MSL: 1.25

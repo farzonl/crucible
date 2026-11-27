@@ -313,6 +313,7 @@ struct BoundResource {
   uint64_t SizeBytes = 0;
   uint64_t AllocBytes = 0;
   std::vector<uint8_t> InlineData;
+  bool IsStandaloneCounter = false;
 };
 
 Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
@@ -378,12 +379,23 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       }
 
       crucible::ResourceClass Class = *ClassOpt;
+      bool MatchedByName = false;
       for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
-        if (RB.Space == Space && RB.LowerBound == BaseReg &&
-            RB.Class == Class) {
+        if (RB.Class == Class && !RB.Name.empty() && RB.Name == Res.Name) {
           Space = RB.Space;
           BaseReg = RB.LowerBound;
+          MatchedByName = true;
           break;
+        }
+      }
+      if (!MatchedByName) {
+        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+          if (RB.Space == Space && RB.LowerBound == BaseReg &&
+              RB.Class == Class) {
+            Space = RB.Space;
+            BaseReg = RB.LowerBound;
+            break;
+          }
         }
       }
 
@@ -400,6 +412,33 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
                             ? ((BR.SizeBytes + 255ull) & ~255ull)
                             : std::max<uint64_t>(BR.SizeBytes, 4ull);
         Bound.push_back(BR);
+      }
+
+      // Vulkan SPIR-V represents RWStructuredBuffer counters as a separate UAV
+      // buffer at CounterBinding (counter.var.<Name>).
+      if (Res.HasCounter && Res.VKBinding && Res.VKBinding->CounterBinding) {
+        uint32_t CSpace = static_cast<uint32_t>(SetIdx);
+        uint32_t CBaseReg = *Res.VKBinding->CounterBinding;
+        std::string CName = "counter.var." + Res.Name;
+        for (const crucible::ResourceBinding &RB : Compiled->Reflect.Resources) {
+          if (RB.Class == crucible::ResourceClass::UAV && RB.Name == CName) {
+            CSpace = RB.Space;
+            CBaseReg = RB.LowerBound;
+            break;
+          }
+        }
+        for (uint32_t A = 0; A < ArrCount; ++A) {
+          BoundResource CBR;
+          CBR.Res = &Res;
+          CBR.ArrIdx = A;
+          CBR.Class = crucible::ResourceClass::UAV;
+          CBR.Space = CSpace;
+          CBR.Register = CBaseReg + A;
+          CBR.SizeBytes = 4;
+          CBR.AllocBytes = 4;
+          CBR.IsStandaloneCounter = true;
+          Bound.push_back(CBR);
+        }
       }
     }
   }
@@ -598,8 +637,13 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
       if (FAILED(Hr))
         return hrErr(Hr, "Map upload");
       std::memset(Mapped, 0, BR.AllocBytes);
-      if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx])
+      if (BR.IsStandaloneCounter) {
+        uint32_t InitVal =
+            (BR.ArrIdx < CPU.Counters.size()) ? CPU.Counters[BR.ArrIdx] : 0u;
+        std::memcpy(Mapped, &InitVal, 4);
+      } else if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx]) {
         std::memcpy(Mapped, CPU.Data[BR.ArrIdx].get(), BR.SizeBytes);
+      }
       BR.UploadBuf->Unmap(0, nullptr);
 
       Cmd->CopyBufferRegion(BR.DefaultBuf, 0, BR.UploadBuf, 0, BR.AllocBytes);
@@ -622,7 +666,20 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
           return RbOrErr.takeError();
         BR.ReadbackBuf = *RbOrErr;
 
-        if (BR.Res->HasCounter) {
+        if (BR.IsStandaloneCounter) {
+          D3D12_UNORDERED_ACCESS_VIEW_DESC UAVDesc{};
+          UAVDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+          UAVDesc.Format = DXGI_FORMAT_UNKNOWN;
+          UAVDesc.Buffer.FirstElement = 0;
+          UAVDesc.Buffer.StructureByteStride = 4;
+          UAVDesc.Buffer.NumElements = 1;
+          Dev->CreateUnorderedAccessView(BR.DefaultBuf, nullptr, &UAVDesc,
+                                         Slot);
+          continue;
+        }
+
+        if (BR.Res->HasCounter &&
+            !(BR.Res->VKBinding && BR.Res->VKBinding->CounterBinding)) {
           auto CDef = createCommittedBuffer(
               Dev, D3D12_HEAP_TYPE_DEFAULT, 4,
               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
@@ -779,8 +836,13 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
     Hr = BR.ReadbackBuf->Map(0, &ReadRange, &Mapped);
     if (FAILED(Hr))
       return hrErr(Hr, "Map readback");
-    if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx])
+    if (BR.IsStandaloneCounter) {
+      if (CPU.Counters.size() <= BR.ArrIdx)
+        CPU.Counters.resize(BR.ArrIdx + 1, 0);
+      std::memcpy(&CPU.Counters[BR.ArrIdx], Mapped, 4);
+    } else if (BR.ArrIdx < CPU.Data.size() && CPU.Data[BR.ArrIdx]) {
       std::memcpy(CPU.Data[BR.ArrIdx].get(), Mapped, BR.SizeBytes);
+    }
     D3D12_RANGE WriteRange{0, 0};
     BR.ReadbackBuf->Unmap(0, &WriteRange);
 
