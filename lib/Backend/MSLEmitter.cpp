@@ -2454,11 +2454,51 @@ bool Emitter::shouldInline(mlir::Operation *Op) {
 
   mlir::Operation *User = *Op->getResult(0).getUsers().begin();
 
+  // Never sink an expression across region/block boundaries (e.g., back into a
+  // loop body after LoopInvariantCodeMotion, or into an scf.if branch).
+  if (User->getBlock() != Op->getBlock())
+    return false;
+
   // Ops whose MSL emission expands their operand more than once (e.g.
   // `crucible.frc` -> `x - floor(x)`) would duplicate the entire inlined
   // subexpression (and blow up exponentially when nested). Materialize the
   // operand into a temporary instead.
   if (mlir::isa<ir::FrcOp>(User))
+    return false;
+
+  // Avoid sinking an expression across a long span of statements in the same
+  // block, which stretches operand live ranges (driving up GPU register
+  // pressure / spilling) and creates huge deeply-nested expressions.
+  constexpr unsigned kMaxSinkDistance = 16;
+  unsigned Dist = 0;
+  for (mlir::Operation *P = Op->getNextNode(); P && P != User;
+       P = P->getNextNode()) {
+    if (!isConstantLike(P) && ++Dist > kMaxSinkDistance)
+      return false;
+  }
+
+  // Cap the transitive inlined AST size so chained single-use reductions
+  // (e.g., dozens of nested min/max/sqrt SDF terms) materialize into local
+  // temporaries instead of multi-kilobyte single-line expressions.
+  constexpr unsigned kMaxInlineNodes = 24;
+  auto CountNodes = [&](auto &Self, mlir::Operation *Cur,
+                        unsigned Budget) -> unsigned {
+    unsigned Total = 1;
+    for (mlir::Value Operand : Cur->getOperands()) {
+      if (ValueNames.count(Operand))
+        continue;
+      mlir::Operation *Def = Operand.getDefiningOp();
+      if (!Def || isConstantLike(Def) || Def->getBlock() != Cur->getBlock())
+        continue;
+      if (Def->getNumResults() == 1 && Def->getResult(0).hasOneUse()) {
+        Total += Self(Self, Def, Budget > Total ? Budget - Total : 0);
+        if (Total > Budget)
+          return Total;
+      }
+    }
+    return Total;
+  };
+  if (CountNodes(CountNodes, Op, kMaxInlineNodes) > kMaxInlineNodes)
     return false;
 
   // A memory read must not be folded forward across a write or barrier,
@@ -3017,6 +3057,51 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return Expr{*DstTy + "(" + Src->Text + ")", PrecPrimary};
   }
   if (mlir::isa<SExtOp, SIToFPOp, mlir::arith::ExtSIOp>(Op)) {
+    // Match DXC's lowered HLSL sign(x) idiom:
+    //   sitofp(sub(zext(fcmp ogt x, 0.0), zext(fcmp olt x, 0.0))) -> sign(x)
+    // MSL sign(x) returns +1 for x>0, -1 for x<0, and 0 for ±0 and NaN,
+    // matching the expanded comparison semantics exactly.
+    if (auto S2F = mlir::dyn_cast<SIToFPOp>(Op);
+        S2F && (S2F.getType().isF32() || S2F.getType().isF16())) {
+      auto MatchZeroCmp = [](mlir::Value V, FCmpPredicate Pred,
+                             mlir::Value &OutX) -> bool {
+        mlir::Value CmpVal = V;
+        if (auto Z = V.getDefiningOp<ZExtOp>())
+          CmpVal = Z.getArg();
+        else if (auto Z = V.getDefiningOp<mlir::arith::ExtUIOp>())
+          CmpVal = Z.getIn();
+        else
+          return false;
+        auto FCmp = CmpVal.getDefiningOp<FCmpOp>();
+        if (!FCmp || FCmp.getPredicate() != Pred)
+          return false;
+        auto Cst = FCmp.getRhs().getDefiningOp<ConstantOp>();
+        if (!Cst)
+          return false;
+        auto FA = mlir::dyn_cast<mlir::FloatAttr>(Cst.getValue());
+        if (!FA || !FA.getValue().isZero())
+          return false;
+        OutX = FCmp.getLhs();
+        return true;
+      };
+      mlir::Value Lhs, Rhs;
+      if (auto Sub = S2F.getArg().getDefiningOp<SubOp>()) {
+        Lhs = Sub.getLhs();
+        Rhs = Sub.getRhs();
+      } else if (auto Sub = S2F.getArg().getDefiningOp<mlir::arith::SubIOp>()) {
+        Lhs = Sub.getLhs();
+        Rhs = Sub.getRhs();
+      }
+      mlir::Value X1, X2;
+      if (Lhs && Rhs && MatchZeroCmp(Lhs, FCmpPredicate::ogt, X1) &&
+          MatchZeroCmp(Rhs, FCmpPredicate::olt, X2) && X1 == X2 &&
+          X1.getType() == S2F.getType()) {
+        auto XE = exprFor(X1, PrecUnknown);
+        if (!XE)
+          return XE.takeError();
+        return Expr{"sign(" + XE->Text + ")", PrecPrimary};
+      }
+    }
     auto Src = exprFor(Op->getOperand(0), PrecUnknown);
     if (!Src)
       return Src.takeError();
@@ -3926,7 +4011,7 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
                 PrecPrimary};
   }
   if (mlir::isa<ir::WaveIsFirstLaneOp>(Op))
-    return Expr{"simd_prefix_exclusive_sum(1u) == 0u", PrecEq};
+    return Expr{"simd_is_first()", PrecPrimary};
   if (auto WV = mlir::dyn_cast<ir::WaveVoteOp>(Op)) {
     auto A = exprFor(WV.getValue(), PrecUnknown);
     if (!A)
@@ -5334,9 +5419,30 @@ Error Emitter::emitSwitch(mlir::scf::IndexSwitchOp Switch, unsigned Ind) {
     ValueNames[Res] = Name;
     ResultNames.push_back(Name);
   }
-  auto Selector = exprFor(Switch.getArg(), PrecUnknown);
+  // Avoid 64-bit switch discriminants on GPU when the index selector comes
+  // from a 32-bit integer and all case labels fit in 32 bits.
+  mlir::Value SelVal = Switch.getArg();
+  if (auto *Def = SelVal.getDefiningOp();
+      Def && mlir::isa<mlir::arith::IndexCastOp, mlir::arith::IndexCastUIOp>(Def) &&
+      Def->getOperand(0).getType().isInteger(32)) {
+    bool IsUnsigned = mlir::isa<mlir::arith::IndexCastUIOp>(Def);
+    bool Fits32 = true;
+    for (int64_t V : Switch.getCases()) {
+      if (IsUnsigned ? (V < 0 || V > int64_t(UINT32_MAX))
+                     : (V < INT32_MIN || V > INT32_MAX)) {
+        Fits32 = false;
+        break;
+      }
+    }
+    if (Fits32)
+      SelVal = Def->getOperand(0);
+  }
+  auto Selector = exprFor(SelVal, PrecUnknown);
   if (!Selector)
     return Selector.takeError();
+  if (SelVal != Switch.getArg() &&
+      mlir::isa<mlir::arith::IndexCastOp>(Switch.getArg().getDefiningOp()))
+    Selector->Text = signedView(SelVal.getType(), Selector->Text);
   line(Ind, "switch (" + Selector->Text + ") {");
   auto EmitCase = [&](mlir::Block &B, const std::string &Label) -> Error {
     line(Ind + 1, Label + ": {");

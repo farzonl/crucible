@@ -12,7 +12,7 @@
 
 # MSL: kernel void crucible_ops(
 # MSL: float [[SAT:v[0-9]+]] = saturate(
-# MSL: simd_prefix_exclusive_sum(1u) == 0u
+# MSL: simd_is_first()
 # MSL: simd_any(
 # MSL: threadgroup_barrier(mem_flags::mem_threadgroup);
 # MSL: [[SAT]] - floor([[SAT]])
