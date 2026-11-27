@@ -810,29 +810,39 @@ Error DXILLowerer::lowerTexLoad(CallInst *CI) {
       CoordVal = B.CreateInsertElement(CoordVal, CI->getArgOperand(4 + I),
                                        B.getInt32(I));
   }
-  Value *ZeroOffset = Constant::getNullValue(CoordVal->getType());
+  Value *OffsetVal = Constant::getNullValue(CoordVal->getType());
+  unsigned OffStart = 4 + NumCoords;
+  if (OffStart < CI->arg_size()) {
+    uint32_t NumOffsets =
+        cast<ConstantInt>(CI->getArgOperand(OffStart))->getZExtValue();
+    if (NumOffsets > 0) {
+      if (NumCoords == 1) {
+        OffsetVal = CI->getArgOperand(OffStart + 1);
+      } else {
+        Type *OffTy = CoordVal->getType();
+        OffsetVal = Constant::getNullValue(OffTy);
+        for (unsigned I = 0; I < std::min(NumOffsets, NumCoords); ++I)
+          OffsetVal = B.CreateInsertElement(
+              OffsetVal, CI->getArgOperand(OffStart + 1 + I), B.getInt32(I));
+      }
+    }
+  }
   bool IsMS = RH.RB && (RH.RB->Kind == ResourceKind::Texture2DMS ||
                         RH.RB->Kind == ResourceKind::Texture2DMSArray);
-  Function *Fn = Intrinsic::getOrInsertDeclaration(
-      &M, IsMS ? Intrinsic::dx_resource_load_ms : Intrinsic::dx_resource_load_level,
-      {CI->getType(), RH.DxHandleTy, CoordVal->getType(),
-       IsMS ? ZeroOffset->getType() : MipOrSample->getType(),
-       ZeroOffset->getType()});
   Value *Res = nullptr;
   if (IsMS) {
     Function *MSFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::dx_resource_load_ms,
         {CI->getType(), RH.DxHandleTy, CoordVal->getType(),
-         ZeroOffset->getType()});
-    Res = B.CreateCall(MSFn, {RH.DxHandle, CoordVal, MipOrSample, ZeroOffset});
+         OffsetVal->getType()});
+    Res = B.CreateCall(MSFn, {RH.DxHandle, CoordVal, MipOrSample, OffsetVal});
   } else {
     Function *LvlFn = Intrinsic::getOrInsertDeclaration(
         &M, Intrinsic::dx_resource_load_level,
         {CI->getType(), RH.DxHandleTy, CoordVal->getType(),
-         MipOrSample->getType(), ZeroOffset->getType()});
-    Res = B.CreateCall(LvlFn, {RH.DxHandle, CoordVal, MipOrSample, ZeroOffset});
+         MipOrSample->getType(), OffsetVal->getType()});
+    Res = B.CreateCall(LvlFn, {RH.DxHandle, CoordVal, MipOrSample, OffsetVal});
   }
-  (void)Fn;
   CI->replaceAllUsesWith(Res);
   CI->eraseFromParent();
   return Error::success();
@@ -912,6 +922,27 @@ Error DXILLowerer::lowerTexSample(CallInst *CI) {
                        : static_cast<Type *>(
                              FixedVectorType::get(B.getInt32Ty(), NumCoords));
   Value *ZeroOffset = Constant::getNullValue(OffsetTy);
+  unsigned OffIdx = 7 + NumCoords;
+  if (Mode == ir::SampleMode::Grad && OffIdx < CI->arg_size()) {
+    uint32_t NumGrads =
+        cast<ConstantInt>(CI->getArgOperand(OffIdx))->getZExtValue();
+    OffIdx += 1 + 2 * NumGrads;
+  }
+  if (OffIdx < CI->arg_size()) {
+    uint32_t NumOffsets =
+        cast<ConstantInt>(CI->getArgOperand(OffIdx))->getZExtValue();
+    if (NumOffsets > 0) {
+      if (NumCoords == 1) {
+        ZeroOffset = CI->getArgOperand(OffIdx + 1);
+      } else {
+        Value *OV = Constant::getNullValue(OffsetTy);
+        for (unsigned I = 0; I < std::min(NumOffsets, NumCoords); ++I)
+          OV = B.CreateInsertElement(OV, CI->getArgOperand(OffIdx + 1 + I),
+                                     B.getInt32(I));
+        ZeroOffset = OV;
+      }
+    }
+  }
 
   Value *Res = nullptr;
   switch (Mode) {
@@ -2404,10 +2435,13 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
     if (auto COp = mlir::dyn_cast<ir::TexLoadOp>(Op)) {
       mlir::Value Mip =
           COp.getMipOrSample() ? COp.getMipOrSample() : i32C(B, Loc, 0);
-      SmallVector<mlir::Value, 8> Args = {
+      SmallVector<mlir::Value, 12> Args = {
           COp.getHandle(), Mip,
           i32C(B, Loc, static_cast<int32_t>(COp.getCoords().size()))};
       Args.append(COp.getCoords().begin(), COp.getCoords().end());
+      Args.push_back(
+          i32C(B, Loc, static_cast<int32_t>(COp.getOffsets().size())));
+      Args.append(COp.getOffsets().begin(), COp.getOffsets().end());
       mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::TexLoad,
                                        COp.getResult().getType(), Args);
       COp.getResult().replaceAllUsesWith(Rep);
@@ -2441,6 +2475,9 @@ lowerMLIRToDXILLLVM(mlir::ModuleOp Mod, LLVMContext &LLVMCtx) {
         Args.append(COp.getDdx().begin(), COp.getDdx().end());
         Args.append(COp.getDdy().begin(), COp.getDdy().end());
       }
+      Args.push_back(
+          i32C(B, Loc, static_cast<int32_t>(COp.getOffsets().size())));
+      Args.append(COp.getOffsets().begin(), COp.getOffsets().end());
       mlir::Value Rep = makeBridgeCall(B, Loc, DxOp::TexSample,
                                        COp.getResult().getType(), Args);
       COp.getResult().replaceAllUsesWith(Rep);

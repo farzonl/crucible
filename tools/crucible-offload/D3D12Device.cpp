@@ -533,6 +533,10 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
               static_cast<uint32_t>(std::max(1, CPU.OutputProps.MipLevels));
           BR.TexSlices =
               static_cast<uint32_t>(std::max(1, CPU.OutputProps.ArraySlices));
+          if (Res.Kind == ResourceKind::TextureCube)
+            BR.TexSlices = 6;
+          else if (Res.Kind == ResourceKind::TextureCubeArray)
+            BR.TexSlices = std::max(6u, BR.TexSlices);
           BR.TexFmt = dxgiFormatForBuffer(CPU);
           unsigned Ch = CPU.Channels ? static_cast<unsigned>(CPU.Channels) : 1u;
           BR.TexBytesPerPixel =
@@ -944,6 +948,8 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
         }
         Dev->CreateUnorderedAccessView(BR.DefaultBuf, nullptr, &UAVDesc, Slot);
       } else {
+        bool IsCube = (BR.Res->Kind == ResourceKind::TextureCube);
+        bool IsCubeArray = (BR.Res->Kind == ResourceKind::TextureCubeArray);
         D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc{};
         SRVDesc.Format = BR.TexFmt;
         SRVDesc.Shader4ComponentMapping =
@@ -960,6 +966,13 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
         } else if (Is3D) {
           SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
           SRVDesc.Texture3D.MipLevels = BR.TexMips;
+        } else if (IsCube) {
+          SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+          SRVDesc.TextureCube.MipLevels = BR.TexMips;
+        } else if (IsCubeArray) {
+          SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+          SRVDesc.TextureCubeArray.MipLevels = BR.TexMips;
+          SRVDesc.TextureCubeArray.NumCubes = std::max(1u, BR.TexSlices / 6u);
         } else if (IsArray) {
           SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
           SRVDesc.Texture2DArray.MipLevels = BR.TexMips;
