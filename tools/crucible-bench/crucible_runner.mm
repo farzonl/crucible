@@ -34,6 +34,23 @@ struct CompiledCrucibleStage {
   crucible::Reflection reflect;
 };
 
+MTLCompileOptions *makeFastCompileOptions() {
+  MTLCompileOptions *co = [[MTLCompileOptions alloc] init];
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+  if (@available(macOS 15.0, *)) {
+    co.mathMode = MTLMathModeFast;
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    co.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+  }
+#else
+  co.fastMathEnabled = YES;
+#endif
+  return co;
+}
+
 bool compileStageWithCrucible(id<MTLDevice> device,
                               const std::vector<uint8_t> &dxil,
                               const crucible::Options &opts,
@@ -48,20 +65,7 @@ bool compileStageWithCrucible(id<MTLDevice> device,
     return false;
   }
 
-  MTLCompileOptions *co = [[MTLCompileOptions alloc] init];
-#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
-  if (@available(macOS 15.0, *)) {
-    co.mathMode = MTLMathModeFast;
-  } else {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    co.fastMathEnabled = YES;
-#pragma clang diagnostic pop
-  }
-#else
-  co.fastMathEnabled = YES;
-#endif
-
+  MTLCompileOptions *co = makeFastCompileOptions();
   NSString *src = [NSString stringWithUTF8String:compiled->MSL.c_str()];
   NSError *mtlErr = nil;
   out.lib = [device newLibraryWithSource:src options:co error:&mtlErr];
@@ -83,6 +87,116 @@ bool compileStageWithCrucible(id<MTLDevice> device,
     return false;
   }
   out.reflect = std::move(compiled->Reflect);
+  return true;
+}
+
+struct StageCompileReq {
+  const std::vector<uint8_t> *dxil = nullptr;
+  crucible::Options opts;
+  CompiledCrucibleStage *out = nullptr;
+};
+
+static void replaceAll(std::string &s, const std::string &from,
+                       const std::string &to) {
+  size_t pos = 0;
+  while ((pos = s.find(from, pos)) != std::string::npos) {
+    s.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+}
+
+// Compile multiple pipeline stages (e.g. VS+PS or AS+MS+PS) into a single
+// MTLLibrary so Apple's runtime Metal compiler parses <metal_stdlib> once per
+// pipeline instead of once per stage.
+bool compileStagesWithCrucible(id<MTLDevice> device,
+                               std::vector<StageCompileReq> &reqs,
+                               std::string &errOut) {
+  if (reqs.size() == 1)
+    return compileStageWithCrucible(device, *reqs[0].dxil, reqs[0].opts,
+                                    *reqs[0].out, errOut);
+
+  std::vector<crucible::CompileResult> compiled;
+  compiled.reserve(reqs.size());
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    llvm::MemoryBufferRef buf(
+        llvm::StringRef(reinterpret_cast<const char *>(reqs[i].dxil->data()),
+                        reqs[i].dxil->size()),
+        "shader.dxil");
+    auto res = crucible::compileDXILToMSL(buf, reqs[i].opts);
+    if (!res) {
+      errOut = "crucible: " + llvm::toString(res.takeError());
+      return false;
+    }
+    compiled.push_back(std::move(*res));
+  }
+
+  // Deduplicate entry names if two stages share one, and build one combined
+  // MSL translation unit with stage-scoped struct names.
+  std::string combined = "#include <metal_stdlib>\nusing namespace metal;\n";
+  bool hasRaytracing = false;
+  for (const auto &c : compiled)
+    if (c.MSL.find("using namespace metal::raytracing;") != std::string::npos)
+      hasRaytracing = true;
+  if (hasRaytracing)
+    combined += "using namespace metal::raytracing;\n";
+
+  // Check if any two stages have colliding entry names or duplicate helpers;
+  // if so, fall back to individual compiles cleanly.
+  bool canBatch = true;
+  for (size_t i = 0; i < compiled.size() && canBatch; ++i) {
+    if (compiled[i].MSL.find("#pragma METAL") != std::string::npos)
+      canBatch = false;
+    for (size_t j = i + 1; j < compiled.size(); ++j)
+      if (compiled[i].Reflect.MSLEntryName == compiled[j].Reflect.MSLEntryName)
+        canBatch = false;
+  }
+
+  if (canBatch) {
+    for (size_t i = 0; i < compiled.size(); ++i) {
+      std::string body = compiled[i].MSL;
+      replaceAll(body, "#include <metal_stdlib>\n", "");
+      replaceAll(body, "using namespace metal;\n", "");
+      replaceAll(body, "using namespace metal::raytracing;\n", "");
+      std::string suf = "_s" + std::to_string(i);
+      replaceAll(body, "CrucibleStageIn", "CrucibleStageIn" + suf);
+      replaceAll(body, "CrucibleStageOut", "CrucibleStageOut" + suf);
+      replaceAll(body, "CrucibleMeshVert", "CrucibleMeshVert" + suf);
+      replaceAll(body, "CrucibleMeshPrim", "CrucibleMeshPrim" + suf);
+      replaceAll(body, "CrucibleStruct", "CrucibleStruct" + suf + "_");
+      replaceAll(body, "crucible_powi", "crucible_powi" + suf);
+      replaceAll(body, "crucible_pow2_5", "crucible_pow2_5" + suf);
+      combined += "\n// --- stage " + std::to_string(i) + " ---\n" + body;
+    }
+
+    MTLCompileOptions *co = makeFastCompileOptions();
+    NSString *src = [NSString stringWithUTF8String:combined.c_str()];
+    NSError *mtlErr = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:src options:co error:&mtlErr];
+    if (lib) {
+      bool allFound = true;
+      for (size_t i = 0; i < compiled.size(); ++i) {
+        NSString *entry = [NSString
+            stringWithUTF8String:compiled[i].Reflect.MSLEntryName.c_str()];
+        id<MTLFunction> fn = [lib newFunctionWithName:entry];
+        if (!fn) {
+          allFound = false;
+          break;
+        }
+        reqs[i].out->lib = lib;
+        reqs[i].out->fn = fn;
+        reqs[i].out->reflect = std::move(compiled[i].Reflect);
+      }
+      if (allFound)
+        return true;
+    }
+  }
+
+  // Fallback: compile each stage individually.
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    if (!compileStageWithCrucible(device, *reqs[i].dxil, reqs[i].opts,
+                                  *reqs[i].out, errOut))
+      return false;
+  }
   return true;
 }
 
@@ -384,8 +498,11 @@ MetalBenchResult runCrucibleGraphicsBench(
     crucible::Options opts;
     CompiledCrucibleStage vsStage, psStage;
     std::string errStr;
-    if (!compileStageWithCrucible(device, vsDxil, opts, vsStage, errStr) ||
-        !compileStageWithCrucible(device, psDxil, opts, psStage, errStr)) {
+    std::vector<StageCompileReq> reqs = {
+        {&vsDxil, opts, &vsStage},
+        {&psDxil, opts, &psStage},
+    };
+    if (!compileStagesWithCrucible(device, reqs, errStr)) {
       res.status = "FAILED (" + errStr + ")";
       return res;
     }
@@ -715,13 +832,12 @@ MetalBenchResult runCrucibleMeshBench(const std::string &benchId,
     crucible::Options opts;
     CompiledCrucibleStage asStage, msStage, psStage;
     std::string errStr;
-    if (!asDxil.empty() &&
-        !compileStageWithCrucible(device, asDxil, opts, asStage, errStr)) {
-      res.status = "FAILED (" + errStr + ")";
-      return res;
-    }
-    if (!compileStageWithCrucible(device, msDxil, opts, msStage, errStr) ||
-        !compileStageWithCrucible(device, psDxil, opts, psStage, errStr)) {
+    std::vector<StageCompileReq> reqs;
+    if (!asDxil.empty())
+      reqs.push_back({&asDxil, opts, &asStage});
+    reqs.push_back({&msDxil, opts, &msStage});
+    reqs.push_back({&psDxil, opts, &psStage});
+    if (!compileStagesWithCrucible(device, reqs, errStr)) {
       res.status = "FAILED (" + errStr + ")";
       return res;
     }
