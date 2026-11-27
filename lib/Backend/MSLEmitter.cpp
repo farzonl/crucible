@@ -203,6 +203,21 @@ StringRef helperSource(StringRef Name) {
            "  return select(x, as_type<float4>(as_type<uint4>(x) & 0x80000000u),\n"
            "                (as_type<uint4>(x) & 0x7f800000u) == 0u);\n"
            "}\n";
+  if (Name == "crucible_powi")
+    return "template <int N, typename T> static inline T crucible_powi(T x) {\n"
+           "  T r = T(1), b = x;\n"
+           "  int e = N;\n"
+           "  while (e > 0) {\n"
+           "    if (e & 1) r *= b;\n"
+           "    e >>= 1;\n"
+           "    if (e > 0) b *= b;\n"
+           "  }\n"
+           "  return r;\n"
+           "}\n";
+  if (Name == "crucible_pow2_5")
+    return "template <typename T> static inline T crucible_pow2_5(T x) {\n"
+           "  return x * x * sqrt(x);\n"
+           "}\n";
   if (Name == "crucible_ray_params")
     return "static inline intersection_params crucible_ray_params(uint flags) {\n"
            "  intersection_params p;\n"
@@ -3253,7 +3268,7 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
           return Expr{It->second + "." + std::string(1, "xyzw"[*Pos & 3]),
                       PrecPrimary};
         }
-        if (mlir::isa<ir::BufferLoadOp>(Prod)) {
+        if (mlir::isa<ir::BufferLoadOp, ir::CBufferLoadOp>(Prod)) {
           if (auto It = ValueNames.find(EE.getVector());
               It != ValueNames.end()) {
             return Expr{It->second + "." + std::string(1, "xyzw"[*Pos & 3]),
@@ -3755,8 +3770,68 @@ Expected<Expr> Emitter::opExpr(mlir::Operation *Op) {
     return emitUnaryCall("tanh");
   if (mlir::isa<mlir::LLVM::ExpOp, mlir::math::ExpOp>(Op))
     return emitUnaryCall("exp");
-  if (mlir::isa<mlir::LLVM::Exp2Op, mlir::math::Exp2Op>(Op))
+  if (mlir::isa<mlir::LLVM::Exp2Op, mlir::math::Exp2Op>(Op)) {
+    // Strength-reduce DXC's lowered `pow(x, C)` -> `exp2(log2(x) * C)` for
+    // small integer and half-integer constants, replacing pairs of SFU
+    // transcendentals with FPU multiplies / sqrt (outside strict FP mode).
+    mlir::Type ResTy = Op->getResult(0).getType();
+    if (!R.RequiresStrictFP && !Opts.EmulateF64 &&
+        (ResTy.isF32() || ResTy.isF16())) {
+      if (auto Mul = Op->getOperand(0).getDefiningOp<FMulOp>()) {
+        auto MatchLog2AndConst = [](mlir::Value A, mlir::Value B,
+                                    mlir::Value &OutX, double &OutC) -> bool {
+          auto *LogDef = A.getDefiningOp();
+          if (!LogDef || !mlir::isa<mlir::LLVM::Log2Op, mlir::math::Log2Op>(LogDef))
+            return false;
+          auto Cst = B.getDefiningOp<ConstantOp>();
+          if (!Cst)
+            return false;
+          auto FA = mlir::dyn_cast<mlir::FloatAttr>(Cst.getValue());
+          if (!FA)
+            return false;
+          OutX = LogDef->getOperand(0);
+          OutC = FA.getValueAsDouble();
+          return true;
+        };
+        mlir::Value BaseX;
+        double ExpC = 0.0;
+        if (MatchLog2AndConst(Mul.getLhs(), Mul.getRhs(), BaseX, ExpC) ||
+            MatchLog2AndConst(Mul.getRhs(), Mul.getLhs(), BaseX, ExpC)) {
+          if (ExpC == 0.5) {
+            auto XE = exprFor(BaseX, PrecUnknown);
+            if (!XE)
+              return XE.takeError();
+            return Expr{"sqrt(" + XE->Text + ")", PrecPrimary};
+          }
+          if (ExpC == -0.5) {
+            auto XE = exprFor(BaseX, PrecUnknown);
+            if (!XE)
+              return XE.takeError();
+            return Expr{"rsqrt(" + XE->Text + ")", PrecPrimary};
+          }
+          if (ExpC == 2.5) {
+            auto XE = exprFor(BaseX, PrecUnknown);
+            if (!XE)
+              return XE.takeError();
+            requireHelper("crucible_pow2_5");
+            return Expr{"crucible_pow2_5(" + XE->Text + ")", PrecPrimary};
+          }
+          int IntExp = static_cast<int>(ExpC);
+          if (ExpC == static_cast<double>(IntExp) && IntExp >= 2 &&
+              IntExp <= 16) {
+            auto XE = exprFor(BaseX, PrecUnknown);
+            if (!XE)
+              return XE.takeError();
+            requireHelper("crucible_powi");
+            return Expr{"crucible_powi<" + std::to_string(IntExp) + ">(" +
+                            XE->Text + ")",
+                        PrecPrimary};
+          }
+        }
+      }
+    }
     return emitUnaryCall("exp2");
+  }
   if (mlir::isa<mlir::LLVM::LogOp, mlir::math::LogOp>(Op))
     return emitUnaryCall("log");
   if (mlir::isa<mlir::LLVM::Log2Op, mlir::math::Log2Op>(Op))
@@ -6185,6 +6260,42 @@ Error Emitter::emitStatement(mlir::Operation *Op, unsigned Ind) {
           ValueNames[BL.getResult()] = Name;
           return Error::success();
         }
+      }
+    }
+  }
+
+  if (auto CB = mlir::dyn_cast<ir::CBufferLoadOp>(Op);
+      CB && !CB.getResult().use_empty() && !constInt(CB.getRegIndex())) {
+    ResState *RS = stateFor(CB.getHandle());
+    auto VecTy = mlir::dyn_cast<mlir::VectorType>(CB.getResult().getType());
+    if (RS && VecTy && VecTy.getNumElements() == 4 &&
+        VecTy.getElementType().isF32() && RS->ElemType == "float4") {
+      uint32_t UsedMask = 0;
+      bool AllConstExtract = true;
+      for (mlir::Operation *U : CB.getResult().getUsers()) {
+        auto EE = mlir::dyn_cast<mlir::LLVM::ExtractElementOp>(U);
+        if (!EE) {
+          AllConstExtract = false;
+          break;
+        }
+        auto Pos = constInt(EE.getPosition());
+        if (!Pos || *Pos >= 4) {
+          AllConstExtract = false;
+          break;
+        }
+        UsedMask |= (1u << static_cast<unsigned>(*Pos));
+      }
+      if (AllConstExtract && llvm::popcount(UsedMask) >= 2) {
+        auto RName = resourceExpr(CB.getHandle());
+        if (!RName)
+          return RName.takeError();
+        auto Row = exprFor(CB.getRegIndex(), PrecUnknown);
+        if (!Row)
+          return Row.takeError();
+        std::string Name = freshName();
+        line(Ind, "float4 " + Name + " = " + *RName + "[" + Row->Text + "];");
+        ValueNames[CB.getResult()] = Name;
+        return Error::success();
       }
     }
   }
