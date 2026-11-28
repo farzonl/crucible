@@ -37,9 +37,20 @@ jobs:
             os: ubuntu-latest
           - platform: macos-arm64
             os: macos-latest
+          - platform: windows-x86_64
+            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout DirectX-Headers submodule (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git submodule update --init --depth 1 third_party/DirectX-Headers
+
+      - name: Setup MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Determine release version
         id: version
@@ -79,38 +90,56 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ninja
 
+      - name: Install build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python -m pip install --upgrade ninja
+
       - name: Setup third_party LLVM/MLIR
         uses: ./.github/actions/setup-llvm
 
       - name: Configure
+        shell: bash
         run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            WS="$(cygpath -m "${{ github.workspace }}")"
+          else
+            WS="${{ github.workspace }}"
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCRUCIBLE_ENABLE_TESTS=OFF \
-            -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/stage/crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}" \
-            -DLLVM_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/llvm" \
-            -DMLIR_DIR="${{ github.workspace }}/.toolchains/llvm/lib/cmake/mlir"
+            -DCMAKE_INSTALL_PREFIX="${WS}/stage/crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}" \
+            -DLLVM_DIR="${WS}/.toolchains/llvm/lib/cmake/llvm" \
+            -DMLIR_DIR="${WS}/.toolchains/llvm/lib/cmake/mlir"
 
       - name: Build
+        shell: bash
         run: cmake --build build --target cruciblec crucible-run --parallel
 
       - name: Install and stage release archive
         shell: bash
         run: |
           cmake --install build
-          STAGE_DIR="stage/crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}"
+          STAGE_NAME="crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}"
+          STAGE_DIR="stage/${STAGE_NAME}"
           cp LICENSE README.md "${STAGE_DIR}/"
           "${STAGE_DIR}/bin/cruciblec" --version
           "${STAGE_DIR}/bin/crucible-run" --version
           mkdir -p dist
-          ARCHIVE="crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}.tar.gz"
-          tar -C stage -czf "dist/${ARCHIVE}" "crucible-${{ steps.version.outputs.tag }}-${{ matrix.platform }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ARCHIVE="${STAGE_NAME}.zip"
+            python -c "import os, zipfile; z=zipfile.ZipFile('dist/${ARCHIVE}','w',zipfile.ZIP_DEFLATED); [z.write(os.path.join(r,f), os.path.relpath(os.path.join(r,f),'stage')) for r,_,fs in os.walk('${STAGE_DIR}') for f in fs]; z.close()"
+          else
+            ARCHIVE="${STAGE_NAME}.tar.gz"
+            tar -C stage -czf "dist/${ARCHIVE}" "${STAGE_NAME}"
+          fi
 
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
-          path: dist/*.tar.gz
+          path: dist/*
 
   publish:
     name: Publish GitHub Release
@@ -130,10 +159,10 @@ jobs:
       - name: Generate SHA256SUMS.txt
         working-directory: dist
         run: |
-          sha256sum *.tar.gz > SHA256SUMS.txt
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -150,7 +179,11 @@ jobs:
             EXTRA_FLAGS+=(--prerelease)
           fi
 
-          gh release create "${TAG}" dist/*.tar.gz dist/SHA256SUMS.txt \
-            --title "Crucible ${TAG}" \
-            --generate-notes \
-            "${EXTRA_FLAGS[@]}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "${TAG}" dist/*.tar.gz dist/*.zip dist/SHA256SUMS.txt \
+              --title "Crucible ${TAG}" \
+              --generate-notes \
+              "${EXTRA_FLAGS[@]}"
+          fi
