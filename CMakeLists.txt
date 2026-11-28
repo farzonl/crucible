@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(crucible VERSION 0.0.1 LANGUAGES C CXX)
+project(crucible VERSION 0.0.2 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 

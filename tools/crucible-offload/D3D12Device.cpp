@@ -2527,7 +2527,7 @@ public:
                                                    : BackendCaps.AdapterName) +
                   ")";
     DriverName = "Crucible";
-    DriverVersion = "0.0.1";
+    DriverVersion = "0.0.2";
     GPUGeneration = BackendCaps.AdapterName.empty() ? "D3D12"
                                                     : BackendCaps.AdapterName;
 
