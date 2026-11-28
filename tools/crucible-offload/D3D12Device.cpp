@@ -421,12 +421,8 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
           ? BackendCaps.HighestShaderModel
           : "6.6";
 
-  for (const auto &SC : CS.SpecializationConstants) {
-    uint64_t Bits = 0;
-    if (SC.Value.size() <= sizeof(Bits))
-      std::memcpy(&Bits, SC.Value.data(), SC.Value.size());
-    Opts.SpecConstants[SC.ConstantID] = Bits;
-  }
+  if (Error E = parseSpecConstants(CS, Opts))
+    return E;
 
   auto Compiled =
       crucible::compileToDXIL(CS.Shader->getMemBufferRef(), Opts);
@@ -641,7 +637,12 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
 
       // Vulkan SPIR-V represents RWStructuredBuffer counters as a separate UAV
       // buffer at CounterBinding (counter.var.<Name>).
-      if (Res.HasCounter && Res.VKBinding && Res.VKBinding->CounterBinding) {
+      if (Res.HasCounter && !Res.HeapIndex && Res.VKBinding) {
+        if (!Res.VKBinding->CounterBinding)
+          return createStringError(
+              inconvertibleErrorCode(),
+              "No CounterBinding provided for resource '%s' with a counter",
+              Res.Name.c_str());
         uint32_t CSpace = static_cast<uint32_t>(SetIdx);
         uint32_t CBaseReg = *Res.VKBinding->CounterBinding;
         std::string CName = "counter.var." + Res.Name;
@@ -1589,6 +1590,13 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
                              "graphics pipeline requires both Vertex and Pixel "
                              "shaders");
 
+  if (P.Bindings.SampleCount == 0 || P.Bindings.SampleCount > 64 ||
+      (P.Bindings.SampleCount & (P.Bindings.SampleCount - 1)) != 0)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "SampleCount must be one of 1, 2, 4, 8, 16, 32, or 64; got %u",
+        P.Bindings.SampleCount);
+
   auto compileStage = [&](const offloadtest::Shader &S)
       -> Expected<crucible::DXILCompileResult> {
     crucible::Options Opts;
@@ -1599,12 +1607,8 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
          BackendCaps.HighestShaderModel < "6.6")
             ? BackendCaps.HighestShaderModel
             : "6.6";
-    for (const auto &SC : S.SpecializationConstants) {
-      uint64_t Bits = 0;
-      if (SC.Value.size() <= sizeof(Bits))
-        std::memcpy(&Bits, SC.Value.data(), SC.Value.size());
-      Opts.SpecConstants[SC.ConstantID] = Bits;
-    }
+    if (Error E = parseSpecConstants(S, Opts))
+      return E;
     auto Res = crucible::compileToDXIL(S.Shader->getMemBufferRef(), Opts);
     if (!Res)
       return Res.takeError();
