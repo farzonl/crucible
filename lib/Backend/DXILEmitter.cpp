@@ -1956,7 +1956,128 @@ void DXILLowerer::emitSemanticSignatures() {
 }
 
 void DXILLowerer::normalizeGroupsharedAtomics() {
-  // DXIL 3.7 bitcode uses typed pointers: atomicrmw / cmpxchg must operate on a
+  // 1. Promote float / [N x float] groupshared (addrspace(3)) globals touched
+  // by atomicrmw / cmpxchg to i32 / [N x i32] so DXIL atomic ops operate on a
+  // native i32 groupshared pointer without bitcasting float addrspace(3)*
+  // (which causes DXGI_ERROR_DEVICE_REMOVED on WARP).
+  auto isFloatOrFloatArray = [](Type *T) {
+    while (auto *AT = dyn_cast<ArrayType>(T))
+      T = AT->getElementType();
+    return T->isFloatTy();
+  };
+  auto replaceFloatWithI32 = [&](auto &Self, Type *T) -> Type * {
+    if (auto *AT = dyn_cast<ArrayType>(T))
+      return ArrayType::get(Self(Self, AT->getElementType()),
+                            AT->getNumElements());
+    if (T->isFloatTy())
+      return Type::getInt32Ty(M.getContext());
+    return T;
+  };
+  SmallPtrSet<GlobalVariable *, 8> FloatAtomicGVs;
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : BB) {
+        Value *Ptr = nullptr;
+        if (auto *RMW = dyn_cast<AtomicRMWInst>(&I))
+          Ptr = RMW->getPointerOperand();
+        else if (auto *CX = dyn_cast<AtomicCmpXchgInst>(&I))
+          Ptr = CX->getPointerOperand();
+        else
+          continue;
+        Value *Base = Ptr;
+        while (true) {
+          if (auto *GEP = dyn_cast<GEPOperator>(Base))
+            Base = GEP->getPointerOperand();
+          else if (auto *BC = dyn_cast<BitCastOperator>(Base))
+            Base = BC->getOperand(0);
+          else if (auto *ASC = dyn_cast<AddrSpaceCastOperator>(Base))
+            Base = ASC->getOperand(0);
+          else
+            break;
+        }
+        if (auto *GV = dyn_cast<GlobalVariable>(Base)) {
+          if (GV->getAddressSpace() == 3 &&
+              isFloatOrFloatArray(GV->getValueType()))
+            FloatAtomicGVs.insert(GV);
+        }
+      }
+    }
+  }
+  for (GlobalVariable *OldGV : FloatAtomicGVs) {
+    Type *NewValTy = replaceFloatWithI32(replaceFloatWithI32, OldGV->getValueType());
+    auto *NewGV = new GlobalVariable(
+        M, NewValTy, OldGV->isConstant(), OldGV->getLinkage(),
+        OldGV->hasInitializer() ? UndefValue::get(NewValTy) : nullptr, "",
+        OldGV, OldGV->getThreadLocalMode(), OldGV->getAddressSpace());
+    NewGV->takeName(OldGV);
+    NewGV->setAlignment(OldGV->getAlign());
+    NewGV->setUnnamedAddr(OldGV->getUnnamedAddr());
+
+    // Collect all instructions derived from OldGV (GEPs, bitcasts, loads, stores).
+    SmallVector<Instruction *, 16> Worklist;
+    SmallPtrSet<Value *, 32> Derived;
+    Derived.insert(OldGV);
+    for (User *U : OldGV->users())
+      if (auto *Inst = dyn_cast<Instruction>(U))
+        Worklist.push_back(Inst);
+    // BFS to find all GEP/bitcast chains, then rewrite loads/stores/GEPs.
+    SmallVector<GetElementPtrInst *, 16> GEPs;
+    SmallVector<LoadInst *, 16> Loads;
+    SmallVector<StoreInst *, 16> Stores;
+    for (size_t Idx = 0; Idx < Worklist.size(); ++Idx) {
+      Instruction *Inst = Worklist[Idx];
+      if (!Derived.insert(Inst).second)
+        continue;
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(Inst)) {
+        GEPs.push_back(GEP);
+        for (User *U : GEP->users())
+          if (auto *UI = dyn_cast<Instruction>(U))
+            Worklist.push_back(UI);
+      } else if (isa<BitCastInst>(Inst) || isa<AddrSpaceCastInst>(Inst)) {
+        for (User *U : Inst->users())
+          if (auto *UI = dyn_cast<Instruction>(U))
+            Worklist.push_back(UI);
+      } else if (auto *LI = dyn_cast<LoadInst>(Inst)) {
+        if (LI->getType()->isFloatTy())
+          Loads.push_back(LI);
+      } else if (auto *SI = dyn_cast<StoreInst>(Inst)) {
+        if (SI->getValueOperand()->getType()->isFloatTy())
+          Stores.push_back(SI);
+      }
+    }
+    OldGV->replaceAllUsesWith(NewGV);
+    OldGV->eraseFromParent();
+    for (GetElementPtrInst *GEP : GEPs) {
+      Type *NewSrcTy =
+          replaceFloatWithI32(replaceFloatWithI32, GEP->getSourceElementType());
+      SmallVector<Value *, 4> Idxs(GEP->indices());
+      auto *NewGEP = GetElementPtrInst::Create(
+          NewSrcTy, GEP->getPointerOperand(), Idxs, "", GEP->getIterator());
+      NewGEP->setIsInBounds(GEP->isInBounds());
+      NewGEP->takeName(GEP);
+      GEP->replaceAllUsesWith(NewGEP);
+      GEP->eraseFromParent();
+    }
+    for (LoadInst *LI : Loads) {
+      IRBuilder<> B(LI);
+      auto *IntLoad = B.CreateAlignedLoad(B.getInt32Ty(), LI->getPointerOperand(),
+                                          LI->getAlign(), LI->isVolatile());
+      Value *Flt = B.CreateBitCast(IntLoad, B.getFloatTy());
+      LI->replaceAllUsesWith(Flt);
+      LI->eraseFromParent();
+    }
+    for (StoreInst *SI : Stores) {
+      IRBuilder<> B(SI);
+      Value *IntVal = B.CreateBitCast(SI->getValueOperand(), B.getInt32Ty());
+      B.CreateAlignedStore(IntVal, SI->getPointerOperand(), SI->getAlign(),
+                           SI->isVolatile());
+      SI->eraseFromParent();
+    }
+  }
+
+  // 2. DXIL 3.7 bitcode uses typed pointers: atomicrmw / cmpxchg must operate on a
   // pointer to the scalar element type, not directly on an array global like
   // `[1 x i32] addrspace(3)*`. Insert a zero-index GEP when needed.
   for (Function &F : M) {

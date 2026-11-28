@@ -11,6 +11,7 @@
 #include "API/Capabilities.h"
 #include "API/Device.h"
 #include "Support/Pipeline.h"
+#include "crucible/Compiler.h"
 #include "crucible/Reflection.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Error.h"
@@ -41,6 +42,9 @@ std::optional<crucible::ResourceClass>
 classifyResource(offloadtest::ResourceKind Kind);
 
 llvm::Error validateRootParameters(const offloadtest::Pipeline &P);
+
+llvm::Error parseSpecConstants(const offloadtest::Shader &S,
+                               crucible::Options &Opts);
 
 #ifdef CRUCIBLE_HAS_METAL_OFFLOAD
 llvm::Expected<llvm::SmallVector<std::unique_ptr<offloadtest::Device>>>
