@@ -611,6 +611,34 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
         }
       }
 
+      // Combined image+sampler resources (e.g. vk::SampledTexture2D) carry both
+      // BufferPtr and SamplerPtr; bind the split sampler slot as well.
+      if (Res.SamplerPtr) {
+        uint32_t SSpace = static_cast<uint32_t>(SetIdx);
+        uint32_t SBaseReg = 0;
+        if (Res.VKBinding) {
+          SBaseReg = Res.VKBinding->Binding;
+        } else if (Res.DXBinding) {
+          SSpace = Res.DXBinding->Space;
+          SBaseReg = Res.DXBinding->Register;
+        }
+        const crucible::ResourceBinding *SMatched = findReflected(
+            crucible::ResourceClass::Sampler, SSpace, SBaseReg,
+            Res.Name + "_sampler", static_cast<bool>(Res.VKBinding));
+        if (!SMatched)
+          SMatched = findReflected(crucible::ResourceClass::Sampler, SSpace,
+                                   SBaseReg, Res.Name,
+                                   static_cast<bool>(Res.VKBinding));
+        if (SMatched) {
+          BoundSampler BS;
+          BS.Res = &Res;
+          BS.Space = SMatched->Space;
+          BS.Register = SMatched->LowerBound;
+          BS.IsUnbounded = (SMatched->RangeSize == 0xFFFFFFFFu);
+          BoundSamplers.push_back(BS);
+        }
+      }
+
       // Vulkan SPIR-V represents RWStructuredBuffer counters as a separate UAV
       // buffer at CounterBinding (counter.var.<Name>).
       if (Res.HasCounter && Res.VKBinding && Res.VKBinding->CounterBinding) {
@@ -1413,7 +1441,8 @@ Error executeComputeD3D12(Pipeline &P, ID3D12Device *Dev,
   Cmd->Dispatch(Grid[0], Grid[1], Grid[2]);
 
   for (BoundResource &BR : Bound) {
-    if (BR.Class != crucible::ResourceClass::UAV)
+    if (BR.Class != crucible::ResourceClass::UAV || !BR.DefaultBuf ||
+        !BR.ReadbackBuf)
       continue;
     D3D12_RESOURCE_BARRIER Barrier{};
     Barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1726,6 +1755,42 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
         }
         Bound.push_back(std::move(BR));
       }
+
+      // Combined image+sampler resources (e.g. vk::SampledTexture2D) carry both
+      // BufferPtr and SamplerPtr; bind the split sampler slot as well.
+      if (Res.SamplerPtr) {
+        uint32_t SSpace = static_cast<uint32_t>(SetIdx);
+        uint32_t SBaseReg = Res.VKBinding   ? Res.VKBinding->Binding
+                            : Res.DXBinding ? Res.DXBinding->Register
+                                            : 0u;
+        if (Res.DXBinding)
+          SSpace = Res.DXBinding->Space;
+        const crucible::ResourceBinding *SMatched = nullptr;
+        if (Res.VKBinding) {
+          for (const auto &RB : AllReflect) {
+            if (RB.Class == crucible::ResourceClass::Sampler &&
+                RB.SPIRVSet == SSpace && RB.SPIRVBinding == SBaseReg) {
+              SMatched = &RB;
+              break;
+            }
+          }
+        }
+        if (!SMatched) {
+          std::string SName = Res.Name + "_sampler";
+          for (const auto &RB : AllReflect) {
+            if (RB.Class == crucible::ResourceClass::Sampler &&
+                !RB.Name.empty() &&
+                (RB.Name == SName || RB.Name == Res.Name)) {
+              SMatched = &RB;
+              break;
+            }
+          }
+        }
+        if (SMatched)
+          BoundSamplers.push_back(
+              {&Res, SMatched->Space, SMatched->LowerBound,
+               SMatched->RangeSize == 0xFFFFFFFFu});
+      }
     }
   }
 
@@ -1869,7 +1934,7 @@ Error executeGraphicsD3D12(Pipeline &P, ID3D12Device *Dev,
   PSODesc.SampleMask = UINT_MAX;
   PSODesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   PSODesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  PSODesc.RasterizerState.FrontCounterClockwise = FALSE;
+  PSODesc.RasterizerState.FrontCounterClockwise = TRUE;
   PSODesc.RasterizerState.DepthClipEnable = TRUE;
   bool HasStencil = P.Stencil && P.Stencil->Enabled;
   DXGI_FORMAT DSVFmt =

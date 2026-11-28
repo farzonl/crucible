@@ -5734,6 +5734,9 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
   // augmented with signless integer/vector conversions for signed/unsigned
   // SPIR-V struct fields (e.g. si32 / vector<3xsi32>).
   mlir::LLVMTypeConverter AggregateTypes(&Ctx);
+  mlir::populateSPIRVToLLVMTypeConversion(AggregateTypes);
+  // Register signless integer/vector conversions AFTER populateSPIRVToLLVMTypeConversion
+  // because MLIR TypeConverter evaluates conversions in LIFO order.
   AggregateTypes.addConversion([](mlir::IntegerType T) -> mlir::Type {
     if (T.isSignless())
       return T;
@@ -5745,7 +5748,6 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       return nullptr;
     return mlir::VectorType::get(VT.getShape(), E);
   });
-  mlir::populateSPIRVToLLVMTypeConversion(AggregateTypes);
   SmallVector<mlir::spirv::CompositeConstructOp, 8> AggregateConstructs;
   EntryFn.walk([&](mlir::spirv::CompositeConstructOp CC) {
     if (mlir::isa<mlir::spirv::StructType, mlir::spirv::ArrayType,
@@ -5753,14 +5755,18 @@ loadSPIRV(MemoryBufferRef Buf, mlir::MLIRContext &Ctx,
       AggregateConstructs.push_back(CC);
   });
   for (auto CC : AggregateConstructs) {
-    auto Ty = AggregateTypes.convertType(CC.getType());
-    if (!Ty)
-      return makeError("unsupported SPIR-V aggregate construction type");
     mlir::OpBuilder B(CC);
     auto Loc = CC.getLoc();
+    auto Ty = AggregateTypes.convertType(CC.getType());
+    if (!Ty)
+      Ty = convertSpirvDataType(CC.getType(), B);
+    if (!Ty)
+      return makeError("unsupported SPIR-V aggregate construction type");
     mlir::Value Value = mlir::LLVM::UndefOp::create(B, Loc, Ty);
     for (auto [I, Elem] : llvm::enumerate(CC.getConstituents())) {
       auto ElemTy = AggregateTypes.convertType(Elem.getType());
+      if (!ElemTy)
+        ElemTy = convertSpirvDataType(Elem.getType(), B);
       if (!ElemTy)
         return makeError("unsupported SPIR-V aggregate element type");
       if (ElemTy != Elem.getType())

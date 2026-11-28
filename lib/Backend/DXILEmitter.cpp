@@ -845,7 +845,8 @@ Error DXILLowerer::lowerTexLoad(CallInst *CI) {
   uint32_t NumOffsets = 0;
   if (OffStart < CI->arg_size())
     NumOffsets = cast<ConstantInt>(CI->getArgOperand(OffStart))->getZExtValue();
-  if (SpatialDims > 0) {
+  bool IsUAV = RH.RB && RH.RB->Class == ResourceClass::UAV;
+  if (SpatialDims > 0 && !IsUAV) {
     if (NumCoords == 1) {
       OffsetVal = (NumOffsets > 0) ? CI->getArgOperand(OffStart + 1)
                                    : static_cast<Value *>(B.getInt32(0));
